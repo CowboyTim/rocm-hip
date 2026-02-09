@@ -28,14 +28,14 @@ HOST_SRC  := main.cpp
 HOST_OBJ  := main.o
 
 # --- Build Rules ---
-all: $(TARGET)
+all: $(TARGET) $(GPU_CO)
 
 # 1. Compile Kernels separately with hipcc
-$(GPU_CO): $(GPU_SRC)
+%.co: %.hip
 	$(HIPCC) $(HIPFLAGS) -c $< -o $@
 
 # 2. Compile Host code with standard clang++
-$(HOST_OBJ): $(HOST_SRC)
+%.o: %.cpp
 	$(CLANG) $(CXXFLAGS) -c $< -o $@
 
 # 3. Link everything together with clang++
