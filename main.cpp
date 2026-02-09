@@ -13,9 +13,6 @@
     } \
 }
 
-// Declare the kernel from the other file
-extern "C" __global__ void halo_kernel(float* data, size_t n);
-
 int main() {
     const char* filepath = "/dev/shm/test_data.bin"; // RAM-disk for speed
     //const char* filepath = "/var/tmp/test_data.bin"; // RAM-disk for speed
@@ -24,29 +21,55 @@ int main() {
 
     // 1. Create a file-backed memory region
     int fd = open(filepath, O_RDWR | O_CREAT, 0666);
-    ftruncate(fd, size);
+    if (fd < 0) {
+        perror("Failed to open file");
+        return EXIT_FAILURE;
+    }
+    int r = ftruncate(fd, size);
+    if (r != 0) {
+        perror("Failed to set file size");
+        close(fd);
+        return EXIT_FAILURE;
+    }
 
     // Standard CPU mmap (Pageable memory)
     void* hostPtr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 
-    // 2. Register the mmap'ed memory for GPU access
+    // Simple kernel to modify the data
+    HIP_CHECK(hipInit(0), "initializing HIP");
+
+    // Load the Code Object file
+    hipModule_t module;
+    HIP_CHECK(hipModuleLoad(&module, "kernels.co"), "loading kernel module");
+
+    // Extract the function (use the C-name of the kernel)
+    hipFunction_t kernelFunc;
+    HIP_CHECK(hipModuleGetFunction(&kernelFunc, module, "halo_kernel"), "getting kernel function");
+
+    // Register the mmap'ed memory for GPU access
     // This 'pins' the pages in the IOMMU so the GPU can walk them.
     // hipHostRegisterMapped is the key flag for Strix Halo.
     HIP_CHECK(hipHostRegister(hostPtr, size, hipHostRegisterMapped), "registering host memory");
 
-    // 3. Get the Device Pointer
+    // Get the Device Pointer
     // On APUs, devPtr might be equal to hostPtr, but always use this API for safety.
     float* devPtr;
     HIP_CHECK(hipHostGetDevicePointer((void**)&devPtr, hostPtr, 0), "getting device pointer");
 
-    // 4. Launch Kernel (No hipMemcpy needed!)
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
-    hipLaunchKernelGGL(halo_kernel, dim3(blocks), dim3(threads), 0, 0, devPtr, n);
+    // Launch Kernel (No hipMemcpy needed!) 
+    // Set up Kernel Arguments (This is different from GGL launch)
+    // You pass an array of pointers to each argument
+    void* args[] = { &devPtr, &n };
+    HIP_CHECK(hipModuleLaunchKernel(kernelFunc, 
+                          (n+255)/256, 1, 1, // Grid
+                          256, 1, 1,         // Block
+                          0, 0, args, nullptr), "launching kernel");
 
+
+    // Wait for the GPU to finish. The data is updated in-place in the file.
     HIP_CHECK(hipDeviceSynchronize(), "synchronizing device");
 
-    // 5. Success! The data is updated in the file via the GPU.
+    // Success! The data is updated in the file via the GPU.
     std::cout << "GPU finished. First element: " << ((float*)hostPtr)[0] << std::endl;
     std::cout << "GPU finished. Last element: " << ((float*)hostPtr)[n-1] << std::endl;
 

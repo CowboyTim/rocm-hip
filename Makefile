@@ -9,7 +9,7 @@ ARCH      := gfx1151
 
 # Compilation Flags
 CXXFLAGS  := -O3 -Wall -x hip -I$(ROCM_PATH)/include -D__HIP_PLATFORM_AMD__ -D__HIP_ENABLE_AMD_HSA__
-HIPFLAGS  := -O3 --offload-arch=$(ARCH)
+HIPFLAGS  := -O3 --offload-arch=$(ARCH) --genco
 
 # Linker Flags
 # We need amdhip64 and hsa-runtime64 for the IOMMU/Memory features
@@ -21,18 +21,17 @@ TARGET    := halo_test
 # --- Files ---
 # Kernels (GPU code)
 GPU_SRC   := kernels.hip
-GPU_OBJ   := kernels.o
+GPU_CO    := kernels.co
 
 # Host (CPU code)
 HOST_SRC  := main.cpp
 HOST_OBJ  := main.o
 
 # --- Build Rules ---
-
 all: $(TARGET)
 
 # 1. Compile Kernels separately with hipcc
-$(GPU_OBJ): $(GPU_SRC)
+$(GPU_CO): $(GPU_SRC)
 	$(HIPCC) $(HIPFLAGS) -c $< -o $@
 
 # 2. Compile Host code with standard clang++
