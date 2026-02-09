@@ -1,6 +1,7 @@
 #include <iostream>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <hip/hip_runtime.h>
 
@@ -39,8 +40,35 @@ int main() {
     HIP_CHECK(hipInit(0), "initializing HIP");
 
     // Load the Code Object file
+    int kfd = open("kernels.co", O_RDONLY);
+    if (kfd < 0) {
+        perror("Failed to open kernel module");
+        munmap(hostPtr, size);
+        close(fd);
+        return EXIT_FAILURE;
+    }
+
+    // Load the Code Object file in memory
+    struct stat st;
+    int t = fstat(kfd, &st);
+    if (t != 0) {
+        perror("Failed to stat kernel module");
+        munmap(hostPtr, size);
+        close(fd);
+        close(kfd);
+        return EXIT_FAILURE;
+    }
+    void* kfdData = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, kfd, 0);
+    if (kfdData == MAP_FAILED) {
+        perror("Failed to mmap kernel module");
+        munmap(hostPtr, size);
+        close(fd);
+        close(kfd);
+        return EXIT_FAILURE;
+    }
+
     hipModule_t module;
-    HIP_CHECK(hipModuleLoad(&module, "kernels.co"), "loading kernel module");
+    HIP_CHECK(hipModuleLoadData(&module, kfdData), "loading kernel module");
 
     // Extract the function (use the C-name of the kernel)
     hipFunction_t kernelFunc;
@@ -73,9 +101,17 @@ int main() {
     std::cout << "GPU finished. First element: " << ((float*)hostPtr)[0] << std::endl;
     std::cout << "GPU finished. Last element: " << ((float*)hostPtr)[n-1] << std::endl;
 
+    // Unload the module and cleanup
+    // Note: You can keep the module loaded if you want to launch more kernels, but we unload it here for completeness.
+    HIP_CHECK(hipModuleUnload(module), "unloading kernel module");
+
     // Cleanup
     HIP_CHECK(hipHostUnregister(hostPtr), "unregistering host memory");
     munmap(hostPtr, size);
+    munmap(kfdData, st.st_size);
     close(fd);
+    close(kfd);
+    printf("Done.\n");
+
     return 0;
 }
