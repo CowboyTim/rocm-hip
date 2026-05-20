@@ -2,3 +2,10 @@
 *.o
 *.co
 halo_test
+mandelbrot
+
+# Temporary/build directories
+.tmp/
+mandelbrot.ppm
+vectorAdd.cpp.bak
+vectorAdd.cpp.orig
