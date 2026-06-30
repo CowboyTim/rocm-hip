@@ -3,9 +3,12 @@
 *.co
 halo_test
 mandelbrot
+wmma_matmul
 
 # Temporary/build directories
 .tmp/
 mandelbrot.ppm
 vectorAdd.cpp.bak
 vectorAdd.cpp.orig
+# CocoIndex Code (ccc)
+/.cocoindex_code/
