@@ -17,11 +17,23 @@ KERNEL_SRC = kernels.hip
 KERNEL_CO  = kernels.co
 OBJ        = main.o
 
-# WMMA matmul: uses hipLaunchKernelGGL with mmap zero-copy
+# WMMA matmul (FP16): uses hipModuleLoadData + mmap zero-copy
 WMMA_SRC  = wmma_kernel.hip
 WMMA_CO   = wmma_kernel.co
 WMMA_OBJ  = wmma_main.o
 WMMA_TARGET = wmma_matmul
+
+# WMMA matmul (FP4 ROCmFP4): FP4 dequant via DP4A perm + WMMA FP16
+WMMA_FP4_SRC  = wmma_kernel_fp4.hip
+WMMA_FP4_CO   = wmma_kernel_fp4.co
+WMMA_FP4_OBJ  = wmma_main_fp4.o
+WMMA_FP4_TARGET = wmma_matmul_fp4
+
+# WMMA matmul (FP4 native): uses __builtin_amdgcn_wmma_f32_32x16x128_f4
+WMMA_FP4_NATIVE_SRC  = wmma_kernel_fp4_native.hip
+WMMA_FP4_NATIVE_CO   = wmma_kernel_fp4_native.co
+WMMA_FP4_NATIVE_OBJ  = wmma_main_fp4_native.o
+WMMA_FP4_NATIVE_TARGET = wmma_matmul_fp4_native
 
 # --- Build Rules ---
 all: $(TARGET)
@@ -32,16 +44,22 @@ $(TARGET): $(OBJ) $(KERNEL_CO)
 $(WMMA_TARGET): $(WMMA_OBJ) $(WMMA_CO)
 	$(CLANG) $(WMMA_OBJ) $(LDFLAGS) -o $@
 
+$(WMMA_FP4_TARGET): $(WMMA_FP4_OBJ) $(WMMA_FP4_CO)
+	$(CLANG) $(WMMA_FP4_OBJ) $(LDFLAGS) -o $@
+
+$(WMMA_FP4_NATIVE_TARGET): $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO)
+	$(CLANG) $(WMMA_FP4_NATIVE_OBJ) $(LDFLAGS) -o $@
+
 %.co: %.hip
 	$(HIPCC) $(HIPFLAGS) -c $< -o $@
 
 %.o: %.cpp
 	$(CLANG) $(CXXFLAGS) -c $< -o $@
 
-# Build both demos
-both: $(TARGET) $(WMMA_TARGET)
+# Build all demos
+both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET)
 
 clean:
-	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO)
+	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO)
 
 .PHONY: all clean both
