@@ -166,15 +166,13 @@ Examples:
     print(f"  Total MAC:    {2.0 * M * K * N / 1e9:.1f} billion")
     print("=" * 78)
     
-    # Compile kernels
+    # Compile kernels - original rocmfp4 (DP4A) and new (FP16 WMMA + LDS LUT)
     print("\nCompiling HIP kernels...")
     kernels = [
-        "wmma_bench_fp4_dp4a",
-        "wmma_bench_fp4_dp4a_hardware", 
-        "wmma_bench_fp4_native",
-        "wmma_bench_fp4_lut",
-        "wmma_bench_fp4_lut_fixed",
-        "wmma_bench_fp4_dp4a_int8"
+        "wmma_bench_fp4_dp4a",      # Original: DP4A for FP4->int8 + int8 multiply
+        "wmma_bench_fp4_dp4a_hardware",  # DP4A hardware intrinsics
+        "wmma_bench_fp4_native",    # Native fallback
+        "wmma_bench_fp4_lut"        # New: FP4->FP16 via LDS LUT + WMMA tensor core
     ]
     
     for kernel in kernels:
