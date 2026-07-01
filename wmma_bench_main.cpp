@@ -35,9 +35,9 @@ float fp4_dequant(uint8_t nibble) {
     return (float)fp4_codebook[nibble];
 }
 
-// FP4 matmul on CPU
-void fp4_matmul_cpu(const unsigned char* A, const unsigned char* B, float* C,
-                    int M, int N, int K, float scale) {
+// FP4 matmul on CPU reference
+void fp4_matmul_cpu_ref(const unsigned char* A, const unsigned char* B, float* C,
+                        int M, int N, int K, float scale) {
     for (int i = 0; i < M; ++i) {
         for (int j = 0; j < N; ++j) {
             float sum = 0.0f;
@@ -49,32 +49,128 @@ void fp4_matmul_cpu(const unsigned char* A, const unsigned char* B, float* C,
     }
 }
 
-// FP4 matmul kernel
-__global__ void fp4_matmul_kernel(const unsigned char* A, const unsigned char* B,
-                                   float* C, int M, int N, int K, float scale) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    int col = blockIdx.y * blockDim.y + threadIdx.y;
+// DP4A + FP16-WMMA kernel (externally linked from .o)
+extern "C" void wmma_bench_fp4_dp4a(const unsigned char*, const unsigned char*,
+                                     float*, int, int, int, float);
+
+// Native FP4 WMMA kernel (externally linked from .o)
+extern "C" void wmma_bench_fp4_native(const unsigned char*, const unsigned char*,
+                                       float*, int, int, int, float);
+
+void run_benchmark(const char* name,
+                   void (*kernel)(const unsigned char*, const unsigned char*,
+                                  float*, int, int, int, float),
+                   const unsigned char* d_A, const unsigned char* d_B,
+                   float* d_C, int M, int N, int K, float scale,
+                   int NUM_RUNS, int NUM_WARMUP) {
+    printf("  Benchmarking: %s\n", name);
     
-    for (int r = row; r < M; r += blockDim.x * gridDim.x) {
-        for (int c = col; c < N; c += blockDim.y * gridDim.y) {
-            float sum = 0.0f;
-            for (int k = 0; k < K; k++) {
-                uint8_t a_nibble = A[r * K + k];
-                uint8_t b_nibble = B[k * N + c];
-                sum += (float)fp4_codebook[a_nibble] * (float)fp4_codebook[b_nibble] * scale;
+    hipError_t err;
+    size_t resultBytes = N * sizeof(float);
+    
+    // Warmup
+    for (int w = 0; w < NUM_WARMUP; ++w) {
+        err = hipMemset(d_C, 0, resultBytes);
+        if (err != hipSuccess) {
+            printf("    hipMemset failed: %s\n", hipGetErrorString(err));
+            return;
+        }
+        kernel(d_A, d_B, d_C, M, N, K, scale);
+        err = hipDeviceSynchronize();
+        if (err != hipSuccess) {
+            printf("    Kernel launch failed: %s\n", hipGetErrorString(err));
+            return;
+        }
+    }
+    
+    // Timed runs
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int r = 0; r < NUM_RUNS; ++r) {
+        err = hipMemset(d_C, 0, resultBytes);
+        kernel(d_A, d_B, d_C, M, N, K, scale);
+        err = hipDeviceSynchronize();
+        if (err != hipSuccess) {
+            printf("    Kernel failed: %s\n", hipGetErrorString(err));
+            return;
+        }
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    
+    std::chrono::duration<double, std::milli> elapsed = end - start;
+    double avg_time = elapsed.count() / NUM_RUNS;
+    double gflops = 2.0 * M * K * N / avg_time / 1e6;
+    
+    printf("    Avg time:   %.3f ms\n", avg_time);
+    printf("    Throughput: %.1f GFLOPS\n", gflops);
+    printf("    Total MAC:  %.1f million\n", 2.0 * M * K * N / 1e6f);
+}
+
+void verify_results(const char* name,
+                    const float* C_host, const float* C_cpu_ref,
+                    int M, int N, int max_print) {
+    int failures = 0;
+    float max_diff = 0.0f;
+    
+    for (int i = 0; i < M; ++i) {
+        for (int j = 0; j < N; ++j) {
+            float diff = fabsf(C_host[i * N + j] - C_cpu_ref[i * N + j]);
+            if (diff > max_diff) max_diff = diff;
+            if (diff >= 1.0f) failures++;
+        }
+    }
+    
+    float pct = 100.0f * failures / (M * N);
+    printf("    Mismatch:   %d / %d elements (%.1f%%)\n", failures, M * N, pct);
+    printf("    Max diff:   %.3f\n", max_diff);
+    
+    if (max_print > 0 && failures > 0) {
+        printf("    First few mismatches:\n");
+        int count = 0;
+        for (int i = 0; i < M && count < max_print; ++i) {
+            for (int j = 0; j < N && count < max_print; ++j) {
+                float diff = fabsf(C_host[i * N + j] - C_cpu_ref[i * N + j]);
+                if (diff >= 1.0f) {
+                    printf("      C[%d][%d]: GPU=%.3f  CPU=%.3f  diff=%.3f\n",
+                           i, j, C_host[i * N + j], C_cpu_ref[i * N + j], diff);
+                    count++;
+                }
             }
-            C[r * N + c] = sum;
         }
     }
 }
 
-int main() {
-    const int M = 256;
-    const int N = 256;
-    const int K = 256;
-    const int NUM_RUNS = 10;
-    const int NUM_WARMUP = 3;
-    const float scale_val = 1.0f;
+int main(int argc, char* argv[]) {
+    printf("[DEBUG] main() entered\n");
+    fflush(stdout);
+    // Parse cmdline options
+    int M = 256, N = 256, K = 256;
+    int NUM_RUNS = 10;
+    int NUM_WARMUP = 5;
+    int VERIFY_SAMPLES = 5;
+    float scale_val = 1.0f;
+    
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-M") == 0 && i + 1 < argc) M = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-N") == 0 && i + 1 < argc) N = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-K") == 0 && i + 1 < argc) K = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-runs") == 0 && i + 1 < argc) NUM_RUNS = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-warmup") == 0 && i + 1 < argc) NUM_WARMUP = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-verify") == 0 && i + 1 < argc) VERIFY_SAMPLES = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-scale") == 0 && i + 1 < argc) scale_val = atof(argv[++i]);
+        else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            printf("Usage: %s [options]\n", argv[0]);
+            printf("Options:\n");
+            printf("  -M N       Matrix rows (default: 256)\n");
+            printf("  -N N       Matrix cols (default: 256)\n");
+            printf("  -K N       Inner dimension (default: 256)\n");
+            printf("  -runs N    Number of benchmark runs (default: 10)\n");
+            printf("  -warmup N  Number of warmup runs (default: 5)\n");
+            printf("  -verify N  Number of mismatch samples to print (default: 5, 0=none)\n");
+            printf("  -scale F   FP4 scale factor (default: 1.0)\n");
+            printf("  -h, --help Show this help\n");
+            return 0;
+        }
+    }
     
     printf("==========================================================\n");
     printf("  FP4 Matmul Benchmark (gfx1151)\n");
@@ -82,6 +178,7 @@ int main() {
     printf("  Matrix size:  %d x %d x %d\n", M, K, N);
     printf("  FP4 format:   ROCmFP4 Codebook10\n");
     printf("  Values:       0, +/-1, +/-2, +/-3, +/-4, +/-6, +/-8, +/-10\n");
+    printf("  Scale:        %.1f\n", scale_val);
     printf("  Runs:         %d (after %d warmup)\n", NUM_RUNS, NUM_WARMUP);
     printf("  Total MAC:    %.1f million\n", 2.0f * M * K * N / 1e6f);
     printf("==========================================================\n\n");
@@ -89,7 +186,7 @@ int main() {
     // Allocate host memory
     size_t matBytes = M * K;
     size_t resultBytes = N * sizeof(float);
-    size_t totalBytes = 3 * matBytes + resultBytes;
+    size_t totalBytes = 3 * matBytes + resultBytes + resultBytes;
     
     const char* filepath = "/dev/shm/fp4_bench.bin";
     
@@ -102,9 +199,10 @@ int main() {
     
     unsigned char* A_fp4 = (unsigned char*)hostPtr;
     unsigned char* B_fp4 = (unsigned char*)((char*)hostPtr + matBytes);
-    float* C_gpu = (float*)((char*)hostPtr + 2 * matBytes);
+    float* C_gpu_dp4a = (float*)((char*)hostPtr + 2 * matBytes);
+    float* C_cpu_ref = (float*)((char*)hostPtr + 2 * matBytes + resultBytes);
     
-    // Generate random FP4 matrices
+    // Generate random FP4 matrices (same seed for reproducibility)
     printf("Generating FP4 matrices...\n");
     srand(42);
     for (int i = 0; i < M * K; ++i) {
@@ -117,11 +215,19 @@ int main() {
     }
     printf("  Done.\n\n");
     
+    // Compute CPU reference result (same for both benchmarks)
+    printf("Computing CPU reference...\n");
+    fp4_matmul_cpu_ref(A_fp4, B_fp4, C_cpu_ref, M, N, K, scale_val);
+    printf("  Done. (C_cpu_ref[0] = %.3f)\n\n", C_cpu_ref[0]);
+    
     // Allocate device memory
     unsigned char* d_A = NULL, *d_B = NULL;
-    float* d_C = NULL;
+    float* d_C_dp4a = NULL, *d_C_native = NULL;
     
     printf("Allocating device memory...\n");
+    printf("  matBytes = %zu, resultBytes = %zu\n", matBytes, resultBytes);
+    fflush(stdout);
+    
     hipError_t err = hipMalloc(&d_A, matBytes);
     if (err != hipSuccess) {
         printf("  hipMalloc d_A failed: %s\n", hipGetErrorString(err));
@@ -132,9 +238,14 @@ int main() {
         printf("  hipMalloc d_B failed: %s\n", hipGetErrorString(err));
         return 1;
     }
-    err = hipMalloc(&d_C, resultBytes);
+    err = hipMalloc(&d_C_dp4a, resultBytes);
     if (err != hipSuccess) {
-        printf("  hipMalloc d_C failed: %s\n", hipGetErrorString(err));
+        printf("  hipMalloc d_C_dp4a failed: %s\n", hipGetErrorString(err));
+        return 1;
+    }
+    err = hipMalloc(&d_C_native, resultBytes);
+    if (err != hipSuccess) {
+        printf("  hipMalloc d_C_native failed: %s\n", hipGetErrorString(err));
         return 1;
     }
     printf("  Device memory allocated.\n\n");
@@ -153,62 +264,53 @@ int main() {
     }
     printf("  Copy done.\n\n");
     
-    // Run kernel
-    dim3 block(16, 16);
-    dim3 grid((M + 15) / 16, (N + 15) / 16);
+    // ---- Benchmark DP4A + FP16-WMMA ----
+    printf("----------------------------------------------------------\n");
+    printf("  Method 1: DP4A + FP16-WMMA\n");
+    printf("  (Dequant FP4 via DP4A perm, then FP16 WMMA 16x16x16)\n");
+    printf("----------------------------------------------------------\n");
+    run_benchmark("  DP4A + FP16-WMMA", wmma_bench_fp4_dp4a,
+                  d_A, d_B, d_C_dp4a, M, N, K, scale_val, NUM_RUNS, NUM_WARMUP);
     
-    printf("Running FP4 matmul kernel...\n");
-    err = hipMemset(d_C, 0, resultBytes);
-    if (err != hipSuccess) {
-        printf("  hipMemset failed: %s\n", hipGetErrorString(err));
-        return 1;
-    }
+    // ---- Benchmark Native FP4 WMMA ----
+    printf("\n----------------------------------------------------------\n");
+    printf("  Method 2: Native FP4 WMMA\n");
+    printf("  (__builtin_amdgcn_wmma_f32_32x16x128_f4)\n");
+    printf("----------------------------------------------------------\n");
+    run_benchmark("  Native FP4 WMMA", wmma_bench_fp4_native,
+                  d_A, d_B, d_C_native, M, N, K, scale_val, NUM_RUNS, NUM_WARMUP);
     
-    // Warmup
-    for (int w = 0; w < NUM_WARMUP; ++w) {
-        hipMemset(d_C, 0, resultBytes);
-        fp4_matmul_kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K, scale_val);
-        err = hipDeviceSynchronize();
-        if (err != hipSuccess) {
-            printf("  Kernel launch failed: %s\n", hipGetErrorString(err));
-            return 1;
-        }
-    }
-    printf("  Warmup done.\n\n");
-    
-    // Timed runs
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int r = 0; r < NUM_RUNS; ++r) {
-        hipMemset(d_C, 0, resultBytes);
-        fp4_matmul_kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K, scale_val);
-        err = hipDeviceSynchronize();
-        if (err != hipSuccess) {
-            printf("  Kernel failed: %s\n", hipGetErrorString(err));
-            return 1;
-        }
-    }
-    auto end = std::chrono::high_resolution_clock::now();
-    
-    std::chrono::duration<double, std::milli> elapsed = end - start;
-    double avg_time = elapsed.count() / NUM_RUNS;
-    double gflops = 2.0 * M * K * N / avg_time / 1e6;
-    
-    printf("  Results:\n");
-    printf("    Avg time:   %.3f ms\n", avg_time);
-    printf("    Throughput: %.1f GFLOPS\n", gflops);
+    printf("\n==========================================================\n");
+    printf("  Summary\n");
     printf("==========================================================\n");
     
     // Copy results back
-    err = hipMemcpy(C_gpu, d_C, resultBytes, hipMemcpyDeviceToHost);
+    err = hipMemcpy(C_gpu_dp4a, d_C_dp4a, resultBytes, hipMemcpyDeviceToHost);
     if (err != hipSuccess) {
-        printf("  hipMemcpy back failed: %s\n", hipGetErrorString(err));
+        printf("  hipMemcpy back dp4a failed: %s\n", hipGetErrorString(err));
         return 1;
     }
+    err = hipMemcpy(C_cpu_ref, d_C_native, resultBytes, hipMemcpyDeviceToHost);
+    // Note: C_cpu_ref is already computed on CPU, this is just for verification
+    // Actually let me copy native result to a separate buffer
+    float* C_gpu_native = (float*)((char*)hostPtr + 2 * matBytes);
+    err = hipMemcpy(C_gpu_native, d_C_native, resultBytes, hipMemcpyDeviceToHost);
+    if (err != hipSuccess) {
+        printf("  hipMemcpy back native failed: %s\n", hipGetErrorString(err));
+        return 1;
+    }
+    
+    printf("\n  Verification vs CPU reference:\n");
+    printf("    DP4A + FP16-WMMA:\n");
+    verify_results("    ", C_gpu_dp4a, C_cpu_ref, M, N, VERIFY_SAMPLES);
+    printf("\n    Native FP4 WMMA:\n");
+    verify_results("    ", C_gpu_native, C_cpu_ref, M, N, VERIFY_SAMPLES);
     
     // Cleanup
     hipFree(d_A);
     hipFree(d_B);
-    hipFree(d_C);
+    hipFree(d_C_dp4a);
+    hipFree(d_C_native);
     munmap(hostPtr, totalBytes);
     close(fd);
     

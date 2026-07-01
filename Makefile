@@ -37,6 +37,7 @@ WMMA_FP4_NATIVE_TARGET = wmma_matmul_fp4_native
 
 # FP4 Matmul Benchmark
 BENCH_TARGET = wmma_bench
+BENCH_OBJS = wmma_bench_main.o wmma_bench_fp4_dp4a.o wmma_bench_fp4_native.o
 
 # --- Build Rules ---
 all: $(TARGET)
@@ -59,14 +60,17 @@ $(WMMA_FP4_NATIVE_TARGET): $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO)
 %.o: %.cpp
 	$(HIPCC) -O3 -I$(ROCM_PATH)/include -D__HIP_PLATFORM_AMD__ -D__HIP_ENABLE_AMD_HSA__ -c $< -o $@
 
+%.o: %.hip
+	$(HIPCC) -O3 --offload-arch=$(ARCH) -c $< -o $@
+
 # Build the benchmark
-$(BENCH_TARGET): wmma_bench_main.o
-	$(HIPCC) -o $@ wmma_bench_main.o $(LDFLAGS)
+$(BENCH_TARGET): $(BENCH_OBJS)
+	$(HIPCC) -o $@ $(BENCH_OBJS) $(LDFLAGS)
 
 # Build all demos and benchmark
 both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)
 
 clean:
-	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) wmma_bench_main.o wmma_bench_kernels.* $(BENCH_TARGET) $(BENCH_OBJ) $(BENCH_CO)
+	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) $(BENCH_OBJS)
 
 .PHONY: all clean both
