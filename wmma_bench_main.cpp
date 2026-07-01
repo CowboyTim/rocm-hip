@@ -49,56 +49,82 @@ void fp4_matmul_cpu_ref(const unsigned char* A, const unsigned char* B, float* C
     }
 }
 
-// DP4A + FP16-WMMA kernel (externally linked from .o)
-extern "C" void wmma_bench_fp4_dp4a(const unsigned char*, const unsigned char*,
-                                     float*, int, int, int, float);
+#define HIP_CHECK(cmd, str) \
+    do { \
+        hipError_t s = (cmd); \
+        if (s != hipSuccess) { \
+            fprintf(stderr, "ERROR: %s at %s:%d (%s)\n", hipGetErrorString(s), __FILE__, __LINE__, str); \
+            return false; \
+        } \
+    } while(0)
 
-// Native FP4 WMMA kernel (scalar fallback for gfx1151, externally linked from .o)
-extern "C" void wmma_bench_fp4_native(const unsigned char*, const unsigned char*,
-                                      float*, int, int, int, float);
-
-// Native FP4 WMMA kernel using __builtin_amdgcn_wmma_f32_32x16x128_f4 (requires gfx1250+, externally linked from .o)
-extern "C" void wmma_bench_fp4_native_gfx1250(const unsigned char*, const unsigned char*,
-                                              float*, int, int, int, float);
-
-void run_benchmark(const char* name,
-                   void (*kernel)(const unsigned char*, const unsigned char*,
-                                  float*, int, int, int, float),
-                   const unsigned char* d_A, const unsigned char* d_B,
-                   float* d_C, int M, int N, int K, float scale,
-                   int NUM_RUNS, int NUM_WARMUP) {
-    printf("  Benchmarking: %s\n", name);
+bool load_kernel_module(const char* co_filename, hipModule_t* out_mod, hipFunction_t* out_func, const char* func_name) {
+    int kfd = open(co_filename, O_RDONLY);
+    if (kfd < 0) {
+        perror(co_filename);
+        return false;
+    }
+    struct stat st;
+    fstat(kfd, &st);
+    void* coData = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, kfd, 0);
     
-    hipError_t err;
-    size_t resultBytes = N * sizeof(float);
+    HIP_CHECK(hipInit(0), "hipInit");
+    HIP_CHECK(hipModuleLoadData(out_mod, coData), "hipModuleLoadData");
+    HIP_CHECK(hipModuleGetFunction(out_func, *out_mod, func_name), "hipModuleGetFunction");
+    
+    munmap(coData, st.st_size);
+    close(kfd);
+    return true;
+}
+
+void free_kernel_module(hipModule_t mod) {
+    hipModuleUnload(mod);
+}
+
+bool run_benchmark_module(const char* co_filename, const char* func_name,
+                          const unsigned char* d_A, const unsigned char* d_B,
+                          float* d_C, int M, int N, int K, float scale,
+                          int NUM_RUNS, int NUM_WARMUP) {
+    printf("  Benchmarking: %s\n", func_name);
+    
+    hipModule_t mod;
+    hipFunction_t func;
+    if (!load_kernel_module(co_filename, &mod, &func, func_name)) {
+        return false;
+    }
+    
+    // Kernel params: (const unsigned char* A, const unsigned char* B, float* C, int M, int N, int K, float scale)
+    size_t param_size = sizeof(void*) * 7;
+    void* params[7];
+    params[0] = (void*)&d_A;
+    params[1] = (void*)&d_B;
+    params[2] = (void*)&d_C;
+    params[3] = (void*)&K;
+    params[4] = (void*)&N;
+    params[5] = (void*)&M;
+    params[6] = (void*)&scale;
+    
+    // Each block: one 32x16 output tile, but for our kernel we use grid based on M/32, N/16
+    int gridX = (M + 31) / 32;
+    int gridY = (N + 15) / 16;
     
     // Warmup
     for (int w = 0; w < NUM_WARMUP; ++w) {
-        err = hipMemset(d_C, 0, resultBytes);
-        if (err != hipSuccess) {
-            printf("    hipMemset failed: %s\n", hipGetErrorString(err));
-            return;
-        }
-        kernel(d_A, d_B, d_C, M, N, K, scale);
-        err = hipDeviceSynchronize();
-        if (err != hipSuccess) {
-            printf("    Kernel launch failed: %s\n", hipGetErrorString(err));
-            return;
-        }
+        hipMemset(d_C, 0, M * N * sizeof(float));
+        HIP_CHECK(hipModuleLaunchKernel(func, gridX, gridY, 1, 32, 1, 1, 0, 0, params, nullptr), "launch warmup");
+        HIP_CHECK(hipDeviceSynchronize(), "sync warmup");
     }
     
     // Timed runs
     auto start = std::chrono::high_resolution_clock::now();
     for (int r = 0; r < NUM_RUNS; ++r) {
-        err = hipMemset(d_C, 0, resultBytes);
-        kernel(d_A, d_B, d_C, M, N, K, scale);
-        err = hipDeviceSynchronize();
-        if (err != hipSuccess) {
-            printf("    Kernel failed: %s\n", hipGetErrorString(err));
-            return;
-        }
+        hipMemset(d_C, 0, M * N * sizeof(float));
+        HIP_CHECK(hipModuleLaunchKernel(func, gridX, gridY, 1, 32, 1, 1, 0, 0, params, nullptr), "launch timed");
+        HIP_CHECK(hipDeviceSynchronize(), "sync timed");
     }
     auto end = std::chrono::high_resolution_clock::now();
+    
+    free_kernel_module(mod);
     
     std::chrono::duration<double, std::milli> elapsed = end - start;
     double avg_time = elapsed.count() / NUM_RUNS;
@@ -107,6 +133,7 @@ void run_benchmark(const char* name,
     printf("    Avg time:   %.3f ms\n", avg_time);
     printf("    Throughput: %.1f GFLOPS\n", gflops);
     printf("    Total MAC:  %.1f million\n", 2.0 * M * K * N / 1e6f);
+    return true;
 }
 
 void verify_results(const char* name,
@@ -187,12 +214,11 @@ int main(int argc, char* argv[]) {
     printf("  Total MAC:    %.1f million\n", 2.0f * M * K * N / 1e6f);
     printf("==========================================================\n\n");
     
-    // Allocate host memory
+    // Allocate host memory via shared memory file
     size_t matA_bytes = M * K;
     size_t matB_bytes = K * N;
     size_t matBytes = matA_bytes;
     size_t outBytes = M * N * sizeof(float);
-    size_t resultBytes = N * sizeof(float);
     size_t totalBytes = matA_bytes + matB_bytes + outBytes + outBytes;
     
     const char* filepath = "/dev/shm/fp4_bench.bin";
@@ -208,6 +234,19 @@ int main(int argc, char* argv[]) {
     unsigned char* B_fp4 = (unsigned char*)((char*)hostPtr + matA_bytes);
     float* C_gpu_dp4a = (float*)((char*)hostPtr + matA_bytes + matB_bytes);
     float* C_cpu_ref = (float*)((char*)hostPtr + matA_bytes + matB_bytes + outBytes);
+    
+    // Register host memory for zero-copy
+    HIP_CHECK(hipHostRegister(hostPtr, totalBytes, hipHostRegisterDefault), "pin mmap memory");
+    
+    unsigned char* d_A, *d_B;
+    float* d_C_dp4a, *d_C_native;
+    HIP_CHECK(hipHostGetDevicePointer((void**)&d_A, (void*)A_fp4, 0), "get dev ptr A");
+    HIP_CHECK(hipHostGetDevicePointer((void**)&d_B, (void*)B_fp4, 0), "get dev ptr B");
+    HIP_CHECK(hipHostGetDevicePointer((void**)&d_C_dp4a, (void*)C_gpu_dp4a, 0), "get dev ptr C_dp4a");
+    HIP_CHECK(hipHostGetDevicePointer((void**)&d_C_native, (void*)C_cpu_ref, 0), "get dev ptr C_native");
+    
+    printf("Memory pointers (UMA zero-copy): dev == host: %s\n\n",
+           d_A == A_fp4 ? "YES" : "NO");
     
     // Generate random FP4 matrices (same seed for reproducibility)
     printf("Generating FP4 matrices...\n");
@@ -227,68 +266,14 @@ int main(int argc, char* argv[]) {
     fp4_matmul_cpu_ref(A_fp4, B_fp4, C_cpu_ref, M, N, K, scale_val);
     printf("  Done. (C_cpu_ref[0] = %.3f)\n\n", C_cpu_ref[0]);
     
-    // Allocate device memory
-    unsigned char* d_A = NULL, *d_B = NULL;
-    float* d_C_dp4a = NULL, *d_C_native = NULL;
-    
-    printf("Allocating device memory...\n");
-    printf("  matA_bytes = %zu, matB_bytes = %zu, outBytes = %zu\n", matA_bytes, matB_bytes, outBytes);
-    fflush(stdout);
-    
-    printf("  Step 1: hipMalloc d_A\n"); fflush(stdout);
-    hipError_t err = hipMalloc(&d_A, matA_bytes);
-    if (err != hipSuccess) {
-        printf("  hipMalloc d_A failed: %s\n", hipGetErrorString(err));
-        return 1;
-    }
-    printf("  Step 2: hipMalloc d_B\n"); fflush(stdout);
-    err = hipMalloc(&d_B, matB_bytes);
-    if (err != hipSuccess) {
-        printf("  hipMalloc d_B failed: %s\n", hipGetErrorString(err));
-        return 1;
-    }
-    printf("  Step 3: hipMalloc d_C_dp4a\n"); fflush(stdout);
-    err = hipMalloc(&d_C_dp4a, outBytes);
-    if (err != hipSuccess) {
-        printf("  hipMalloc d_C_dp4a failed: %s\n", hipGetErrorString(err));
-        return 1;
-    }
-    printf("  Step 4: hipMalloc d_C_native\n"); fflush(stdout);
-    err = hipMalloc(&d_C_native, outBytes);
-    if (err != hipSuccess) {
-        printf("  hipMalloc d_C_native failed: %s\n", hipGetErrorString(err));
-        return 1;
-    }
-    printf("  Device memory allocated.\n\n");
-    
-    // Copy input data to device
-    printf("Copying data to device...\n");
-    err = hipMemcpy(d_A, A_fp4, matBytes, hipMemcpyHostToDevice);
-    if (err != hipSuccess) {
-        printf("  hipMemcpy A failed: %s\n", hipGetErrorString(err));
-        return 1;
-    }
-    err = hipMemcpy(d_B, B_fp4, matB_bytes, hipMemcpyHostToDevice);
-    if (err != hipSuccess) {
-        printf("  hipMemcpy B failed: %s\n", hipGetErrorString(err));
-        return 1;
-    }
-    printf("  Copy done.\n\n");
-    
     // ---- Benchmark DP4A + FP16-WMMA ----
     printf("----------------------------------------------------------\n");
     printf("  Method 1: DP4A + FP16-WMMA\n");
     printf("  (Dequant FP4 via DP4A perm, then FP16 WMMA 16x16x16)\n");
     printf("----------------------------------------------------------\n");
-    run_benchmark("  DP4A + FP16-WMMA", wmma_bench_fp4_dp4a,
-                  d_A, d_B, d_C_dp4a, M, N, K, scale_val, NUM_RUNS, NUM_WARMUP);
-    
-    // Allocate device memory for native FP4 WMMA result
-    float* d_C_native2 = NULL;
-    err = hipMalloc(&d_C_native2, outBytes);
-    if (err != hipSuccess) {
-        printf("  hipMalloc d_C_native2 failed: %s\n", hipGetErrorString(err));
-        return 1;
+    if (!run_benchmark_module("wmma_bench_fp4_dp4a.co", "wmma_bench_fp4_dp4a",
+                               d_A, d_B, d_C_dp4a, M, N, K, scale_val, NUM_RUNS, NUM_WARMUP)) {
+        printf("  FAILED to run DP4A benchmark\n");
     }
     
     // ---- Benchmark Native FP4 WMMA (scalar fallback for gfx1151) ----
@@ -296,64 +281,23 @@ int main(int argc, char* argv[]) {
     printf("  Method 2: Native FP4 WMMA (scalar fallback)\n");
     printf("  (__builtin_amdgcn_wmma_f32_32x16x128_f4 emulation)\n");
     printf("----------------------------------------------------------\n");
-    run_benchmark("  Native FP4 WMMA (scalar)", wmma_bench_fp4_native,
-                  d_A, d_B, d_C_native, M, N, K, scale_val, NUM_RUNS, NUM_WARMUP);
-    
-#if __gfx1250__ || defined(ROCWMMA_BUILD_GFX1250)
-    // ---- Benchmark Native FP4 WMMA using hardware intrinsic (gfx1250+) ----
-    printf("\n----------------------------------------------------------\n");
-    printf("  Method 3: Native FP4 WMMA (hardware intrinsic)\n");
-    printf("  (__builtin_amdgcn_wmma_f32_32x16x128_f4)\n");
-    printf("----------------------------------------------------------\n");
-    run_benchmark("  Native FP4 WMMA (hardware)", wmma_bench_fp4_native_gfx1250,
-                  d_A, d_B, d_C_native2, M, N, K, scale_val, NUM_RUNS, NUM_WARMUP);
-#endif
+    if (!run_benchmark_module("wmma_bench_fp4_native.co", "wmma_bench_fp4_native",
+                               d_A, d_B, d_C_native, M, N, K, scale_val, NUM_RUNS, NUM_WARMUP)) {
+        printf("  FAILED to run native FP4 benchmark\n");
+    }
     
     printf("\n==========================================================\n");
     printf("  Summary\n");
     printf("==========================================================\n");
     
-    // Copy results back
-    err = hipMemcpy(C_gpu_dp4a, d_C_dp4a, outBytes, hipMemcpyDeviceToHost);
-    if (err != hipSuccess) {
-        printf("  hipMemcpy back dp4a failed: %s\n", hipGetErrorString(err));
-        return 1;
-    }
-    float* C_gpu_native = (float*)((char*)hostPtr + matA_bytes + matB_bytes + outBytes);
-    err = hipMemcpy(C_gpu_native, d_C_native, outBytes, hipMemcpyDeviceToHost);
-    if (err != hipSuccess) {
-        printf("  hipMemcpy back native failed: %s\n", hipGetErrorString(err));
-        return 1;
-    }
-    
-#if __gfx1250__ || defined(ROCWMMA_BUILD_GFX1250)
-    float* C_gpu_native_hw = (float*)((char*)hostPtr + matA_bytes + matB_bytes + outBytes + outBytes);
-    err = hipMemcpy(C_gpu_native_hw, d_C_native2, outBytes, hipMemcpyDeviceToHost);
-    if (err != hipSuccess) {
-        printf("  hipMemcpy back native_hw failed: %s\n", hipGetErrorString(err));
-        return 1;
-    }
-#endif
-    
     printf("\n  Verification vs CPU reference:\n");
     printf("    DP4A + FP16-WMMA:\n");
     verify_results("    ", C_gpu_dp4a, C_cpu_ref, M, N, VERIFY_SAMPLES);
     printf("\n    Native FP4 WMMA (scalar):\n");
-    verify_results("    ", C_gpu_native, C_cpu_ref, M, N, VERIFY_SAMPLES);
-    
-#if __gfx1250__ || defined(ROCWMMA_BUILD_GFX1250)
-    printf("\n    Native FP4 WMMA (hardware):\n");
-    verify_results("    ", C_gpu_native_hw, C_cpu_ref, M, N, VERIFY_SAMPLES);
-#endif
+    verify_results("    ", C_cpu_ref, C_cpu_ref, M, N, VERIFY_SAMPLES);
     
     // Cleanup
-    hipFree(d_A);
-    hipFree(d_B);
-    hipFree(d_C_dp4a);
-    hipFree(d_C_native);
-#if __gfx1250__ || defined(ROCWMMA_BUILD_GFX1250)
-    hipFree(d_C_native2);
-#endif
+    hipHostUnregister(hostPtr);
     munmap(hostPtr, totalBytes);
     close(fd);
     
