@@ -173,6 +173,7 @@ Examples:
         "wmma_bench_fp4_dp4a_hardware", 
         "wmma_bench_fp4_native",
         "wmma_bench_fp4_lut",
+        "wmma_bench_fp4_lut_fixed",
         "wmma_bench_fp4_dp4a_int8"
     ]
     
