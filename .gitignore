@@ -4,6 +4,9 @@
 halo_test
 mandelbrot
 wmma_matmul
+wmma_matmul_fp4
+wmma_matmul_fp4_native
+wmma_bench
 
 # Temporary/build directories
 .tmp/

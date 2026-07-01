@@ -109,7 +109,7 @@ int main() {
 
     // Fill FP16 activations: B[i][j] = codebook[(j % 8) + 1]
     // B stored row-major: activations[i*M + j]
-    printf("\nFP16 activations B (row-major, B[i][j] = codebook[(j % 8)+1]):\n");
+    printf("\nFP16 activations B (row-major, B[i][j] = codebook[(j %% 8)+1]):\n");
     for (int i = 0; i < MATRIX_SIZE; ++i) {
         for (int j = 0; j < MATRIX_SIZE; ++j) {
             float bval = (float)((j % 8) + 1);

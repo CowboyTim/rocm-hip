@@ -8,10 +8,8 @@ static const int8_t fp4_codebook_int8[16] = {
 };
 
 // DP4A + FP16-WMMA kernel for FP4 matmul benchmark
-// A[MxK] FP4 x B[KxN] FP4 -> C[MxN] FP32
-// Uses 16x16x16 WMMA tiles with DP4A codebook permutation for FP4 dequant
-// Each block computes one 16x16 output tile, accumulates across K strips
-
+// Uses 16x16x16 WMMA tiles with FP4 dequant via LUT
+// Each thread accumulates in register (no atomics), then writes once to shared memory
 extern "C" __global__ void wmma_bench_fp4_dp4a(
     const unsigned char* A,       // M x K FP4, row-major
     const unsigned char* B,       // K x N FP4, row-major
@@ -50,17 +48,17 @@ extern "C" __global__ void wmma_bench_fp4_dp4a(
         int kEnd = min(kStart + stripSize, K);
         int kLen = kEnd - kStart;
         
-        // Compute partial dot product using FP4 dequant + FP32 accumulate
-        // Each thread handles one (row, col) pair for this K-strip
+        // Each thread computes partial dot product for its (row, col) pair
+        // Accumulate in register to avoid atomicAdd issues on RDNA3
         int outRow = laneInWarp;
         int outCol = warpId * 8;
         
+        float partial = 0.0f;
         if (outRow < 16 && outCol < 16) {
             int realRow = baseRow + outRow;
             int realCol = baseCol + outCol;
             
             if (realRow < M && realCol < N) {
-                float partial = 0.0f;
                 for (int k = 0; k < kLen; k++) {
                     uint8_t a_nibble = A[realRow * K + kStart + k];
                     uint8_t b_nibble = B[(kStart + k) * N + realCol];
@@ -68,13 +66,18 @@ extern "C" __global__ void wmma_bench_fp4_dp4a(
                     int8_t b_code = fp4_codebook_int8[b_nibble];
                     partial += (float)a_code * (float)b_code * scale;
                 }
-                atomicAdd(&accum[outRow][outCol], partial);
             }
+        }
+        
+        // Write partial sum to shared memory once per strip (no atomics)
+        if (outRow < 16 && outCol < 16) {
+            float old = accum[outRow][outCol];
+            accum[outRow][outCol] = old + partial;
         }
         __syncthreads();
     }
     
-    // Write accumulated results
+    // Write accumulated results to global memory
     int outRow = laneInWarp;
     int outCol = warpId * 8;
     

@@ -74,8 +74,12 @@ wmma_bench_fp4_dp4a.co: wmma_bench_fp4_dp4a.hip
 wmma_bench_fp4_native.co: wmma_bench_fp4_native.hip
 	$(HIPCC) $(HIPFLAGS) -c $< -o $@
 
+# DP4A hardware intrinsics kernel (uses __builtin_amdgcn_perm + sudot4)
+wmma_bench_fp4_dp4a_hardware.co: wmma_bench_fp4_dp4a_hardware.hip
+	$(HIPCC) $(HIPFLAGS) -c $< -o $@
+
 # Build the benchmark binary (links host .o, loads .co at runtime)
-$(BENCH_TARGET): $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_native.co
+$(BENCH_TARGET): $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_dp4a_hardware.co
 	$(CLANG) $(BENCH_HOST) $(LDFLAGS) -o $@
 
 # Native FP4 WMMA kernel for gfx1250+
@@ -90,6 +94,6 @@ $(BENCH_TARGET)_gfx1250: $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_nat
 both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)
 
 clean:
-	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_native.co wmma_bench_fp4_native_gfx1250.co
+	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_native.co wmma_bench_fp4_dp4a_hardware.co wmma_bench_fp4_native_gfx1250.co
 
 .PHONY: all clean both
