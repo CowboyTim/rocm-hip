@@ -172,7 +172,8 @@ Examples:
         "wmma_bench_fp4_dp4a",
         "wmma_bench_fp4_dp4a_hardware", 
         "wmma_bench_fp4_native",
-        "wmma_bench_fp4_lut"
+        "wmma_bench_fp4_lut",
+        "wmma_bench_fp4_dp4a_int8"
     ]
     
     for kernel in kernels:
