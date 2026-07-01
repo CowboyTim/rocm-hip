@@ -214,7 +214,7 @@ int main(int argc, char* argv[]) {
     size_t matA_bytes = (size_t)M * K;
     size_t matB_bytes = (size_t)K * N;
     size_t outBytes = (size_t)M * N * sizeof(float);
-    size_t totalBytes = matA_bytes + matB_bytes + outBytes * 3;
+    size_t totalBytes = matA_bytes + matB_bytes + outBytes * 4;
 
     const char* filepath = "/dev/shm/fp4_bench.bin";
 
@@ -229,17 +229,19 @@ int main(int argc, char* argv[]) {
     unsigned char* B_fp4 = (unsigned char*)((char*)hostPtr + matA_bytes);
     float* C_gpu_scalar = (float*)((char*)hostPtr + matA_bytes + matB_bytes);
     float* C_gpu_dp4a_hw = (float*)((char*)hostPtr + matA_bytes + matB_bytes + outBytes);
-    float* C_cpu_ref = (float*)((char*)hostPtr + matA_bytes + matB_bytes + outBytes * 2);
+    float* C_gpu_native = (float*)((char*)hostPtr + matA_bytes + matB_bytes + outBytes * 2);
+    float* C_cpu_ref = (float*)((char*)hostPtr + matA_bytes + matB_bytes + outBytes * 3);
 
     // Register host memory for zero-copy
     (void)hipHostRegister(hostPtr, totalBytes, hipHostRegisterDefault);
 
     unsigned char* d_A, *d_B;
-    float* d_C_scalar, *d_C_dp4a_hw;
+    float* d_C_scalar, *d_C_dp4a_hw, *d_C_native;
     (void)hipHostGetDevicePointer((void**)&d_A, (void*)A_fp4, 0);
     (void)hipHostGetDevicePointer((void**)&d_B, (void*)B_fp4, 0);
     (void)hipHostGetDevicePointer((void**)&d_C_scalar, (void*)C_gpu_scalar, 0);
     (void)hipHostGetDevicePointer((void**)&d_C_dp4a_hw, (void*)C_gpu_dp4a_hw, 0);
+    (void)hipHostGetDevicePointer((void**)&d_C_native, (void*)C_gpu_native, 0);
 
     printf("Memory: UMA zero-copy enabled (dev == host: %s)\n\n",
            d_A == A_fp4 ? "YES" : "NO");
@@ -298,28 +300,56 @@ int main(int argc, char* argv[]) {
         "  DP4A Hardware Intrinsics");
     print_stats("  DP4A Hardware Intrinsics", dp4a_hw_result, M, N, K);
 
+    // ---- Method 3: Native FP4 WMMA (scalar fallback on gfx1151) ----
+    // Uses wmma_bench_fp4_native.hip (32x16x128 tile, strip=128)
+    // On gfx1151: scalar FP4 dequant + FP32 accumulate with atomicAdd
+    // On gfx1250+: would use native __builtin_amdgcn_wmma_f32_32x16x128_f4
+    printf("\n==========================================================\n");
+    printf("  Method 3: Native FP4 WMMA (gfx1151 fallback)\n");
+    printf("  Tile: 32x16x128  |  Grid: (M/32, N/16)  |  32 threads/block\n");
+    printf("  Dequant: fp4_codebook_int8[nibble]  (scalar)\n");
+    printf("  Accumulate: atomicAdd to shared memory\n");
+    printf("  Note: gfx1151 lacks native FP4 WMMA; uses scalar fallback\n");
+    printf("==========================================================\n");
+    BenchmarkResult native_result = load_and_run_kernel(
+        "wmma_bench_fp4_native.co", "wmma_bench_fp4_native",
+        d_A, d_B, d_C_native,
+        M, N, K, scale_val,
+        (M + 31) / 32, (N + 15) / 16, 32,
+        NUM_RUNS, NUM_WARMUP,
+        "  Native FP4 WMMA (gfx1151 fallback)");
+    print_stats("  Native FP4 WMMA (gfx1151 fallback)", native_result, M, N, K);
+
     // ---- Summary ----
     printf("\n==========================================================\n");
     printf("  Summary & Comparison\n");
     printf("==========================================================\n\n");
 
-    printf("  Scalar LUT Dequant:     %.1f GFLOPS  (%.3f ms)\n",
+    printf("  Scalar LUT Dequant:       %.1f GFLOPS  (%.3f ms)\n",
            scalar_result.gflops, scalar_result.avg_ms);
-    printf("  DP4A Hardware:          %.1f GFLOPS  (%.3f ms)\n",
+    printf("  DP4A Hardware:            %.1f GFLOPS  (%.3f ms)\n",
            dp4a_hw_result.gflops, dp4a_hw_result.avg_ms);
+    printf("  Native FP4 WMMA (fallback): %.1f GFLOPS  (%.3f ms)\n",
+           native_result.gflops, native_result.avg_ms);
 
     printf("\n  --- Pairwise speedups (lower is better = faster) ---\n");
     double dp4a_over_scalar = scalar_result.avg_ms / dp4a_hw_result.avg_ms;
-    printf("  DP4A / Scalar LUT:      %.2fx\n", dp4a_over_scalar);
+    printf("  DP4A / Scalar LUT:        %.2fx\n", dp4a_over_scalar);
+    double native_over_scalar = scalar_result.avg_ms / native_result.avg_ms;
+    printf("  Native / Scalar LUT:      %.2fx\n", native_over_scalar);
+    double dp4a_over_native = native_result.avg_ms / dp4a_hw_result.avg_ms;
+    printf("  DP4A / Native:            %.2fx\n", dp4a_over_native);
 
     // ---- Verification ----
     printf("\n==========================================================\n");
     printf("  Verification vs CPU Reference\n");
     printf("==========================================================\n");
     printf("\n");
-    verify_results("  Scalar LUT:     ", C_gpu_scalar, C_cpu_ref, M, N, VERIFY_SAMPLES);
+    verify_results("  Scalar LUT:       ", C_gpu_scalar, C_cpu_ref, M, N, VERIFY_SAMPLES);
     printf("\n");
-    verify_results("  DP4A Hardware:  ", C_gpu_dp4a_hw, C_cpu_ref, M, N, VERIFY_SAMPLES);
+    verify_results("  DP4A Hardware:    ", C_gpu_dp4a_hw, C_cpu_ref, M, N, VERIFY_SAMPLES);
+    printf("\n");
+    verify_results("  Native FP4 WMMA:  ", C_gpu_native, C_cpu_ref, M, N, VERIFY_SAMPLES);
 
     // Cleanup
     (void)hipHostUnregister(hostPtr);

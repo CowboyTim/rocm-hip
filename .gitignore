@@ -7,6 +7,7 @@ wmma_matmul
 wmma_matmul_fp4
 wmma_matmul_fp4_native
 wmma_bench
+wmma_bench_fp4_native_gfx1250
 
 # Temporary/build directories
 .tmp/
