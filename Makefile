@@ -5,8 +5,8 @@ CLANG     := $(ROCM_PATH)/lib/llvm/bin/clang++
 
 ARCH      := gfx1151
 
-CXXFLAGS  := -O3 -Wall -I$(ROCM_PATH)/include -D__HIP_PLATFORM_AMD__ -D__HIP_ENABLE_AMD_HSA__
-HIPFLAGS  := -O3 --offload-arch=$(ARCH) --genco
+CXXFLAGS  := -x hip -O3 -Wall -I$(ROCM_PATH)/include -D__HIP_PLATFORM_AMD__ -D__HIP_ENABLE_AMD_HSA__
+HIPFLAGS  := -Xarch_device -mno-wavefrontsize64 -isystem $(ROCM_PATH)/include --rocm-path=$(ROCM_PATH) -O3 --offload-arch=$(ARCH) --genco -D__HIP_PLATFORM_AMD__ -D__HIP_ENABLE_AMD_HSA__
 
 LDFLAGS   := -L$(ROCM_PATH)/lib -lamdhip64 -lhsa-runtime64 -Wl,-rpath,$(ROCM_PATH)/lib
 
@@ -40,7 +40,7 @@ BENCH_TARGET = wmma_bench
 BENCH_OBJS = wmma_bench_main.o wmma_bench_fp4_dp4a.o wmma_bench_fp4_native.o
 
 # --- Build Rules ---
-all: $(TARGET)
+all: $(TARGET) $(WMMA_TARGET) $(BENCH_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET)
 
 $(TARGET): $(OBJ) $(KERNEL_CO)
 	$(CLANG) $(OBJ) $(LDFLAGS) -o $@
@@ -58,10 +58,10 @@ $(WMMA_FP4_NATIVE_TARGET): $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO)
 	$(HIPCC) $(HIPFLAGS) -c $< -o $@
 
 %.o: %.cpp
-	$(HIPCC) -O3 -I$(ROCM_PATH)/include -D__HIP_PLATFORM_AMD__ -D__HIP_ENABLE_AMD_HSA__ -c $< -o $@
+	$(HIPCC) $(HIPFLAGS) -c $< -o $@
 
 %.o: %.hip
-	$(HIPCC) -O3 --offload-arch=$(ARCH) -c $< -o $@
+	$(HIPCC) $(HIPFLAGS) -c $< -o $@
 
 # Build the benchmark
 $(BENCH_TARGET): $(BENCH_OBJS)

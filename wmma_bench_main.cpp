@@ -143,7 +143,7 @@ int main(int argc, char* argv[]) {
     printf("[DEBUG] main() entered\n");
     fflush(stdout);
     // Parse cmdline options
-    int M = 256, N = 256, K = 256;
+    int M = 1024, N = 1024, K = 1024;
     int NUM_RUNS = 10;
     int NUM_WARMUP = 5;
     int VERIFY_SAMPLES = 5;
@@ -160,9 +160,9 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("Usage: %s [options]\n", argv[0]);
             printf("Options:\n");
-            printf("  -M N       Matrix rows (default: 256)\n");
-            printf("  -N N       Matrix cols (default: 256)\n");
-            printf("  -K N       Inner dimension (default: 256)\n");
+            printf("  -M N       Matrix rows (default: 1024)\n");
+            printf("  -N N       Matrix cols (default: 1024)\n");
+            printf("  -K N       Inner dimension (default: 1024)\n");
             printf("  -runs N    Number of benchmark runs (default: 10)\n");
             printf("  -warmup N  Number of warmup runs (default: 5)\n");
             printf("  -verify N  Number of mismatch samples to print (default: 5, 0=none)\n");
@@ -184,9 +184,12 @@ int main(int argc, char* argv[]) {
     printf("==========================================================\n\n");
     
     // Allocate host memory
-    size_t matBytes = M * K;
+    size_t matA_bytes = M * K;
+    size_t matB_bytes = K * N;
+    size_t matBytes = matA_bytes;
+    size_t outBytes = M * N * sizeof(float);
     size_t resultBytes = N * sizeof(float);
-    size_t totalBytes = 3 * matBytes + resultBytes + resultBytes;
+    size_t totalBytes = matA_bytes + matB_bytes + outBytes + outBytes;
     
     const char* filepath = "/dev/shm/fp4_bench.bin";
     
@@ -198,9 +201,9 @@ int main(int argc, char* argv[]) {
     if (hostPtr == MAP_FAILED) { perror("mmap"); close(fd); return 1; }
     
     unsigned char* A_fp4 = (unsigned char*)hostPtr;
-    unsigned char* B_fp4 = (unsigned char*)((char*)hostPtr + matBytes);
-    float* C_gpu_dp4a = (float*)((char*)hostPtr + 2 * matBytes);
-    float* C_cpu_ref = (float*)((char*)hostPtr + 2 * matBytes + resultBytes);
+    unsigned char* B_fp4 = (unsigned char*)((char*)hostPtr + matA_bytes);
+    float* C_gpu_dp4a = (float*)((char*)hostPtr + matA_bytes + matB_bytes);
+    float* C_cpu_ref = (float*)((char*)hostPtr + matA_bytes + matB_bytes + outBytes);
     
     // Generate random FP4 matrices (same seed for reproducibility)
     printf("Generating FP4 matrices...\n");
@@ -225,25 +228,29 @@ int main(int argc, char* argv[]) {
     float* d_C_dp4a = NULL, *d_C_native = NULL;
     
     printf("Allocating device memory...\n");
-    printf("  matBytes = %zu, resultBytes = %zu\n", matBytes, resultBytes);
+    printf("  matA_bytes = %zu, matB_bytes = %zu, outBytes = %zu\n", matA_bytes, matB_bytes, outBytes);
     fflush(stdout);
     
-    hipError_t err = hipMalloc(&d_A, matBytes);
+    printf("  Step 1: hipMalloc d_A\n"); fflush(stdout);
+    hipError_t err = hipMalloc(&d_A, matA_bytes);
     if (err != hipSuccess) {
         printf("  hipMalloc d_A failed: %s\n", hipGetErrorString(err));
         return 1;
     }
-    err = hipMalloc(&d_B, matBytes);
+    printf("  Step 2: hipMalloc d_B\n"); fflush(stdout);
+    err = hipMalloc(&d_B, matB_bytes);
     if (err != hipSuccess) {
         printf("  hipMalloc d_B failed: %s\n", hipGetErrorString(err));
         return 1;
     }
-    err = hipMalloc(&d_C_dp4a, resultBytes);
+    printf("  Step 3: hipMalloc d_C_dp4a\n"); fflush(stdout);
+    err = hipMalloc(&d_C_dp4a, outBytes);
     if (err != hipSuccess) {
         printf("  hipMalloc d_C_dp4a failed: %s\n", hipGetErrorString(err));
         return 1;
     }
-    err = hipMalloc(&d_C_native, resultBytes);
+    printf("  Step 4: hipMalloc d_C_native\n"); fflush(stdout);
+    err = hipMalloc(&d_C_native, outBytes);
     if (err != hipSuccess) {
         printf("  hipMalloc d_C_native failed: %s\n", hipGetErrorString(err));
         return 1;
@@ -257,7 +264,7 @@ int main(int argc, char* argv[]) {
         printf("  hipMemcpy A failed: %s\n", hipGetErrorString(err));
         return 1;
     }
-    err = hipMemcpy(d_B, B_fp4, matBytes, hipMemcpyHostToDevice);
+    err = hipMemcpy(d_B, B_fp4, matB_bytes, hipMemcpyHostToDevice);
     if (err != hipSuccess) {
         printf("  hipMemcpy B failed: %s\n", hipGetErrorString(err));
         return 1;
@@ -285,16 +292,13 @@ int main(int argc, char* argv[]) {
     printf("==========================================================\n");
     
     // Copy results back
-    err = hipMemcpy(C_gpu_dp4a, d_C_dp4a, resultBytes, hipMemcpyDeviceToHost);
+    err = hipMemcpy(C_gpu_dp4a, d_C_dp4a, outBytes, hipMemcpyDeviceToHost);
     if (err != hipSuccess) {
         printf("  hipMemcpy back dp4a failed: %s\n", hipGetErrorString(err));
         return 1;
     }
-    err = hipMemcpy(C_cpu_ref, d_C_native, resultBytes, hipMemcpyDeviceToHost);
-    // Note: C_cpu_ref is already computed on CPU, this is just for verification
-    // Actually let me copy native result to a separate buffer
-    float* C_gpu_native = (float*)((char*)hostPtr + 2 * matBytes);
-    err = hipMemcpy(C_gpu_native, d_C_native, resultBytes, hipMemcpyDeviceToHost);
+    float* C_gpu_native = (float*)((char*)hostPtr + matA_bytes + matB_bytes + outBytes);
+    err = hipMemcpy(C_gpu_native, d_C_native, outBytes, hipMemcpyDeviceToHost);
     if (err != hipSuccess) {
         printf("  hipMemcpy back native failed: %s\n", hipGetErrorString(err));
         return 1;

@@ -66,7 +66,7 @@ extern "C" __global__ void wmma_bench_fp4_dp4a(
                     uint8_t b_nibble = B[(kStart + k) * N + realCol];
                     int8_t a_code = fp4_codebook_int8[a_nibble];
                     int8_t b_code = fp4_codebook_int8[b_nibble];
-                    partial += (float)a_code * (float)b_code * scale * scale;
+                    partial += (float)a_code * (float)b_code * scale;
                 }
                 atomicAdd(&accum[outRow][outCol], partial);
             }
