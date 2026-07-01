@@ -38,9 +38,10 @@ WMMA_FP4_NATIVE_CO   = wmma_kernel_fp4_native.co
 WMMA_FP4_NATIVE_OBJ  = wmma_main_fp4_native.o
 WMMA_FP4_NATIVE_TARGET = wmma_matmul_fp4_native
 
-# FP4 Matmul Benchmark
+# FP4 Matmul Benchmark (LUT version)
 BENCH_TARGET = wmma_bench
 BENCH_HOST = wmma_bench_main.o
+BENCH_LUT_CO = wmma_bench_fp4_lut.co
 
 # --- Build Rules ---
 all: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)
@@ -77,13 +78,13 @@ wmma_bench_fp4_dp4a_hardware.co: wmma_bench_fp4_dp4a_hardware.hip
 	$(HIPCC) $(HIPFLAGS) -c $< -o $@
 
 # Build the benchmark binary (links host .o, loads .co at runtime)
-$(BENCH_TARGET): $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_dp4a_hardware.co wmma_bench_fp4_native.co
+$(BENCH_TARGET): $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_dp4a_hardware.co wmma_bench_fp4_native.co $(BENCH_LUT_CO)
 	$(CLANG) $(BENCH_HOST) $(LDFLAGS) -o $@
 
 # Build all demos and benchmark
 both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)
 
 clean:
-	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_native.co wmma_bench_fp4_dp4a_hardware.co
+	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_native.co wmma_bench_fp4_dp4a_hardware.co $(BENCH_LUT_CO)
 
 .PHONY: all clean both

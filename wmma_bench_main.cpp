@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <cstdint>
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #include <vector>
 #include <algorithm>
 
@@ -55,6 +56,7 @@ struct BenchmarkResult {
     double avg_ms;
     double gflops;
     float* d_C;
+    bool is_fp16;
 };
 
 #define HIP_CHECK(cmd, str) \
@@ -70,7 +72,8 @@ BenchmarkResult load_and_run_kernel(const char* co_filename, const char* func_na
     const unsigned char* d_A, const unsigned char* d_B,
     float* d_C, int M, int N, int K, float scale,
     int gridX, int gridY, int threads,
-    int NUM_RUNS, int NUM_WARMUP, const char* label) {
+    int NUM_RUNS, int NUM_WARMUP, const char* label,
+    bool is_fp16_wmma = false) {
 
     printf("  Loading kernel: %s from %s\n", func_name, co_filename);
 
@@ -100,15 +103,17 @@ BenchmarkResult load_and_run_kernel(const char* co_filename, const char* func_na
     params[5] = (void*)&M;
     params[6] = (void*)&scale;
 
+    size_t out_bytes = is_fp16_wmma ? M * N * sizeof(__half) : M * N * sizeof(float);
+
     for (int w = 0; w < NUM_WARMUP; ++w) {
-        (void)hipMemset(d_C, 0, M * N * sizeof(float));
+        (void)hipMemset(d_C, 0, out_bytes);
         HIP_CHECK(hipModuleLaunchKernel(func, gridX, gridY, 1, threads, 1, 1, 0, 0, params, nullptr), "launch warmup");
         HIP_CHECK(hipDeviceSynchronize(), "sync warmup");
     }
 
     auto start = std::chrono::high_resolution_clock::now();
     for (int r = 0; r < NUM_RUNS; ++r) {
-        (void)hipMemset(d_C, 0, M * N * sizeof(float));
+        (void)hipMemset(d_C, 0, out_bytes);
         HIP_CHECK(hipModuleLaunchKernel(func, gridX, gridY, 1, threads, 1, 1, 0, 0, params, nullptr), "launch timed");
         HIP_CHECK(hipDeviceSynchronize(), "sync timed");
     }
@@ -124,6 +129,7 @@ BenchmarkResult load_and_run_kernel(const char* co_filename, const char* func_na
     res.avg_ms = avg_ms;
     res.gflops = gflops;
     res.d_C = d_C;
+    res.is_fp16 = is_fp16_wmma;
     return res;
 }
 
@@ -135,14 +141,15 @@ void print_stats(const char* name, const BenchmarkResult& res, int M, int N, int
 }
 
 void verify_results(const char* label,
-                    const float* C_host, const float* C_cpu_ref,
-                    int M, int N, int max_print) {
+                    const void* C_host, const float* C_cpu_ref,
+                    int M, int N, int max_print, bool is_fp16) {
     int failures = 0;
     float max_diff = 0.0f;
 
     for (int i = 0; i < M; ++i) {
         for (int j = 0; j < N; ++j) {
-            float diff = fabsf(C_host[i * N + j] - C_cpu_ref[i * N + j]);
+            float gpu_val = is_fp16 ? (float)((const __half*)C_host)[i * N + j] : ((const float*)C_host)[i * N + j];
+            float diff = fabsf(gpu_val - C_cpu_ref[i * N + j]);
             if (diff > max_diff) max_diff = diff;
             if (diff >= 1.0f) failures++;
         }
@@ -158,10 +165,11 @@ void verify_results(const char* label,
         int count = 0;
         for (int i = 0; i < M && count < max_print; ++i) {
             for (int j = 0; j < N && count < max_print; ++j) {
-                float diff = fabsf(C_host[i * N + j] - C_cpu_ref[i * N + j]);
+                float gpu_val = is_fp16 ? (float)((const __half*)C_host)[i * N + j] : ((const float*)C_host)[i * N + j];
+                float diff = fabsf(gpu_val - C_cpu_ref[i * N + j]);
                 if (diff >= 1.0f) {
                     printf("%s    C[%d][%d]: GPU=%.3f  CPU=%.3f  diff=%.3f\n",
-                           label, i, j, C_host[i * N + j], C_cpu_ref[i * N + j], diff);
+                           label, i, j, gpu_val, C_cpu_ref[i * N + j], diff);
                     count++;
                 }
             }
@@ -227,18 +235,21 @@ int main(int argc, char* argv[]) {
 
     unsigned char* A_fp4 = (unsigned char*)hostPtr;
     unsigned char* B_fp4 = (unsigned char*)((char*)hostPtr + matA_bytes);
-    float* C_gpu_scalar = (float*)((char*)hostPtr + matA_bytes + matB_bytes);
-    float* C_gpu_dp4a_hw = (float*)((char*)hostPtr + matA_bytes + matB_bytes + outBytes);
-    float* C_gpu_native = (float*)((char*)hostPtr + matA_bytes + matB_bytes + outBytes * 2);
-    float* C_cpu_ref = (float*)((char*)hostPtr + matA_bytes + matB_bytes + outBytes * 3);
+    __half* C_gpu_fp16_wmma = (__half*)((char*)hostPtr + matA_bytes + matB_bytes);
+    float* C_gpu_scalar = (float*)((char*)hostPtr + matA_bytes + matB_bytes + outBytes);
+    float* C_gpu_dp4a_hw = (float*)((char*)hostPtr + matA_bytes + matB_bytes + outBytes * 2);
+    float* C_gpu_native = (float*)((char*)hostPtr + matA_bytes + matB_bytes + outBytes * 3);
+    float* C_cpu_ref = (float*)((char*)hostPtr + matA_bytes + matB_bytes + outBytes * 4);
 
     // Register host memory for zero-copy
     (void)hipHostRegister(hostPtr, totalBytes, hipHostRegisterDefault);
 
     unsigned char* d_A, *d_B;
+    __half* d_C_fp16_wmma;
     float* d_C_scalar, *d_C_dp4a_hw, *d_C_native;
     (void)hipHostGetDevicePointer((void**)&d_A, (void*)A_fp4, 0);
     (void)hipHostGetDevicePointer((void**)&d_B, (void*)B_fp4, 0);
+    (void)hipHostGetDevicePointer((void**)&d_C_fp16_wmma, (void*)C_gpu_fp16_wmma, 0);
     (void)hipHostGetDevicePointer((void**)&d_C_scalar, (void*)C_gpu_scalar, 0);
     (void)hipHostGetDevicePointer((void**)&d_C_dp4a_hw, (void*)C_gpu_dp4a_hw, 0);
     (void)hipHostGetDevicePointer((void**)&d_C_native, (void*)C_gpu_native, 0);
@@ -320,6 +331,25 @@ int main(int argc, char* argv[]) {
         "  Native FP4 WMMA (gfx1151 fallback)");
     print_stats("  Native FP4 WMMA (gfx1151 fallback)", native_result, M, N, K);
 
+    // ---- Method 4: FP4 -> FP16 WMMA + LDS LUT (best on gfx1151) ----
+    // Uses wmma_bench_fp4_lut.hip - dequant FP4->FP16 via LDS LUT, then WMMA
+    printf("\n==========================================================\n");
+    printf("  Method 4: FP4->FP16 WMMA + LDS LUT (best on gfx1151)\n");
+    printf("  Tile: 16x16x16  |  Grid: (M/16, N/16)  |  32 threads/block\n");
+    printf("  Dequant: LDS LUT (32 bytes, ~2-4 cycle latency)\n");
+    printf("  Multiply: __builtin_amdgcn_wmma_f16_16x16x16_f16_w32 (tensor core)\n");
+    printf("  Note: FP4 weights converted to FP16 before WMMA tensor core\n");
+    printf("==========================================================\n");
+    BenchmarkResult lut_wmma_result = load_and_run_kernel(
+        "wmma_bench_fp4_lut.co", "wmma_bench_fp4_lut",
+        d_A, d_B, (float*)d_C_fp16_wmma,
+        M, N, K, scale_val,
+        (M + 15) / 16, (N + 15) / 16, 32,
+        NUM_RUNS, NUM_WARMUP,
+        "  FP4->FP16 WMMA + LDS LUT",
+        true);  // is_fp16_wmma = true
+    print_stats("  FP4->FP16 WMMA + LDS LUT", lut_wmma_result, M, N, K);
+
     // ---- Summary ----
     printf("\n==========================================================\n");
     printf("  Summary & Comparison\n");
@@ -331,25 +361,31 @@ int main(int argc, char* argv[]) {
            dp4a_hw_result.gflops, dp4a_hw_result.avg_ms);
     printf("  Native FP4 WMMA (fallback): %.1f GFLOPS  (%.3f ms)\n",
            native_result.gflops, native_result.avg_ms);
+    printf("  FP4->FP16 WMMA + LDS LUT: %.1f GFLOPS  (%.3f ms)\n",
+           lut_wmma_result.gflops, lut_wmma_result.avg_ms);
 
     printf("\n  --- Pairwise speedups (lower is better = faster) ---\n");
     double dp4a_over_scalar = scalar_result.avg_ms / dp4a_hw_result.avg_ms;
     printf("  DP4A / Scalar LUT:        %.2fx\n", dp4a_over_scalar);
     double native_over_scalar = scalar_result.avg_ms / native_result.avg_ms;
     printf("  Native / Scalar LUT:      %.2fx\n", native_over_scalar);
-    double dp4a_over_native = native_result.avg_ms / dp4a_hw_result.avg_ms;
-    printf("  DP4A / Native:            %.2fx\n", dp4a_over_native);
+    double lut_wmma_over_scalar = scalar_result.avg_ms / lut_wmma_result.avg_ms;
+    printf("  FP4->FP16 WMMA / Scalar:  %.2fx\n", lut_wmma_over_scalar);
+    double lut_wmma_over_dp4a = dp4a_hw_result.avg_ms / lut_wmma_result.avg_ms;
+    printf("  FP4->FP16 WMMA / DP4A:    %.2fx\n", lut_wmma_over_dp4a);
 
     // ---- Verification ----
     printf("\n==========================================================\n");
     printf("  Verification vs CPU Reference\n");
     printf("==========================================================\n");
     printf("\n");
-    verify_results("  Scalar LUT:       ", C_gpu_scalar, C_cpu_ref, M, N, VERIFY_SAMPLES);
+    verify_results("  Scalar LUT:       ", C_gpu_scalar, C_cpu_ref, M, N, VERIFY_SAMPLES, false);
     printf("\n");
-    verify_results("  DP4A Hardware:    ", C_gpu_dp4a_hw, C_cpu_ref, M, N, VERIFY_SAMPLES);
+    verify_results("  DP4A Hardware:    ", C_gpu_dp4a_hw, C_cpu_ref, M, N, VERIFY_SAMPLES, false);
     printf("\n");
-    verify_results("  Native FP4 WMMA:  ", C_gpu_native, C_cpu_ref, M, N, VERIFY_SAMPLES);
+    verify_results("  Native FP4 WMMA:  ", C_gpu_native, C_cpu_ref, M, N, VERIFY_SAMPLES, false);
+    printf("\n");
+    verify_results("  FP4->FP16 WMMA:   ", C_gpu_fp16_wmma, C_cpu_ref, M, N, VERIFY_SAMPLES, true);
 
     // Cleanup
     (void)hipHostUnregister(hostPtr);
