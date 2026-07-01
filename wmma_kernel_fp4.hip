@@ -49,7 +49,8 @@ extern "C" __global__ void wmma_matmul_fp4(const unsigned char* weights_fp4,
     half16 c_frag = {};
 
     // Dequantize FP4 nibbles via LDS LUT lookup
-    // Row-major layout: weights_fp4[lane + ele*16]
+    // Column-major layout: weights_fp4[lane + ele*16]
+    // lane selects the column, ele iterates rows
     // Each byte contains one nibble (4 bits), LDS load replaces FP32 multiply
     // Nibbles are indices into codebook: 0-7 -> positive values (0,1,2,3,4,6,8,10)
     for (int ele = 0; ele < 16; ++ele) {

@@ -89,20 +89,36 @@ int main() {
 
     printf("FP4 scale: %.1f\n\n", scale_val);
 
-   // Fill FP4 weights: A[i][j] = quantize(i + 1)
-    printf("Filling FP4 weights (row-major):\n");
+  // Fill FP4 weights: A[i][j] = quantize((i % 8) + 1)
+    // Kernel loads column-major: weights_fp4[lane + ele*16]
+    // Fill column-major: weights_fp4[j*M + i] = A[i][j]
+    printf("Filling FP4 weights (column-major):\n");
+    for (int j = 0; j < MATRIX_SIZE; ++j) {
+        for (int i = 0; i < MATRIX_SIZE; ++i) {
+            float val = (float)((i % 8) + 1);
+            uint8_t nibble = fp4_quant(val);
+            weights_fp4[j * MATRIX_SIZE + i] = nibble;
+            float dq = fp4_dequant(nibble, scale_val);
+            if (j < MATRIX_SIZE - 1) {
+                printf("  %4.1f", dq);
+            } else {
+                printf("  %4.1f\n", dq);
+            }
+        }
+    }
+
+    // Fill FP16 activations: B[i][j] = codebook[(j % 8) + 1]
+    // B stored row-major: activations[i*M + j]
+    printf("\nFP16 activations B (row-major, B[i][j] = codebook[(j % 8)+1]):\n");
     for (int i = 0; i < MATRIX_SIZE; ++i) {
         for (int j = 0; j < MATRIX_SIZE; ++j) {
-            float val = (float)(i + 1);
-            uint8_t nibble = fp4_quant(val);
-            weights_fp4[i * MATRIX_SIZE + j] = nibble;
-            float dq = fp4_dequant(nibble, scale_val);
-            printf("  %4.1f", dq);
+            float bval = (float)((j % 8) + 1);
+            uint8_t bidx = fp4_quant(bval);
+            activations[i * MATRIX_SIZE + j] = __half(fp4_dequant(bidx, 1.0f));
+            printf("  %4.1f", (float)activations[i * MATRIX_SIZE + j]);
         }
         printf("\n");
     }
-
-    // Fill FP16 activations: B[i][j] = (float)(j + 1)
     printf("\nFP16 activations B (row-major, B[i][j] = j+1):\n");
     for (int i = 0; i < MATRIX_SIZE; ++i) {
         for (int j = 0; j < MATRIX_SIZE; ++j) {
@@ -168,7 +184,8 @@ int main() {
         printf("\n");
     }
 
-    // CPU verification: dequant FP4 on CPU, compute matmul
+   // CPU verification: dequant FP4 on CPU, compute matmul
+    // weights_fp4 stored column-major: weights_fp4[j*M+i] = A[i][j]
     printf("\nCPU Verification:\n");
     printf("  Dequant A_fp4[i][k] using ROCmFP4 Codebook10\n");
     printf("  Compute C[i][j] = sum_k A_fp4[i][k] x B[k][j]\n\n");
@@ -178,9 +195,11 @@ int main() {
         for (int j = 0; j < MATRIX_SIZE; ++j) {
             float sum = 0.0f;
             for (int k = 0; k < MATRIX_SIZE; ++k) {
-                uint8_t nibble = weights_fp4[i * MATRIX_SIZE + k];
+                // Column-major storage: A[i][k] = weights_fp4[k*M+i]
+                uint8_t nibble = weights_fp4[k * MATRIX_SIZE + i];
                 float a_val = fp4_dequant(nibble, scale_val);
-                float b_val = (float)(k + 1);
+                // B[k][j] from activations (row-major): activations[k*M+j]
+                float b_val = (float)activations[k * MATRIX_SIZE + j];
                 sum += a_val * b_val;
             }
             result_cpu[i * MATRIX_SIZE + j] = (__half)sum;
