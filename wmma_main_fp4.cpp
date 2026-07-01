@@ -34,18 +34,20 @@ __host__ __device__ __forceinline__ float fp4_dequant(uint8_t nibble, float scal
     return (float)code * scale;
 }
 
-// FP4 quantize: float → nibble via nearest codebook lookup
+// FP4 quantize: float → nibble via nearest codebook lookup (positive values only)
+// ROCmFP4 Codebook10: 8 positive values (indices 0-7), 8 negative values (indices 8-15)
 __host__ __device__ __forceinline__ uint8_t fp4_quant(float val) {
     float best_dist = 1e30f;
-    uint8_t best_idx = 0;
-    for (int i = 0; i < 16; ++i) {
+    int best_idx = 0;
+    // Only search positive half of codebook (indices 0-7)
+    for (int i = 0; i < 8; ++i) {
         float diff = fabsf((float)fp4_codebook[i] - val);
         if (diff < best_dist) {
             best_dist = diff;
             best_idx = i;
         }
     }
-    return best_idx;
+    return (uint8_t)best_idx;
 }
 
 extern "C" __global__ void wmma_matmul_fp4(const unsigned char*, const __half*, __half*, float);
@@ -54,7 +56,7 @@ int main() {
     printf("=== FP4 WMMA Matmul Demo (gfx1151) ===\n\n");
     printf("ROCmFP4: E2M1-derived with Codebook10\n");
     printf("Values: 0, +/-1, +/-2, +/-3, +/-4, +/-6, +/-8, +/-10\n");
-    printf("Packed: 2 nibbles/byte, scale: UE4M3 per block\n\n");
+    printf("Packed: 1 nibble/byte (single nibble per entry)\n\n");
 
     size_t fp4_bytes = MAT_SIZE;  // 1 nibble per FP4 value = 256 bytes
     size_t fp16_bytes = MAT_SIZE * sizeof(__half);
@@ -87,7 +89,7 @@ int main() {
 
     printf("FP4 scale: %.1f\n\n", scale_val);
 
-    // Fill FP4 weights: A[i][j] = quantize(i + 1)
+   // Fill FP4 weights: A[i][j] = quantize(i + 1)
     printf("Filling FP4 weights (row-major):\n");
     for (int i = 0; i < MATRIX_SIZE; ++i) {
         for (int j = 0; j < MATRIX_SIZE; ++j) {
@@ -122,7 +124,8 @@ int main() {
     HIP_CHECK(hipHostGetDevicePointer((void**)&dev_weights_fp4, (void*)weights_fp4, 0), "get dev ptr fp4");
     HIP_CHECK(hipHostGetDevicePointer((void**)&dev_activations, (void*)activations, 0), "get dev ptr act");
     HIP_CHECK(hipHostGetDevicePointer((void**)&dev_result, (void*)result_gpu, 0), "get dev ptr result");
-    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_result, (void*)result_cpu, 0), "get dev ptr cpu");
+    __half* dev_result_cpu;
+    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_result_cpu, (void*)result_cpu, 0), "get dev ptr cpu");
 
     float dev_scale = scale_val;
 
@@ -157,7 +160,7 @@ int main() {
     HIP_CHECK(hipModuleUnload(mod), "unload");
 
     // Read results (already in host-visible memory via mmap)
-    printf("\nGPU Result C = A_fp4 x B (16x16 FP16 matrix):\n");
+   printf("\nGPU Result C = A_fp4 x B (16x16 FP16 matrix):\n");
     for (int i = 0; i < MATRIX_SIZE; ++i) {
         for (int j = 0; j < MATRIX_SIZE; ++j) {
             printf("  %7.1f", (float)result_gpu[i * MATRIX_SIZE + j]);

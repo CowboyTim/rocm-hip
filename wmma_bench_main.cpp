@@ -53,9 +53,13 @@ void fp4_matmul_cpu_ref(const unsigned char* A, const unsigned char* B, float* C
 extern "C" void wmma_bench_fp4_dp4a(const unsigned char*, const unsigned char*,
                                      float*, int, int, int, float);
 
-// Native FP4 WMMA kernel (externally linked from .o)
+// Native FP4 WMMA kernel (scalar fallback for gfx1151, externally linked from .o)
 extern "C" void wmma_bench_fp4_native(const unsigned char*, const unsigned char*,
-                                       float*, int, int, int, float);
+                                      float*, int, int, int, float);
+
+// Native FP4 WMMA kernel using __builtin_amdgcn_wmma_f32_32x16x128_f4 (requires gfx1250+, externally linked from .o)
+extern "C" void wmma_bench_fp4_native_gfx1250(const unsigned char*, const unsigned char*,
+                                              float*, int, int, int, float);
 
 void run_benchmark(const char* name,
                    void (*kernel)(const unsigned char*, const unsigned char*,
@@ -279,13 +283,31 @@ int main(int argc, char* argv[]) {
     run_benchmark("  DP4A + FP16-WMMA", wmma_bench_fp4_dp4a,
                   d_A, d_B, d_C_dp4a, M, N, K, scale_val, NUM_RUNS, NUM_WARMUP);
     
-    // ---- Benchmark Native FP4 WMMA ----
+    // Allocate device memory for native FP4 WMMA result
+    float* d_C_native2 = NULL;
+    err = hipMalloc(&d_C_native2, outBytes);
+    if (err != hipSuccess) {
+        printf("  hipMalloc d_C_native2 failed: %s\n", hipGetErrorString(err));
+        return 1;
+    }
+    
+    // ---- Benchmark Native FP4 WMMA (scalar fallback for gfx1151) ----
     printf("\n----------------------------------------------------------\n");
-    printf("  Method 2: Native FP4 WMMA\n");
+    printf("  Method 2: Native FP4 WMMA (scalar fallback)\n");
+    printf("  (__builtin_amdgcn_wmma_f32_32x16x128_f4 emulation)\n");
+    printf("----------------------------------------------------------\n");
+    run_benchmark("  Native FP4 WMMA (scalar)", wmma_bench_fp4_native,
+                  d_A, d_B, d_C_native, M, N, K, scale_val, NUM_RUNS, NUM_WARMUP);
+    
+#if __gfx1250__ || defined(ROCWMMA_BUILD_GFX1250)
+    // ---- Benchmark Native FP4 WMMA using hardware intrinsic (gfx1250+) ----
+    printf("\n----------------------------------------------------------\n");
+    printf("  Method 3: Native FP4 WMMA (hardware intrinsic)\n");
     printf("  (__builtin_amdgcn_wmma_f32_32x16x128_f4)\n");
     printf("----------------------------------------------------------\n");
-    run_benchmark("  Native FP4 WMMA", wmma_bench_fp4_native,
-                  d_A, d_B, d_C_native, M, N, K, scale_val, NUM_RUNS, NUM_WARMUP);
+    run_benchmark("  Native FP4 WMMA (hardware)", wmma_bench_fp4_native_gfx1250,
+                  d_A, d_B, d_C_native2, M, N, K, scale_val, NUM_RUNS, NUM_WARMUP);
+#endif
     
     printf("\n==========================================================\n");
     printf("  Summary\n");
@@ -304,17 +326,34 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
+#if __gfx1250__ || defined(ROCWMMA_BUILD_GFX1250)
+    float* C_gpu_native_hw = (float*)((char*)hostPtr + matA_bytes + matB_bytes + outBytes + outBytes);
+    err = hipMemcpy(C_gpu_native_hw, d_C_native2, outBytes, hipMemcpyDeviceToHost);
+    if (err != hipSuccess) {
+        printf("  hipMemcpy back native_hw failed: %s\n", hipGetErrorString(err));
+        return 1;
+    }
+#endif
+    
     printf("\n  Verification vs CPU reference:\n");
     printf("    DP4A + FP16-WMMA:\n");
     verify_results("    ", C_gpu_dp4a, C_cpu_ref, M, N, VERIFY_SAMPLES);
-    printf("\n    Native FP4 WMMA:\n");
+    printf("\n    Native FP4 WMMA (scalar):\n");
     verify_results("    ", C_gpu_native, C_cpu_ref, M, N, VERIFY_SAMPLES);
+    
+#if __gfx1250__ || defined(ROCWMMA_BUILD_GFX1250)
+    printf("\n    Native FP4 WMMA (hardware):\n");
+    verify_results("    ", C_gpu_native_hw, C_cpu_ref, M, N, VERIFY_SAMPLES);
+#endif
     
     // Cleanup
     hipFree(d_A);
     hipFree(d_B);
     hipFree(d_C_dp4a);
     hipFree(d_C_native);
+#if __gfx1250__ || defined(ROCWMMA_BUILD_GFX1250)
+    hipFree(d_C_native2);
+#endif
     munmap(hostPtr, totalBytes);
     close(fd);
     

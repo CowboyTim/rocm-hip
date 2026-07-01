@@ -39,12 +39,16 @@ WMMA_FP4_NATIVE_OBJ  = wmma_main_fp4_native.o
 WMMA_FP4_NATIVE_TARGET = wmma_matmul_fp4_native
 
 # FP4 Matmul Benchmark
+# wmma_bench_fp4_native.hip: scalar FP4 dequant + FP32 accumulate (works on gfx1151)
+# wmma_bench_fp4_native_gfx1250.hip: native FP4 WMMA using __builtin_amdgcn_wmma_f32_32x16x128_f4 (requires gfx1250+)
 BENCH_TARGET = wmma_bench
 BENCH_HOST = wmma_bench_main.o
 BENCH_KERNS = wmma_bench_fp4_dp4a.hip wmma_bench_fp4_native.hip
+BENCH_NATIVE_GFX1250 = wmma_bench_fp4_native_gfx1250.o
+BENCH_NATIVE_GFX1250_SRC = wmma_bench_fp4_native_gfx1250.hip
 
 # --- Build Rules ---
-all: $(TARGET) $(WMMA_TARGET) $(BENCH_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET)
+all: $(TARGET) $(WMMA_TARGET) $(BENCH_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_NATIVE_GFX1250)
 
 $(TARGET): $(OBJ) $(KERNEL_CO)
 	$(CLANG) $(OBJ) $(LDFLAGS) -o $@
@@ -73,9 +77,22 @@ wmma_bench_fp4_dp4a.o: wmma_bench_fp4_dp4a.hip
 wmma_bench_fp4_native.o: wmma_bench_fp4_native.hip
 	$(HIPCC) $(HIPFLAGS) -c $< -o $@
 
-# Build the benchmark (mixed host + device sources via hipcc)
+# Native FP4 WMMA kernel for gfx1250+ (RDNA4 / AMD AI engines)
+# Uses __builtin_amdgcn_wmma_f32_32x16x128_f4 intrinsic
+# REQUIRES: --offload-arch=gfx1250 or later
+native_gfx1250: $(BENCH_NATIVE_GFX1250)
+	@echo "Built native FP4 WMMA kernel for gfx1250+"
+
+$(BENCH_NATIVE_GFX1250): $(BENCH_NATIVE_GFX1250_SRC)
+	$(HIPCC) -Xarch_device -mno-wavefrontsize64 -isystem $(ROCM_PATH)/include --rocm-path=$(ROCM_PATH) -O3 --offload-arch=gfx1250 --genco -D__HIP_PLATFORM_AMD__ -D__HIP_ENABLE_AMD_HSA__ -c $< -o $@
+
+# Build the benchmark for gfx1151 (FP4 native uses scalar fallback)
 $(BENCH_TARGET): $(BENCH_HOST) $(BENCH_KERNS)
 	$(HIPCC) -isystem $(ROCM_PATH)/include --rocm-path=$(ROCM_PATH)  -o $@ $(BENCH_HOST) $(BENCH_KERNS) $(LDFLAGS) -mno-wavefrontsize64
+
+# Build the benchmark for gfx1250 (FP4 native uses hardware intrinsic)
+$(BENCH_TARGET)_gfx1250: $(BENCH_HOST) $(BENCH_KERNS) $(BENCH_NATIVE_GFX1250)
+	$(HIPCC) -isystem $(ROCM_PATH)/include --rocm-path=$(ROCM_PATH) -DROCWMMA_BUILD_GFX1250 --offload-arch=gfx1250 --genco -o $@ $(BENCH_HOST) $(BENCH_KERNS) $(BENCH_NATIVE_GFX1250) $(LDFLAGS) -mno-wavefrontsize64
 
 # Build all demos and benchmark
 both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)
