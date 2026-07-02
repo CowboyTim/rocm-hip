@@ -175,6 +175,8 @@ Examples:
         "wmma_bench_fp4_lut"        # New: FP4->FP16 via LDS LUT + WMMA tensor core
     ]
     
+    # FP4 × FP16 kernels (for KV-cache FP16 use case)
+    
     for kernel in kernels:
         co_file = f"{kernel}.co"
         if compile_kernel(f"{kernel}.hip", co_file):
@@ -192,9 +194,9 @@ Examples:
         return 1
     print("  OK: wmma_bench")
     
-    # Run benchmarks
+    # Run benchmarks - FP4 × Q8_1 (quantized activations)
     print("\n" + "=" * 78)
-    print("  Running Benchmarks")
+    print("  Running Benchmarks: FP4 × Q8_1 (quantized activations)")
     print("=" * 78)
     
     success, stdout = run_benchmark(M, N, K, runs, warmup, args.scale)
@@ -206,9 +208,9 @@ Examples:
     
     results = parse_benchmark_output(stdout)
     
-    # Summary
+    # Summary - FP4 × Q8_1
     print("\n" + "=" * 78)
-    print("  Summary")
+    print("  Summary: FP4 × Q8_1")
     print("=" * 78)
     
     if not results:
@@ -231,6 +233,65 @@ Examples:
         for r in results_sorted:
             speedup = slowest / r.latency_ms
             print(f"  {r.name:<45s} {speedup:8.2f}x")
+    
+    # Run benchmarks - FP4 × FP16 (direct activations, no quantization)
+    print("\n" + "=" * 78)
+    print("  Running Benchmarks: FP4 × FP16 (direct activations, no Q8_1 quantization)")
+    print("=" * 78)
+    
+    # Build separate binary for FP16 kernel
+    print("\nBuilding wmma_bench_fp16 binary...")
+    result = subprocess.run(["make", "wmma_bench_fp16"], capture_output=True, text=True)
+    if result.returncode != 0:
+        print("  FAIL: Build failed")
+        print(result.stderr)
+    else:
+        print("  OK: wmma_bench_fp16")
+        
+        # Run FP16 benchmarks
+        cmd = ["./wmma_bench_fp16", "-M", str(M), "-N", str(N), "-K", str(K),
+               "-runs", str(runs), "-warmup", str(warmup)]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            results_fp16 = parse_benchmark_output(result.stdout)
+            
+            print("\n" + "=" * 78)
+            print("  Summary: FP4 × FP16")
+            print("=" * 78)
+            
+            if results_fp16:
+                results_fp16_sorted = sorted(results_fp16, key=lambda r: r.latency_ms)
+                
+                print(f"\n  {'Method':<45s} {'Latency':>10s} {'GFLOPS':>10s} {'Mismatch':>10s} {'Status':>8s}")
+                print("  " + "-" * 70)
+                
+                for r in results_fp16_sorted:
+                    print(f"  {r.name:<45s} {r.latency_ms:>9.3f}ms {r.gflops:>9.1f} {r.mismatch_pct:>9.2f}% {r.status:>8s}")
+                
+                if len(results_fp16_sorted) >= 2:
+                    print("\n  --- Speedups (relative to slowest) ---")
+                    slowest = results_fp16_sorted[-1].latency_ms
+                    for r in results_fp16_sorted:
+                        speedup = slowest / r.latency_ms
+                        print(f"  {r.name:<45s} {speedup:8.2f}x")
+                
+                # Cross-comparison
+                print("\n  --- Cross-comparison: FP4×Q8_1 vs FP4×FP16 ---")
+                q8_1_results = {r.name: r for r in results_sorted}
+                fp16_results = {r.name: r for r in results_fp16_sorted}
+                
+                for name in q8_1_results:
+                    if name in fp16_results:
+                        q8_1 = q8_1_results[name]
+                        fp16 = fp16_results[name]
+                        speedup = q8_1.latency_ms / fp16.latency_ms
+                        print(f"  {name:<45s} {speedup:8.2f}x faster (FP16 vs Q8_1)")
+            else:
+                print("  No results parsed from FP16 benchmark")
+        else:
+            print("  FAIL: FP16 benchmark crashed")
+            print(result.stderr)
     
     # JSON output if requested
     if args.json:

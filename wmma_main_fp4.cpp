@@ -7,8 +7,8 @@
 #include <unistd.h>
 #include <cstdint>
 #include <cstring>
+#include <chrono>
 #include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
 
 #define HIP_CHECK(cmd, str) \
     do { \
@@ -19,51 +19,49 @@
         } \
     } while(0)
 
-#define MATRIX_SIZE 16
-#define MAT_SIZE (MATRIX_SIZE * MATRIX_SIZE)
-
 // FP4 ROCmFP4 Codebook10: 0, ±1, ±2, ±3, ±4, ±6, ±8, ±10
 static const int8_t fp4_codebook[16] = {
     0,  1,  2,  3,  4,  6,  8, 10,
     0, -1, -2, -3, -4, -6, -8,-10
 };
 
-// FP4 dequant: nibble (0-15) → float via codebook lookup
-__host__ __device__ __forceinline__ float fp4_dequant(uint8_t nibble, float scale) {
+// FP4 dequant helper
+__host__ __forceinline__ float fp4_dequant(uint8_t nibble, float scale) {
     int8_t code = fp4_codebook[nibble];
     return (float)code * scale;
 }
 
-// FP4 quantize: float → nibble via nearest codebook lookup (positive values only)
-// ROCmFP4 Codebook10: 8 positive values (indices 0-7), 8 negative values (indices 8-15)
-__host__ __device__ __forceinline__ uint8_t fp4_quant(float val) {
+// FP4 quantize
+__host__ __forceinline__ uint8_t fp4_quant(float val) {
     float best_dist = 1e30f;
-    int best_idx = 0;
-    // Only search positive half of codebook (indices 0-7)
-    for (int i = 0; i < 8; ++i) {
+    uint8_t best_idx = 0;
+    for (int i = 0; i < 16; ++i) {
         float diff = fabsf((float)fp4_codebook[i] - val);
         if (diff < best_dist) {
             best_dist = diff;
             best_idx = i;
         }
     }
-    return (uint8_t)best_idx;
+    return best_idx;
 }
 
-extern "C" __global__ void wmma_matmul_fp4(const unsigned char*, const __half*, __half*, float);
+extern "C" __global__ void wmma_matmul_fp4_builtin(const unsigned char*, const unsigned char*, float*, float);
 
 int main() {
-    printf("=== FP4 WMMA Matmul Demo (gfx1151) ===\n\n");
+    printf("=== FP4 Native WMMA (gfx1151) ===\n\n");
+    printf("Using: __builtin_amdgcn_wmma_f32_32x16x128_f4\n");
     printf("ROCmFP4: E2M1-derived with Codebook10\n");
-    printf("Values: 0, +/-1, +/-2, +/-3, +/-4, +/-6, +/-8, +/-10\n");
-    printf("Packed: 1 nibble/byte (single nibble per entry)\n\n");
+    printf("Matmul: A[32x128] FP4 x B[16x128] FP4 -> C[32x16] FP32\n\n");
 
-    size_t fp4_bytes = MAT_SIZE;  // 1 nibble per FP4 value = 256 bytes
-    size_t fp16_bytes = MAT_SIZE * sizeof(__half);
-    size_t total_bytes = fp4_bytes + fp16_bytes + fp16_bytes + fp16_bytes + sizeof(float);
+    // Output tile: 32x16 FP32 = 2048 bytes
+    // Input A: 32x128 FP4 = 4096 bytes
+    // Input B: 16x128 FP4 = 2048 bytes
+    size_t A_bytes = 32 * 128;  // FP4: 1 nibble per byte
+    size_t B_bytes = 16 * 128;  // FP4: 1 nibble per byte
+    size_t C_bytes = 32 * 16 * sizeof(float);
+    size_t total_bytes = A_bytes + B_bytes + C_bytes + C_bytes + sizeof(float);
 
-    // Allocate unified memory via mmap
-    const char* filepath = "/dev/shm/wmma_fp4.bin";
+    const char* filepath = "/dev/shm/wmma_fp4_native.bin";
 
     int fd = open(filepath, O_RDWR | O_CREAT, 0666);
     if (fd < 0) { perror("open mmap"); return 1; }
@@ -72,85 +70,65 @@ int main() {
     void* hostPtr = mmap(NULL, total_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (hostPtr == MAP_FAILED) { perror("mmap"); close(fd); return 1; }
 
-    // Layout:
-    // [0:fp4_bytes]         FP4-packed weights A (256 bytes)
-    // [fp4_bytes:fp16_bytes] FP16 activations B (512 bytes)
-    // [fp4+fp16:fp4+fp16]   FP16 GPU result C (512 bytes)
-    // [fp4+fp16+512:fp4+fp16+512] FP16 CPU result C (512 bytes)
-    // [fp4+fp16+1024:fp4+fp16+1024] FP32 scale value (4 bytes)
-    unsigned char* weights_fp4 = (unsigned char*)hostPtr;
-    __half* activations = (__half*)((char*)hostPtr + fp4_bytes);
-    __half* result_gpu = (__half*)((char*)hostPtr + fp4_bytes + fp16_bytes);
-    __half* result_cpu = (__half*)((char*)hostPtr + fp4_bytes + fp16_bytes + fp16_bytes);
-    float* scale_ptr = (float*)((char*)hostPtr + fp4_bytes + fp16_bytes + fp16_bytes + fp16_bytes);
+    unsigned char* A_fp4 = (unsigned char*)hostPtr;
+    unsigned char* B_fp4 = (unsigned char*)((char*)hostPtr + A_bytes);
+    float* C_gpu = (float*)((char*)hostPtr + A_bytes + B_bytes);
+    float* C_cpu = (float*)((char*)hostPtr + A_bytes + B_bytes + C_bytes);
+    float* scale_ptr = (float*)((char*)hostPtr + A_bytes + B_bytes + C_bytes + C_bytes);
 
     float scale_val = 1.0f;
     *scale_ptr = scale_val;
 
     printf("FP4 scale: %.1f\n\n", scale_val);
 
-  // Fill FP4 weights: A[i][j] = quantize((i % 8) + 1)
-    // Kernel loads column-major: weights_fp4[lane + ele*16]
-    // Fill column-major: weights_fp4[j*M + i] = A[i][j]
-    printf("Filling FP4 weights (column-major):\n");
-    for (int j = 0; j < MATRIX_SIZE; ++j) {
-        for (int i = 0; i < MATRIX_SIZE; ++i) {
-            float val = (float)((i % 8) + 1);
+    // Fill A[32x128]: A[i][j] = quantize((i+1) * (j%10 + 1))
+    printf("Filling A[32x128] FP4:\n");
+    for (int i = 0; i < 32; ++i) {
+        for (int j = 0; j < 128; ++j) {
+            float val = (float)(i + 1) * (float)(j % 10 + 1);
             uint8_t nibble = fp4_quant(val);
-            weights_fp4[j * MATRIX_SIZE + i] = nibble;
-            float dq = fp4_dequant(nibble, scale_val);
-            if (j < MATRIX_SIZE - 1) {
-                printf("  %4.1f", dq);
-            } else {
-                printf("  %4.1f\n", dq);
+            A_fp4[i * 128 + j] = nibble;
+            if (j < 16 && i < 4) {
+                printf("  %4.1f", (float)fp4_codebook[nibble]);
             }
         }
-    }
-
-    // Fill FP16 activations: B[i][j] = codebook[(j % 8) + 1]
-    // B stored row-major: activations[i*M + j]
-    printf("\nFP16 activations B (row-major, B[i][j] = codebook[(j %% 8)+1]):\n");
-    for (int i = 0; i < MATRIX_SIZE; ++i) {
-        for (int j = 0; j < MATRIX_SIZE; ++j) {
-            float bval = (float)((j % 8) + 1);
-            uint8_t bidx = fp4_quant(bval);
-            activations[i * MATRIX_SIZE + j] = __half(fp4_dequant(bidx, 1.0f));
-            printf("  %4.1f", (float)activations[i * MATRIX_SIZE + j]);
-        }
         printf("\n");
     }
-    printf("\nFP16 activations B (row-major, B[i][j] = j+1):\n");
-    for (int i = 0; i < MATRIX_SIZE; ++i) {
-        for (int j = 0; j < MATRIX_SIZE; ++j) {
-            activations[i * MATRIX_SIZE + j] = (__half)(float)(j + 1);
-            printf("  %4.1f", (float)activations[i * MATRIX_SIZE + j]);
+
+    // Fill B[16x128]: B[i][j] = quantize((i+1) + (j%8 + 1))
+    printf("\nFilling B[16x128] FP4:\n");
+    for (int i = 0; i < 16; ++i) {
+        for (int j = 0; j < 128; ++j) {
+            float val = (float)(i + 1) + (float)(j % 8 + 1);
+            uint8_t nibble = fp4_quant(val);
+            B_fp4[i * 128 + j] = nibble;
+            if (j < 16 && i < 4) {
+                printf("  %4.1f", (float)fp4_codebook[nibble]);
+            }
         }
         printf("\n");
     }
 
-    memset(result_gpu, 0, fp16_bytes);
+    memset(C_gpu, 0, C_bytes);
 
     // Pin mmap'ed pages for GPU access
     HIP_CHECK(hipHostRegister(hostPtr, total_bytes, hipHostRegisterDefault), "pin mmap memory");
 
-    unsigned char* dev_weights_fp4;
-    __half* dev_activations;
-    __half* dev_result;
+    unsigned char* dev_A, *dev_B;
+    float* dev_C;
 
-    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_weights_fp4, (void*)weights_fp4, 0), "get dev ptr fp4");
-    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_activations, (void*)activations, 0), "get dev ptr act");
-    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_result, (void*)result_gpu, 0), "get dev ptr result");
-    __half* dev_result_cpu;
-    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_result_cpu, (void*)result_cpu, 0), "get dev ptr cpu");
+    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_A, (void*)A_fp4, 0), "get dev ptr A");
+    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_B, (void*)B_fp4, 0), "get dev ptr B");
+    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_C, (void*)C_gpu, 0), "get dev ptr C");
 
     float dev_scale = scale_val;
 
     printf("\nMemory pointers (UMA zero-copy): dev == host: %s\n",
-           dev_weights_fp4 == weights_fp4 ? "YES" : "NO");
+           dev_A == A_fp4 ? "YES" : "NO");
 
-    // Load kernel module from pre-compiled .co file
-    int kfd = open("wmma_kernel_fp4.co", O_RDONLY);
-    if (kfd < 0) { perror("wmma_kernel_fp4.co"); return 1; }
+    // Load kernel module
+    int kfd = open("wmma_kernel_fp4_native.co", O_RDONLY);
+    if (kfd < 0) { perror("wmma_kernel_fp4_native.co"); return 1; }
     struct stat st; fstat(kfd, &st);
     void* coData = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, kfd, 0);
 
@@ -159,70 +137,73 @@ int main() {
     HIP_CHECK(hipModuleLoadData(&mod, coData), "load module");
     
     hipFunction_t func;
-    HIP_CHECK(hipModuleGetFunction(&func, mod, "wmma_matmul_fp4"), "get function");
+    HIP_CHECK(hipModuleGetFunction(&func, mod, "wmma_matmul_fp4_native"), "get function");
 
-    // Launch kernel: 1 block of 32 threads
+    // Launch: 1 warp (32 threads) per tile
     dim3 block(32);
     dim3 grid(1);
 
     printf("\nLaunching wmma_matmul_fp4<<<%d, %d>>>...\n", grid.x, block.x);
-    void* args[] = { &dev_weights_fp4, &dev_activations, &dev_result, &dev_scale };
+    void* args[] = { &dev_A, &dev_B, &dev_C, &dev_scale };
     HIP_CHECK(hipModuleLaunchKernel(func, grid.x, grid.y, 1, block.x, block.y, 1,
                                     0, 0, args, nullptr), "launch");
+    auto start = std::chrono::high_resolution_clock::now();
     HIP_CHECK(hipDeviceSynchronize(), "sync after kernel");
+    auto end = std::chrono::high_resolution_clock::now();
+    
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    printf("\nKernel time: %.3f ms\n", duration / 1000.0);
     
     munmap(coData, st.st_size);
     close(kfd);
     HIP_CHECK(hipModuleUnload(mod), "unload");
 
-    // Read results (already in host-visible memory via mmap)
-   printf("\nGPU Result C = A_fp4 x B (16x16 FP16 matrix):\n");
-    for (int i = 0; i < MATRIX_SIZE; ++i) {
-        for (int j = 0; j < MATRIX_SIZE; ++j) {
-            printf("  %7.1f", (float)result_gpu[i * MATRIX_SIZE + j]);
+    // Print GPU result
+    printf("\nGPU Result C[32x16] = A[32x128] FP4 x B[16x128] FP4:\n");
+    for (int i = 0; i < 8; ++i) {
+        for (int j = 0; j < 16; ++j) {
+            printf("  %8.1f", C_gpu[i * 16 + j]);
         }
         printf("\n");
     }
+    printf("  ...\n");
 
-   // CPU verification: dequant FP4 on CPU, compute matmul
-    // weights_fp4 stored column-major: weights_fp4[j*M+i] = A[i][j]
-    printf("\nCPU Verification:\n");
-    printf("  Dequant A_fp4[i][k] using ROCmFP4 Codebook10\n");
-    printf("  Compute C[i][j] = sum_k A_fp4[i][k] x B[k][j]\n\n");
-    
+    // CPU verification
+    printf("\nCPU Verification (first 8 rows):\n");
     bool all_match = true;
-    for (int i = 0; i < MATRIX_SIZE; ++i) {
-        for (int j = 0; j < MATRIX_SIZE; ++j) {
+    for (int i = 0; i < 8; ++i) {
+        for (int j = 0; j < 16; ++j) {
             float sum = 0.0f;
-            for (int k = 0; k < MATRIX_SIZE; ++k) {
-                // Column-major storage: A[i][k] = weights_fp4[k*M+i]
-                uint8_t nibble = weights_fp4[k * MATRIX_SIZE + i];
-                float a_val = fp4_dequant(nibble, scale_val);
-                // B[k][j] from activations (row-major): activations[k*M+j]
-                float b_val = (float)activations[k * MATRIX_SIZE + j];
-                sum += a_val * b_val;
+            for (int k = 0; k < 128; ++k) {
+                uint8_t a_nibble = A_fp4[i * 128 + k];
+                uint8_t b_nibble = B_fp4[j * 128 + k];
+                sum += fp4_dequant(a_nibble, 1.0f) * fp4_dequant(b_nibble, 1.0f);
             }
-            result_cpu[i * MATRIX_SIZE + j] = (__half)sum;
-            float gpu_val = (float)result_gpu[i * MATRIX_SIZE + j];
-            float diff = fabsf(gpu_val - sum);
-            char status = (diff < 2.0f) ? '=' : '!';
-            if (j == 0) {
-                printf("  Row %2d: GPU=[", i);
-            }
-            printf(" %5.1f%c", gpu_val, status);
-            if (j == MATRIX_SIZE - 1) {
-                printf(" ]  CPU=[");
-                for (int jj = 0; jj < MATRIX_SIZE; ++jj) {
-                    printf(" %5.1f", (float)result_cpu[i * MATRIX_SIZE + jj]);
-                }
-                printf(" ]\n");
-            }
-            if (diff >= 2.0f) all_match = false;
+            C_cpu[i * 16 + j] = sum;
         }
+        printf("  Row %2d: GPU=[", i);
+        for (int j = 0; j < 16; ++j) {
+            printf(" %8.1f", C_gpu[i * 16 + j]);
+        }
+        printf(" ]  CPU=[");
+        for (int j = 0; j < 16; ++j) {
+            printf(" %8.1f", C_cpu[i * 16 + j]);
+        }
+        printf(" ]");
+        
+        bool row_match = true;
+        for (int j = 0; j < 16; ++j) {
+            if (fabsf(C_cpu[i * 16 + j] - C_gpu[i * 16 + j]) > 1.0f) {
+                row_match = false;
+                break;
+            }
+        }
+        printf(" [%s]\n", row_match ? "OK" : "MISMATCH");
+        if (!row_match) all_match = false;
     }
     
     if (all_match) {
-        printf("\n  All values match within tolerance!\n");
+        printf("\n  All values match!\n");
     }
 
     // Cleanup

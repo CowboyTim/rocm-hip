@@ -27,8 +27,8 @@ WMMA_OBJ  = wmma_main.o
 WMMA_TARGET = wmma_matmul
 
 # WMMA matmul (FP4 ROCmFP4): FP4 dequant via DP4A perm + WMMA FP16
-WMMA_FP4_SRC  = wmma_kernel_fp4.hip
-WMMA_FP4_CO   = wmma_kernel_fp4.co
+WMMA_FP4_SRC  = wmma_kernel_fp4_native.hip
+WMMA_FP4_CO   = wmma_kernel_fp4_native.co
 WMMA_FP4_OBJ  = wmma_main_fp4.o
 WMMA_FP4_TARGET = wmma_matmul_fp4
 
@@ -38,14 +38,19 @@ WMMA_FP4_NATIVE_CO   = wmma_kernel_fp4_native.co
 WMMA_FP4_NATIVE_OBJ  = wmma_main_fp4_native.o
 WMMA_FP4_NATIVE_TARGET = wmma_matmul_fp4_native
 
-# FP4 Matmul Benchmark
+# FP4 Matmul Benchmark (FP4 × Q8_1)
 BENCH_TARGET = wmma_bench
 BENCH_HOST = wmma_bench_main.o
 BENCH_LUT_CO = wmma_bench_fp4_lut.co
 BENCH_DP4A_INT8_CO = wmma_bench_fp4_dp4a_int8.co
 
+# FP4 × FP16 Benchmark (direct FP16 activations, no Q8_1 quantization)
+BENCH_FP16_TARGET = wmma_bench_fp16
+BENCH_FP16_HOST = wmma_bench_fp16_main.o
+BENCH_FP16_CO = wmma_bench_fp4_lut.co  # Same kernel, different test data
+
 # --- Build Rules ---
-all: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)
+all: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET) $(BENCH_FP16_TARGET) $(BENCH_FP16_CO) $(BENCH_FP16_TARGET)
 
 $(TARGET): $(OBJ) $(KERNEL_CO)
 	$(CLANG) $(OBJ) $(LDFLAGS) -o $@
@@ -85,10 +90,14 @@ wmma_bench_fp4_dp4a_hardware.co: wmma_bench_fp4_dp4a_hardware.hip
 $(BENCH_TARGET): $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_dp4a_hardware.co wmma_bench_fp4_native.co $(BENCH_LUT_CO) $(BENCH_DP4A_INT8_CO)
 	$(CLANG) $(BENCH_HOST) $(LDFLAGS) -o $@
 
+# Build the FP16 benchmark binary (same kernel, FP16 activation data path)
+$(BENCH_FP16_TARGET): $(BENCH_FP16_HOST) wmma_bench_fp4_lut.co
+	$(CLANG) $(BENCH_FP16_HOST) $(LDFLAGS) -o $@
+
 # Build all demos and benchmark
-both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)
+both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET) $(BENCH_FP16_TARGET)
 
 clean:
-	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_native.co wmma_bench_fp4_dp4a_hardware.co $(BENCH_LUT_CO) $(BENCH_DP4A_INT8_CO)
+	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_native.co wmma_bench_fp4_dp4a_hardware.co $(BENCH_LUT_CO) $(BENCH_DP4A_INT8_CO) $(BENCH_FP16_TARGET) $(BENCH_FP16_HOST)
 
 .PHONY: all clean both
