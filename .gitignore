@@ -1,18 +1,21 @@
-*~
-*.o
-*.co
-halo_test
-mandelbrot
-wmma_matmul
-wmma_matmul_fp4
-wmma_matmul_fp4_native
-wmma_bench
-wmma_bench_fp4_native_gfx1250
+# Large binary model files
+*.gguf
 
-# Temporary/build directories
-.tmp/
-mandelbrot.ppm
-vectorAdd.cpp.bak
-vectorAdd.cpp.orig
-# CocoIndex Code (ccc)
-/.cocoindex_code/
+# Session logs
+session-*.md
+
+# Compiled artifacts
+llama
+llama.sh
+rocm.html
+rocmfp4-llama/
+
+# Build output
+*.o
+*.a
+*.so
+*.dylib
+
+# IDE
+.vscode/
+.idea/
