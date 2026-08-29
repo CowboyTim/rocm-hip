@@ -31,7 +31,8 @@ echo "======================================================================"
 
 # Configure with explicit compiler paths and architecture
 # We add --rocm-path directly to the HIP flags to stop Clang from complaining
-mkdir -p build && cd build || exit 1
+LLAMA_CPP_DIR="${LLAMA_CPP_DIR:-$(pwd)/llama.cpp}"
+mkdir -p "$LLAMA_CPP_DIR/build" && cd "$LLAMA_CPP_DIR/build" || exit 1
 cmake \
     .. \
     -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
@@ -80,6 +81,9 @@ cmake \
     -DGGML_HIP_MMQ_MFMA=ON \
     -DGGML_CUDA_FORCE_CUBLAS=OFF \
     \
+    `# === UMA Zero-Copy (Strix Halo) ===` \
+    -DGGML_HIP_USE_MMAP_ALIASED=ON \
+    \
     `# === Performance Profiling ===` \
     -DGGML_HIP_EXPORT_METRICS=OFF \
     \
@@ -103,8 +107,7 @@ cmake \
 # Build with all cores
 echo ""
 echo "Building with $(nproc) parallel jobs..."
-cd ..
-cmake --build build --config Release -j$(nproc) --target \
+cmake --build . --config Release -j$(nproc) --target \
     llama-cli \
     llama-server \
     llama-completion \
@@ -121,6 +124,7 @@ if [ $BUILD_STATUS -eq 0 ]; then
     echo "New optimizations enabled in this build:"
     echo "  • GGML_CUDA_FA_ALL_QUANTS: Fine-grained KV cache quantization"
     echo "  • GGML_HIP_MMQ_MFMA: MFMA-accelerated MMQ kernels for RDNA3.5"
+    echo "  • GGML_HIP_USE_MMAP_ALIASED: mmap+hipHostRegisterMapped zero-copy (Strix Halo)"
     echo "  • GGML_HIP_EXPORT_METRICS: Kernel profiling metrics"
     echo "  • GGML_HIP_GRAPHS: Enabled (override with env var if needed)"
     echo "  • CMAKE_HIP_ARCHITECTURES: Explicit gfx1151 targeting"

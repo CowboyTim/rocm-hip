@@ -19,3 +19,5 @@ rocmfp4-llama/
 # IDE
 .vscode/
 .idea/
+# CocoIndex Code (ccc)
+/.cocoindex_code/

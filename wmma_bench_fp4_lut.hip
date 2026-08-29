@@ -53,7 +53,7 @@ extern "C" __global__ void wmma_bench_fp4_lut(
     // lane selects the column, ele iterates rows
     for (int ele = 0; ele < 16; ++ele) {
         uint8_t nibble = A[lane + ele * 16];
-        int idx = (nibble < 8) ? nibble : 7;  // clamp for test (no negative values in data)
+        int idx = nibble & 0x0F;
         w_frag[ele] = lds_lut[idx];
     }
     

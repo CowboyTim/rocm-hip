@@ -55,7 +55,7 @@ extern "C" __global__ void wmma_matmul_fp4(const unsigned char* weights_fp4,
     // Nibbles are indices into codebook: 0-7 -> positive values (0,1,2,3,4,6,8,10)
     for (int ele = 0; ele < 16; ++ele) {
         uint8_t nibble = weights_fp4[lane + ele * 16];
-        int idx = (nibble < 8) ? nibble : 7;
+        int idx = nibble & 0x0F;
         w_frag[ele] = lds_lut[idx];  // Fast LDS indexed load
     }
 
