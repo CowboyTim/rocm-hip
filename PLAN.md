@@ -150,21 +150,30 @@ All implementation lives in C++ with HIP device code. The C API is a thin FFI wr
 
 ## Phased Approach
 
-### Phase 0: Foundation (already done or trivial)
+### Phase 0: Foundation (~complete)
 
 - [x] FP4_FP6_FP8_Analysis.md written and committed to main branch
-- [ ] Update README.md from "Initial Commit" to proper project description
-- [ ] Create AGENTS.md on main with useful content from q4 branch
-- [ ] Update PLAN.md's build section with new target structure
+- [x] README.md updated from "Initial Commit" to project overview with component table and build instructions
+- [x] AGENTS.md created on main with project description, branches, and core pattern
+- [x] PLAN.md build section kept in sync with Makefile targets
 
-### Phase 1: GGUF Loading Infrastructure (~2 weeks)
+### Phase 1: GGUF Loading Infrastructure (~completed)
 
-**Goal**: mmap() a quantized GGUF file (including split files), load metadata into CPU-visible structures, register GPU-accessible mappings.
+**Goal**: mmap() a quantized GGUF file, load metadata into CPU-visible structures.
 
 Deliverables:
-1. `gguf_mmap.h` / `gguf_mmap.cpp` -- custom GGUF reader that uses `mmap()` instead of `fread()`. Parses GGUF magic, version, tensor count, key/value pairs, then maps each tensor's data region directly at its file offset.
-2. Supports multi-file splits: detects `splits_count` and `split_no` keys from GGUF header, opens additional `.gguf` files and indexes their tensors alongside the primary file.
-3. Registers all mapped regions with `hipHostRegister(mapped_ptr, size, hipHostRegisterMapped)` so the GPU can access them without copies. Prints device pointer for verification against the original mapping address.
+1. ✅ `gguf_mmap.h` / `gguf_mmap.cpp` -- standalone mmap-based GGUF reader. No `fread()` anywhere. Parses GGUF magic, version, tensor count, key/value pairs (including string arrays), then maps each tensor's data region directly at its file offset.
+2. ✅ Clean C API with opaque handles for all state. All functions exported as `extern "C"`.
+3. ✅ Tensor introspection: name, type, dimensions (ne[]), block size, type size, row size, data offset, byte counts (padded/unpadded).
+4. ✅ KV metadata access by index: typed getters for all scalar types (u8/i8/u16/i16/u32/i32/f32/u64/i64/f64).
+5. ✅ Model-level queries: architecture, vocab info, head counts, context length, embedding dim, block count via GGUF key lookup.
+6. ✅ KV cache configuration bridge: `inference_set_n_ctx()` / `inference_get_n_ctx()` for downstream allocation.
+7. ✅ Demo binary (`demo_gguf`) that loads a model and exercises the full API surface.
+
+Not yet implemented (deferred to Phase 3):
+- Multi-file split support (`splits_count`/`split_no` keys) -- not needed for single-file models
+- `hipHostRegister()` mapping -- deferred until GPU kernels exist
+- String value storage during load (Phase 2 enhancement) -- currently skipped but parsed correctly
 4. Tensor type detection: reads GGUF type field (GGML_TYPE_MXFP4=39, etc.) and stores block_size/row_size info from ggml.h.
 
 Key design decisions:

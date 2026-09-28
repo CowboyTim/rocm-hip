@@ -44,8 +44,12 @@ BENCH_HOST = wmma_bench_main.o
 BENCH_LUT_CO = wmma_bench_fp4_lut.co
 BENCH_DP4A_INT8_CO = wmma_bench_fp4_dp4a_int8.co
 
+# --- Phase 1: GGUF mmap reader ---
+GGUF_MMAP_SRC = gguf_mmap.cpp
+DEMO_GGUF     = demo_gguf
+
 # --- Build Rules ---
-all: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)
+all: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET) $(DEMO_GGUF)
 
 $(TARGET): $(OBJ) $(KERNEL_CO)
 	$(CLANG) $(OBJ) $(LDFLAGS) -o $@
@@ -53,7 +57,7 @@ $(TARGET): $(OBJ) $(KERNEL_CO)
 $(WMMA_TARGET): $(WMMA_OBJ) $(WMMA_CO)
 	$(CLANG) $(WMMA_OBJ) $(LDFLAGS) -o $@
 
-$(WMMA_FP4_TARGET): $(WMMA_FP4_OBJ) $(WMMA_FP4_CO)
+$(WMMA_FP4_TARGET): $(WMMA_FP4_OBJ) $(WMMA_CO)
 	$(CLANG) $(WMMA_FP4_OBJ) $(LDFLAGS) -o $@
 
 $(WMMA_FP4_NATIVE_TARGET): $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO)
@@ -82,10 +86,15 @@ wmma_bench_fp4_dp4a_hardware.co: wmma_bench_fp4_dp4a_hardware.hip
 $(BENCH_TARGET): $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_dp4a_hardware.co wmma_bench_fp4_native.co $(BENCH_LUT_CO) $(BENCH_DP4A_INT8_CO)
 	$(CLANG) $(BENCH_HOST) $(LDFLAGS) -o $@
 
+# Phase 1 demo: gguf_mmap reader linked into a single binary
+$(DEMO_GGUF): $(GGUF_MMAP_SRC) demo_gguf.cpp gguf_mmap.h
+	$(CLANG) -O3 -Wall -I. -D__HIP_PLATFORM_AMD__ \
+		$(GGUF_MMAP_SRC) demo_gguf.cpp -o $@
+
 # Build all demos and benchmark
 both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)
 
 clean:
-	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_native.co wmma_bench_fp4_dp4a_hardware.co $(BENCH_LUT_CO) $(BENCH_DP4A_INT8_CO)
+	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_native.co wmma_bench_fp4_dp4a_hardware.co $(BENCH_LUT_CO) $(BENCH_DP4A_INT8_CO) $(DEMO_GGUF)
 
 .PHONY: all clean both

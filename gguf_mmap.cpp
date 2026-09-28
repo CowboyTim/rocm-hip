@@ -1,0 +1,651 @@
+/* ---------------------------------------------------------------------------
+ * gguf_mmap -- standalone mmap-based GGUF reader (Phase 1)
+ * Loads a GGUF file via mmap(), parses header + KV pairs + tensor metadata.
+ * --------------------------------------------------------------------------- */
+
+#include "gguf_mmap.h"
+
+#include <stdio.h>      /* fprintf, stderr */
+#include <stdlib.h>     /* calloc, free, malloc */
+#include <string.h>     /* memcpy, strcmp, strlen */
+#include <fcntl.h>      /* open, O_RDONLY */
+#include <unistd.h>     /* close, munmap */
+#include <sys/mman.h>   /* mmap, MAP_FAILED */
+#include <sys/stat.h>   /* ::stat, struct stat */
+#include <cerrno>       /* errno */
+
+static const char  GGUF_MAGIC[]       = "GGUF";
+static const uint32_t GGUF_VERSION    = 3;
+static const size_t  GGUF_ALIGN       = 32;
+
+static inline size_t align_up(size_t x, size_t n) { return ((x + n - 1) & ~(n - 1)); }
+
+typedef uint16_t ggml_half;
+
+enum gguf_type {
+    GGUF_TYPE_UINT8   = 0,
+    GGUF_TYPE_INT8    = 1,
+    GGUF_TYPE_UINT16  = 2,
+    GGUF_TYPE_INT16   = 3,
+    GGUF_TYPE_UINT32  = 4,
+    GGUF_TYPE_INT32   = 5,
+    GGUF_TYPE_FLOAT32 = 6,
+    GGUF_TYPE_BOOL    = 7,
+    GGUF_TYPE_STRING  = 8,
+    GGUF_TYPE_ARRAY   = 9,
+    GGUF_TYPE_UINT64  = 10,
+    GGUF_TYPE_INT64   = 11,
+    GGUF_TYPE_FLOAT64 = 12,
+};
+
+/* Block sizes (elements per block for quantized types) */
+static const int64_t BLOCK_SIZES[] __attribute__((unused)) = {
+    [0] = 1,[1] = 1,[2] = 32,[3] = 32,[6] = 32,[7] = 32,[8] = 32,[9] = 32,
+    [10]=256,[11]=256,[12]=256,[13]=256,[14]=256,[15]=256,[39]=32,[40]=64,
+};
+
+/* Type sizes (bytes per block) */
+static const size_t TYPE_SIZES[] __attribute__((unused)) = {
+    [0] /* F32 */=sizeof(float),[1] /* F16 */=sizeof(ggml_half),[2]=18,[3]=20,
+    [6]=22,[7]=24,[8]=34,[9]=36,[10]=62,[11]=70,[12]=134,[13]=154,
+    [14]=176,[15]=290,[39]=17,[40]=36,
+};
+
+static inline int64_t get_block_size(int type) {
+    return (type >= 0 && type < 43) ? BLOCK_SIZES[type] : -1;
+}
+
+static inline size_t get_type_size(int type) {
+    return (type >= 0 && type < 43) ? TYPE_SIZES[type] : (size_t)-1;
+}
+
+/* ---------------------------------------------------------------------------
+ * Internal structures
+ * --------------------------------------------------------------------------- */
+
+struct tensor_meta {
+    char         name[64];
+    uint8_t      n_dims;       /* actual dimensions count (1-4) */
+    int64_t      ne[4];        /* dimension sizes; ne[i>=n_dims]==1 */
+    int          type;         /* ggml_type enum value */
+    uint64_t     data_offset;  /* byte offset from start of data blob */
+};
+
+/* KV scalar value with explicit type tag for correct retrieval */
+struct kv_scalar {
+    uint8_t type;   /* original gguf_type */
+    union {
+        uint8_t  v_u8;  int8_t   v_i8;  uint16_t v_u16; int16_t  v_i16;
+        uint32_t v_u32; int32_t  v_i32; float      v_f32; bool     v_bool;
+        uint64_t v_u64; int64_t  v_i64; double     v_f64;
+    };
+};
+
+struct kv_entry {
+    char            *key;         /* allocated string, owned by us */
+    uint8_t          is_array : 1;/* 0=scalar, 1=array */
+    uint8_t          arr_type : 7;/* element type (only when is_array) */
+    struct kv_scalar scalar;      /* used only when !is_array */
+    uint64_t         arr_n;       /* number of elements (only when is_array) */
+    char             *str_val;    /* allocated string (for string-type scalars) */
+};
+
+/* Opaque handle matching the public API declaration */
+typedef struct inference_model inference_model_t;
+
+struct inference_model {
+    void           *map_ptr;         /* base pointer from mmap() */
+    size_t          map_size;        /* file size we mapped */
+    uint32_t        version;         /* GGUF version */
+    size_t          alignment;       /* effective alignment (default 32) */
+    size_t          data_off;        /* data blob start offset from file begin */
+    int64_t         n_tensors;       /* total tensors in file */
+    struct tensor_meta *tensors;     /* heap-allocated array[n_tensors] */
+    int64_t         n_kv;            /* total KV pairs */
+    struct kv_entry *kvs;            /* heap-allocated array[n_kv] */
+    int64_t         n_ctx;           /* requested context length, default 512 */
+};
+
+/* ---------------------------------------------------------------------------
+ * Helpers: read values at current position in the mapped buffer
+ * --------------------------------------------------------------------------- */
+
+static char *read_string(const uint8_t **pp) {
+    const uint8_t *p = *pp;
+    uint64_t len; memcpy(&len, p, 8); p += 8;
+    if (len > (1ULL << 30)) return NULL;
+    char *s = (char *)malloc(len + 1); if (!s) return NULL;
+    memcpy(s, p, len); s[len] = '\0'; p += len;
+    *pp = p; return s;
+}
+
+/* ---------------------------------------------------------------------------
+ * Core: load and parse a single GGUF file via mmap()
+ * --------------------------------------------------------------------------- */
+
+static inference_model_t *load_gguf(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        fprintf(stderr, "gguf_mmap: cannot stat '%s': %s\n", path, strerror(errno));
+        return NULL;
+    }
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "gguf_mmap: cannot open '%s': %s\n", path, strerror(errno));
+        return NULL;
+    }
+
+    void *mapped = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (mapped == MAP_FAILED) {
+        fprintf(stderr, "gguf_mmap: mmap failed for '%s': %s\n", path, strerror(errno));
+        return NULL;
+    }
+
+    const uint8_t *base = (const uint8_t *)mapped;
+
+    /* Verify magic + version */
+    if (memcmp(base, GGUF_MAGIC, 4) != 0 || *(const uint32_t *)(base + 4) != GGUF_VERSION) {
+        fprintf(stderr, "gguf_mmap: invalid GGUF in '%s' (bad magic/version)\n", path);
+        munmap(mapped, st.st_size); return NULL;
+    }
+
+    inference_model_t *model = (inference_model_t *)calloc(1, sizeof(inference_model_t));
+    if (!model) { munmap(mapped, st.st_size); return NULL; }
+
+    model->map_ptr   = mapped;
+    model->map_size  = st.st_size;
+    model->version   = *(const uint32_t *)(base + 4);
+    model->alignment = GGUF_ALIGN;
+
+    const uint8_t *p = base + 8; /* skip past magic+version header */
+    int64_t n_tensors, n_kv;
+    memcpy(&n_tensors, p, 8); p += 8;
+    memcpy(&n_kv,      p, 8); p += 8;
+
+    model->n_tensors = n_tensors;
+    model->n_kv      = n_kv;
+
+    size_t nt_alloc = (size_t)n_tensors > 0 ? (size_t)n_tensors : 1;
+    size_t nk_alloc = (size_t)n_kv     > 0 ? (size_t)n_kv     : 1;
+    model->tensors = (struct tensor_meta *)calloc(nt_alloc, sizeof(struct tensor_meta));
+    model->kvs     = (struct kv_entry *)calloc(nk_alloc, sizeof(struct kv_entry));
+
+    if (!model->tensors || !model->kvs) goto fail;
+
+    /* --- Parse KV pairs --- */
+    for (int64_t i = 0; i < n_kv; ++i) {
+        struct kv_entry *kv = &model->kvs[i];
+
+        char *key = read_string(&p); if (!key) goto fail;
+        kv->key = key;
+
+        int32_t type_id; memcpy(&type_id, p, 4); p += 4;
+
+        if (type_id == GGUF_TYPE_STRING) {
+            /* String value: skip for Phase 1. Store in str_val later. */
+            char *s = read_string(&p); free(s);
+        } else if (type_id == GGUF_TYPE_ARRAY) {
+            int32_t arr_type; uint64_t arr_n;
+            memcpy(&arr_type, p, 4); p += 4;
+            memcpy(&arr_n, p, 8); p += 8;
+
+            /* String arrays have variable-length elements -- skip each individually */
+            if ((enum gguf_type)arr_type == GGUF_TYPE_STRING) {
+                for (uint64_t j = 0; j < arr_n; ++j) { char *s = read_string(&p); free(s); }
+            } else {
+                size_t elem_sz = 0; switch ((enum gguf_type)arr_type) {
+                    case GGUF_TYPE_UINT8:   elem_sz=1; break; case GGUF_TYPE_INT8:    elem_sz=1; break;
+                    case GGUF_TYPE_UINT16:  elem_sz=2; break; case GGUF_TYPE_INT16:   elem_sz=2; break;
+                    case GGUF_TYPE_UINT32:  elem_sz=4; break; case GGUF_TYPE_INT32:   elem_sz=4; break;
+                    case GGUF_TYPE_FLOAT32: elem_sz=4; break; case GGUF_TYPE_BOOL:    elem_sz=1; break;
+                    case GGUF_TYPE_UINT64:  elem_sz=8; break; case GGUF_TYPE_INT64:   elem_sz=8; break;
+                    case GGUF_TYPE_FLOAT64: elem_sz=8; break; default: goto fail;
+                }
+                p += arr_n * elem_sz;
+            }
+
+            kv->is_array     = 1;
+            kv->is_array     = 1;
+            kv->arr_type     = (uint8_t)arr_type;
+            kv->arr_n        = arr_n;
+        } else {
+            /* Scalar value -- read into union based on type */
+            kv->is_array      = 0;
+            kv->scalar.type   = (uint8_t)type_id;
+
+            switch ((enum gguf_type)type_id) {
+                case GGUF_TYPE_UINT8:   memcpy(&kv->scalar.v_u8, p, 1); ++p; break;
+                case GGUF_TYPE_INT8:    memcpy(&kv->scalar.v_i8, p, 1); ++p; break;
+                case GGUF_TYPE_UINT16:  memcpy(&kv->scalar.v_u16, p, 2); p+=2; break;
+                case GGUF_TYPE_INT16:   memcpy(&kv->scalar.v_i16, p, 2); p+=2; break;
+                case GGUF_TYPE_UINT32:  memcpy(&kv->scalar.v_u32, p, 4); p+=4; break;
+                case GGUF_TYPE_INT32:   memcpy(&kv->scalar.v_i32, p, 4); p+=4; break;
+                case GGUF_TYPE_FLOAT32: memcpy(&kv->scalar.v_f32, p, 4); p+=4; break;
+                case GGUF_TYPE_BOOL:    memcpy(&kv->scalar.v_bool, p, 1); ++p; break;
+                case GGUF_TYPE_STRING:  { char *s = read_string(&p); free(s); } break;
+                case GGUF_TYPE_UINT64:  memcpy(&kv->scalar.v_u64, p, 8); p+=8; break;
+                case GGUF_TYPE_INT64:   memcpy(&kv->scalar.v_i64, p, 8); p+=8; break;
+                case GGUF_TYPE_FLOAT64: memcpy(&kv->scalar.v_f64, p, 8); p+=8; break;
+                default: goto fail;
+            }
+
+            /* Track specific KV pairs we care about */
+            if (strcmp(key, "general.alignment") == 0) {
+                model->alignment = kv->is_array ? 32 : (size_t)(uint64_t)kv->scalar.v_u32;
+            }
+        }
+    }
+
+    /* --- Parse tensor metadata --- */
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        struct tensor_meta *tm = &model->tensors[i];
+
+        char *name = read_string(&p); if (!name) goto fail;
+        size_t nl = strlen(name);
+        if (nl >= sizeof(tm->name)) nl = sizeof(tm->name) - 1;
+        memcpy(tm->name, name, nl); tm->name[nl] = '\0'; free(name);
+
+        uint32_t nd; memcpy(&nd, p, 4); p += 4;
+        if (nd < 1 || nd > 4) goto fail;
+        tm->n_dims = (uint8_t)nd;
+
+        for (uint8_t d = 0; d < nd; ++d) { int64_t dim; memcpy(&dim, p, 8); p += 8; tm->ne[d] = dim; }
+
+        int32_t tid; memcpy(&tid, p, 4); p += 4;
+        tm->type = tid;
+
+        uint64_t doff; memcpy(&doff, p, 8); p += 8;
+        tm->data_offset = doff;
+    }
+
+    /* Data blob starts at aligned offset after all tensor info */
+    model->data_off   = align_up((size_t)(p - base), model->alignment);
+    return model;
+
+fail:
+    fprintf(stderr, "gguf_mmap: corrupted structure in '%s'\n", path);
+    munmap(mapped, st.st_size);
+    for (int64_t i = 0; i < n_kv; ++i) free(model->kvs[i].key);
+    free(model->tensors); free(model->kvs); free(model);
+    return NULL;
+}
+
+/* ---------------------------------------------------------------------------
+ * Public API implementation
+ * --------------------------------------------------------------------------- */
+
+inference_model_t *inference_load_model(const char *path) {
+    if (!path) return NULL;
+    return load_gguf(path);
+}
+
+void inference_free_model(inference_model_t *model) {
+    if (!model) return;
+    for (int64_t i = 0; i < model->n_kv; ++i) free(model->kvs[i].str_val);
+    for (int64_t i = 0; i < model->n_kv; ++i) free(model->kvs[i].key);
+    free(model->tensors); free(model->kvs);
+    if (model->map_ptr) munmap(model->map_ptr, model->map_size);
+    free(model);
+}
+
+/* --- Tensor introspection --- */
+
+int64_t      inference_n_tensors(const inference_model_t *m)   { return m ? m->n_tensors : 0; }
+
+const char  *inference_tensor_name(const inference_model_t *m, int64_t idx) {
+    if (!m || idx<0 || idx>=m->n_tensors) return "(null)";
+    return m->tensors[idx].name;
+}
+
+int          inference_tensor_type(const inference_model_t *m, int64_t idx) {
+    if (!m || idx<0 || idx>=m->n_tensors) return -1;
+    return m->tensors[idx].type;
+}
+
+int64_t     *inference_tensor_ne(const inference_model_t *m, int64_t idx) {
+    if (!m || idx<0 || idx>=m->n_tensors) return NULL;
+    return m->tensors[idx].ne;
+}
+
+uint8_t      inference_tensor_dims(const inference_model_t *m, int64_t idx) {
+    if (!m || idx<0 || idx>=m->n_tensors) return 0;
+    return m->tensors[idx].n_dims;
+}
+
+size_t       inference_tensor_block_size(const inference_model_t *m, int64_t idx) {
+    if (!m || idx<0 || idx>=m->n_tensors) return (size_t)-1;
+    return get_block_size(m->tensors[idx].type);
+}
+
+size_t       inference_tensor_type_size(const inference_model_t *m, int64_t idx) {
+    if (!m || idx<0 || idx>=m->n_tensors) return (size_t)-1;
+    return get_type_size(m->tensors[idx].type);
+}
+
+size_t inference_tensor_row_size(const inference_model_t *m, int64_t idx) {
+    if (!m || idx<0 || idx>=m->n_tensors) return (size_t)-1;
+    const struct tensor_meta *tm = &m->tensors[idx];
+    int64_t bs = get_block_size(tm->type); size_t ts = get_type_size(tm->type);
+    if (bs <= 0 || ts == (size_t)-1) return (size_t)-1;
+    int64_t n_blocks = (tm->ne[0] + bs - 1) / bs;
+    return align_up(n_blocks * ts, GGUF_ALIGN); /* aligned to block boundary */
+}
+
+uint64_t inference_tensor_offset(const inference_model_t *m, int64_t idx) {
+    if (!m || idx<0 || idx>=m->n_tensors) return UINT64_MAX;
+    return m->tensors[idx].data_offset;
+}
+
+size_t inference_tensor_nbytes(const inference_model_t *m, int64_t idx) {
+    if (!m || idx<0 || idx>=m->n_tensors) return (size_t)-1;
+    const struct tensor_meta *tm = &m->tensors[idx];
+    int64_t bs  = get_block_size(tm->type); size_t ts = get_type_size(tm->type);
+    if (bs <= 0 || ts == (size_t)-1) return (size_t)-1;
+    int64_t nelem = 1; for (int d = 0; d < tm->n_dims; ++d) nelem *= tm->ne[d];
+    return (size_t)(nelem / bs) * ts;
+}
+
+size_t inference_tensor_nbytes_pad(const inference_model_t *m, int64_t idx) {
+    /* In GGUF the data blob is contiguous and aligned at start. */
+    return inference_tensor_nbytes(m, idx);
+}
+
+/* --- KV metadata --- */
+
+int64_t      inference_n_kv(const inference_model_t *m)   { return m ? m->n_kv : 0; }
+
+const char  *inference_kv_key(const inference_model_t *m, int64_t idx) {
+    if (!m || idx<0 || idx>=m->n_kv) return "(null)";
+    return m->kvs[idx].key;
+}
+
+/* Read scalar KV values by index. Returns 0 on success, -1 on error/type mismatch. */
+int32_t inference_kv_get_u8(const inference_model_t *m, int64_t idx, uint8_t *out) {
+    if (!m || !out || idx<0 || idx>=m->n_kv) return -1;
+    const struct kv_entry *kv = &m->kvs[idx];
+    if (kv->is_array) return -1;
+    switch (kv->scalar.type) {
+        case GGUF_TYPE_UINT8:  *out=kv->scalar.v_u8; break;
+        case GGUF_TYPE_INT8:   *out=(uint8_t)kv->scalar.v_i8; break;
+        default: return -1;
+    }
+    return 0;
+}
+
+int32_t inference_kv_get_i8(const inference_model_t *m, int64_t idx, int8_t *out) {
+    if (!m || !out || idx<0 || idx>=m->n_kv) return -1;
+    const struct kv_entry *kv = &m->kvs[idx];
+    if (kv->is_array) return -1;
+    switch (kv->scalar.type) {
+        case GGUF_TYPE_INT8:   *out=kv->scalar.v_i8; break;
+        case GGUF_TYPE_UINT8:  *out=(int8_t)kv->scalar.v_u8; break;
+        default: return -1;
+    }
+    return 0;
+}
+
+int32_t inference_kv_get_u16(const inference_model_t *m, int64_t idx, uint16_t *out) {
+    if (!m || !out || idx<0 || idx>=m->n_kv) return -1;
+    const struct kv_entry *kv = &m->kvs[idx];
+    if (kv->is_array) return -1;
+    switch (kv->scalar.type) {
+        case GGUF_TYPE_UINT8:  *out=kv->scalar.v_u8; break;
+        case GGUF_TYPE_INT8:   *out=(uint16_t)kv->scalar.v_i8; break;
+        case GGUF_TYPE_UINT16: *out=kv->scalar.v_u16; break;
+        case GGUF_TYPE_INT16:  *out=(uint16_t)kv->scalar.v_i16; break;
+        default: return -1;
+    }
+    return 0;
+}
+
+int32_t inference_kv_get_i16(const inference_model_t *m, int64_t idx, int16_t *out) {
+    if (!m || !out || idx<0 || idx>=m->n_kv) return -1;
+    const struct kv_entry *kv = &m->kvs[idx];
+    if (kv->is_array) return -1;
+    switch (kv->scalar.type) {
+        case GGUF_TYPE_INT8:   *out=kv->scalar.v_i8; break;
+        case GGUF_TYPE_UINT8:  *out=(int16_t)kv->scalar.v_u8; break;
+        case GGUF_TYPE_INT16:  *out=kv->scalar.v_i16; break;
+        case GGUF_TYPE_UINT16: *out=(int16_t)kv->scalar.v_u16; break;
+        default: return -1;
+    }
+    return 0;
+}
+
+int32_t inference_kv_get_u32(const inference_model_t *m, int64_t idx, uint32_t *out) {
+    if (!m || !out || idx<0 || idx>=m->n_kv) return -1;
+    const struct kv_entry *kv = &m->kvs[idx];
+    if (kv->is_array) return -1;
+    switch (kv->scalar.type) {
+        case GGUF_TYPE_UINT8:  *out=kv->scalar.v_u8; break;
+        case GGUF_TYPE_INT8:   *out=(uint32_t)kv->scalar.v_i8; break;
+        case GGUF_TYPE_UINT16: *out=kv->scalar.v_u16; break;
+        case GGUF_TYPE_INT16:  *out=(uint32_t)kv->scalar.v_i16; break;
+        case GGUF_TYPE_UINT32: *out=kv->scalar.v_u32; break;
+        case GGUF_TYPE_INT32:  *out=(uint32_t)kv->scalar.v_i32; break;
+        default: return -1;
+    }
+    return 0;
+}
+
+int32_t inference_kv_get_i32(const inference_model_t *m, int64_t idx, int32_t *out) {
+    if (!m || !out || idx<0 || idx>=m->n_kv) return -1;
+    const struct kv_entry *kv = &m->kvs[idx];
+    if (kv->is_array) return -1;
+    switch (kv->scalar.type) {
+        case GGUF_TYPE_UINT8:  *out=kv->scalar.v_u8; break;
+        case GGUF_TYPE_INT8:   *out=kv->scalar.v_i8; break;
+        case GGUF_TYPE_UINT16: *out=kv->scalar.v_u16; break;
+        case GGUF_TYPE_INT16:  *out=kv->scalar.v_i16; break;
+        case GGUF_TYPE_UINT32: *out=(int32_t)kv->scalar.v_u32; break;
+        case GGUF_TYPE_INT32:  *out=kv->scalar.v_i32; break;
+        default: return -1;
+    }
+    return 0;
+}
+
+int32_t inference_kv_get_f32(const inference_model_t *m, int64_t idx, float *out) {
+    if (!m || !out || idx<0 || idx>=m->n_kv) return -1;
+    const struct kv_entry *kv = &m->kvs[idx];
+    if (kv->is_array) return -1;
+    switch (kv->scalar.type) {
+        case GGUF_TYPE_FLOAT32:{ *out=kv->scalar.v_f32; } break;
+        default: return -1;
+    }
+    return 0;
+}
+
+int32_t inference_kv_get_u64(const inference_model_t *m, int64_t idx, uint64_t *out) {
+    if (!m || !out || idx<0 || idx>=m->n_kv) return -1;
+    const struct kv_entry *kv = &m->kvs[idx];
+    if (kv->is_array) return -1;
+    switch (kv->scalar.type) {
+        case GGUF_TYPE_UINT8:  *out=kv->scalar.v_u8; break;
+        case GGUF_TYPE_INT8:   *out=(uint64_t)(uint8_t)kv->scalar.v_i8; break;
+        case GGUF_TYPE_UINT16: *out=kv->scalar.v_u16; break;
+        case GGUF_TYPE_INT16:  *out=(uint64_t)(int16_t)kv->scalar.v_i16; break;
+        case GGUF_TYPE_UINT32: *out=kv->scalar.v_u32; break;
+        case GGUF_TYPE_INT32:  *out=(uint64_t)(int32_t)kv->scalar.v_i32; break;
+        case GGUF_TYPE_UINT64: *out=kv->scalar.v_u64; break;
+        default: return -1;
+    }
+    return 0;
+}
+
+int32_t inference_kv_get_i64(const inference_model_t *m, int64_t idx, int64_t *out) {
+    if (!m || !out || idx<0 || idx>=m->n_kv) return -1;
+    const struct kv_entry *kv = &m->kvs[idx];
+    if (kv->is_array) return -1;
+    switch (kv->scalar.type) {
+        case GGUF_TYPE_UINT8:  *out=kv->scalar.v_u8; break;
+        case GGUF_TYPE_INT8:   *out=kv->scalar.v_i8; break;
+        case GGUF_TYPE_UINT16: *out=kv->scalar.v_u16; break;
+        case GGUF_TYPE_INT16:  *out=kv->scalar.v_i16; break;
+        case GGUF_TYPE_UINT32: *out=(int64_t)kv->scalar.v_u32; break;
+        case GGUF_TYPE_INT32:  *out=kv->scalar.v_i32; break;
+        case GGUF_TYPE_UINT64: *out=(int64_t)kv->scalar.v_u64; break;
+        case GGUF_TYPE_INT64:  *out=kv->scalar.v_i64; break;
+        default: return -1; /* type mismatch */
+    }
+    return 0;
+}
+
+int32_t inference_kv_get_f64(const inference_model_t *m, int64_t idx, double *out) {
+    if (!m || !out || idx<0 || idx>=m->n_kv) return -1;
+    const struct kv_entry *kv = &m->kvs[idx];
+    if (kv->is_array) return -1;
+    switch (kv->scalar.type) {
+        case GGUF_TYPE_FLOAT32:{ double v = (double)kv->scalar.v_f32; *out=v; } break;
+        case GGUF_TYPE_FLOAT64:{ double v = kv->scalar.v_f64; *out=v; } break;
+        default: return -1;
+    }
+    return 0;
+}
+
+/* Read scalar KV value as string. Returns NULL if not a string or key not found. */
+const char *inference_kv_str_val(const inference_model_t *m, int64_t idx) {
+    if (!m || idx<0 || idx>=m->n_kv) return NULL;
+    const struct kv_entry *kv = &m->kvs[idx];
+    if (kv->is_array == 0 && kv->scalar.type != GGUF_TYPE_STRING) return NULL;
+    return kv->str_val ? kv->str_val : "";
+}
+
+/* --- Model-level queries --- */
+
+size_t    inference_alignment(const inference_model_t *m)     { return m ? m->alignment : GGUF_ALIGN; }
+size_t    inference_data_offset(const inference_model_t *m)   { return m ? m->data_off : 0; }
+uint32_t  inference_version(const inference_model_t *m)       { return m ? m->version : 0; }
+
+/* Helper: find a key index by name. Returns -1 if not found. */
+static int64_t find_kv_index(const inference_model_t *m, const char *key) {
+    if (!m || !key) return -1;
+    for (int64_t i = 0; i < m->n_kv; ++i) {
+        if (strcmp(m->kvs[i].key, key) == 0) return i;
+    }
+    return -1;
+}
+
+const char *inference_arch(const inference_model_t *m) {
+    /* Architecture stored as string in GGUF -- see implementation notes */
+    return "(string value)";
+}
+
+const char *inference_vocab_name(const inference_model_t *m) {
+    /* Tokenizer name stored as string */
+    return "(string value)";
+}
+
+const char *inference_tokenizer_type(const inference_model_t *m) {
+    int64_t idx = find_kv_index(m, "tokenizer.ggml.model");
+    if (idx < 0) return "";
+    /* tokenizer model is a string like "gpt2", "bpe", etc. */
+    return "(string value)";
+}
+
+const char *inference_pre_type(const inference_model_t *m) {
+    int64_t idx = find_kv_index(m, "tokenizer.ggml.pre");
+    if (idx < 0) return "";
+    /* pre-processing type is a string like "default", "qwen35" */
+    return "(string value)";
+}
+
+int64_t inference_vocab_size(const inference_model_t *m) {
+    int64_t idx = find_kv_index(m, "tokenizer.ggml.vocab_size");
+    if (idx < 0) return 0;
+    const struct kv_entry *kv = &m->kvs[idx];
+    if (!kv || kv->is_array) return 0;
+    switch (kv->scalar.type) {
+        case GGUF_TYPE_UINT32: return (int64_t)kv->scalar.v_u32;
+        case GGUF_TYPE_INT32:  return (int64_t)kv->scalar.v_i32;
+        case GGUF_TYPE_UINT64: return (int64_t)kv->scalar.v_u64;
+        case GGUF_TYPE_INT64:  return (int64_t)kv->scalar.v_i64;
+        default: return 0;
+    }
+}
+
+int64_t inference_head_count(const inference_model_t *m) {
+    int64_t idx = find_kv_index(m, "attention.head_count");
+    if (idx < 0) return 0;
+    const struct kv_entry *kv = &m->kvs[idx];
+    if (!kv || kv->is_array) return 0;
+    switch (kv->scalar.type) {
+        case GGUF_TYPE_UINT32: return (int64_t)kv->scalar.v_u32;
+        case GGUF_TYPE_INT32:  return (int64_t)kv->scalar.v_i32;
+        case GGUF_TYPE_UINT64: return (int64_t)kv->scalar.v_u64;
+        case GGUF_TYPE_INT64:  return (int64_t)kv->scalar.v_i64;
+        default: return 0;
+    }
+}
+
+int64_t inference_head_count_kv(const inference_model_t *m) {
+    int64_t idx = find_kv_index(m, "attention.head_count_kv");
+    if (idx < 0) return 0; /* Some models use attention.head_count for MQA */
+    const struct kv_entry *kv = &m->kvs[idx];
+    if (!kv || kv->is_array) return 0;
+    switch (kv->scalar.type) {
+        case GGUF_TYPE_UINT32: return (int64_t)kv->scalar.v_u32;
+        case GGUF_TYPE_INT32:  return (int64_t)kv->scalar.v_i32;
+        case GGUF_TYPE_UINT64: return (int64_t)kv->scalar.v_u64;
+        case GGUF_TYPE_INT64:  return (int64_t)kv->scalar.v_i64;
+        default: return 0;
+    }
+}
+
+int64_t inference_context_length(const inference_model_t *m) {
+    int64_t idx = find_kv_index(m, "general.context_length");
+    if (idx < 0) idx = find_kv_index(m, "context_length");
+    if (idx < 0) idx = find_kv_index(m, "qwen2.context_length"); /* Qwen2-specific key */
+    if (idx < 0) return 0;
+    const struct kv_entry *kv = &m->kvs[idx];
+    if (!kv || kv->is_array) return 0;
+    switch (kv->scalar.type) {
+        case GGUF_TYPE_UINT32: return (int64_t)kv->scalar.v_u32;
+        case GGUF_TYPE_INT32:  return (int64_t)kv->scalar.v_i32;
+        case GGUF_TYPE_UINT64: return (int64_t)kv->scalar.v_u64;
+        case GGUF_TYPE_INT64:  return (int64_t)kv->scalar.v_i64;
+        default: return 0;
+    }
+}
+
+int64_t inference_embedding_length(const inference_model_t *m) {
+    int64_t idx = find_kv_index(m, "embedding_length");
+    if (idx < 0) idx = find_kv_index(m, "qwen2.embedding_length"); /* Qwen2-specific key */
+    if (idx < 0) return 0;
+    const struct kv_entry *kv = &m->kvs[idx];
+    if (!kv || kv->is_array) return 0;
+    switch (kv->scalar.type) {
+        case GGUF_TYPE_UINT32: return (int64_t)kv->scalar.v_u32;
+        case GGUF_TYPE_INT32:  return (int64_t)kv->scalar.v_i32;
+        case GGUF_TYPE_UINT64: return (int64_t)kv->scalar.v_u64;
+        case GGUF_TYPE_INT64:  return (int64_t)kv->scalar.v_i64;
+        default: return 0;
+    }
+}
+
+int64_t inference_block_count(const inference_model_t *m) {
+    int64_t idx = find_kv_index(m, "block_count");
+    if (idx < 0) idx = find_kv_index(m, "qwen2.block_count"); /* Qwen2-specific key */
+    if (idx < 0) return 0;
+    const struct kv_entry *kv = &m->kvs[idx];
+    if (!kv || kv->is_array) return 0;
+    switch (kv->scalar.type) {
+        case GGUF_TYPE_UINT32: return (int64_t)kv->scalar.v_u32;
+        case GGUF_TYPE_INT32:  return (int64_t)kv->scalar.v_i32;
+        case GGUF_TYPE_UINT64: return (int64_t)kv->scalar.v_u64;
+        case GGUF_TYPE_INT64:  return (int64_t)kv->scalar.v_i64;
+        default: return 0;
+    }
+}
+
+/* --- KV cache configuration (bridge to Phase 3) --- */
+
+void      inference_set_n_ctx(inference_model_t *m, int64_t n_ctx) {
+    if (m && n_ctx > 0) m->n_ctx = n_ctx;
+}
+
+int64_t   inference_get_n_ctx(const inference_model_t *m)         {
+    return m ? m->n_ctx : 512;
+}
+
