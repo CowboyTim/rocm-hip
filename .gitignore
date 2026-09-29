@@ -1,6 +1,9 @@
 # Large binary model files
 *.gguf
 
+# llama.cpp submodule (full repo)
+llama.cpp/
+
 # Session logs
 session-*.md
 
