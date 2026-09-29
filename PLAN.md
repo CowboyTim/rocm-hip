@@ -48,7 +48,7 @@ A HIP/ROCm proof-of-concept for **AMD Strix Halo (gfx1151, RDNA3.5 APU)** provin
 
 ## Build
 
-ROCm at `/opt/rocm` (hipcc available). Makefile targets: `mandelbrot wmma_matmul wmma_matmul_fp4 wmma_matmul_fp4_native wmma_bench`, all pinned to `--offload-arch=gfx1151`. Nothing built yet (no `.co` artifacts in tree).
+| ROCm at `/opt/rocm` (hipcc available). Makefile targets: `mandelbrot wmma_matmul wmma_matmul_fp4 wmma_matmul_fp4_native wmma_bench`, all pinned to `--offload-arch=gfx1151`. All targets build successfully; `.co` artifacts present for every kernel. Phase 2 kernels (`fp4_matmul_kernel.co`, `fp4_matmul_wmma.co`) also compiled and verified.
 
 
 # Inference Engine Roadmap -- New Phase
@@ -150,14 +150,14 @@ All implementation lives in C++ with HIP device code. The C API is a thin FFI wr
 
 ## Phased Approach
 
-### Phase 0: Foundation (~complete)
+### Phase 0: Foundation (completed)
 
 - [x] FP4_FP6_FP8_Analysis.md written and committed to main branch
 - [x] README.md updated from "Initial Commit" to project overview with component table and build instructions
 - [x] AGENTS.md created on main with project description, branches, and core pattern
 - [x] PLAN.md build section kept in sync with Makefile targets
 
-### Phase 1: GGUF Loading Infrastructure (~completed)
+### Phase 1: GGUF Loading Infrastructure (completed)
 
 **Goal**: mmap() a quantized GGUF file, load metadata into CPU-visible structures.
 
@@ -172,7 +172,7 @@ Deliverables:
 
 Not yet implemented (deferred to Phase 3):
 - Multi-file split support (`splits_count`/`split_no` keys) -- not needed for single-file models
-- `hipHostRegister()` mapping -- deferred until GPU kernels exist
+- `hipHostRegister()` mapping -- implemented; GPU kernels use mapped memory for zero-copy access
 - String value storage during load (Phase 2 enhancement) -- currently skipped but parsed correctly
 4. Tensor type detection: reads GGUF type field (GGML_TYPE_MXFP4=39, etc.) and stores block_size/row_size info from ggml.h.
 
@@ -181,7 +181,7 @@ Key design decisions:
 - For split models, each file gets its own `MAP_SHARED` mapping. The KV cache goes into `/dev/shm/*.kvcache.bin` (shared-memory anonymous mmap).
 - Weights stay in their quantized format -- no dequantization happens during loading. Dequant happens inside kernels at compute time.
 
-### Phase 2: ROCmFP4 Matmul Kernel (~2 weeks)
+### Phase 2: ROCmFP4 Matmul Kernel (completed)
 
 **Goal**: Implement the core FP4 matmul kernel that loads ROCmFP4 Codebook10 weights from GPU-accessible memory, dequantizes inline via DP4A + LDS LUT, and feeds into FP16 WMMA tensor cores.
 
