@@ -1,73 +1,28 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include "fp4_common.h"
+
+using namespace rocmfp4;
 
 // FP4 ROCmFP4 Codebook10: 0, ±1, ±2, ±3, ±4, ±6, ±8, ±10
-// 
-// DP4A dequant using __builtin_amdgcn_perm:
-//   The intrinsic selects from 2 source registers based on bit 0 of the nibble index.
-//   Positive values (bit 0=0): reg0 = [ 0,  1,  2,  3] = 0x03020100
-//   Positive values (bit 0=1): reg1 = [ 4,  6,  8, 10] = 0x0a080604
-//   Negative values (bit 0=0): reg2 = [ 0, -1, -2, -3] = 0xfdfeff00
-//   Negative values (bit 0=1): reg3 = [-4, -6, -8,-10] = 0xf6f8fafc
 //
-// Permutation process for each nibble:
-//   1. Extract nibble index (4 bits) from each byte position
-//   2. perm(reg1, reg0, idx) → selects from pos table based on bit 0
-//   3. Extract sign bit (bit 2 of nibble): sign = nibble >> 1
-//   4. perm(reg3, reg2, sign|0x03020100) → selects from neg table if sign bit set
-//
-// The input uint32 must have nibbles placed in each byte:
-//   byte3 | byte2 | byte1 | byte0
-//   nib7..nibble | nib5..nibble | nib3..nibble | nib1..nibble
+// DP4A dequant using __builtin_amdgcn_perm -- hardware-verified scheme for this toolchain
+// (see PLAN.md "Empirically Verified Perm Semantics"):
+//   - perm(X, Y, m): per mask byte, bit2 selects X[m&3] vs Y[m&3]; mask bytes >= 8 are undefined.
+//   - Magnitude: one perm over {P_LO=[+0..+3], P_HI=[+4,+6,+8,+10]} with a <=7 mask built from
+//     the nibble's low 3 bits (bit2 = magnitude half-select, low 2 bits = index within table).
+//   - Sign: sign bit (nibble bit3) shifted into bit2 drives a second perm expanding an FF/00 lane mask.
+//   - Signed code: pos ^ (mask & (neg ^ pos)) -- pure bitwise combine, no select builtin needed.
 
-// Positive table: perm(reg1, reg0, idx) gives:
-//   if idx[0]=0 → values from reg0 [0,1,2,3]
-//   if idx[0]=1 → values from reg1 [4,6,8,10]
-static const uint32_t dp4a_pos_reg0 = 0x03020100u;
-static const uint32_t dp4a_pos_reg1 = 0x0a080604u;
-
-// Negative table: perm(reg3, reg2, sign_sel) gives:
-//   if sign[0]=0 → values from reg2 [0,-1,-2,-3]
-//   if sign[0]=1 → values from reg3 [-4,-6,-8,-10]
-static const uint32_t dp4a_neg_reg2 = 0xfdfeff00u;
-static const uint32_t dp4a_neg_reg3 = 0xf6f8fafcu;
-
-// Dequant 4 FP4 nibbles packed in a uint32 (each byte holds one nibble in low 4 bits)
-// Returns int32_t where each byte holds the dequantized int8 value
-__device__ __forceinline__ uint32_t dp4a_dequant_4(uint32_t nibbles) {
-    // Step 1: perm positive values based on bit 0 of each nibble
-    //   nibble 0→3 from reg0, nibble 4,6,8,10 from reg1
-    uint32_t pos = __builtin_amdgcn_perm(dp4a_pos_reg1, dp4a_pos_reg0, nibbles);
-    
-    // Step 2: extract sign bit (bit 2 of nibble), shift right by 1
-    //   This gives bit 0 of sign for each nibble position
-    uint32_t sign = nibbles >> 1;
-    
-    // Step 3: build selector - bit 2 of nibble selects between pos and neg tables
-    //   (sign & 0x04040404) | 0x03020100
-    uint32_t sel = (sign & 0x04040404u) | 0x03020100u;
-    
-    // Step 4: perm between positive and negative tables
-    //   If sign bit was 0 → from reg2 [0,-1,-2,-3]
-    //   If sign bit was 1 → from reg3 [-4,-6,-8,-10]
-    //   We permute (reg3, reg2) but we already have the positive values,
-    //   so we need to select between pos and the neg tables
-    //   Actually we need to permute neg tables, not re-use pos
-    // The correct approach: we need two separate perms for the negative case
-    // But since we're using a single perm, we select from [0,-1,-2,-3] or [-4,-6,-8,-10]
-    uint32_t result = __builtin_amdgcn_perm(dp4a_neg_reg3, dp4a_neg_reg2, sel);
-    
-    return result;
-}
-
-// Dequant a single nibble (4-bit index) using DP4A perm
-__device__ __forceinline__ int8_t dp4a_dequant_1(uint8_t nibble) {
-    uint32_t nibbles = nibble;  // place nibble in byte 0
-    uint32_t pos = __builtin_amdgcn_perm(dp4a_pos_reg1, dp4a_pos_reg0, nibbles);
-    uint32_t sign = nibbles >> 1;
-    uint32_t sel = (sign & 0x04040404u) | 0x03020100u;
-    uint32_t result = __builtin_amdgcn_perm(dp4a_neg_reg3, dp4a_neg_reg2, sel);
-    return (int8_t)result;
+// Dequant 4 FP4 nibbles packed in a uint32 (each byte holds one nibble in bits [3:0], upper zeroed)
+// Returns uint32 where each byte holds the dequantized int8 Codebook10 value.
+__device__ __forceinline__ uint32_t dp4a_dequant_4(uint32_t nib) {
+    uint32_t msel  = nib & 0x07070707u;          // magnitude index bits (bit3 clear by construction)
+    uint32_t signm = (nib >> 1) & 0x0C0C0C0Cu;   // sign bit moved into bit2 position
+    uint32_t sFF   = __builtin_amdgcn_perm(0xffffffffu, 0x00000000u, signm); // FF lanes where negative
+    uint32_t pos   = __builtin_amdgcn_perm(CB_P_HI, CB_P_LO, msel);           // +magnitude codes
+    uint32_t negv  = __builtin_amdgcn_perm(CB_N_HI, CB_N_LO, msel);           // -magnitude codes
+    return pos ^ (sFF & (negv ^ pos));
 }
 
 extern "C" __global__ void wmma_bench_fp4_dp4a_hardware(
@@ -77,18 +32,15 @@ extern "C" __global__ void wmma_bench_fp4_dp4a_hardware(
     int M, int N, int K,
     float scale)
 {
-    const int lane = threadIdx.x;  // 0..15
-    const int warpId = lane / 8;   // 0 or 1
-    const int laneInWarp = lane % 8;
+    const int lane = threadIdx.x;          // 0..31
+    const int rInTile = lane >> 1;         // 0..15 output row within tile (full coverage)
+    const int cBase   = (lane & 1) * 8;    // first column for this thread (owns 8 columns)
 
     // Each block: one 16x16 output tile
     int baseRow = blockIdx.x * 16;
     int baseCol = blockIdx.y * 16;
 
     if (baseRow >= M || baseCol >= N) return;
-
-    int row_end = min(baseRow + 16, M);
-    int col_end = min(baseCol + 16, N);
 
     // Shared memory accumulator across K strips
     __shared__ float accum[16][16];
@@ -108,62 +60,58 @@ extern "C" __global__ void wmma_bench_fp4_dp4a_hardware(
         int kEnd = min(kStart + stripSize, K);
         int kLen = kEnd - kStart;
 
-        int outRow = laneInWarp;
-        int outCol = warpId * 8;
+        int realRow = baseRow + rInTile;
 
-        if (outRow < 16 && outCol < 16) {
-            int realRow = baseRow + outRow;
-            int realCol = baseCol + outCol;
-
-            if (realRow < M && realCol < N) {
-                // Use DP4A hardware intrinsics for dequant + dot product
-                // Process 4 values at a time using __builtin_amdgcn_perm + sudot4
-                int acc = 0;  // int32 accumulator for sudot4
-
-                // Process groups of 4 FP4 values (4 bytes = 8 nibbles, but each byte is one FP4)
-                // Each sudot4 processes 4 int8×int8 pairs in 1 instruction
-                for (int k = 0; k < kLen; k += 4) {
-                    int kEndGroup = min(k + 4, kLen);
-                    
-                    // Load A values and dequant using __builtin_amdgcn_perm
-                    // Pack 4 nibbles into a uint32 where each byte holds one nibble
-                    uint32_t a_nibbles = 0;
-                    uint32_t b_nibbles = 0;
-                    for (int i = 0; i < 4 && (k + i) < kEndGroup; i++) {
-                        uint8_t a_byte = A[realRow * K + kStart + k + i];
-                        uint8_t b_byte = B[(kStart + k + i) * N + realCol];
-                        uint8_t a_nibble = a_byte & 0x0F;      // low nibble
-                        uint8_t b_nibble = b_byte & 0x0F;       // low nibble
-                        a_nibbles |= ((uint32_t)a_nibble << (i * 8));
-                        b_nibbles |= ((uint32_t)b_nibble << (i * 8));
-                    }
-                    
-                    // Dequant using DP4A perm
-                    uint32_t a_codes = dp4a_dequant_4(a_nibbles);
-                    uint32_t b_codes = dp4a_dequant_4(b_nibbles);
-                    
-                    // sudot4: multiply 4 pairs of int8 and accumulate to int32
-                    // acc += a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3]
-                    acc = __builtin_amdgcn_sudot4(true, a_codes, true, b_codes, acc, false);
+        if (realRow < M) {
+            // Load + dequant the A row for this strip ONCE; reused across all columns.
+            uint32_t a_codes_strip[HALF_BLOCK / 4];   // one dequanted group per 4 values
+            for (int g = 0; g < HALF_BLOCK / 4; g++) {
+                int kg = kStart + g * 4;
+                int kEndGroup = min(kg + 4, K);
+                uint32_t a_nibbles = 0;
+                for (int i = 0; i < 4 && (kg + i) < kEndGroup; i++) {
+                    uint8_t a_byte = A[realRow * K + kg + i];
+                    a_nibbles |= ((uint32_t)(a_byte & 0x0F) << (i * 8));
                 }
+                a_codes_strip[g] = dp4a_dequant_4(a_nibbles);   // verified DP4A perm chain
+            }
 
-                // Scale from int32 to FP32
-                float partial = (float)acc * scale;
-                atomicAdd(&accum[outRow][outCol], partial);
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                int realCol = baseCol + cBase + j;
+
+                if (realCol >= N) continue;
+
+                // Per column: load B, dequant, dot against the pre-dequanted A row.
+                for (int k = 0; k < kLen; k += 4) {
+                    int g = k / 4;
+
+                    // Load B values (column-dependent) and dequant
+                    uint32_t b_nibbles = 0;
+                    for (int i = 0; i < 4 && (kStart + k + i) < K; i++) {
+                        uint8_t b_byte = B[(kStart + k + i) * N + realCol];
+                        b_nibbles |= ((uint32_t)(b_byte & 0x0F) << (i * 8));
+                    }
+                    uint32_t b_codes = dp4a_dequant_4(b_nibbles);
+
+                    // sudot4: multiply 4 pairs of int8 and accumulate to int32
+                    int acc = __builtin_amdgcn_sudot4(true, a_codes_strip[g], true, b_codes, 0, false);
+
+                    // Scale from int32 to FP32
+                    float partial = (float)acc * scale;
+                    atomicAdd(&accum[rInTile][cBase + j], partial);
+                }
             }
         }
-        __syncthreads();
+        __syncthreads();   // unconditional: every thread reaches it each strip
     }
 
-    // Write accumulated results
-    int outRow = laneInWarp;
-    int outCol = warpId * 8;
-
-    if (outRow < 16 && outCol < 16) {
-        int realRow = baseRow + outRow;
-        int realCol = baseCol + outCol;
-        if (realRow < row_end && realCol < col_end) {
-            C[realRow * N + realCol] = accum[outRow][outCol];
+    // Write accumulated results: thread owns cells {row rInTile, cols cBase..cBase+7}
+    int realRow = baseRow + rInTile;
+    if (realRow < M) {
+        for (int j = 0; j < 8; j++) {
+            int realCol = baseCol + cBase + j;
+            if (realCol < N) C[realRow * N + realCol] = accum[rInTile][cBase + j];
         }
     }
 }

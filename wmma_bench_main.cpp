@@ -94,13 +94,14 @@ BenchmarkResult load_and_run_kernel(const char* co_filename, const char* func_na
     munmap(coData, st.st_size);
     close(kfd);
 
+    // Kernels declare (A, B, C, M, N, K, scale) -- pass in exactly that order
     void* params[7];
     params[0] = (void*)&d_A;
     params[1] = (void*)&d_B;
     params[2] = (void*)&d_C;
-    params[3] = (void*)&K;
+    params[3] = (void*)&M;
     params[4] = (void*)&N;
-    params[5] = (void*)&M;
+    params[5] = (void*)&K;
     params[6] = (void*)&scale;
 
     size_t out_bytes = is_fp16_wmma ? M * N * sizeof(__half) : M * N * sizeof(float);
@@ -183,6 +184,7 @@ int main(int argc, char* argv[]) {
     int NUM_WARMUP = 8;
     int VERIFY_SAMPLES = 3;
     float scale_val = 1.0f;
+    bool signed_data = false;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-M") == 0 && i + 1 < argc) M = atoi(argv[++i]);
@@ -192,6 +194,7 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "-warmup") == 0 && i + 1 < argc) NUM_WARMUP = atoi(argv[++i]);
         else if (strcmp(argv[i], "-verify") == 0 && i + 1 < argc) VERIFY_SAMPLES = atoi(argv[++i]);
         else if (strcmp(argv[i], "-scale") == 0 && i + 1 < argc) scale_val = atof(argv[++i]);
+        else if (strcmp(argv[i], "-signed") == 0) signed_data = true;   // generate values in [-10, 10) to exercise negative codebook entries
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("Usage: %s [options]\n", argv[0]);
             printf("Options:\n");
@@ -202,6 +205,7 @@ int main(int argc, char* argv[]) {
             printf("  -warmup N  Warmup runs    (default: 8)\n");
             printf("  -verify N  Mismatch samples (default: 3, 0=none)\n");
             printf("  -scale F   FP4 scale      (default: 1.0)\n");
+            printf("  -signed    Generate data in [-10, 10) instead of [0, 10)\n");
             printf("  -h, --help Show this help\n");
             return 0;
         }
@@ -219,10 +223,12 @@ int main(int argc, char* argv[]) {
     printf("==========================================================\n\n");
 
     // Allocate host memory via shared memory file
+    // Layout: [A][B][C_fp16(2B/elem) + padding][C_scalar][C_dp4a_hw][C_native][C_cpu_ref]
+    // Five output slots spaced outBytes apart; total must cover the last slot fully.
     size_t matA_bytes = (size_t)M * K;
     size_t matB_bytes = (size_t)K * N;
     size_t outBytes = (size_t)M * N * sizeof(float);
-    size_t totalBytes = matA_bytes + matB_bytes + outBytes * 4;
+    size_t totalBytes = matA_bytes + matB_bytes + outBytes * 5;
 
     const char* filepath = "/dev/shm/fp4_bench.bin";
 
@@ -260,12 +266,16 @@ int main(int argc, char* argv[]) {
     // Generate random FP4 matrices (same seed for reproducibility)
     printf("Generating FP4 matrices...\n");
     srand(42);
+    // signed_data exercises the negative Codebook10 entries (nibbles 8-F); default stays
+    // unsigned so methods with positive-only workarounds keep their existing behavior.
     for (int i = 0; i < M * K; ++i) {
-        float val = ((float)rand() / (float)RAND_MAX) * 10.0f;
+        float r = (float)rand() / (float)RAND_MAX;
+        float val = signed_data ? (r * 2.0f - 1.0f) * 10.0f : r * 10.0f;
         A_fp4[i] = fp4_quant(val);
     }
     for (int i = 0; i < K * N; ++i) {
-        float val = ((float)rand() / (float)RAND_MAX) * 10.0f;
+        float r = (float)rand() / (float)RAND_MAX;
+        float val = signed_data ? (r * 2.0f - 1.0f) * 10.0f : r * 10.0f;
         B_fp4[i] = fp4_quant(val);
     }
     printf("  Done.\n");
