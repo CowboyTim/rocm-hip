@@ -28,6 +28,13 @@ wmma_matmul_fp4_native
 wmma_bench
 demo_gguf
 fp4_verify
+kv_verify
+gemm_verify
+actfp4_verify
+layernorm_verify
+rope_verify
+softmax_verify
+attn_verify
 
 # Demo image output (mandelbrot writes this; regenerate via `./mandelbrot`)
 mandelbrot.ppm

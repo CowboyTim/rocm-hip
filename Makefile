@@ -50,8 +50,19 @@ DEMO_GGUF     = demo_gguf
 # Phase 2: ROCmFP4 Codebook10 matmul verification harness (CPU reference vs GPU kernels)
 FP4_VERIFY   = fp4_verify
 
+# Phase 3: KV cache manager + zero-copy self-test on hardware
+KV_VERIFY    = kv_verify
+
+# Phase 3: FP16 WMMA GEMM verification harness (CPU reference vs GPU kernel)
+GEMM_VERIFY  = gemm_verify
+
+# Phase 3: RMSNorm / RoPE / masked-softmax verification harnesses
+LAYERNORM_VERIFY = layernorm_verify
+ROPE_VERIFY      = rope_verify
+SOFTMAX_VERIFY   = softmax_verify
+
 # --- Build Rules ---
-all: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET) $(DEMO_GGUF) $(FP4_VERIFY)
+all: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET) $(DEMO_GGUF) $(FP4_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY)
 
 $(TARGET): $(OBJ) $(KERNEL_CO)
 	$(CLANG) $(OBJ) $(LDFLAGS) -o $@
@@ -97,10 +108,30 @@ $(DEMO_GGUF): $(GGUF_MMAP_SRC) demo_gguf.cpp gguf_mmap.h
 $(FP4_VERIFY): fp4_verify.cpp fp4_common.h fp4_matmul_kernel.co fp4_matmul_wmma.co
 	$(CLANG) $(CXXFLAGS) -I. fp4_verify.cpp $(LDFLAGS) -o $@
 
+# Phase 3 verify: KV cache manager + zero-copy self-test (loads kv_cache_kernel.co at runtime)
+$(KV_VERIFY): kv_cache.cpp kv_verify.cpp kv_cache.h kv_cache_kernel.co
+	$(CLANG) $(CXXFLAGS) -I. kv_cache.cpp kv_verify.cpp $(LDFLAGS) -o $@
+
+# Phase 3 verify: FP16 WMMA GEMM vs CPU reference over /dev/shm (loads fp16_gemm.co at runtime)
+$(GEMM_VERIFY): gemm_verify.cpp fp16_gemm.co
+	$(CLANG) $(CXXFLAGS) -I. gemm_verify.cpp $(LDFLAGS) -o $@
+
+# Phase 3 verify: RMSNorm kernel vs CPU reference (loads layernorm.co at runtime)
+$(LAYERNORM_VERIFY): layernorm_verify.cpp layernorm.co
+	$(CLANG) $(CXXFLAGS) -I. layernorm_verify.cpp $(LDFLAGS) -o $@
+
+# Phase 3 verify: RoPE rotate-half kernel vs CPU reference (loads rope_embedding.co at runtime)
+$(ROPE_VERIFY): rope_verify.cpp rope_embedding.co
+	$(CLANG) $(CXXFLAGS) -I. rope_verify.cpp $(LDFLAGS) -o $@
+
+# Phase 3 verify: masked row-softmax vs CPU reference (loads softmax_masked.co at runtime)
+$(SOFTMAX_VERIFY): softmax_verify.cpp softmax_masked.co
+	$(CLANG) $(CXXFLAGS) -I. softmax_verify.cpp $(LDFLAGS) -o $@
+
 # Build all demos and benchmark
 both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)
 
 clean:
-	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_native.co wmma_bench_fp4_dp4a_hardware.co $(BENCH_LUT_CO) $(DEMO_GGUF) $(FP4_VERIFY) *.co
+	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_native.co wmma_bench_fp4_dp4a_hardware.co $(BENCH_LUT_CO) $(DEMO_GGUF) $(FP4_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) *.co
 
 .PHONY: all clean both
