@@ -1,91 +1,80 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include "fp4_common.h"
 
-// FP4 ROCmFP4 Codebook10: 0, ±1, ±2, ±3, ±4, ±6, ±8, ±10
-static const int8_t fp4_codebook_int8[16] = {
-    0,  1,  2,  3,  4,  6,  8, 10,
-    0, -1, -2, -3, -4, -6, -8,-10
-};
+using namespace rocmfp4;
 
-// DP4A + FP16-WMMA kernel for FP4 matmul benchmark
-// Uses 16x16x16 WMMA tiles with FP4 dequant via LUT
-// Each thread accumulates in register (no atomics), then writes once to shared memory
+// Scalar LUT dequant bench kernel: per-value Codebook10 lookup + scalar float multiply.
+// Thread mapping (full tile coverage with 32 threads): thread t owns output row t/2 and
+// columns (t&1)*8 .. (t&1)*8+7 within the 16x16 tile. Per-strip partials accumulate in
+// registers; shared-memory accumulator receives one add per strip; final write is guarded.
 extern "C" __global__ void wmma_bench_fp4_dp4a(
-    const unsigned char* A,       // M x K FP4, row-major
-    const unsigned char* B,       // K x N FP4, row-major
+    const unsigned char* A,       // M x K FP4, row-major (1 nibble per byte)
+    const unsigned char* B,       // K x N FP4, row-major (1 nibble per byte)
     float* C,                     // M x N FP32, row-major
     int M, int N, int K,
     float scale)
 {
-    const int lane = threadIdx.x;  // 0..15
-    const int warpId = lane / 8;   // 0 or 1
-    const int laneInWarp = lane % 8;
-    
+    const int lane = threadIdx.x;            // 0..31
+    const int rInTile = lane >> 1;           // 0..15 output row within tile
+    const int cBase   = (lane & 1) * 8;      // first column owned by this thread
+
     // Each block: one 16x16 output tile
     int baseRow = blockIdx.x * 16;
     int baseCol = blockIdx.y * 16;
-    
+
     if (baseRow >= M || baseCol >= N) return;
-    
-    int row_end = min(baseRow + 16, M);
-    int col_end = min(baseCol + 16, N);
-    
+
+    int realRow = baseRow + rInTile;
+    bool rowOK = realRow < M;
+
     // Shared memory accumulator across K strips
     __shared__ float accum[16][16];
-    
-    // Initialize accumulator to zero
+
     for (int i = lane; i < 16*16; i += 32) {
         accum[i / 16][i % 16] = 0.0f;
     }
     __syncthreads();
-    
+
     // Loop over K strips (each strip = 16 FP4 elements)
     const int stripSize = 16;
     const int numStrips = (K + stripSize - 1) / stripSize;
-    
+
+    float partial[8];
+
     for (int s = 0; s < numStrips; s++) {
         int kStart = s * stripSize;
         int kEnd = min(kStart + stripSize, K);
-        int kLen = kEnd - kStart;
-        
-        // Each thread computes partial dot product for its (row, col) pair
-        // Accumulate in register to avoid atomicAdd issues on RDNA3
-        int outRow = laneInWarp;
-        int outCol = warpId * 8;
-        
-        float partial = 0.0f;
-        if (outRow < 16 && outCol < 16) {
-            int realRow = baseRow + outRow;
-            int realCol = baseCol + outCol;
-            
-            if (realRow < M && realCol < N) {
-                for (int k = 0; k < kLen; k++) {
-                    uint8_t a_nibble = A[realRow * K + kStart + k];
-                    uint8_t b_nibble = B[(kStart + k) * N + realCol];
-                    int8_t a_code = fp4_codebook_int8[a_nibble];
-                    int8_t b_code = fp4_codebook_int8[b_nibble];
-                    partial += (float)a_code * (float)b_code * scale;
+
+        #pragma unroll
+        for (int j = 0; j < 8; j++) partial[j] = 0.0f;
+
+        if (rowOK) {
+            for (int k = kStart; k < kEnd; k++) {
+                int8_t a_code = CODEBOOK[A[realRow * K + k] & 0x0F];
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    int col = baseCol + cBase + j;
+                    if (col < N) {
+                        int8_t b_code = CODEBOOK[B[k * N + col] & 0x0F];
+                        partial[j] += (float)a_code * (float)b_code * scale;
+                    }
                 }
             }
         }
-        
-        // Write partial sum to shared memory once per strip (no atomics)
-        if (outRow < 16 && outCol < 16) {
-            float old = accum[outRow][outCol];
-            accum[outRow][outCol] = old + partial;
+
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int col = baseCol + cBase + j;
+            if (col < N) accum[rInTile][cBase + j] += partial[j];
         }
-        __syncthreads();
+        __syncthreads();   // flush complete before the next strip adds to accum
     }
-    
-    // Write accumulated results to global memory
-    int outRow = laneInWarp;
-    int outCol = warpId * 8;
-    
-    if (outRow < 16 && outCol < 16) {
-        int realRow = baseRow + outRow;
-        int realCol = baseCol + outCol;
-        if (realRow < row_end && realCol < col_end) {
-            C[realRow * N + realCol] = accum[outRow][outCol];
-        }
+
+    // Write accumulated results (guarded: every thread writes only cells that exist)
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        int col = baseCol + cBase + j;
+        if (col < N) C[realRow * N + col] = accum[rInTile][cBase + j];
     }
 }

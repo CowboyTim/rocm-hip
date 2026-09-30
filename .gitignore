@@ -29,6 +29,9 @@ wmma_bench
 demo_gguf
 fp4_verify
 
+# Demo image output (mandelbrot writes this; regenerate via `./mandelbrot`)
+mandelbrot.ppm
+
 # IDE
 .vscode/
 .idea/

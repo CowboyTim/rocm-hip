@@ -5,7 +5,7 @@ HIP/ROCm proof-of-concept for **AMD Strix Halo (gfx1151, RDNA3.5 APU)** proving 
 1. `mmap()` file-backed memory as zero-copy GPU data via `hipHostRegister`
 2. Low-precision matmul (FP16 WMMA + ROCmFP4 FP4) using RDNA3.5 hardware intrinsics
 
-~35 commits; a second branch (`q4_0_rocmfp4_q8_1`) extends this into full llama.cpp integration work.
+All development happens on **`main`**. The `q4_0_rocmfp4_q8_1` branch is an archived reference (earlier forked-llama.cpp snapshot) — see `PLAN.md`.
 
 ## Quick Links
 

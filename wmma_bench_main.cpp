@@ -12,19 +12,16 @@
 #include <hip/hip_fp16.h>
 #include <vector>
 #include <algorithm>
+#include "fp4_common.h"
 
-// FP4 ROCmFP4 Codebook10
-static const int8_t fp4_codebook[16] = {
-    0,  1,  2,  3,  4,  6,  8, 10,
-    0, -1, -2, -3, -4, -6, -8,-10
-};
+using namespace rocmfp4;
 
-// FP4 quantize (CPU)
+// FP4 quantize (CPU) -- nearest Codebook10 entry
 uint8_t fp4_quant(float val) {
     float best_dist = 1e30f;
     uint8_t best_idx = 0;
     for (int i = 0; i < 16; ++i) {
-        float diff = fabsf((float)fp4_codebook[i] - val);
+        float diff = fabsf(dequant_code(i) - val);
         if (diff < best_dist) {
             best_dist = diff;
             best_idx = i;
@@ -35,7 +32,7 @@ uint8_t fp4_quant(float val) {
 
 // FP4 dequant (CPU)
 float fp4_dequant(uint8_t nibble) {
-    return (float)fp4_codebook[nibble];
+    return dequant_code(nibble);
 }
 
 // FP4 matmul on CPU reference
@@ -141,18 +138,37 @@ void print_stats(const char* name, const BenchmarkResult& res, int M, int N, int
     printf("    Total MAC:    %.1f billion\n", 2.0f * M * K * N / 1e9f);
 }
 
+// ULP of the FP16 grid at |v|: spacing between adjacent __half values near v.
+// Grows with magnitude (e.g. 32 near 25k), so FP16-output methods can be judged fairly at any K.
+static float half_ulp(float v) {
+    if (!std::isfinite(v)) return 0.0f;
+    uint32_t b; memcpy(&b, &v, sizeof(b));
+    int e = ((int)(b >> 23) & 0xFF) - 127;   // binary exponent of |v|
+    e = e < -9 ? -9 : (e > 15 ? 15 : e);     // clamp to fp16 normal range
+    return ldexp(1.0f, e - 9);               // p=10 significant bits -> step 2^(e-9)
+}
+
 void verify_results(const char* label,
                     const void* C_host, const float* C_cpu_ref,
                     int M, int N, int max_print, bool is_fp16) {
     int failures = 0;
     float max_diff = 0.0f;
 
+    // Failure predicate: absolute diff must stay within max(2.0, one FP16 ulp at the result's
+    // magnitude). The 2.0 floor flags real errors on small results (Phase-2 convention); the ulp
+    // clause admits differences that are only FP16 storage/accumulation rounding at large magnitudes.
+    auto fails = [is_fp16](float gpu_val, float ref) {
+        float abs_diff = fabsf(gpu_val - ref);
+        float allowed = is_fp16 ? std::max(2.0f, half_ulp(ref)) : 2.0f;
+        return abs_diff > allowed;
+    };
+
     for (int i = 0; i < M; ++i) {
         for (int j = 0; j < N; ++j) {
             float gpu_val = is_fp16 ? (float)((const __half*)C_host)[i * N + j] : ((const float*)C_host)[i * N + j];
             float diff = fabsf(gpu_val - C_cpu_ref[i * N + j]);
             if (diff > max_diff) max_diff = diff;
-            if (diff >= 1.0f) failures++;
+            if (fails(gpu_val, C_cpu_ref[i * N + j])) failures++;
         }
     }
 
@@ -168,7 +184,7 @@ void verify_results(const char* label,
             for (int j = 0; j < N && count < max_print; ++j) {
                 float gpu_val = is_fp16 ? (float)((const __half*)C_host)[i * N + j] : ((const float*)C_host)[i * N + j];
                 float diff = fabsf(gpu_val - C_cpu_ref[i * N + j]);
-                if (diff >= 1.0f) {
+                if (fails(gpu_val, C_cpu_ref[i * N + j])) {
                     printf("%s    C[%d][%d]: GPU=%.3f  CPU=%.3f  diff=%.3f\n",
                            label, i, j, gpu_val, C_cpu_ref[i * N + j], diff);
                     count++;
@@ -290,7 +306,7 @@ int main(int argc, char* argv[]) {
     printf("==========================================================\n");
     printf("  Method 1: Scalar LUT Dequant + Multiply\n");
     printf("  Tile: 16x16x16  |  Grid: (M/16, N/16)  |  32 threads/block\n");
-    printf("  Dequant: fp4_codebook_int8[nibble]  (CPU-style LUT)\n");
+    printf("  Dequant: Codebook10 int8 LUT[nibble]  (scalar)\n");
     printf("  Multiply: scalar float multiply\n");
     printf("==========================================================\n");
     BenchmarkResult scalar_result = load_and_run_kernel(
@@ -328,8 +344,8 @@ int main(int argc, char* argv[]) {
     printf("\n==========================================================\n");
     printf("  Method 3: Native FP4 WMMA (gfx1151 fallback)\n");
     printf("  Tile: 32x16x128  |  Grid: (M/32, N/16)  |  32 threads/block\n");
-    printf("  Dequant: fp4_codebook_int8[nibble]  (scalar)\n");
-    printf("  Accumulate: atomicAdd to shared memory\n");
+    printf("  Dequant: Codebook10 int8 LUT[nibble]  (scalar)\n");
+    printf("  Accumulate: register FP32 across K strips\n");
     printf("  Note: gfx1151 lacks native FP4 WMMA; uses scalar fallback\n");
     printf("==========================================================\n");
     BenchmarkResult native_result = load_and_run_kernel(

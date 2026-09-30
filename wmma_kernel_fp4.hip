@@ -1,10 +1,13 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include "fp4_common.h"
+
+using namespace rocmfp4;
 
 // FP4 ROCmFP4 Matmul using WMMA intrinsics on gfx1151
 //
-// ROCmFP4: E2M1-derived with Codebook10
-// Values: 0, ±1, ±2, ±3, ±4, ±6, ±8, ±10
+// ROCmFP4: E2M1-derived with Codebook10 (see fp4_common.h)
+// Values: 0, ±1, ±2, ±3, ±4, ±6, ±8, ±10 (sign in nibble bit 3)
 // Packed: 1 nibble per byte (single nibble per entry)
 // Scale: UE4M3 encoded as uint8_t, per block
 //
@@ -16,12 +19,6 @@
 // Then feed FP16 into native WMMA 16x16x16 matrix units
 
 typedef _Float16 half16 __attribute__((ext_vector_type(16)));
-
-// FP4 ROCmFP4 Codebook10: 0, ±1, ±2, ±3, ±4, ±6, ±8, ±10
-static const int8_t fp4_codebook_int8[16] = {
-    0,  1,  2,  3,  4,  6,  8, 10,
-    0, -1, -2, -3, -4, -6, -8,-10
-};
 
 extern "C" __global__ void wmma_matmul_fp4(const unsigned char* weights_fp4,
                                               const __half* activations,
@@ -38,7 +35,7 @@ extern "C" __global__ void wmma_matmul_fp4(const unsigned char* weights_fp4,
 
     // Build LUT: only threads 0-15 participate, each builds one entry
     if (tid < 16) {
-        float val = (float)fp4_codebook_int8[tid] * scale;
+        float val = dequant_code(tid) * scale;
         lds_lut[tid] = __half(val);
     }
     __syncthreads();
@@ -51,12 +48,10 @@ extern "C" __global__ void wmma_matmul_fp4(const unsigned char* weights_fp4,
     // Dequantize FP4 nibbles via LDS LUT lookup
     // Column-major layout: weights_fp4[lane + ele*16]
     // lane selects the column, ele iterates rows
-    // Each byte contains one nibble (4 bits), LDS load replaces FP32 multiply
-    // Nibbles are indices into codebook: 0-7 -> positive values (0,1,2,3,4,6,8,10)
+    // Each byte contains one nibble (4 bits); full Codebook10 decode (sign in bit 3)
     for (int ele = 0; ele < 16; ++ele) {
         uint8_t nibble = weights_fp4[lane + ele * 16];
-        int idx = (nibble < 8) ? nibble : 7;
-        w_frag[ele] = lds_lut[idx];  // Fast LDS indexed load
+        w_frag[ele] = lds_lut[nibble & 0x0F];  // Fast LDS indexed load
     }
 
     // Load FP16 activations row-major: B[ele][lane] = ele*16 + lane

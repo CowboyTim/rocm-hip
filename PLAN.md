@@ -25,7 +25,7 @@ A HIP/ROCm proof-of-concept for **AMD Strix Halo (gfx1151, RDNA3.5 APU)** provin
 | `wmma_matmul` | wmma_kernel.hip, wmma_main.cpp | 16x16 FP16 matmul via `__builtin_amdgcn_wmma_f16_16x16x16_f16_w32`; documents RDNA3 OPSEL=false unpacked-fragment lane/row mapping in detail; CPU-verifies C=(i+1)(j+1)*16 |
 | `wmma_matmul_fp4` | wmma_kernel_fp4.hip, wmma_main_fp4.cpp | **ROCmFP4 Codebook10** format (E2M1-derived: 0, +/-1..+/-4,+/-6,+/-8,+/-10, tuned on Qwen3 tensors): dequant nibble->FP16 through a 32-byte LDS LUT, then into the FP16 WMMA tensor core -- the best gfx1151 path |
 | `wmma_matmul_fp4_native` | *_fp4_native.* | FP4xFP4->FP32 32x16 tile; references `__builtin_amdgcn_wmma_f32_32x16x128_f4` but that's gfx1250-only, so ships a scalar fallback for gfx1151 |
-| `wmma_bench` + run_bench.py | 5 bench kernels + host + Python orchestrator | Head-to-head FP4 matmul at configurable M/N/K (default 1K^3): scalar-LUT vs DP4A-intrinsic vs native-fallback vs FP4->FP16-WMMA+LDS-LUT. CPU reference in-mapping, mismatch%/GFLOPS table, JSON export. DP4A variant expands codebook with `__builtin_amdgcn_perm` (4 const tables) and dot-products with `__builtin_amdgcn_sudot4` -- pure integer hardware path |
+| `wmma_bench` + run_bench.py | 4 bench kernels + host + Python orchestrator | Head-to-head FP4 matmul at configurable M/N/K (default 1K^3): scalar-LUT vs DP4A-intrinsic vs native-fallback vs FP4->FP16-WMMA+LDS-LUT. CPU reference in-mapping, mismatch%/GFLOPS table, JSON export; all four verified exact-or-within-FP16-ulp incl. `-signed` and partial-tile shapes. DP4A variants expand codebook via `__builtin_amdgcn_perm` (const tables from `fp4_common.h`) and dot-product with `__builtin_amdgcn_sudot4` -- pure integer hardware path |
 
 ## Analysis Doc & Second Branch
 
@@ -38,15 +38,23 @@ A HIP/ROCm proof-of-concept for **AMD Strix Halo (gfx1151, RDNA3.5 APU)** provin
 - Remote `origin/main`; working tree clean. History arc: trivial test -> error-handling fixes -> Mandelbrot-over-UMa -> WMMA intrinsics exploration -> FP4 benchmark suite -> llama.cpp submodule added Jul 1 then **removed** from main ("no llama.cpp"), leaving `.gitmodules` as an empty file and the gitlink deleted -- that work lives only on the q4 branch.
 - A prior commit also deleted `.COMMIT_NOTES.md`, `PLAN.md`/`TODO.md`, `rocmfp4-llama/`, old docs (consolidated into INTEGRATION_STATUS.md on q4).
 
-### Issues Worth Fixing
+### Issues Worth Fixing -- Resolution Status
 
-1. README still says "Initial Commit"; AGENTS.md on main is a stub (the useful version is on q4)
-2. `wmma_main_fp4_native.cpp:47` has a stale prototype `wmma_matmul_fp4_builtin` that matches no symbol -- dead code (dispatch uses string names), but misleading
-3. The 5th bench kernel (`wmma_bench_fp4_dp4a_int8`) is compiled by Makefile/run_bench.py but **never executed** by `wmma_bench_main.cpp` (only 4 methods run)
-4. ~~DP4A dequant sign bug~~ -- **fully fixed**: `fp4_matmul_kernel.hip` uses the hardware-verified chain (see Phase 2 notes), and `wmma_bench_fp4_dp4a_hardware.hip` was migrated to the same scheme via `fp4_common.h` constants (full-tile thread mapping also fixed). Bench Method 2 now verifies 100% exact vs CPU reference on unsigned AND `-signed` data (nibbles 8-F), at 1K³ cube and non-cube shapes.
-5. Codebooks + `HIP_CHECK` macros are duplicated across ~9 files instead of shared headers -- partially addressed: `fp4_common.h` now holds canonical Codebook10, UE4M3 decode, packed-layout helpers and DP4A table constants; bench/demo files not yet migrated.
-6. Bench Methods 1/3/4 (`wmma_bench_fp4_dp4a`, `_native`, `_lut`) produce wrong results even for the default 1K³ cube (GPU≈0, ~94–100% mismatch) -- pre-existing thread-mapping/indexing bugs that were invisible because `main()` always returns 0 and no one gated on the printed mismatch tables. Method 2 is the only fully verified path today.
-7. Fixed en route while debugging the bench: `load_and_run_kernel` passed kernel dims as (&K,&N,&M) against kernels' declared `(M,N,K,scale)` order (invisible on cube shapes); and `totalBytes` was under-allocated by one float-buffer slot (`outBytes*4` -> `*5`), SIGSEGV-ing inside `fp4_matmul_cpu_ref` at 1K³. New `-signed` flag generates data in [-10,10) to exercise negative codebook entries (default stays unsigned so methods with positive-only workarounds keep current behavior).
+All items below were resolved on `main` during the housekeeping pass; each fix was re-verified on gfx1151 hardware.
+
+1. ~~README still says "Initial Commit"; AGENTS.md on main is a stub~~ -- done earlier (Phase 0); AGENTS.md now states the single-branch policy (all work on `main`).
+2. ~~Stale prototype `wmma_matmul_fp4_builtin` at `wmma_main_fp4_native.cpp:47`~~ -- removed.
+3. ~~5th bench kernel (`wmma_bench_fp4_dp4a_int8`) compiled by Makefile/run_bench.py but never executed~~ -- **retired**: its dequant was broken (sign step selected from the negative table only, so positive values decoded wrong) and its thread mapping covered just 16 of 256 tile cells; it also duplicated Method 2's algorithm. Deleted from the repo (recoverable via git history) and from Makefile/run_bench.py.
+4. DP4A dequant sign bug -- fixed earlier via the hardware-verified perm chain (see Phase 2 notes).
+5. ~~Codebook + `HIP_CHECK` macros duplicated across ~9 files~~ -- **fully consolidated**: all bench kernels and demo host/kernel files now use `fp4_common.h` for Codebook10, UE4M3 decode, and packed-layout helpers. As part of this, `wmma_kernel_fp4.hip` dropped a positive-only clamp that mis-decoded signed nibbles as +10 (demo data is unsigned, so verified behavior is unchanged).
+6. ~~Bench Methods 1/3/4 produced wrong results even at default 1K³ (GPU≈0, ~94–100% mismatch)~~ -- root causes: under-covered thread mappings (lanes ≥16 no-op'd; Methods 1 & 3 wrote only 16 of their tile cells), plus Method 4 violated the bench contract entirely (declared B as `__half`, ignored tile offsets in A/B/C indexing, clamped negative nibbles). All three rewritten with full tile coverage; Method 4 re-implemented on the bench data contract using the same WMMA fragment conventions as the verified Phase-2 kernel. **Verified after fix:** all 4 methods exact or within one FP16 ulp vs CPU reference at 1K³ (default and `-signed`) and partial-tile shapes (96×80·K256, 40×48·K128, 33×17·K40 incl. zero-padded partial K strip).
+7. Param-order / under-allocation bugs found while debugging the bench (`(M,N,K)` order, `outBytes*5`) -- fixed earlier (see Phase 2 notes); `-signed` flag retained for negative-codebook coverage.
+
+Newly discovered during housekeeping and fixed:
+
+8. Makefile: `$(WMMA_FP4_TARGET)` listed `$(WMMA_CO)` instead of `$(WMMA_FP4_CO)`, so after `make clean` the binary linked fine but crashed at runtime (`wmma_kernel_fp4.co: No such file`). Dependency corrected.
+
+Verification-harness change: `wmma_bench_main.cpp` now judges results with an FP16-aware tolerance -- a failure requires diff > max(2.0, one FP16 ulp at the result's magnitude), because FP16 output quantization grows with magnitude (step 32 near 25k). This mirrors `fp4_verify`'s dual-threshold convention and is what makes Method 4's mismatch table meaningful at large K.
 
 ### Empirically Verified `__builtin_amdgcn_perm` Semantics on gfx1151 (ROCm/LLVM toolchain here)
 
@@ -59,7 +67,7 @@ This drove the final Codebook10 dequant design (see Phase 2): magnitude via one 
 
 ## Build
 
-| ROCm at `/opt/rocm` (hipcc available). Makefile targets (`make all`): `mandelbrot wmma_matmul wmma_matmul_fp4 wmma_matmul_fp4_native wmma_bench demo_gguf fp4_verify`, all pinned to `--offload-arch=gfx1151`. Full clean rebuild ~12s on Strix Halo. `./fp4_verify [--M m --N n --K k] [--dp4a|--wmma|--both]` runs the Phase 2 acceptance test: CPU reference vs both GPU kernels over the shared /dev/shm mapping — **verified passing on gfx1151 hardware** (all shapes tested incl. partial tiles; DP4A exact, WMMA within FP16 flush tolerance). Set `HSA_OVERRIDE_GFX_VERSION=11.5.1 HSA_ENABLE_SDMA=0`; `FP4_DUMP_MISMATCH=1` prints mismatching elements for debugging.
+| ROCm at `/opt/rocm` (hipcc available). Makefile targets (`make all`): `mandelbrot wmma_matmul wmma_matmul_fp4 wmma_matmul_fp4_native wmma_bench demo_gguf fp4_verify`, all pinned to `--offload-arch=gfx1151`. Full clean rebuild ~12s on Strix Halo. `./fp4_verify [--M m --N n --K k] [--dp4a|--wmma|--both]` runs the Phase 2 acceptance test: CPU reference vs both GPU kernels over the shared /dev/shm mapping — **verified passing on gfx1151 hardware** (all shapes tested incl. partial tiles; DP4A exact, WMMA within FP16 flush tolerance). `./wmma_bench [-M m -N n -K k] [-runs r -warmup w] [-verify n] [-scale f] [-signed]` runs the 4-method comparison with per-method mismatch tables (FP16-aware tolerance; see Issues section). Set `HSA_OVERRIDE_GFX_VERSION=11.5.1 HSA_ENABLE_SDMA=0`; `FP4_DUMP_MISMATCH=1` prints mismatching elements for debugging.
 
 
 # Inference Engine Roadmap -- New Phase

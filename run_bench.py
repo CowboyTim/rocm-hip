@@ -3,7 +3,8 @@
 ROCm HIP FP4 Matmul Benchmark Orchestrator
 
 Runs benchmarks comparing different FP4 quantization methods on ROCm GPUs.
-Tests: FP4->FP16 WMMA + LDS LUT, DP4A hardware intrinsics, scalar fallback.
+Tests: scalar-LUT dequant, DP4A hardware intrinsics (perm + sudot4),
+native-FP4 WMMA fallback, and FP4->FP16 WMMA + LDS LUT.
 """
 
 import subprocess
@@ -172,8 +173,7 @@ Examples:
         "wmma_bench_fp4_dp4a",
         "wmma_bench_fp4_dp4a_hardware", 
         "wmma_bench_fp4_native",
-        "wmma_bench_fp4_lut",
-        "wmma_bench_fp4_dp4a_int8"
+        "wmma_bench_fp4_lut"
     ]
     
     for kernel in kernels:

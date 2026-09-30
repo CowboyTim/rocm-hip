@@ -8,6 +8,9 @@
 #include <cstdint>
 #include <cstring>
 #include <hip/hip_runtime.h>
+#include "fp4_common.h"
+
+using namespace rocmfp4;
 
 #define HIP_CHECK(cmd, str) \
     do { \
@@ -18,24 +21,17 @@
         } \
     } while(0)
 
-// FP4 ROCmFP4 Codebook10: 0, ±1, ±2, ±3, ±4, ±6, ±8, ±10
-static const int8_t fp4_codebook[16] = {
-    0,  1,  2,  3,  4,  6,  8, 10,
-    0, -1, -2, -3, -4, -6, -8,-10
-};
-
-// FP4 dequant helper
+// FP4 dequant helper (Codebook10 from fp4_common.h)
 __host__ __forceinline__ float fp4_dequant(uint8_t nibble, float scale) {
-    int8_t code = fp4_codebook[nibble];
-    return (float)code * scale;
+    return dequant_code(nibble) * scale;
 }
 
-// FP4 quantize
+// FP4 quantize: nearest Codebook10 entry
 __host__ __forceinline__ uint8_t fp4_quant(float val) {
     float best_dist = 1e30f;
     uint8_t best_idx = 0;
     for (int i = 0; i < 16; ++i) {
-        float diff = fabsf((float)fp4_codebook[i] - val);
+        float diff = fabsf(dequant_code(i) - val);
         if (diff < best_dist) {
             best_dist = diff;
             best_idx = i;
@@ -43,8 +39,6 @@ __host__ __forceinline__ uint8_t fp4_quant(float val) {
     }
     return best_idx;
 }
-
-extern "C" __global__ void wmma_matmul_fp4_builtin(const unsigned char*, const unsigned char*, float*, float);
 
 int main() {
     printf("=== FP4 Native WMMA (gfx1151) ===\n\n");
@@ -88,7 +82,7 @@ int main() {
             uint8_t nibble = fp4_quant(val);
             A_fp4[i * 128 + j] = nibble;
             if (j < 16 && i < 4) {
-                printf("  %4.1f", (float)fp4_codebook[nibble]);
+                printf("  %4.1f", dequant_code(nibble));
             }
         }
         printf("\n");
@@ -102,7 +96,7 @@ int main() {
             uint8_t nibble = fp4_quant(val);
             B_fp4[i * 128 + j] = nibble;
             if (j < 16 && i < 4) {
-                printf("  %4.1f", (float)fp4_codebook[nibble]);
+                printf("  %4.1f", dequant_code(nibble));
             }
         }
         printf("\n");

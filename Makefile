@@ -42,7 +42,6 @@ WMMA_FP4_NATIVE_TARGET = wmma_matmul_fp4_native
 BENCH_TARGET = wmma_bench
 BENCH_HOST = wmma_bench_main.o
 BENCH_LUT_CO = wmma_bench_fp4_lut.co
-BENCH_DP4A_INT8_CO = wmma_bench_fp4_dp4a_int8.co
 
 # --- Phase 1: GGUF mmap reader ---
 GGUF_MMAP_SRC = gguf_mmap.cpp
@@ -60,7 +59,7 @@ $(TARGET): $(OBJ) $(KERNEL_CO)
 $(WMMA_TARGET): $(WMMA_OBJ) $(WMMA_CO)
 	$(CLANG) $(WMMA_OBJ) $(LDFLAGS) -o $@
 
-$(WMMA_FP4_TARGET): $(WMMA_FP4_OBJ) $(WMMA_CO)
+$(WMMA_FP4_TARGET): $(WMMA_FP4_OBJ) $(WMMA_FP4_CO)
 	$(CLANG) $(WMMA_FP4_OBJ) $(LDFLAGS) -o $@
 
 $(WMMA_FP4_NATIVE_TARGET): $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO)
@@ -86,7 +85,7 @@ wmma_bench_fp4_dp4a_hardware.co: wmma_bench_fp4_dp4a_hardware.hip
 	$(HIPCC) $(HIPFLAGS) -c $< -o $@
 
 # Build the benchmark binary (links host .o, loads .co at runtime)
-$(BENCH_TARGET): $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_dp4a_hardware.co wmma_bench_fp4_native.co $(BENCH_LUT_CO) $(BENCH_DP4A_INT8_CO)
+$(BENCH_TARGET): $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_dp4a_hardware.co wmma_bench_fp4_native.co $(BENCH_LUT_CO)
 	$(CLANG) $(BENCH_HOST) $(LDFLAGS) -o $@
 
 # Phase 1 demo: gguf_mmap reader linked into a single binary
@@ -102,6 +101,6 @@ $(FP4_VERIFY): fp4_verify.cpp fp4_common.h fp4_matmul_kernel.co fp4_matmul_wmma.
 both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)
 
 clean:
-	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_native.co wmma_bench_fp4_dp4a_hardware.co $(BENCH_LUT_CO) $(BENCH_DP4A_INT8_CO) $(DEMO_GGUF) $(FP4_VERIFY) *.co
+	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_native.co wmma_bench_fp4_dp4a_hardware.co $(BENCH_LUT_CO) $(DEMO_GGUF) $(FP4_VERIFY) *.co
 
 .PHONY: all clean both

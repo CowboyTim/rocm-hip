@@ -9,6 +9,9 @@
 #include <cstring>
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include "fp4_common.h"
+
+using namespace rocmfp4;
 
 #define HIP_CHECK(cmd, str) \
     do { \
@@ -22,26 +25,19 @@
 #define MATRIX_SIZE 16
 #define MAT_SIZE (MATRIX_SIZE * MATRIX_SIZE)
 
-// FP4 ROCmFP4 Codebook10: 0, ±1, ±2, ±3, ±4, ±6, ±8, ±10
-static const int8_t fp4_codebook[16] = {
-    0,  1,  2,  3,  4,  6,  8, 10,
-    0, -1, -2, -3, -4, -6, -8,-10
-};
-
-// FP4 dequant: nibble (0-15) → float via codebook lookup
+// FP4 dequant: nibble (0-15) -> float via Codebook10 lookup (fp4_common.h)
 __host__ __device__ __forceinline__ float fp4_dequant(uint8_t nibble, float scale) {
-    int8_t code = fp4_codebook[nibble];
-    return (float)code * scale;
+    return dequant_code(nibble) * scale;
 }
 
-// FP4 quantize: float → nibble via nearest codebook lookup (positive values only)
+// FP4 quantize: float -> nibble via nearest codebook lookup (positive values only)
 // ROCmFP4 Codebook10: 8 positive values (indices 0-7), 8 negative values (indices 8-15)
 __host__ __device__ __forceinline__ uint8_t fp4_quant(float val) {
     float best_dist = 1e30f;
     int best_idx = 0;
     // Only search positive half of codebook (indices 0-7)
     for (int i = 0; i < 8; ++i) {
-        float diff = fabsf((float)fp4_codebook[i] - val);
+        float diff = fabsf(dequant_code(i) - val);
         if (diff < best_dist) {
             best_dist = diff;
             best_idx = i;

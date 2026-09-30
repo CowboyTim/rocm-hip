@@ -7,12 +7,14 @@ This is a proof-of-concept integrating two features into [llama.cpp](https://git
 
 Similar in spirit to [blazux/qwen3.8-Flash-DGX](https://github.com/blazux/qwen3.8-Flash-DGX), which adds mmap() support for n-gram MoE Qwen3.8-Flash models in vLLM, but targeting llama.cpp's GGUF format with ROCm hardware acceleration.
 
-See `PLAN.md` and `TODO.md` for current status and roadmap.
+See `PLAN.md` for current status and roadmap.
 
 ## Branches
 
-- **`main`** — POC demos: Mandelbrot, WMMA matmul, ROCmFP4 benchmarks (no llama.cpp submodule). These are standalone zero-copy kernels proving the core concepts.
-- **`q4_0_rocmfp4_q8_1`** — full llama.cpp integration work: forked llama.cpp with ROCmFP4 ftype 107/108 support, zero-copy GGUF loading, 13-week roadmap toward MFMA/WMMA/FP4 + KV-cache fast path.
+All work happens on **`main`**.
+
+- **`main`** — everything: POC demos (Mandelbrot, WMMA matmul, ROCmFP4 benchmarks), Phase 1–2 infrastructure (`gguf_mmap` zero-copy GGUF loader, verified FP4 matmul kernels + `fp4_verify` harness), and the inference-engine roadmap (Phases 3–7). Standalone zero-copy kernels proving the core concepts; no llama.cpp submodule.
+- **`q4_0_rocmfp4_q8_1`** — archived reference only: an earlier forked-llama.cpp snapshot (ROCmFP4 ftype 107/108, zero-copy GGUF loading, INTEGRATION_STATUS.md analysis incl. the Qwen3.8-Flash-DGX comparison). No new work goes here; cherry-pick anything still useful into `main`.
 
 ## Core Pattern
 

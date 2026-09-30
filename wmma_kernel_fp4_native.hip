@@ -1,13 +1,10 @@
 #include <hip/hip_runtime.h>
+#include "fp4_common.h"
 
-// FP4 ROCmFP4 Codebook10: 0, ±1, ±2, ±3, ±4, ±6, ±8, ±10
-static const int8_t fp4_codebook[16] = {
-    0,  1,  2,  3,  4,  6,  8, 10,
-    0, -1, -2, -3, -4, -6, -8,-10
-};
+using namespace rocmfp4;
 
 __host__ __device__ __forceinline__ float fp4_dequant(uint8_t nibble) {
-    return (float)fp4_codebook[nibble];
+    return dequant_code(nibble);
 }
 
 extern "C" __global__ void wmma_matmul_fp4_native(const unsigned char* A,
