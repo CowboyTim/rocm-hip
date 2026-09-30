@@ -43,12 +43,21 @@ A HIP/ROCm proof-of-concept for **AMD Strix Halo (gfx1151, RDNA3.5 APU)** provin
 1. README still says "Initial Commit"; AGENTS.md on main is a stub (the useful version is on q4)
 2. `wmma_main_fp4_native.cpp:47` has a stale prototype `wmma_matmul_fp4_builtin` that matches no symbol -- dead code (dispatch uses string names), but misleading
 3. The 5th bench kernel (`wmma_bench_fp4_dp4a_int8`) is compiled by Makefile/run_bench.py but **never executed** by `wmma_bench_main.cpp` (only 4 methods run)
-4. DP4A dequant in `wmma_bench_fp4_dp4a_hardware.hip:37-61`: the second `perm` selects between negative tables based on bit 2, but Codebook10's sign is bit 3 of the nibble -- positive codes come back as negatives; comments in-file even flag the confusion ("we need two separate perms..."). Scalar/negative data works around it via clamping; this method likely fails verification for real signed data
-5. Codebooks + `HIP_CHECK` macros are duplicated across ~9 files instead of shared headers
+4. ~~DP4A dequant sign bug~~ -- **fixed in `fp4_matmul_kernel.hip`**: replaced the broken single-perm scheme with the hardware-verified chain (see Phase 2 notes). `wmma_bench_fp4_dp4a_hardware.hip:37-61` still carries the old broken scheme and should be migrated to `fp4_common.h`'s tables or removed.
+5. Codebooks + `HIP_CHECK` macros are duplicated across ~9 files instead of shared headers -- partially addressed: `fp4_common.h` now holds canonical Codebook10, UE4M3 decode, packed-layout helpers and DP4A table constants; bench/demo files not yet migrated.
+
+### Empirically Verified `__builtin_amdgcn_perm` Semantics on gfx1151 (ROCm/LLVM toolchain here)
+
+Probed with dedicated test kernels (mask bytes 0..255); results differ from a naive reading of the ISA docs:
+
+- Per mask byte, **bit 2 selects the operand** (set → first arg's byte `m&3`, clear → second arg's byte `m&3`).
+- **Mask bytes ≥ 8 are undefined behavior** (hardware returns degenerate constants: 0 for m∈{8..12}, −1 for {13..15}, independent of operands). All masks in production code must therefore be kept ≤ 7 by construction.
+
+This drove the final Codebook10 dequant design (see Phase 2): magnitude via one perm over `{[+0..+3],[+4,+6,+8,+10]}` with a ≤7 mask built from the nibble's low 3 bits; sign via a second perm (`sign bit shifted into bit 2`) expanding an FF/00 lane mask; signed value = `pos ^ (mask & (neg ^ pos))`. ~11 ALU/perm instructions per 4 values — no select builtin exists in this clang and none is needed.
 
 ## Build
 
-| ROCm at `/opt/rocm` (hipcc available). Makefile targets: `mandelbrot wmma_matmul wmma_matmul_fp4 wmma_matmul_fp4_native wmma_bench`, all pinned to `--offload-arch=gfx1151`. All targets build successfully; `.co` artifacts present for every kernel. Phase 2 kernels (`fp4_matmul_kernel.co`, `fp4_matmul_wmma.co`) also compiled and verified.
+| ROCm at `/opt/rocm` (hipcc available). Makefile targets (`make all`): `mandelbrot wmma_matmul wmma_matmul_fp4 wmma_matmul_fp4_native wmma_bench demo_gguf fp4_verify`, all pinned to `--offload-arch=gfx1151`. Full clean rebuild ~12s on Strix Halo. `./fp4_verify [--M m --N n --K k] [--dp4a|--wmma|--both]` runs the Phase 2 acceptance test: CPU reference vs both GPU kernels over the shared /dev/shm mapping — **verified passing on gfx1151 hardware** (all shapes tested incl. partial tiles; DP4A exact, WMMA within FP16 flush tolerance). Set `HSA_OVERRIDE_GFX_VERSION=11.5.1 HSA_ENABLE_SDMA=0`; `FP4_DUMP_MISMATCH=1` prints mismatching elements for debugging.
 
 
 # Inference Engine Roadmap -- New Phase
@@ -181,27 +190,28 @@ Key design decisions:
 - For split models, each file gets its own `MAP_SHARED` mapping. The KV cache goes into `/dev/shm/*.kvcache.bin` (shared-memory anonymous mmap).
 - Weights stay in their quantized format -- no dequantization happens during loading. Dequant happens inside kernels at compute time.
 
-### Phase 2: ROCmFP4 Matmul Kernel (completed)
+### Phase 2: ROCmFP4 Matmul Kernel (completed — verified on hardware)
 
 **Goal**: Implement the core FP4 matmul kernel that loads ROCmFP4 Codebook10 weights from GPU-accessible memory, dequantizes inline via DP4A + LDS LUT, and feeds into FP16 WMMA tensor cores.
 
 Deliverables:
-1. `fp4_matmul_kernel.hip` -- the primary compute kernel. Each work-group handles one output tile (e.g., 256x32 or similar). Inside the kernel:
-   - Load FP4 nibbles from weight matrix (GPU-visible mmap'd memory)
-   - Expand nibbles to int8 codes via `__builtin_amdgcn_perm` against a 32-byte constant codebook table
-   - Accumulate dot products via `__builtin_amdgcn_sudot4` (int8xint8->int32 reduction over 8 values)
-   - Scale accumulated sums by UE4M3 scale factors loaded from per-block scale bytes
-   - Output is FP32 sum ready for add-on bias/activation
+1. `fp4_matmul_kernel.hip` -- the primary compute kernel. Each work-group handles one 16x16 output tile. Inside the kernel:
+    - Load FP4 nibbles from weight matrix (GPU-visible mmap'd memory), packed two-per-byte
+    - Expand nibbles to int8 codes via the verified `__builtin_amdgcn_perm` chain (see "Empirically Verified Perm Semantics" above)
+    - Accumulate dot products via `__builtin_amdgcn_sudot4` (int8xint8->int32 reduction over 4 values at a time)
+    - Scale accumulated sums by UE4M3 scale factors (one byte per 16-element half-block) loaded from the scales line
+    - Output is FP32 sum in shared-memory tile accumulators, written back row-major
+2. `fp4_matmul_wmma.hip` -- bridges the FP4 path into WMMA tensor cores. Dequantized FP4 values are converted nibble -> FP16 via register lookup (`dequant_code`), scaled per half-block, then fed into `__builtin_amdgcn_wmma_f16_16x16x16_f16_w32`. Fragment load/store conventions match the CPU-verified `wmma_kernel.hip` demo.
+3. Verification harness (`fp4_verify.cpp`, Makefile target `fp4_verify`): CPU-side reference on the same mapped buffer; compares each kernel with tolerance + mismatch% table.
 
-2. `fp4_matmul_wmma.hip` -- bridges the FP4 dequant path into WMMA tensor cores. Dequantized FP4 values go through an LDS LUT (nibble -> FP16 lookup), then feed into `__builtin_amdgcn_wmma_f16_16x16x16_f16_w32`. This leverages the hardware tensor core while keeping dequant overhead low via LDS caching of the LUT.
-
-3. Verification harness: CPU-side reference implementation that runs on the same mapped buffer, produces expected FP32 results, and compares against GPU output with tolerance threshold.
+**Verification status (on Strix Halo gfx1151, this machine):** both kernels pass against the CPU reference — DP4A exact (0.00% max mismatch), WMMA 0.00–0.10% — across shapes 16²·K64, 32×32·K64, 40×48·K128, 64×32·K32, 96×80·K256 incl. partial-tile edge guards.
 
 Key design decisions:
-- Weights in ROCmFP4 format stay in their native packed layout on the GPU. No conversion to FP16 happens before the kernel; dequant is inline at compute time.
-- The DP4A path (`perm` + `sudot4`) is preferred over LDS-LUT-for-dequant because it's a single hardware instruction vs ~6 instructions for bit-manipulation scale decode.
-- Block size: 32 values per block (matching llama.cpp convention). Scale per 16-element half-block (matching ROCmFP4 Codebook10 spec).
-- No shared memory allocation needed -- all data lives in the mmap'd GGUF file regions already registered with `hipHostRegister`.
+- Weights stay in their native packed layout (2 nibbles/byte, low first; A = M lines of K values, B = N lines of K values so every dot product reads contiguous data). No conversion happens before the kernel; dequant is inline at compute time.
+- The DP4A path (`perm` chain + `sudot4`) is preferred over LDS-LUT-for-dequant for weights; the WMMA path keeps a register LUT for nibble->FP16 because the tensor core needs FP16 operands anyway.
+- Block size: 32 values per block (llama.cpp convention); scale per 16-element half-block (Codebook10 spec) -> K/16 UE4M3 bytes per line.
+- WMMA accumulator is flushed into an FP32 shared-memory tile after **every** strip and reset: pure FP16 accumulation across many strips drifts past tolerance once magnitudes exceed ~2048 (ulp=2 there); per-strip flushing bounds rounding to one strip's magnitude. DP4A accumulates int32 per strip then scales in FP32 — exact for all tested data.
+- Shared memory is used only for tile accumulators (16x16 floats or halves); all operand/scale data lives in the mmap'd regions registered with `hipHostRegister`.
 
 ### Phase 3: KV Cache & Attention (~3 weeks)
 
