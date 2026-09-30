@@ -19,6 +19,16 @@ rocmfp4-llama/
 *.so
 *.dylib
 
+# Compiled kernel objects (hipcc --genco) and demo binaries (rebuild via `make all`)
+*.co
+mandelbrot
+wmma_matmul
+wmma_matmul_fp4
+wmma_matmul_fp4_native
+wmma_bench
+demo_gguf
+fp4_verify
+
 # IDE
 .vscode/
 .idea/
