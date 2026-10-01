@@ -260,7 +260,7 @@ New toolchain findings baked into code (documented for Phase 4+):
 
 Makefile: new targets `kv_verify gemm_verify actfp4_verify layernorm_verify rope_verify softmax_verify attn_verify` added to `all`/`clean`; binaries gitignored. All Phase 3 files now tracked and committed.
 
-### Phase 4: Model Architecture Integration (~3 weeks)
+### Phase 4: Model Architecture Integration (~3 weeks) — IN PROGRESS
 
 **Goal**: Wire up the kernels into a complete forward pass for Qwen 3 dense transformer architecture (MLP layers with gated linear units, multi-head/multi-query attention with SwiGLU gating).
 
@@ -273,6 +273,25 @@ Deliverables:
 Key design decisions:
 - Model parallelism is not needed on 128GB UMA -- the entire model fits in unified memory even at FP4 quantization. A single GPU thread-block grid handles everything.
 - For a ~7B parameter model at ROCmFP4 (~0.56 BPW), weights consume approximately 4GB. At Q8_0 it would be ~7GB. With KV cache at 128K context length, total memory footprint stays well under 128GB.
+
+#### Phase 4 Status (current)
+
+Core kernel scaffolding committed and compiles on gfx1151:
+
+| Component | Files | Status |
+|---|---|---|
+| SwiGLU fused kernel | `swiglu.hip`, `swiglu.co` | COMPILES (16x16 tile, FP4 weights, FP32 output) |
+| Embedding lookup | `embedding_lookup.hip`, `embedding_lookup.co` | COMPILES (vectorized 128-bit load) |
+| C API surface | `inference.h`, `inference.cpp` | SCAFFOLDED (load_model, tokenize, decode_token, get_logits, kv_cache, tensor access) |
+| Demo binary | `demo_inference.cpp` | SCAFFOLDED |
+
+Open issues:
+- Inference library (`libinference.a`) build blocked by GGUF mmap type conflict: `gguf_model_t` (internal GGUF mmap struct) vs `inference_model_t` (engine model struct) are different opaque types. Need to unify or add proper conversion layer.
+- Full forward pass (`qwen_model.hip/cpp`) not yet implemented.
+
+Verification:
+- Phase 3 component tests + `attn_verify` integration test all PASS on gfx1151.
+- New kernels (`swiglu.co`, `embedding_lookup.co`) compile successfully.
 
 ### Phase 5: Tokenizer & C API Surface (~2 weeks)
 
