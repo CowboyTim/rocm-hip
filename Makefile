@@ -58,11 +58,17 @@ GEMM_VERIFY  = gemm_verify
 
 # Phase 3: RMSNorm / RoPE / masked-softmax verification harnesses
 LAYERNORM_VERIFY = layernorm_verify
+
+# Phase 3: FP16 activation x Codebook10-FP4 weight GEMM verification (the projection path)
+ACTFP4_VERIFY    = actfp4_verify
+
+# Phase 3: end-to-end attention block integration test (chains every Phase-3 kernel)
+ATTN_VERIFY      = attn_verify
 ROPE_VERIFY      = rope_verify
 SOFTMAX_VERIFY   = softmax_verify
 
 # --- Build Rules ---
-all: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET) $(DEMO_GGUF) $(FP4_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY)
+all: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET) $(DEMO_GGUF) $(FP4_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(ATTN_VERIFY)
 
 $(TARGET): $(OBJ) $(KERNEL_CO)
 	$(CLANG) $(OBJ) $(LDFLAGS) -o $@
@@ -128,10 +134,18 @@ $(ROPE_VERIFY): rope_verify.cpp rope_embedding.co
 $(SOFTMAX_VERIFY): softmax_verify.cpp softmax_masked.co
 	$(CLANG) $(CXXFLAGS) -I. softmax_verify.cpp $(LDFLAGS) -o $@
 
+# Phase 3 verify: Act x FP4 GEMM vs CPU reference over /dev/shm (loads gemm_act_fp4.co at runtime)
+$(ACTFP4_VERIFY): actfp4_verify.cpp gemm_act_fp4.co
+	$(CLANG) $(CXXFLAGS) -I. actfp4_verify.cpp $(LDFLAGS) -o $@
+
+# Phase 3 verify: full attention block chain; loads layernorm/gemm_act_fp4/rope_embedding/kv_cache_store/fp16_gemm/softmax_masked .co files
+$(ATTN_VERIFY): attn_verify.cpp kv_cache.cpp kv_cache.h kv_cache_store.co gemm_act_fp4.co fp16_gemm.co layernorm.co rope_embedding.co softmax_masked.co
+	$(CLANG) $(CXXFLAGS) -I. attn_verify.cpp kv_cache.cpp $(LDFLAGS) -o $@
+
 # Build all demos and benchmark
 both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)
 
 clean:
-	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_native.co wmma_bench_fp4_dp4a_hardware.co $(BENCH_LUT_CO) $(DEMO_GGUF) $(FP4_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) *.co
+	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_native.co wmma_bench_fp4_dp4a_hardware.co $(BENCH_LUT_CO) $(DEMO_GGUF) $(FP4_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(ATTN_VERIFY) *.co
 
 .PHONY: all clean both

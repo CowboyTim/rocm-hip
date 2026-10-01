@@ -43,6 +43,17 @@ static const uint32_t CB_N_HI = 0xf6f8fafcu;   // bytes [-4,-6,-8,-10]
 
 FP4_HD inline float dequant_code(int nibble) { return (float)CODEBOOK[nibble & 0x0F]; }
 
+// Codebook value -> canonical nibble (inverse of dequant_code). The magnitude is its index into
+// {0,1,2,3,4,6,8,10}; bit 3 carries the sign (see CB_* perm tables above). Two's-complement masking
+// does NOT work: -3 is nibble 11 (-6 lives at 13), etc. Values must be CODEBOOK members.
+FP4_HD inline int encode_code(int v) {
+    static const int mags[8] = {0, 1, 2, 3, 4, 6, 8, 10};
+    bool neg = (v < 0);
+    int av = neg ? -v : v;
+    for (int i = 0; i < 8; ++i) if (mags[i] == av) return neg ? (i | 8) : i;
+    return 0;   // not a codebook member -- caller bug
+}
+
 // UE4M3 byte -> float. Exact port of ggml_cuda_ue4m3_to_fp32 (Analysis doc section 1.4):
 // top nibble (bits [7:4]) is the exponent field incl. sign-bit position, low 3 bits mantissa.
 FP4_HD inline float ue4m3_to_float(uint8_t x) {
