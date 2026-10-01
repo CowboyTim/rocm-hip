@@ -67,8 +67,16 @@ ATTN_VERIFY      = attn_verify
 ROPE_VERIFY      = rope_verify
 SOFTMAX_VERIFY   = softmax_verify
 
+# Phase 4: Model architecture kernels
+SWIGLU_CO        = swiglu.co
+EMBEDDING_CO     = embedding_lookup.co
+
+# Phase 4: Inference engine library and demo
+INFERENCE_LIB    = libinference.a
+INFERENCE_DEMO   = inference_demo
+
 # --- Build Rules ---
-all: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET) $(DEMO_GGUF) $(FP4_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(ATTN_VERIFY)
+all: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET) $(DEMO_GGUF) $(FP4_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO)
 
 $(TARGET): $(OBJ) $(KERNEL_CO)
 	$(CLANG) $(OBJ) $(LDFLAGS) -o $@
@@ -142,10 +150,29 @@ $(ACTFP4_VERIFY): actfp4_verify.cpp gemm_act_fp4.co
 $(ATTN_VERIFY): attn_verify.cpp kv_cache.cpp kv_cache.h kv_cache_store.co gemm_act_fp4.co fp16_gemm.co layernorm.co rope_embedding.co softmax_masked.co
 	$(CLANG) $(CXXFLAGS) -I. attn_verify.cpp kv_cache.cpp $(LDFLAGS) -o $@
 
+# Phase 4: SwiGLU kernel (.co for runtime loading)
+$(SWIGLU_CO): swiglu.hip
+	$(HIPCC) $(HIPFLAGS) -c $< -o $@
+
+# Phase 4: Embedding lookup kernel (.co for runtime loading)
+$(EMBEDDING_CO): embedding_lookup.hip
+	$(HIPCC) $(HIPFLAGS) -c $< -o $@
+
+# Phase 4: Inference engine static library
+$(INFERENCE_LIB): inference.cpp inference.h gguf_mmap.cpp gguf_mmap.h kv_cache.cpp kv_cache.h
+	$(CLANG) $(CXXFLAGS) -I. -fPIC -c inference.cpp -o inference.o
+	$(CLANG) $(CXXFLAGS) -I. -fPIC -c gguf_mmap.cpp -o gguf_mmap.o
+	$(CLANG) $(CXXFLAGS) -I. -fPIC -c kv_cache.cpp -o kv_cache.o
+	ar rcs $@ inference.o gguf_mmap.o kv_cache.o
+
+# Phase 4: Inference demo binary
+$(INFERENCE_DEMO): inference.cpp inference.h demo_inference.cpp
+	$(CLANG) $(CXXFLAGS) -I. inference.cpp gguf_mmap.cpp kv_cache.cpp demo_inference.cpp $(LDFLAGS) -o $@
+
 # Build all demos and benchmark
 both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)
 
 clean:
-	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_native.co wmma_bench_fp4_dp4a_hardware.co $(BENCH_LUT_CO) $(DEMO_GGUF) $(FP4_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(ATTN_VERIFY) *.co
+	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_native.co wmma_bench_fp4_dp4a_hardware.co $(BENCH_LUT_CO) $(DEMO_GGUF) $(FP4_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(INFERENCE_LIB) $(INFERENCE_DEMO) *.co *.o
 
 .PHONY: all clean both
