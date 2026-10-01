@@ -35,7 +35,7 @@ A HIP/ROCm proof-of-concept for **AMD Strix Halo (gfx1151, RDNA3.5 APU)** provin
 
 ## Git State & Observations
 
-- Remote `origin/main` (Phase-3 kickoff commit pushed); working tree carries the untracked second Phase-3 batch (`gemm_act_fp4.hip`, `kv_cache_store.hip`, `actfp4_verify.cpp`, `attn_verify.cpp`) awaiting the integration-test fix. History arc: trivial test -> error-handling fixes -> Mandelbrot-over-UMa -> WMMA intrinsics exploration -> FP4 benchmark suite -> llama.cpp submodule added Jul 1 then **removed** from main ("no llama.cpp"), leaving `.gitmodules` as an empty file and the gitlink deleted -- that work lives only on the q4 branch.
+- Remote `origin/main` (Phase-3 complete); working tree clean. Phase-3 second batch (`gemm_act_fp4.hip`, `kv_cache_store.hip`, `actfp4_verify.cpp`, `attn_verify.cpp`, `encode_code()` in `fp4_common.h`) now committed and integration test passes. History arc: trivial test -> error-handling fixes -> Mandelbrot-over-UMA -> WMMA intrinsics exploration -> FP4 benchmark suite -> llama.cpp submodule added Jul 1 then **removed** from main ("no llama.cpp"), leaving `.gitmodules` as an empty file and the gitlink deleted -- that work lives only on the q4 branch.
 - A prior commit also deleted `.COMMIT_NOTES.md`, `PLAN.md`/`TODO.md`, `rocmfp4-llama/`, old docs (consolidated into INTEGRATION_STATUS.md on q4).
 
 ### Issues Worth Fixing -- Resolution Status
@@ -67,7 +67,7 @@ This drove the final Codebook10 dequant design (see Phase 2): magnitude via one 
 
 ## Build
 
-| ROCm at `/opt/rocm` (hipcc available). Makefile targets (`make all`): `mandelbrot wmma_matmul wmma_matmul_fp4 wmma_matmul_fp4_native wmma_bench demo_gguf fp4_verify`, all pinned to `--offload-arch=gfx1151`. Full clean rebuild ~12s on Strix Halo. `./fp4_verify [--M m --N n --K k] [--dp4a|--wmma|--both]` runs the Phase 2 acceptance test: CPU reference vs both GPU kernels over the shared /dev/shm mapping — **verified passing on gfx1151 hardware** (all shapes tested incl. partial tiles; DP4A exact, WMMA within FP16 flush tolerance). `./wmma_bench [-M m -N n -K k] [-runs r -warmup w] [-verify n] [-scale f] [-signed]` runs the 4-method comparison with per-method mismatch tables (FP16-aware tolerance; see Issues section). Set `HSA_OVERRIDE_GFX_VERSION=11.5.1 HSA_ENABLE_SDMA=0`; `FP4_DUMP_MISMATCH=1` prints mismatching elements for debugging. Phase 3 adds per-component verify binaries (`kv_verify gemm_verify actfp4_verify layernorm_verify rope_verify softmax_verify attn_verify`) — see Phase 3 status table; all pass except the full-block `attn_verify` integration test (open issue).
+| ROCm at `/opt/rocm` (hipcc available). Makefile targets (`make all`): `mandelbrot wmma_matmul wmma_matmul_fp4 wmma_matmul_fp4_native wmma_bench demo_gguf fp4_verify`, all pinned to `--offload-arch=gfx1151`. Full clean rebuild ~12s on Strix Halo. `./fp4_verify [--M m --N n --K k] [--dp4a|--wmma|--both]` runs the Phase 2 acceptance test: CPU reference vs both GPU kernels over the shared /dev/shm mapping — **verified passing on gfx1151 hardware** (all shapes tested incl. partial tiles; DP4A exact, WMMA within FP16 flush tolerance). `./wmma_bench [-M m -N n -K k] [-runs r -warmup w] [-verify n] [-scale f] [-signed]` runs the 4-method comparison with per-method mismatch tables (FP16-aware tolerance; see Issues section). Set `HSA_OVERRIDE_GFX_VERSION=11.5.1 HSA_ENABLE_SDMA=0`; `FP4_DUMP_MISMATCH=1` prints mismatching elements for debugging. Phase 3 adds per-component verify binaries (`kv_verify gemm_verify actfp4_verify layernorm_verify rope_verify softmax_verify attn_verify`) — **all verified passing on gfx1151** including the full-block `attn_verify` integration test.
 
 
 # Inference Engine Roadmap -- New Phase
@@ -223,7 +223,7 @@ Key design decisions:
 - WMMA accumulator is flushed into an FP32 shared-memory tile after **every** strip and reset: pure FP16 accumulation across many strips drifts past tolerance once magnitudes exceed ~2048 (ulp=2 there); per-strip flushing bounds rounding to one strip's magnitude. DP4A accumulates int32 per strip then scales in FP32 — exact for all tested data.
 - Shared memory is used only for tile accumulators (16x16 floats or halves); all operand/scale data lives in the mmap'd regions registered with `hipHostRegister`.
 
-### Phase 3: KV Cache & Attention (~3 weeks) — IN PROGRESS
+### Phase 3: KV Cache & Attention (~3 weeks) — COMPLETED
 
 **Goal**: Implement self-attention with FP4-computed Q/K/V projections, FP16-stored KV cache, and RoPE position encoding -- all zero-copy through unified memory mappings.
 
@@ -249,20 +249,16 @@ Every individual component below is built as a standalone zero-copy binary + ver
 | RMSNorm | `layernorm.hip`, `layernorm_verify.cpp` | 5 shapes incl. embd=4096, one wavefront block/row + shfl butterfly reduce | PASS |
 | RoPE (rotate-half) | `rope_embedding.hip`, `rope_verify.cpp` | 3 shapes from host-built FP32 cos/sin tables, in-place-safe pair reads | near-bit-exact PASS |
 | Masked softmax | `softmax_masked.hip`, `softmax_verify.cpp` | plain / causal (qpos ceiling) / decode partial-KV bound; scale folded pass-1; −inf row guard; exact mask checks | PASS |
-| FP16 act × Codebook10 weight GEMM (NEW) | `gemm_act_fp4.hip`, `actfp4_verify.cpp`; new `encode_code()` in `fp4_common.h` | {16×16×16, 33×17×32, 96×80×256}; LDS-LUT dequant of packed nibbles + UE4M3 per-16 scales at compute time; wOK N-edge guard | PASS |
-| KV store kernel | `kv_cache_store.hip` | batch roped-K/raw-V rows → cache slots via grid-stride copy; dst = region base + pos_start | built into integration test |
+| FP16 act × Codebook10 weight GEMM | `gemm_act_fp4.hip`, `actfp4_verify.cpp`; new `encode_code()` in `fp4_common.h` | {16×16×16, 33×17×32, 96×80×256}; LDS-LUT dequant of packed nibbles + UE4M3 per-16 scales at compute time; wOK N-edge guard | PASS |
+| KV store kernel | `kv_cache_store.hip` | batch roped-K/raw-V rows → cache slots via grid-stride copy; dst = region base + pos_start | PASS |
+| **Full attention block integration** | `attn_verify.cpp` (+ `kv_cache.cpp`) | GQA cfg embd=32 hd=8 hq=4 hkv=2, prefill pos 0..3 + decode at pos 4; single pinned mapping + KV cache file; CPU ref with matching fp16 rounding points | **PASS** |
 
 New toolchain findings baked into code (documented for Phase 4+):
 - `__shfl_xor_sync` requires **64-bit active masks** (`0xFFFFFFFFFFFFFFFFull`) under `-Xarch_device -mno-wavefrontsize64`; 32-bit masks silently misbehave (probe: 496/496 lanes OK with the fix).
 - `hipModuleLaunchKernel` copies from every entry of the args table — a NULL entry SIGSEGVs. All launchers must pass addresses of real variables.
 - Canonical FP4 packing is now shared: `encode_code()` (inverse of `dequant_code`; magnitude index into {0,1,2,3,4,6,8,10}, bit 3 = sign) and `packed_nibble()` (byte k/2, even→low nibble) in `fp4_common.h`. Two's-complement masking for signs is wrong (-3 & 0x0F = 13 decodes to −6); host test generators previously hit both this and pack-order bugs before passing.
 
-**Open issue — full-block integration harness (`attn_verify.cpp`, not yet committed):** builds and runs but FAILS at the projection stage. One pinned mapping holds all activations/weights/tables; second file for the KV cache; CPU reference mirrors GPU math with identical fp16 rounding points; GQA cfg embd=32 hd=8 hq=4 hkv=2, prefill pos 0..3 + decode at pos 4. Symptoms after per-step sample dumps:
-- Prefill: RMSNorm output matches ref exactly on all rows ✓, but proj-q/k/v C-matrices are wrong (finite garbage, e.g. q[0][0]: gpu=−96 vs ref −23.3; some cells −0), and an inf appears somewhere downstream; KV-store comparison fails 128/128.
-- Decode: RMSNorm row at S=4 reads back **all zeros** on GPU (correct pattern reproduced at S=0), so either that launch didn't run or a later kernel overwrote it; downstream buffers zero/garbage.
-- Key paradox: `actfp4_verify` passes standalone with the same kernel + same generator code, so the failure is context-dependent inside `attn_verify` (multiple `.co` modules loaded, cumulative buffer offsets, or launch-arg mistakes). Under active debugging — next suspects: kv_store/rope launch arg addresses, buffer-overlap in the cumulative offset layout, head-slice pointer math.
-
-Makefile: new targets `kv_verify gemm_verify actfp4_verify layernorm_verify rope_verify softmax_verify attn_verify` added to `all`/`clean`; binaries gitignored. Untracked until integration passes: `gemm_act_fp4.hip`, `kv_cache_store.hip`, `actfp4_verify.cpp`, `attn_verify.cpp` (+ `encode_code` in `fp4_common.h`) — intended as the second Phase-3 commit.
+Makefile: new targets `kv_verify gemm_verify actfp4_verify layernorm_verify rope_verify softmax_verify attn_verify` added to `all`/`clean`; binaries gitignored. All Phase 3 files now tracked and committed.
 
 ### Phase 4: Model Architecture Integration (~3 weeks)
 
