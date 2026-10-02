@@ -227,10 +227,174 @@ struct QwenModel {
         }
     }
 
-    // Skeleton forward - minimal to compile
+    // Complete forward pass for one token
     int forward(int token_id, int pos, float* logits_out) {
-        (void)token_id; (void)pos; (void)logits_out;
-        // TODO: Implement full forward pass
+        const int E = n_embd, HD = head_dim, HQ = n_head, HKV = n_head_kv, CTX = n_ctx;
+        const int DQ = HQ * HD, DKV = HKV * HD, GRP = HQ / HKV;
+        const float scale = 1.0f / sqrtf((float)HD);
+        // Local copies for kernel args (avoid rvalue address issues)
+        int one = 1;
+        int E_local = E, DQ_local = DQ, DKV_local = DKV, CTX_local = CTX, pos_local = pos;
+        int vocab_local = vocab_size;
+        float eps_f = (float)eng_model->eps;
+
+        // ---- 1) Embedding lookup ----
+        int32_t tid = token_id;
+        void* emb_args[] = { &tid, &eng_model->d_embed_table, &layer_scratch[0].d_h,
+                            &one, &E_local, &vocab_local };
+        hipModuleLaunchKernel(fn_embedding, 1, 1, 1, 256, 1, 1, 0, 0, emb_args, nullptr);
+        hipDeviceSynchronize();
+
+        // Residual starts as embedding output
+        __half* residual = layer_scratch[0].h;
+
+        // ---- 2) Decoder layers ----
+        for (int l = 0; l < n_layer; ++l) {
+            LayerScratch& s = layer_scratch[l];
+            inference_model::LayerWeights& L = eng_model->layers[l];
+
+            // --- a) RMSNorm (attention) ---
+            void* ln_args[] = {
+                &residual, &L.d_attn_ln, &s.d_h,
+                &E_local, &E_local, &eps_f
+            };
+            hipModuleLaunchKernel(fn_layernorm, E, 1, 1, 32, 1, 1, 0, 0, ln_args, nullptr);
+            hipDeviceSynchronize();
+
+            // --- b) Q/K/V Projections (gemm_act_fp4, M=1) ---
+            // Q: [1 x DQ] = h[1 x E] @ Wq^T
+            void* g4_args[] = { &s.d_h, &L.Wq.d_packed, &L.Wq.d_scales, &s.d_q,
+                               &one, &DQ_local, &E_local };
+            hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DQ+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
+            // K: [1 x DKV] = h[1 x E] @ Wk^T
+            g4_args[1] = &L.Wk.d_packed; g4_args[2] = &L.Wk.d_scales; g4_args[3] = &s.d_k; g4_args[5] = &DKV_local;
+            hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DKV+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
+            // V: [1 x DKV] = h[1 x E] @ Wv^T
+            g4_args[1] = &L.Wv.d_packed; g4_args[2] = &L.Wv.d_scales; g4_args[3] = &s.d_v; g4_args[5] = &DKV_local;
+            hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DKV+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
+            hipDeviceSynchronize();
+
+            // --- c) Per-head staging (FP32 -> FP16) ---
+            for (int h = 0; h < HQ; ++h)
+                for (int d = 0; d < HD; ++d)
+                    s.qh[h*HD + d] = __float2half(s.q_fp32[h*HD + d]);
+            for (int h = 0; h < HKV; ++h)
+                for (int d = 0; d < HD; ++d)
+                    s.kh[h*HD + d] = __float2half(s.k_fp32[h*HD + d]);
+            hipHostGetDevicePointer(&s.d_qh, s.qh, 0);
+            hipHostGetDevicePointer(&s.d_kh, s.kh, 0);
+
+            // --- d) RoPE on Q/K ---
+            build_rope_tables(pos, s);
+            int HQ_local = HQ, HD2_local = HD/2;
+            void* rope_args[] = { &s.d_qh, &s.d_rc, &s.d_rs, &s.d_qh, &HQ_local, &HD2_local };
+            hipModuleLaunchKernel(fn_rope, HQ, 1, 1, 32, 1, 1, 0, 0, rope_args, nullptr);
+            hipModuleLaunchKernel(fn_rope, HKV, 1, 1, 32, 1, 1, 0, 0, rope_args, nullptr);
+            hipDeviceSynchronize();
+
+            // --- e) KV Store ---
+            // Flatten roped K from per-head to token-major rks
+            for (int h = 0; h < HKV; ++h)
+                for (int d = 0; d < HD; ++d)
+                    s.rks[h*HD + d] = s.kh[h*HD + d];
+            hipHostGetDevicePointer(&s.d_rks, s.rks, 0);
+
+            __half* kdst_base = kv_cache_k_row(eng_model->kvc, l, 0);
+            __half* vdst_base = kv_cache_v_row(eng_model->kvc, l, 0);
+            int pos_local = pos, CTX_local2 = CTX;
+            void* kvs_args[] = { &s.d_rks, &s.d_v, &kdst_base, &vdst_base,
+                                &one, &DKV_local, &pos_local, &CTX_local2 };
+            hipModuleLaunchKernel(fn_kv_store, 8, 1, 1, 32, 1, 1, 0, 0, kvs_args, nullptr);
+            hipDeviceSynchronize();
+
+// --- f) Attention per head ---
+            const __half* kc = kv_cache_k_row_const(eng_model->kvc, l, 0);
+            const __half* vc = kv_cache_v_row_const(eng_model->kvc, l, 0);
+            int CTX_local3 = CTX, HD_local = HD, qpos_local = pos, pos1_local = pos + 1;
+            for (int h = 0; h < HQ; ++h) {
+                int kh_ = h / GRP;
+
+                // Build kexpB [HD x CTX] and vexpB [CTX x HD]
+                for (int d = 0; d < HD; ++d)
+                    for (int p = 0; p <= pos; ++p)
+                        s.kh[d*CTX + p] = kc[p*DKV + kh_*HD + d];
+                for (int p = 0; p <= pos; ++p)
+                    for (int d = 0; d < HD; ++d)
+                        s.vexpB[p*HD + d] = vc[p*DKV + kh_*HD + d];
+
+                // Scores: [1 x CTX] = qh[h] @ kexpB^T
+                void* gemm_args[] = {
+                    (void*)((char*)s.d_qh + h*HD*sizeof(__half)), &s.d_vb2, &s.d_sc,
+                    &one, &CTX_local3, &HD_local };
+                hipModuleLaunchKernel(fn_fp16_gemm, 1, (CTX+15)/16, 1, 32, 1, 1, 0, 0, gemm_args, nullptr);
+
+                // Softmax (causal)
+                int qpos = pos;
+                void* sm_args[] = { &s.d_sc, &one, &CTX_local3, (void*)&scale,
+                                   &qpos_local, &pos1_local };
+                hipModuleLaunchKernel(fn_softmax, 1, 1, 1, 32, 1, 1, 0, 0, sm_args, nullptr);
+                hipDeviceSynchronize();
+
+                // Probs to FP16
+                for (int p = 0; p <= pos; ++p)
+                    s.probs_fp16[p] = __float2half(s.scores[p]);
+
+                // Out: [1 x HD] = probs @ vexpB
+                void* gemm2_args[] = { s.d_pf, s.d_vb2, (void*)((char*)s.d_oh + h*HD*sizeof(float)),
+                                       &one, &HD_local, &CTX_local3 };
+                hipModuleLaunchKernel(fn_fp16_gemm, 1, (HD+15)/16, 1, 32, 1, 1, 0, 0, gemm2_args, nullptr);
+            }
+            hipDeviceSynchronize();
+
+            // --- g) Flatten heads -> oin (FP16) ---
+            for (int h = 0; h < HQ; ++h)
+                for (int d = 0; d < HD; ++d)
+                    s.oin[h*HD + d] = __float2half(s.oh[h*HD + d]);
+            hipHostGetDevicePointer(&s.d_oin, s.oin, 0);
+
+            // --- h) O-Projection ---
+            void* o_args[] = { &s.d_oin, &L.Wo.d_packed, &L.Wo.d_scales, &s.d_down,
+                              &one, &E_local, &DQ_local };
+            hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (E+15)/16, 1, 32, 1, 1, 0, 0, o_args, nullptr);
+            hipDeviceSynchronize();
+
+            // --- i) Residual add (attention output) ---
+            for (int i = 0; i < E; ++i)
+                residual[i] = __float2half(__half2float(residual[i]) + s.down_fp32[i]);
+
+            // --- j) RMSNorm (MLP) ---
+            void* ln2_args[] = { &residual, &L.d_mlp_ln, &s.d_hmlp,
+                                &E_local, &E_local, (void*)&eng_model->eps };
+            hipModuleLaunchKernel(fn_layernorm, E, 1, 1, 32, 1, 1, 0, 0, ln2_args, nullptr);
+            hipDeviceSynchronize();
+
+            // --- k) SwiGLU (gate/up/down) ---
+            void* swiglu_args[] = { &s.d_hmlp,
+                                   &L.Wgate.d_packed, &L.Wgate.d_scales,
+                                   &L.Wup.d_packed, &L.Wup.d_scales,
+                                   &s.d_down,
+                                   &one, &E_local, &E_local };
+            hipModuleLaunchKernel(fn_swiglu, 1, (E+15)/16, 1, 32, 1, 1, 0, 0, swiglu_args, nullptr);
+            hipDeviceSynchronize();
+
+            // --- l) Residual add (MLP output) ---
+            for (int i = 0; i < E; ++i)
+                residual[i] = __float2half(__half2float(residual[i]) + s.down_fp32[i]);
+        }
+
+        // ---- 3) Final LayerNorm ----
+        void* lnf_args[] = { &residual, &eng_model->d_final_ln, &layer_scratch[0].d_h,
+                            &E_local, &E_local, (void*)&eng_model->eps };
+        hipModuleLaunchKernel(fn_layernorm, E, 1, 1, 32, 1, 1, 0, 0, lnf_args, nullptr);
+        hipDeviceSynchronize();
+
+        // ---- 4) LM Head (gemm_act_fp4, M=1, N=vocab_size) ----
+        void* lm_args[] = { &layer_scratch[0].d_h, &eng_model->d_lm_head_packed,
+                           &eng_model->d_lm_head_scales, logits_out,
+                           &one, &vocab_local, &E_local };
+        hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (vocab_size+15)/16, 1, 32, 1, 1, 0, 0, lm_args, nullptr);
+        hipDeviceSynchronize();
+
         return 0;
     }
 };
