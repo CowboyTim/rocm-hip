@@ -70,13 +70,18 @@ SOFTMAX_VERIFY   = softmax_verify
 # Phase 4: Model architecture kernels
 SWIGLU_CO        = swiglu.co
 EMBEDDING_CO     = embedding_lookup.co
+QWEN_MODEL_CO    = qwen_model.co
 
 # Phase 4: Inference engine library and demo
 INFERENCE_LIB    = libinference.a
 INFERENCE_DEMO   = inference_demo
 
+# Phase 4: Qwen 3 model library and demo
+QWEN_MODEL_LIB   = libqwen.a
+QWEN_DEMO        = qwen_demo
+
 # --- Build Rules ---
-all: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET) $(DEMO_GGUF) $(FP4_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO)
+all: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET) $(DEMO_GGUF) $(FP4_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO)
 
 $(TARGET): $(OBJ) $(KERNEL_CO)
 	$(CLANG) $(OBJ) $(LDFLAGS) -o $@
@@ -169,10 +174,23 @@ $(INFERENCE_LIB): inference.cpp inference.h gguf_mmap.cpp gguf_mmap.h kv_cache.c
 $(INFERENCE_DEMO): inference.cpp inference.h demo_inference.cpp
 	$(CLANG) $(CXXFLAGS) -I. inference.cpp gguf_mmap.cpp kv_cache.cpp demo_inference.cpp $(LDFLAGS) -o $@
 
+# Phase 4: Qwen 3 model kernel (.co for runtime loading)
+$(QWEN_MODEL_CO): qwen_model.hip
+	$(HIPCC) $(HIPFLAGS) -c $< -o $@
+
+# Phase 4: Qwen 3 model static library
+$(QWEN_MODEL_LIB): qwen_model.cpp qwen_model.h inference.h gguf_mmap.h kv_cache.h
+	$(CLANG) $(CXXFLAGS) -I. -fPIC -c qwen_model.cpp -o qwen_model.o
+	ar rcs $@ qwen_model.o
+
+# Phase 4: Qwen 3 demo binary
+$(QWEN_DEMO): qwen_model.cpp qwen_model.h inference.cpp gguf_mmap.cpp kv_cache.cpp demo_qwen.cpp
+	$(CLANG) $(CXXFLAGS) -I. qwen_model.cpp inference.cpp gguf_mmap.cpp kv_cache.cpp demo_qwen.cpp $(LDFLAGS) -o $@
+
 # Build all demos and benchmark
 both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)
 
 clean:
-	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_native.co wmma_bench_fp4_dp4a_hardware.co $(BENCH_LUT_CO) $(DEMO_GGUF) $(FP4_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(INFERENCE_LIB) $(INFERENCE_DEMO) *.co *.o
+	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_native.co wmma_bench_fp4_dp4a_hardware.co $(BENCH_LUT_CO) $(DEMO_GGUF) $(FP4_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO) $(INFERENCE_LIB) $(INFERENCE_DEMO) $(QWEN_MODEL_LIB) $(QWEN_DEMO) *.co *.o
 
 .PHONY: all clean both
