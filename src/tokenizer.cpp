@@ -18,6 +18,10 @@ struct Tokenizer {
     std::unordered_map<std::string, int> vocab_map; // token string -> id
     std::vector<std::pair<std::string,std::string>> merges; // ordered merges
     std::unordered_map<std::string, int> merge_rank; // "a b" -> rank (lower = earlier)
+    int bos_id = -1;
+    int eos_id = -1;
+    int pad_id = -1;
+    int unk_id = -1;
 };
 
 extern "C" {
@@ -144,6 +148,26 @@ int tokenizer_decode(tokenizer_t* tok, const int* ids, int n_ids, char* out_str,
 size_t tokenizer_vocab_size(tokenizer_t* tok) {
     Tokenizer* t = (Tokenizer*)tok;
     return t ? t->vocab.size() : 0;
+}
+
+int tokenizer_bos_id(tokenizer_t* tok) {
+    Tokenizer* t = (Tokenizer*)tok;
+    return t ? t->bos_id : -1;
+}
+
+int tokenizer_eos_id(tokenizer_t* tok) {
+    Tokenizer* t = (Tokenizer*)tok;
+    return t ? t->eos_id : -1;
+}
+
+int tokenizer_pad_id(tokenizer_t* tok) {
+    Tokenizer* t = (Tokenizer*)tok;
+    return t ? t->pad_id : -1;
+}
+
+int tokenizer_unk_id(tokenizer_t* tok) {
+    Tokenizer* t = (Tokenizer*)tok;
+    return t ? t->unk_id : -1;
 }
 
 // Load tokenizer from GGUF model metadata (vocab, merges, added_tokens)

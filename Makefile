@@ -71,6 +71,9 @@ SOFTMAX_VERIFY   = $(BINDIR)/softmax_verify
 # Phase 3: FP16 activation x Codebook10-FP4 weight GEMM verification (the projection path)
 ACTFP4_VERIFY    = $(BINDIR)/actfp4_verify
 
+# Phase 9: Tokenizer verification
+TOKENIZER_VERIFY = $(BINDIR)/tokenizer_verify
+
 # Phase 3: end-to-end attention block integration test (chains every Phase-3 kernel)
 ATTN_VERIFY      = $(BINDIR)/attn_verify
 
@@ -88,7 +91,7 @@ QWEN_MODEL_LIB   = $(BUILDDIR)/libqwen.a
 QWEN_DEMO        = $(BINDIR)/qwen_demo
 
 # --- Build Rules ---
-all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO) $(INFERENCE_LIB) $(QWEN_MODEL_LIB) $(QWEN_DEMO)
+all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO) $(INFERENCE_LIB) $(QWEN_MODEL_LIB) $(QWEN_DEMO)
 
 $(WMMA_TARGET): $(WMMA_OBJ) $(WMMA_CO)
 	$(CLANG) $(WMMA_OBJ) $(LDFLAGS) -o $@
@@ -157,6 +160,10 @@ $(SOFTMAX_VERIFY): $(TESTSDIR)/softmax_verify.cpp $(CODIR)/softmax_masked.co
 $(ACTFP4_VERIFY): $(TESTSDIR)/actfp4_verify.cpp $(CODIR)/gemm_act_fp4.co
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/actfp4_verify.cpp $(LDFLAGS) -o $@
 
+# Phase 9 verify: Tokenizer BPE encode/decode round‑trip
+$(TOKENIZER_VERIFY): $(TESTSDIR)/tokenizer_verify.cpp $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/tokenizer_verify.cpp $(INFERENCE_LIB) $(LDFLAGS) -o $@
+
 # Phase 3 verify: full attention block chain; loads layernorm/gemm_act_fp4/rope_embedding/kv_cache_store/fp16_gemm/softmax_masked .co files
 $(ATTN_VERIFY): $(TESTSDIR)/attn_verify.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/kv_cache.h $(CODIR)/kv_cache_store.co $(CODIR)/gemm_act_fp4.co $(CODIR)/fp16_gemm.co $(CODIR)/layernorm.co $(CODIR)/rope_embedding.co $(CODIR)/softmax_masked.co
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/attn_verify.cpp $(SRCDIR)/kv_cache.cpp $(LDFLAGS) -o $@
@@ -198,4 +205,6 @@ both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BE
 clean:
 	rm -rf $(BUILDDIR)
 
-.PHONY: all clean both
+.PHONY: all clean both tokenizer_verify
+
+tokenizer_verify: $(TOKENIZER_VERIFY)

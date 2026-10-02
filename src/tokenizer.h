@@ -36,6 +36,12 @@ int tokenizer_decode(tokenizer_t* tok, const int* ids, int n_ids, char* out_str,
 // Get vocab size
 size_t tokenizer_vocab_size(tokenizer_t* tok);
 
+// Get special token IDs (return -1 if not set)
+int tokenizer_bos_id(tokenizer_t* tok);
+int tokenizer_eos_id(tokenizer_t* tok);
+int tokenizer_pad_id(tokenizer_t* tok);
+int tokenizer_unk_id(tokenizer_t* tok);
+
 #ifdef __cplusplus
 }
 #endif
