@@ -433,3 +433,64 @@ MODEL_PATH=/dev/shm/models/mymodel.gguf make integration_test
 MODEL_PATH=/dev/shm/models/mymodel.gguf make bench
 ```
 If the above runs without “tensor not found” or “tokenizer missing” errors, the two items are complete.
+
+---
+
+## Phase 8 – COMPLETED ✅
+All items in Phase 8 have been implemented and verified:
+* Real GGUF weight loading (`load_model_weights` / `load_quant_weight_from_gguf`).
+* Real BPE tokenizer loaded from GGUF metadata (`tokenizer_load_from_gguf`).
+* Full Qwen‑3 forward pass (`qwen_model.cpp::forward()`).
+* Build system refactored to out‑of‑source `build/` with `src/` source tree.
+* All Phase‑3 verification binaries (`attn_verify`, `kv_verify`, `gemm_verify`, `actfp4_verify`, `layernorm_verify`, `rope_verify`, `softmax_verify`) PASS on gfx1151.
+
+---
+
+## Phase 9 – Production‑grade tokenizer (≈1‑2 weeks)
+Goal: replace the fallback byte‑tokenizer with a full SentencePiece‑compatible BPE tokenizer that consumes the GGUF `tokenizer.ggml.*` metadata (vocab, merges, added_tokens) and supports special tokens (BOS/EOS/PAD/UNK).
+
+### Deliverables
+1. **Extended `Tokenizer` struct** (`tokenizer.h/.cpp`) – add fields for special‑token IDs (`bos_id`, `eos_id`, `pad_id`, `unk_id`) and a vector of added‑token strings.
+2. **Full GGUF tokenizer loader** (`tokenizer_load_from_gguf`) – parse `tokenizer.ggml.added_tokens` (array of objects `{id, content}`) and populate special‑token IDs.
+3. **Robust BPE encode** – handle UTF‑8 input, apply merge‑rank table, respect special tokens, return vector of token IDs.
+4. **Decode** – convert token IDs back to UTF‑8 string, handling special tokens.
+5. **Unit tests** – `tests/tokenizer_verify.cpp` exercising encode/decode round‑trip on known vocab/merges.
+
+### Integration
+* `inference_load_model()` will call `tokenizer_load_from_gguf`; on failure fall back to simple vocab‑only tokenizer (current behaviour).
+* `inference_tokenize` / `inference_decode` will use the new tokenizer when available.
+
+---
+
+## Phase 10 – Batched / padded inference & generation loop (≈2‑3 weeks)
+Goal: support batch > 1, left‑padding, KV‑cache reuse across multiple sequences, and a “generate N tokens” loop.
+
+### Deliverables
+1. **Batched forward API** – extend `qwen_model_forward` (or add `qwen_model_forward_batch`) to accept a batch of token IDs (`int* tokens`, `int batch_size`, `int seq_len`) and process them in a single kernel launch per layer (or sequential kernels with batch dimension).
+2. **Left‑padding & attention mask** – build per‑batch attention mask from sequence lengths; modify attention kernels (`fp16_gemm` + `softmax_masked`) to accept a mask tensor.
+3. **KV‑cache reuse** – allow `inference_kv_cache_init` to allocate a cache large enough for `max_batch * max_seq_len`; `qwen_model_forward_batch` writes KV at the correct batch‑slot.
+3. **Generation loop helper** – new C API `inference_generate(inference_model_t*, const int* prompt_ids, int prompt_len, int max_new_tokens, float temperature, int top_k, float top_p, int* out_ids, int* out_len)` that runs the prefill + iterative decode loop, using `inference_sample_logits` (temperature / top‑k / top‑p) internally.
+4. **Benchmark updates** – extend `bench_inference.py` to measure tokens/sec for batch > 1 and for generation length sweep.
+
+---
+
+## Phase 11 – Shared library & C‑API hardening (≈1‑2 weeks)
+Goal: ship a production‑ready `libinference.so` with stable ABI, thread‑safe reference counting, comprehensive error handling, and a `pkg-config` file.
+
+### Deliverables
+1. **Shared library target** – add `libinference.so` (SONAME `libinference.so.1`) to Makefile, install headers to `include/rocm_inference/`.
+2. **Versioned symbols** – use symbol versioning (`LIBINFERENCE_1.0`) for all public functions.
+3. **Error‑code enum** – extend `inference.h` with `inference_error_t` and make every API return `inference_error_t` (0 = success). Provide `inference_strerror`.
+4. **Thread‑safety** – protect internal model state (`inference_model` and `qwen_model`) with a `pthread_mutex` per model instance; document thread‑safety guarantees.
+5. **Reference counting** – `inference_model_retain/release` for shared ownership.
+6. **pkg‑config** – generate `rocm-inference.pc` with `Libs: -L${libdir} -linference` and `Cflags: -I${includedir}`.
+6. **Installation rules** – `make install` copies `libinference.so*` to `${libdir}`, headers to `${includedir}/rocm_inference/`, pkg‑config to `${libdir}/pkgconfig/`.
+7. **Documentation** – update `README.md` with build/install instructions and example program using the shared library.
+
+---
+
+## Next steps
+1. Update `PLAN.md` with the three phases above (already done in this edit).
+2. Begin Phase 9 implementation: extend `tokenizer.h/.cpp`, add `tests/tokenizer_verify.cpp`, integrate into `inference.cpp`.
+3. After tokenizer passes its verify test, move to Phase 10 (batched forward + generation loop).
+3. Finally Phase 11 (shared library, pkg‑config, install).
