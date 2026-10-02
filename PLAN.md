@@ -375,3 +375,61 @@ The inference engine described here is standalone but designed to coexist with o
 - Weight layout compatibility: our FP4 matmul kernel reads the exact same block structure (16 bytes data + 2 bytes scale per 32 values) that llama.cpp uses. This means models quantized with llama.cpp's `llama-quant` tool can be loaded directly by our engine without any conversion step.
 
 - Future path: once the standalone engine is validated, the kernels can be integrated back into the llama.cpp CUDA backend as a gfx1151-specific implementation layer, reusing the existing GGUF loading infrastructure while providing optimized zero-copy paths for Strix Halo's UMA architecture.
+
+## Phase 8: Production hardening – real GGUF weight & tokenizer loading
+
+The engine currently uses placeholder weight loading and a byte-fallback tokenizer.  
+The next engineering step is to load **real Qwen-3-7B weights** and a **real BPE tokenizer** from the same GGUF file that lives in the shared-memory directory:
+
+```
+/dev/shm/models/mymodel.gguf
+```
+
+All work stays in the existing zero-copy / UMA stack – no llama.cpp, no CUDA, no separate VRAM.
+
+### 1. Real GGUF weight loading
+| Step | Action |
+|------|--------|
+| 1.1  | Enumerate every tensor in the mmap (`gguf_n_tensors`, `gguf_tensor_name`) and build a `name → tensor_meta*` index. |
+| 1.2  | Define the expected tensor-name patterns for Qwen-3 (llama.cpp naming): `blk.{i}.attn_q.weight/.scales`, `blk.{i}.attn_k…`, `blk.{i}.attn_v…`, `blk.{i}.attn_o…`, `blk.{i}.ffn_gate…`, `blk.{i}.ffn_up…`, `blk.{i}.ffn_down…`, `blk.{i}.attn_norm.weight`, `blk.{i}.ffn_norm.weight`, `token_embd.weight`, `output.weight/.scales`, `output_norm.weight`. |
+| 1.3  | Implement real `load_quant_weight(gguf, name, QuantWeight&)` that pulls the `.weight` and `.scales` blobs via `gguf_get_tensor_ptr`, derives `N, K` from the tensor metadata, and fills the `QuantWeight` (packed bytes, scales, and a CPU-side `true_v` de-quant copy for reference). |
+| 1.4  | Loop over all layers (`n_layer`) and fill every `LayerWeights` field using the patterns above; also load `token_embd.weight`, `output.weight/.scales`, `output_norm.weight`, and the two norm-scale vectors. |
+| 1.5  | Existing `pin_model_memory()` already walks the model struct and calls `hipHostRegister` on every packed/scales buffer – now they contain real data. |
+| 1.6  | `inference_free_model()` already unmaps the GGUF and releases host vectors – no extra work. |
+
+### 2. Real BPE tokenizer from the same GGUF
+| Step | Action |
+|------|--------|
+| 2.1  | Read tokenizer metadata from the same `gguf_model_t` via the existing `gguf_kv_*` API: `tokenizer.ggml.model`, `tokenizer.ggml.tokens` (vocab array), `tokenizer.ggml.merges` (merge rules), `tokenizer.ggml.added_tokens` (special tokens). |
+| 2.2  | Build `vocab_map[string] → id` preserving order (id = position in `tokens` array). |
+| 2.3  | Build `merge_rank["a b"] = index` by walking the `merges` array in file order (first = highest priority). |
+| 2.4  | Register special tokens (BOS/EOS/PAD/UNK) from `added_tokens` if present. |
+| 2.5  | Hook into `inference_load_model()`: after weight loading call `load_tokenizer_from_gguf(m->gguf, &m->tokenizer)`. |
+| 2.6  | Existing `tokenizer_encode / tokenizer_decode` already implement BPE using the `merge_rank` table and `vocab_map`; no algorithm change required. |
+| 2.7  | `inference_free_model()` already calls `tokenizer_free()`. |
+
+### Integration checklist
+- All weight tensors read from the mmap-backed GGUF (`/dev/shm/models/mymodel.gguf`).
+- No `hipMemcpy`; kernels still read packed bytes directly from pinned mmap pages.
+- Tokenizer built from the same GGUF (no external `.model`/`.vocab` files).
+- No CUDA, no llama.cpp, no VRAM concept – everything stays in the 128 GB UMA.
+- Existing Phase‑3 tests (`attn_verify`, `kv_verify`, …) still pass.
+
+### Minimal new source changes
+| File | New / modified symbols |
+|------|------------------------|
+| `inference.cpp` | `build_tensor_index()`, real `load_quant_weight()`, layer-weight population loop, call `load_tokenizer_from_gguf()`. |
+| `tokenizer.cpp` | `load_tokenizer_from_gguf(gguf_model_t*, Tokenizer*)` – reads vocab, merges, added_tokens. |
+| `tokenizer.h` | (optional) add `added_tokens` fields to `Tokenizer` if special-token handling desired. |
+| `gguf_mmap.h/.cpp` | No API change – only used through existing `gguf_get_tensor_ptr` / `gguf_kv_*` helpers. |
+
+All other files (`qwen_model.cpp`, kernels, Makefile) stay untouched.
+
+### Quick test
+```bash
+cp /path/to/qwen3-7b.gguf /dev/shm/models/mymodel.gguf
+make clean && make -j$(nproc)
+MODEL_PATH=/dev/shm/models/mymodel.gguf make integration_test
+MODEL_PATH=/dev/shm/models/mymodel.gguf make bench
+```
+If the above runs without “tensor not found” or “tokenizer missing” errors, the two items are complete.
