@@ -14,12 +14,6 @@ HIPFLAGS  := -Xarch_device -mno-wavefrontsize64 -isystem $(ROCM_PATH)/include --
 LDFLAGS   := -L$(ROCM_PATH)/lib -lamdhip64 -lhsa-runtime64 -Wl,-rpath,$(ROCM_PATH)/lib
 
 # --- Demos ---
-# Mandelbrot: loads pre-compiled .co module with hipModuleLoadData
-TARGET    := mandelbrot
-KERNEL_SRC = kernels.hip
-KERNEL_CO  = kernels.co
-OBJ        = main.o
-
 # WMMA matmul (FP16): uses hipModuleLoadData + mmap zero-copy
 WMMA_SRC  = wmma_kernel.hip
 WMMA_CO   = wmma_kernel.co
@@ -81,19 +75,16 @@ QWEN_MODEL_LIB   = libqwen.a
 QWEN_DEMO        = qwen_demo
 
 # --- Build Rules ---
-all: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET) $(DEMO_GGUF) $(FP4_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO)
-
-$(TARGET): $(OBJ) $(KERNEL_CO)
-	$(CLANG) $(OBJ) $(LDFLAGS) -o $@
+all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO)
 
 $(WMMA_TARGET): $(WMMA_OBJ) $(WMMA_CO)
 	$(CLANG) $(WMMA_OBJ) $(LDFLAGS) -o $@
 
-$(WMMA_FP4_TARGET): $(WMMA_FP4_OBJ) $(WMMA_FP4_CO)
-	$(CLANG) $(WMMA_FP4_OBJ) $(LDFLAGS) -o $@
-
-$(WMMA_FP4_NATIVE_TARGET): $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO)
-	$(CLANG) $(WMMA_FP4_NATIVE_OBJ) $(LDFLAGS) -o $@
+# $(WMMA_FP4_TARGET): $(WMMA_FP4_OBJ) $(WMMA_FP4_CO)
+# 	$(CLANG) $(WMMA_FP4_OBJ) $(LDFLAGS) -o $@
+#
+# $(WMMA_FP4_NATIVE_TARGET): $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO)
+# 	$(CLANG) $(WMMA_FP4_NATIVE_OBJ) $(LDFLAGS) -o $@
 
 # Pre-compiled kernel objects (.hip -> .co)
 %.co: %.hip
@@ -195,7 +186,7 @@ BENCH_SCRIPT = bench_inference.py
 INTEGRATION_TEST = integration_test
 
 # --- Build Rules ---
-all: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET) $(DEMO_GGUF) $(FP4_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO)
+all: $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO)
 
 # Copy benchmark script to build directory (so it's alongside binaries)
 $(BENCH_SCRIPT): bench_inference.py

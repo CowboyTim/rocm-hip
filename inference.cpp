@@ -264,7 +264,107 @@ static std::vector<int> simple_tokenize(inference_model* m, const char* text) {
     return tokens;
 }
 
-// Forward pass for a single token at position `pos` (0-indexed in sequence)
+// Helper: find tensor index by name
+static int find_tensor_index(gguf_model_t* gguf, const char* name) {
+    int64_t n = gguf_n_tensors(gguf);
+    for (int64_t i = 0; i < n; ++i) {
+        const char* tn = gguf_tensor_name(gguf, i);
+        if (tn && strcmp(tn, name) == 0) return (int)i;
+    }
+    return -1;
+}
+
+// Load a quantized weight matrix (packed + scales) from GGUF by weight and scales tensor names
+static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_name, const char* scales_name, QuantWeight& w) {
+    size_t w_sz, s_sz;
+    const void* w_ptr = gguf_get_tensor_ptr(gguf, weight_name, &w_sz);
+    const void* s_ptr = gguf_get_tensor_ptr(gguf, scales_name, &s_sz);
+    if (!w_ptr || !s_ptr) {
+        fprintf(stderr, "Missing tensor %s or %s\n", weight_name, scales_name);
+        return false;
+    }
+    // Get tensor metadata for shape
+    int idx = find_tensor_index(gguf, weight_name);
+    if (idx < 0) {
+        fprintf(stderr, "Weight tensor %s not found in index\n", weight_name);
+        return false;
+    }
+    // Get dimensions: assume 2D [out_dim, in_dim]
+    int64_t* ne = gguf_tensor_ne(gguf, idx);
+    if (!ne) return false;
+    int64_t out_dim = ne[0];
+    int64_t in_dim = ne[1];
+    w.N = (int)out_dim;
+    w.K = (int)in_dim;
+    // Copy packed bytes and scales
+    w.packed.assign((const unsigned char*)w_ptr, (const unsigned char*)w_ptr + w_sz);
+    w.scales.assign((const unsigned char*)s_ptr, (const unsigned char*)s_ptr + s_sz);
+    // Build true_v for CPU reference (dequant)
+    w.true_v.resize((size_t)w.N * w.K);
+    const size_t strips = w.K / 16;
+    for (int n = 0; n < w.N; ++n) {
+        for (size_t s = 0; s < strips; ++s) {
+            float sc = ue4m3_to_float(w.scales[(size_t)n * strips + s]);
+            for (int i = 0; i < 16; ++i) {
+                int k = (int)s * 16 + i;
+                uint8_t wb = w.packed[(size_t)n * (w.K / 2) + (k >> 1)];
+                uint8_t nib = (k & 1) ? (wb >> 4) : (wb & 0x0F);
+                float code = dequant_code(nib);
+                w.true_v[(size_t)n * w.K + k] = code * sc;
+            }
+        }
+    }
+    return true;
+}
+
+// Load all model weights from GGUF into the inference_model struct
+static bool load_model_weights(inference_model* m) {
+    const int E = m->n_embd;
+    const int DQ = m->n_head * m->head_dim;
+    const int DKV = m->n_head_kv * m->head_dim;
+    m->layers.resize(m->n_layer);
+    for (int i = 0; i < m->n_layer; ++i) {
+        LayerWeights& L = m->layers[i];
+        char wname[64], sname[64];
+        // Attention Q,K,V,O
+        snprintf(wname, sizeof(wname), "blk.%d.attn_q.weight", i);
+        snprintf(sname, sizeof(sname), "blk.%d.attn_q.scales", i);
+        if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wq)) return false;
+        snprintf(wname, sizeof(wname), "blk.%d.attn_k.weight", i);
+        snprintf(sname, sizeof(sname), "blk.%d.attn_k.scales", i);
+        if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wk)) return false;
+        snprintf(wname, sizeof(wname), "blk.%d.attn_v.weight", i);
+        snprintf(sname, sizeof(sname), "blk.%d.attn_v.scales", i);
+        if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wv)) return false;
+        snprintf(wname, sizeof(wname), "blk.%d.attn_o.weight", i);
+        snprintf(sname, sizeof(sname), "blk.%d.attn_o.scales", i);
+        if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wo)) return false;
+        // MLP gate, up, down
+        snprintf(wname, sizeof(wname), "blk.%d.ffn_gate.weight", i);
+        snprintf(sname, sizeof(sname), "blk.%d.ffn_gate.scales", i);
+        if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.W_gate)) return false;
+        snprintf(wname, sizeof(wname), "blk.%d.ffn_up.weight", i);
+        snprintf(sname, sizeof(sname), "blk.%d.ffn_up.scales", i);
+        if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.W_up)) return false;
+        snprintf(wname, sizeof(wname), "blk.%d.ffn_down.weight", i);
+        snprintf(sname, sizeof(sname), "blk.%d.ffn_down.scales", i);
+        if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.W_down)) return false;
+        // LayerNorm scales
+        size_t ln_sz;
+        const void* ln_ptr = gguf_get_tensor_ptr(m->gguf, 
+            (std::string("blk.") + std::to_string(i) + ".attn_norm.weight").c_str(), &ln_sz);
+        if (ln_ptr && ln_sz == (size_t)m->n_embd * sizeof(__half)) {
+            L.attn_ln_scale.assign((const __half*)ln_ptr, (const __half*)ln_ptr + m->n_embd);
+        }
+        ln_ptr = gguf_get_tensor_ptr(m->gguf,
+            (std::string("blk.") + std::to_string(i) + ".ffn_norm.weight").c_str(), &ln_sz);
+        if (ln_ptr && ln_sz == (size_t)m->n_embd * sizeof(__half)) {
+            L.mlp_ln_scale.assign((const __half*)ln_ptr, (const __half*)ln_ptr + m->n_embd);
+        }
+    }
+    return true;
+}
+
 static int forward_pass(inference_model* m, int token_id, int pos, float* logits_out) {
     ensure_kernels_loaded();
 
@@ -331,20 +431,27 @@ inference_model_t* inference_load_model(const char* gguf_path) {
         m->embed_table.assign((const __half*)emb_ptr, (const __half*)emb_ptr + m->vocab_size * m->n_embd);
     }
 
-    // Load per-layer weights (simplified - real impl iterates GGUF tensor names)
-    m->layers.resize(m->n_layer);
-    for (int i = 0; i < m->n_layer; ++i) {
-        LayerWeights& L = m->layers[i];
-        char prefix[64];
-        // This is a placeholder - real code would query actual tensor names from GGUF
-        // load_quant_weight(m->gguf, "blk.0.attn_q", L.Wq); etc.
+    // Load per-layer weights from GGUF tensors
+    if (!load_model_weights(m)) {
+        set_error("Failed to load model weights");
+        unpin_model_memory(m);
+        delete m;
+        return nullptr;
     }
 
     // Load LM head
-    // load_quant_weight(m->gguf, "output.weight", m->lm_head);
+    if (!load_quant_weight_from_gguf(m->gguf, "output.weight", "output.scales", m->lm_head)) {
+        set_error("Failed to load LM head");
+        unpin_model_memory(m);
+        delete m;
+        return nullptr;
+    }
 
-    // Load final LN
-    // ...
+    // Load final LN scale
+    const void* final_ln_ptr = gguf_get_tensor_ptr(m->gguf, "output_norm.weight", &sz);
+    if (final_ln_ptr && sz == (size_t)m->n_embd * sizeof(__half)) {
+        m->final_ln_scale.assign((const __half*)final_ln_ptr, (const __half*)final_ln_ptr + m->n_embd);
+    }
 
     // Create tokenizer from vocab if available (Phase 5)
     if (!m->vocab_tokens.empty()) {
