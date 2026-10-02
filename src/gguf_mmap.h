@@ -71,6 +71,9 @@ const char  *gguf_kv_str_val(const gguf_model_t *model, int64_t idx);
 int32_t gguf_kv_get_string_array(const gguf_model_t *model, const char* key, const char*** out_strings, size_t* out_count);
 void gguf_free_string_array(const char** strings, size_t count);
 
+/* Get added_tokens array (array of strings) from KV by key. Returns 0 on success, -1 if not found or not a string array. */
+int32_t gguf_kv_get_added_tokens(const gguf_model_t *model, const char* key, const char*** out_strings, size_t* out_count);
+
 /* Get tensor data pointer by name. Returns NULL if not found.
  * out_bytes receives the tensor size in bytes. */
 const void* gguf_get_tensor_ptr(const gguf_model_t *model, const char* name, size_t* out_bytes);

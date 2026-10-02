@@ -22,6 +22,9 @@ struct Tokenizer {
     int eos_id = -1;
     int pad_id = -1;
     int unk_id = -1;
+    // special token maps
+    std::unordered_map<std::string, int> special_str_to_id;
+    std::unordered_map<int, std::string> id_to_special_str;
 };
 
 extern "C" {
@@ -67,6 +70,16 @@ static std::vector<std::string> split_utf8(const std::string& str) {
 int tokenizer_encode(tokenizer_t* tok, const char* text, int* out_ids, int max_ids) {
     Tokenizer* t = (Tokenizer*)tok;
     if (!t || !text || !out_ids || max_ids <= 0) return -1;
+
+    // Check for special token strings that map to a single token ID
+    auto it_special = t->special_str_to_id.find(text);
+    if (it_special != t->special_str_to_id.end()) {
+        if (max_ids >= 1) {
+            out_ids[0] = it_special->second;
+            return 1;
+        }
+        return -1;
+    }
 
     // Initial tokenization: split into bytes (or use vocab tokens if present)
     std::string input(text);
@@ -130,7 +143,11 @@ int tokenizer_decode(tokenizer_t* tok, const int* ids, int n_ids, char* out_str,
     result.reserve(n_ids * 4);
     for (int i = 0; i < n_ids; ++i) {
         int id = ids[i];
-        if (id >= 0 && id < (int)t->vocab.size()) {
+        // Check for special token ID
+        auto it_special = t->id_to_special_str.find(id);
+        if (it_special != t->id_to_special_str.end()) {
+            result += it_special->second;
+        } else if (id >= 0 && id < (int)t->vocab.size()) {
             result += t->vocab[id];
         } else if (id >= 256 && id < 512) {
             // byte fallback
@@ -221,7 +238,67 @@ tokenizer_t* tokenizer_load_from_gguf(void* gguf_model) {
     if (gguf_kv_get_u32_by_key((const gguf_model_t*)gguf_model, "tokenizer.ggml.eos_token_id", &val) == 0) t->eos_id = (int)val;
     if (gguf_kv_get_u32_by_key((const gguf_model_t*)gguf_model, "tokenizer.ggml.pad_token_id", &val) == 0) t->pad_id = (int)val;
     if (gguf_kv_get_u32_by_key((const gguf_model_t*)gguf_model, "tokenizer.ggml.unk_token_id", &val) == 0) t->unk_id = (int)val;
-    // Note: vocab_ptrs and merges_ptrs are owned by the GGUF model and will be freed when model is freed.
+    // Try to read added_tokens array (strings) and map known special tokens
+    const char** added_ptrs = nullptr;
+    size_t added_count = 0;
+    if (gguf_kv_get_added_tokens((const gguf_model_t*)gguf_model, "tokenizer.ggml.added_tokens", &added_ptrs, &added_count) == 0) {
+        for (size_t i = 0; i < added_count; ++i) {
+            const char* s = added_ptrs[i];
+            if (!s) continue;
+            auto it = t->vocab_map.find(s);
+            if (it != t->vocab_map.end()) {
+                int id = it->second;
+                // Map known special token strings
+                if (strcmp(added_ptrs[i], "<|endoftext|>") == 0) {
+                    t->eos_id = id;
+                    t->special_str_to_id[s] = id;
+                    t->id_to_special_str[id] = s;
+                } else if (strcmp(added_ptrs[i], "<|pad|>") == 0) {
+                    t->pad_id = id;
+                    t->special_str_to_id[s] = id;
+                    t->id_to_special_str[id] = s;
+                } else if (strcmp(added_ptrs[i], "<|unk|>") == 0) {
+                    t->unk_id = id;
+                    t->special_str_to_id[s] = id;
+                    t->id_to_special_str[id] = s;
+                } else if (strcmp(added_ptrs[i], "<|bos|>") == 0) {
+                    t->bos_id = id;
+                    t->special_str_to_id[s] = id;
+                    t->id_to_special_str[id] = s;
+                }
+            }
+        }
+    }
+    // Populate special token maps from IDs we have
+    if (t->bos_id >= 0) {
+        // find string for bos_id
+        if ((size_t)t->bos_id < t->vocab.size()) {
+            const std::string& s = t->vocab[t->bos_id];
+            t->special_str_to_id[s] = t->bos_id;
+            t->id_to_special_str[t->bos_id] = s;
+        }
+    }
+    if (t->eos_id >= 0) {
+        if ((size_t)t->eos_id < t->vocab.size()) {
+            const std::string& s = t->vocab[t->eos_id];
+            t->special_str_to_id[s] = t->eos_id;
+            t->id_to_special_str[t->eos_id] = s;
+        }
+    }
+    if (t->pad_id >= 0) {
+        if ((size_t)t->pad_id < t->vocab.size()) {
+            const std::string& s = t->vocab[t->pad_id];
+            t->special_str_to_id[s] = t->pad_id;
+            t->id_to_special_str[t->pad_id] = s;
+        }
+    }
+    if (t->unk_id >= 0) {
+        if ((size_t)t->unk_id < t->vocab.size()) {
+            const std::string& s = t->vocab[t->unk_id];
+            t->special_str_to_id[s] = t->unk_id;
+            t->id_to_special_str[t->unk_id] = s;
+        }
+    }
     return tok;
 }
 

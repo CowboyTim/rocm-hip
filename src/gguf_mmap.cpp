@@ -572,6 +572,18 @@ void gguf_free_string_array(const char** strings, size_t count) {
     (void)strings; (void)count; /* strings are owned by the model; no separate free needed */
 }
 
+/* Get added_tokens array from KV by key. Returns 0 on success, -1 if not found or not a string array. */
+int32_t gguf_kv_get_added_tokens(const gguf_model_t *model, const char* key, const char*** out_strings, size_t* out_count) {
+    if (!model || !key || !out_strings || !out_count) return -1;
+    int64_t idx = find_kv_index(model, key);
+    if (idx < 0) return -1;
+    const struct kv_entry *kv = &model->kvs[idx];
+    if (!kv->is_array || kv->arr_type != GGUF_TYPE_STRING) return -1;
+    *out_strings = (const char**)kv->arr_strings;
+    *out_count = kv->arr_str_n;
+    return 0;
+}
+
 /* --- Model-level queries --- */
 const char *gguf_arch(const gguf_model_t *m) {
     /* Architecture stored as string in GGUF -- see implementation notes */
