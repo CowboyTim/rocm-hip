@@ -490,15 +490,20 @@ Goal: ship a production‑ready `libinference.so` with stable ABI, thread‑safe
 
 ---
 
-## Phase 12 – Batched kernel implementation & performance tuning (next)
-Goal: turn the batched forward placeholder into a high‑performance kernel and optimise generation throughput.
+## Phase 12 – Batched kernel implementation & performance tuning (IN PROGRESS 🚧)
+Goal: turn the batched forward placeholder into high‑performance kernels and optimise generation throughput.
 
-### Planned deliverables
-1. **Batched `gemm_act_fp4` / `fp16_gemm` kernels** – support batch dimension in WMMA kernels; use `hipLaunchKernel` with 3‑D grid.
-2. **Batched `softmax_masked`** – accept per‑sequence mask tensors; implement efficient parallel softmax across batch.
-3. **KV‑cache batched store** – single kernel writes all batch slots in one launch.
-4. **Autotuning script** – sweep tile sizes, block dims, LDS usage; pick optimal config per GPU.
-5. **Benchmark suite** – `bench_inference.py` extended with batch‑size sweep, latency/throughput plots, comparison vs. llama.cpp baseline.
+### Completed
+1. **Batched `gemm_act_fp4` kernel** – added batch dimension (`blockIdx.z`), batch offsets for A and C, weights shared across batch.
+2. **Batched `fp16_gemm` kernel** – added batch dimension, batch offsets for A, B, C.
+3. **Batched `softmax_masked` kernel** – added batch dimension, per‑batch qpos, per‑batch score buffers.
+4. **Batched `kv_cache_store` kernel** – added batch dimension, per‑batch source/destination offsets.
+
+### Remaining work
+1. **Host batched forward integration** – implement `inference_forward_batch` / `qwen_model_forward_batch` to launch the batched kernels with proper 3‑D grid (`gridDim.z = batch_size`).
+2. **Batched `softmax_masked` launch** – adjust launch configuration to include batch dimension; handle per‑batch `qpos`.
+3. **Autotuning script** – sweep tile sizes, block dims, LDS usage; pick optimal config per GPU.
+4. **Benchmark suite** – `bench_inference.py` extended with batch‑size sweep, latency/throughput plots, comparison vs. llama.cpp baseline.
 
 ---
 
