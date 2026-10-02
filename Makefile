@@ -164,11 +164,12 @@ $(EMBEDDING_CO): embedding_lookup.hip
 	$(HIPCC) $(HIPFLAGS) -c $< -o $@
 
 # Phase 4: Inference engine static library
-$(INFERENCE_LIB): inference.cpp inference.h gguf_mmap.cpp gguf_mmap.h kv_cache.cpp kv_cache.h
+$(INFERENCE_LIB): inference.cpp inference.h gguf_mmap.cpp gguf_mmap.h kv_cache.cpp kv_cache.h tokenizer.cpp tokenizer.h
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c inference.cpp -o inference.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c gguf_mmap.cpp -o gguf_mmap.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c kv_cache.cpp -o kv_cache.o
-	ar rcs $@ inference.o gguf_mmap.o kv_cache.o
+	$(CLANG) $(CXXFLAGS) -I. -fPIC -c tokenizer.cpp -o tokenizer.o
+	ar rcs $@ inference.o gguf_mmap.o kv_cache.o tokenizer.o
 
 # Phase 4: Inference demo binary
 $(INFERENCE_DEMO): inference.cpp inference.h demo_inference.cpp

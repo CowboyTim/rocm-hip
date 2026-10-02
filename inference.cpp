@@ -5,6 +5,8 @@
 #include "gguf_mmap.h"
 #include "fp4_common.h"
 #include "kv_cache.h"
+#include "tokenizer.h"
+#include "qwen_model.h"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <vector>
@@ -20,6 +22,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <algorithm>
+#include <random>
 
 using namespace rocmfp4;
 
@@ -141,6 +145,8 @@ struct inference_model {
     // Tokenizer (simplified: vocab from GGUF, no BPE for Phase 4)
     std::vector<std::string> vocab_tokens;
     std::unordered_map<std::string, int> vocab_map;
+    tokenizer_t* tokenizer = nullptr;
+    qwen_model_t* qwen = nullptr;
 };
 
 static bool load_quant_weight(gguf_model_t* gguf, const char* prefix, QuantWeight& w) {
@@ -340,6 +346,15 @@ inference_model_t* inference_load_model(const char* gguf_path) {
     // Load final LN
     // ...
 
+    // Create tokenizer from vocab if available (Phase 5)
+    if (!m->vocab_tokens.empty()) {
+        std::vector<const char*> vocab_ptrs;
+        vocab_ptrs.reserve(m->vocab_tokens.size());
+        for (auto& s : m->vocab_tokens) vocab_ptrs.push_back(s.c_str());
+        // No merges for now
+        m->tokenizer = tokenizer_create(vocab_ptrs.data(), vocab_ptrs.size(), nullptr, 0);
+    }
+
     if (!pin_model_memory(m)) {
         set_error("hipHostRegister failed");
         unpin_model_memory(m);
@@ -352,6 +367,8 @@ inference_model_t* inference_load_model(const char* gguf_path) {
 
 void inference_free_model(inference_model_t* m) {
     if (!m) return;
+    if (m->tokenizer) tokenizer_free(m->tokenizer);
+    if (m->qwen) qwen_model_free(m->qwen);
     unpin_model_memory(m);
     if (m->kvc) kv_cache_free(m->kvc);
     if (m->gguf) gguf_mmap_close(m->gguf);
@@ -361,7 +378,17 @@ void inference_free_model(inference_model_t* m) {
 int32_t* inference_tokenize(inference_model_t* m, const char* text, int* out_len) {
     clear_error();
     if (!m || !text || !out_len) { set_error("Invalid args"); return nullptr; }
-    std::vector<int> toks = simple_tokenize(m, text);
+    std::vector<int> toks;
+    if (m->tokenizer) {
+        // allocate max possible tokens (len+2)
+        int max_toks = (int)strlen(text) + 2;
+        std::vector<int> buf(max_toks);
+        int n = tokenizer_encode(m->tokenizer, text, buf.data(), max_toks);
+        if (n < 0) { set_error("tokenizer_encode failed"); return nullptr; }
+        toks.assign(buf.begin(), buf.begin() + n);
+    } else {
+        toks = simple_tokenize(m, text);
+    }
     int32_t* arr = new int32_t[toks.size()];
     std::memcpy(arr, toks.data(), toks.size() * sizeof(int32_t));
     *out_len = (int)toks.size();
@@ -380,6 +407,9 @@ int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
     m->kvc = kv_cache_create("/dev/shm/inference_kvc.bin", &cfg);
     if (!m->kvc) { set_error("kv_cache_create failed"); return -1; }
     m->n_ctx = n_ctx;
+    // Create Qwen model for forward passes
+    m->qwen = qwen_model_create(m);
+    if (!m->qwen) { set_error("qwen_model_create failed"); return -1; }
     return 0;
 }
 
@@ -393,25 +423,99 @@ void inference_set_seed(inference_model_t* m, unsigned int seed) {
 
 int inference_decode_token(inference_model_t* m, int token_id, int* next_token_out) {
     clear_error();
-    if (!m || !m->kvc || !next_token_out) { set_error("Invalid state"); return -1; }
+    if (!m || !m->kvc || !m->qwen || !next_token_out) { set_error("Invalid state"); return -1; }
 
-    // For Phase 4 skeleton, we just return an error
-    // Full implementation runs forward_pass() and samples from logits
-    set_error("Phase 4 decode_token not yet implemented");
-    return -1;
+    // Need a position counter; store in model (simple static)
+    static thread_local int pos = 0;
+    float* logits = new float[m->vocab_size];
+    int rc = qwen_model_forward(m->qwen, token_id, pos, logits);
+    if (rc != 0) { delete[] logits; set_error("qwen_model_forward failed"); return -1; }
+
+    // Greedy sampling
+    int best = 0;
+    float best_val = logits[0];
+    for (int i = 1; i < m->vocab_size; ++i) {
+        if (logits[i] > best_val) { best_val = logits[i]; best = i; }
+    }
+    *next_token_out = best;
+    ++pos;
+    delete[] logits;
+    return 0;
 }
 
 int inference_get_logits(inference_model_t* m, int* vocab_ids, float* logits) {
     clear_error();
-    if (!m || !vocab_ids || !logits) { set_error("Invalid args"); return -1; }
+    if (!m || !m->qwen || !vocab_ids || !logits) { set_error("Invalid args"); return -1; }
     // Fill vocab_ids with 0..vocab_size-1
     for (int i = 0; i < m->vocab_size; ++i) vocab_ids[i] = i;
-    // Run forward to get logits (placeholder)
-    float* tmp = new float[m->vocab_size];
-    int rc = forward_pass(m, 0, 0, tmp); // placeholder
-    if (rc == 0) std::memcpy(logits, tmp, m->vocab_size * sizeof(float));
-    delete[] tmp;
+    // Need a dummy token_id and position 0 for logits
+    static thread_local int pos = 0;
+    int rc = qwen_model_forward(m->qwen, 0, pos, logits);
+    if (rc == 0) {
+        for (int i = 0; i < m->vocab_size; ++i) vocab_ids[i] = i;
+    }
     return rc;
+}
+
+// Sample from logits with temperature, top-k, top-p.
+// vocab_ids: array of vocab indices (size vocab_size)
+// logits: raw logits array (size vocab_size)
+// Returns sampled token ID, or -1 on error.
+int inference_sample_logits(inference_model_t* m, float temperature, int top_k, float top_p,
+                           int* vocab_ids, float* logits, int* out_token) {
+    clear_error();
+    if (!m || !vocab_ids || !logits || !out_token) { set_error("Invalid args"); return -1; }
+    int V = m->vocab_size;
+    // Copy logits to local vector for manipulation
+    std::vector<float> l(logits, logits + V);
+    // Temperature scaling
+    if (temperature > 0.0f) {
+        for (int i = 0; i < V; ++i) l[i] /= temperature;
+    }
+    // Softmax to get probabilities
+    float max_l = l[0];
+    for (int i = 1; i < V; ++i) if (l[i] > max_l) max_l = l[i];
+    float sum = 0.0f;
+    for (int i = 0; i < V; ++i) { l[i] = expf(l[i] - max_l); sum += l[i]; }
+    for (int i = 0; i < V; ++i) l[i] /= sum;
+
+    // Top-k
+    if (top_k > 0 && top_k < V) {
+        std::vector<std::pair<float,int>> idx;
+        idx.reserve(V);
+        for (int i = 0; i < V; ++i) idx.emplace_back(l[i], i);
+        std::nth_element(idx.begin(), idx.begin() + top_k, idx.end(),
+                         [](const auto& a, const auto& b){ return a.first > b.first; });
+        float cutoff = idx[top_k].first;
+        for (int i = 0; i < V; ++i) if (l[i] < cutoff) l[i] = 0.0f;
+        // renormalize
+        sum = 0.0f; for (int i = 0; i < V; ++i) sum += l[i];
+        if (sum > 0) for (int i = 0; i < V; ++i) l[i] /= sum;
+    }
+    // Top-p (nucleus)
+    if (top_p > 0.0f && top_p < 1.0f) {
+        std::vector<std::pair<float,int>> idx;
+        idx.reserve(V);
+        for (int i = 0; i < V; ++i) idx.emplace_back(l[i], i);
+        std::sort(idx.begin(), idx.end(),
+                  [](const auto& a, const auto& b){ return a.first > b.first; });
+        float cum = 0.0f;
+        int cutoff_idx = V;
+        for (int i = 0; i < V; ++i) {
+            cum += idx[i].first;
+            if (cum >= top_p) { cutoff_idx = i + 1; break; }
+        }
+        for (int i = cutoff_idx; i < V; ++i) l[idx[i].second] = 0.0f;
+        sum = 0.0f; for (int i = 0; i < V; ++i) sum += l[i];
+        if (sum > 0) for (int i = 0; i < V; ++i) l[i] /= sum;
+    }
+
+    // Sample from distribution
+    static thread_local std::mt19937 rng((unsigned)std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    std::discrete_distribution<int> dist(l.begin(), l.end());
+    int sampled = dist(rng);
+    *out_token = vocab_ids[sampled];
+    return 0;
 }
 
 int inference_n_ctx(const inference_model_t* m) {
