@@ -91,7 +91,7 @@ QWEN_MODEL_LIB   = $(BUILDDIR)/libqwen.a
 QWEN_DEMO        = $(BINDIR)/qwen_demo
 
 # --- Build Rules ---
-all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO) $(INFERENCE_LIB) $(QWEN_MODEL_LIB) $(QWEN_DEMO)
+all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO)
 
 $(WMMA_TARGET): $(WMMA_OBJ) $(WMMA_CO)
 	$(CLANG) $(WMMA_OBJ) $(LDFLAGS) -o $@
@@ -188,7 +188,45 @@ $(INFERENCE_LIB): $(SRCDIR)/inference.cpp $(SRCDIR)/inference.h $(SRCDIR)/gguf_m
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/tokenizer.cpp -o $(OBJDIR)/tokenizer.o
 	ar rcs $@ $(OBJDIR)/inference.o $(OBJDIR)/gguf_mmap.o $(OBJDIR)/kv_cache.o $(OBJDIR)/tokenizer.o
 
+# Phase 4: Inference engine shared library (versioned)
+INFERENCE_SO    = $(BUILDDIR)/libinference.so.1
+INFERENCE_SO_1  = $(BUILDDIR)/libinference.so.1.0
+$(INFERENCE_SO_1): $(INFERENCE_LIB)
+	$(CLANG) -shared -Wl,-soname,libinference.so.1 -o $@ $(INFERENCE_LIB) $(LDFLAGS)
+$(INFERENCE_SO): $(INFERENCE_SO_1)
+	ln -sf libinference.so.1 $@
 
+# pkg-config file
+PKGCONFIG = $(BUILDDIR)/rocm-inference.pc
+$(PKGCONFIG): $(INFERENCE_SO)
+	@echo "prefix=/usr/local" > $@
+	@echo "exec_prefix=\$${prefix}" >> $@
+	@echo "libdir=\$${exec_prefix}/lib" >> $@
+	@echo "includedir=\$${prefix}/include/rocm_inference" >> $@
+	@echo "" >> $@
+	@echo "Name: rocm-inference" >> $@
+	@echo "Description: Zero-copy ROCmFP4 inference engine for Strix Halo" >> $@
+	@echo "Version: 1.0" >> $@
+	@echo "Libs: -L\$${libdir} -linference" >> $@
+	@echo "Cflags: -I\$${includedir}" >> $@
+
+# Installation
+PREFIX ?= /usr/local
+INSTALL_LIBDIR = $(PREFIX)/lib
+INSTALL_INCDIR = $(PREFIX)/include/rocm_inference
+INSTALL_PKGCONFIGDIR = $(PREFIX)/lib/pkgconfig
+
+install: $(INFERENCE_SO) $(INFERENCE_LIB) $(PKGCONFIG)
+	install -d $(DESTDIR)$(INSTALL_LIBDIR) $(DESTDIR)$(INSTALL_INCDIR) $(DESTDIR)$(INSTALL_PKGCONFIGDIR)
+	cp -f $(INFERENCE_SO_1) $(DESTDIR)$(INSTALL_LIBDIR)/
+	ln -sf libinference.so.1 $(DESTDIR)$(INSTALL_LIBDIR)/libinference.so
+	cp -f $(SRCDIR)/inference.h $(DESTDIR)$(INSTALL_INCDIR)/
+	cp -f $(PKGCONFIG) $(DESTDIR)$(INSTALL_PKGCONFIGDIR)/
+
+uninstall:
+	rm -f $(INSTALL_LIBDIR)/libinference.so $(INSTALL_LIBDIR)/libinference.so.1 $(INSTALL_LIBDIR)/libinference.so.1.0
+	rm -f $(INSTALL_INCDIR)/inference.h
+	rm -f $(INSTALL_PKGCONFIGDIR)/rocm-inference.pc
 
 # Phase 4: Qwen 3 model static library
 $(QWEN_MODEL_LIB): $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_model.h $(SRCDIR)/inference.h $(SRCDIR)/gguf_mmap.h $(SRCDIR)/kv_cache.h

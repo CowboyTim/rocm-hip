@@ -413,4 +413,18 @@ void qwen_model_free(qwen_model_t* model) {
 int qwen_model_forward(qwen_model_t* model, int token_id, int pos, float* logits) {
     return model->forward(token_id, pos, logits);
 }
+
+// Batched forward placeholder
+int qwen_model_forward_batch(qwen_model_t* model,
+                             const int32_t* tokens,
+                             const int* positions,
+                             const int* seq_lens,
+                             int batch_size,
+                             int seq_len,
+                             float* logits_out) {
+    (void)model; (void)tokens; (void)positions; (void)seq_lens;
+    (void)batch_size; (void)seq_len; (void)logits_out;
+    // TODO: implement batched forward
+    return -1; // NOT_IMPLEMENTED
+}
 }

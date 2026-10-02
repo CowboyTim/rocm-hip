@@ -1,4 +1,4 @@
-// inference.h -- Phase 4: C API for zero-copy ROCmFP4 inference engine on Strix Halo (gfx1151).
+// inference.h -- Phase 4/10/11: C API for zero-copy ROCmFP4 inference engine on Strix Halo (gfx1151).
 // All functions are extern "C" with opaque handles. No C++ or HIP types exposed.
 // Designed for eventual Perl XS CPAN module consumption.
 
@@ -12,12 +12,32 @@
 extern "C" {
 #endif
 
+// Error codes (0 = success, negative = error)
+typedef enum {
+    INFERENCE_OK = 0,
+    INFERENCE_ERR_INVALID_ARG = -1,
+    INFERENCE_ERR_OUT_OF_MEMORY = -2,
+    INFERENCE_ERR_MODEL_LOAD = -3,
+    INFERENCE_ERR_KV_CACHE = -4,
+    INFERENCE_ERR_TOKENIZER = -5,
+    INFERENCE_ERR_KERNEL_LAUNCH = -6,
+    INFERENCE_ERR_INVALID_STATE = -7,
+    INFERENCE_ERR_NOT_IMPLEMENTED = -8,
+} inference_error_t;
+
+// Convert error code to human readable string.
+const char* inference_strerror(inference_error_t err);
+
 // Opaque handle for the inference engine model
 typedef struct inference_model inference_model_t;
 
 // Model loading: mmap() the GGUF file, parse metadata, pin weight pages via hipHostRegister.
 // Returns NULL on failure (check inference_get_last_error()).
 inference_model_t* inference_load_model(const char* gguf_path);
+
+// Reference counting for shared ownership
+void inference_model_retain(inference_model_t* model);
+void inference_model_release(inference_model_t* model);
 
 // Free model: unpin all pages, unmap GGUF file, free metadata structures.
 void inference_free_model(inference_model_t* model);
@@ -41,6 +61,34 @@ void inference_set_seed(inference_model_t* model, unsigned int seed);
 // appends to KV cache, returns next predicted token ID (greedy).
 // Returns 0 on success, negative on error. next_token_out is only valid on success.
 int inference_decode_token(inference_model_t* model, int token_id, int* next_token_out);
+
+// Batched forward pass (prefill or decode) for a batch of sequences.
+// tokens: array of token IDs of length batch_size * seq_len (row-major).
+// positions: array of sequence start positions in KV cache (length batch_size).
+// seq_lens: array of actual sequence lengths (length batch_size).
+// Returns 0 on success, negative on error.
+int inference_forward_batch(inference_model_t* model,
+                            const int32_t* tokens,
+                            const int* positions,
+                            const int* seq_lens,
+                            int batch_size,
+                            int seq_len);
+
+// Generation loop helper: runs prefill + iterative decode to generate up to max_new_tokens.
+// prompt_ids: array of token IDs of length prompt_len.
+// temperature, top_k, top_p control sampling.
+// out_ids: output buffer of size max_new_tokens.
+// out_len: receives number of generated tokens.
+// Returns 0 on success, negative on error.
+int inference_generate(inference_model_t* model,
+                       const int32_t* prompt_ids,
+                       int prompt_len,
+                       int max_new_tokens,
+                       float temperature,
+                       int top_k,
+                       float top_p,
+                       int32_t* out_ids,
+                       int* out_len);
 
 // Logits access for sampling (temperature, top-k, top-p)
 // vocab_ids: pre-allocated int32[vocab_size] array

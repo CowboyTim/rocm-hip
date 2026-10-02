@@ -13,6 +13,7 @@
 #include <string>
 #include <unordered_map>
 #include <mutex>
+#include <atomic>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -117,6 +118,10 @@ struct inference_model {
     int head_dim = 0;
     int vocab_size = 0;
     int n_ctx = 0;
+
+    // Reference counting for shared ownership
+    std::atomic<int> ref_count{1};
+    std::mutex mtx;
 
     // Embedding table
     std::vector<__half> embed_table;           // [vocab_size x n_embd] FP16
@@ -582,3 +587,96 @@ const void* inference_get_tensor_ptr(const inference_model_t* m, const char* nam
 const char* inference_get_last_error(void) {
     return g_last_error[0] ? g_last_error : nullptr;
 }
+
+// Error string conversion
+const char* inference_strerror(inference_error_t err) {
+    switch (err) {
+        case INFERENCE_OK: return "Success";
+        case INFERENCE_ERR_INVALID_ARG: return "Invalid argument";
+        case INFERENCE_ERR_OUT_OF_MEMORY: return "Out of memory";
+        case INFERENCE_ERR_MODEL_LOAD: return "Model load failed";
+        case INFERENCE_ERR_KV_CACHE: return "KV cache error";
+        case INFERENCE_ERR_TOKENIZER: return "Tokenizer error";
+        case INFERENCE_ERR_KERNEL_LAUNCH: return "Kernel launch failed";
+        case INFERENCE_ERR_INVALID_STATE: return "Invalid state";
+        case INFERENCE_ERR_NOT_IMPLEMENTED: return "Not implemented";
+        default: return "Unknown error";
+    }
+}
+
+// Reference counting
+void inference_model_retain(inference_model_t* m) {
+    if (m) m->ref_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void inference_model_release(inference_model_t* m) {
+    if (!m) return;
+    int old = m->ref_count.fetch_sub(1, std::memory_order_acq_rel);
+    if (old == 1) {
+        inference_free_model(m);
+    }
+}
+
+// Batched forward (placeholder)
+int inference_forward_batch(inference_model_t* model,
+                            const int32_t* tokens,
+                            const int* positions,
+                            const int* seq_lens,
+                            int batch_size,
+                            int seq_len) {
+    clear_error();
+    if (!model || !tokens || !positions || !seq_lens || batch_size <= 0 || seq_len <= 0) {
+        set_error("Invalid arguments");
+        return INFERENCE_ERR_INVALID_ARG;
+    }
+    // TODO: implement batched forward using qwen_model_forward_batch
+    set_error("Batched forward not yet implemented");
+    return INFERENCE_ERR_NOT_IMPLEMENTED;
+}
+
+// Generation loop helper
+int inference_generate(inference_model_t* model,
+                       const int32_t* prompt_ids,
+                       int prompt_len,
+                       int max_new_tokens,
+                       float temperature,
+                       int top_k,
+                       float top_p,
+                       int32_t* out_ids,
+                       int* out_len) {
+    clear_error();
+    if (!model || !prompt_ids || !out_ids || !out_len || prompt_len <= 0 || max_new_tokens <= 0) {
+        set_error("Invalid arguments");
+        return INFERENCE_ERR_INVALID_ARG;
+    }
+    // Prefill prompt
+    for (int i = 0; i < prompt_len; ++i) {
+        int next = 0;
+        int rc = inference_decode_token(model, prompt_ids[i], &next);
+        if (rc != 0) return rc;
+    }
+    // Generate new tokens
+    int generated = 0;
+    int token = 0;
+    float* logits = new float[model->vocab_size];
+    int* vocab_ids = new int[model->vocab_size];
+    for (int i = 0; i < model->vocab_size; ++i) vocab_ids[i] = i;
+    for (int step = 0; step < max_new_tokens; ++step) {
+        int rc = inference_get_logits(model, vocab_ids, logits);
+        if (rc != 0) { delete[] logits; delete[] vocab_ids; return rc; }
+        int next = 0;
+        rc = inference_sample_logits(model, temperature, top_k, top_p, vocab_ids, logits, &next);
+        if (rc != 0) { delete[] logits; delete[] vocab_ids; return rc; }
+        out_ids[generated++] = next;
+        // feed next token back
+        int dummy = 0;
+        rc = inference_decode_token(model, next, &dummy);
+        if (rc != 0) { delete[] logits; delete[] vocab_ids; return rc; }
+        if (next == tokenizer_eos_id(model->tokenizer)) break; // stop on EOS
+    }
+    *out_len = generated;
+    delete[] logits;
+    delete[] vocab_ids;
+    return INFERENCE_OK;
+}
+
