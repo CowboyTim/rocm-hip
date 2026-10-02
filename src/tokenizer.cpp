@@ -170,6 +170,33 @@ int tokenizer_unk_id(tokenizer_t* tok) {
     return t ? t->unk_id : -1;
 }
 
+// Helper to read a uint32 scalar from GGUF KV by key using public API
+static int gguf_kv_get_u32_by_key(const gguf_model_t* model, const char* key, uint32_t* out) {
+    if (!model || !key || !out) return -1;
+    int64_t n_kv = gguf_n_kv(model);
+    for (int64_t i = 0; i < n_kv; ++i) {
+        const char* k = gguf_kv_key(model, i);
+        if (k && strcmp(k, key) == 0) {
+            int type = gguf_kv_type(model, i);
+            if (type == 4) { // GGUF_TYPE_UINT32
+                uint32_t val;
+                if (gguf_kv_get_u32(model, i, out) == 0) return 0;
+            } else if (type == 5) { // GGUF_TYPE_INT32
+                int32_t v;
+                if (gguf_kv_get_i32(model, i, (int32_t*)out) == 0) return 0;
+            } else if (type == 10) { // GGUF_TYPE_UINT64
+                uint64_t v;
+                if (gguf_kv_get_u64(model, i, (uint64_t*)out) == 0) return 0;
+            } else if (type == 11) { // GGUF_TYPE_INT64
+                int64_t v;
+                if (gguf_kv_get_i64(model, i, (int64_t*)out) == 0) return 0;
+            }
+            return -1;
+        }
+    }
+    return -1;
+}
+
 // Load tokenizer from GGUF model metadata (vocab, merges, added_tokens)
 // Returns NULL on failure.
 tokenizer_t* tokenizer_load_from_gguf(void* gguf_model) {
@@ -186,6 +213,14 @@ tokenizer_t* tokenizer_load_from_gguf(void* gguf_model) {
     gguf_kv_get_string_array((const gguf_model_t*)gguf_model, "tokenizer.ggml.merges", &merges_ptrs, &merges_count);
     // Create tokenizer using existing create function
     tokenizer_t* tok = tokenizer_create(vocab_ptrs, vocab_count, merges_ptrs, merges_count);
+    if (!tok) return nullptr;
+    Tokenizer* t = (Tokenizer*)tok;
+    // Try to read special token IDs from GGUF metadata (common keys)
+    uint32_t val;
+    if (gguf_kv_get_u32_by_key((const gguf_model_t*)gguf_model, "tokenizer.ggml.bos_token_id", &val) == 0) t->bos_id = (int)val;
+    if (gguf_kv_get_u32_by_key((const gguf_model_t*)gguf_model, "tokenizer.ggml.eos_token_id", &val) == 0) t->eos_id = (int)val;
+    if (gguf_kv_get_u32_by_key((const gguf_model_t*)gguf_model, "tokenizer.ggml.pad_token_id", &val) == 0) t->pad_id = (int)val;
+    if (gguf_kv_get_u32_by_key((const gguf_model_t*)gguf_model, "tokenizer.ggml.unk_token_id", &val) == 0) t->unk_id = (int)val;
     // Note: vocab_ptrs and merges_ptrs are owned by the GGUF model and will be freed when model is freed.
     return tok;
 }

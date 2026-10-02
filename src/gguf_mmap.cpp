@@ -533,6 +533,14 @@ const char *gguf_kv_str_val(const gguf_model_t *m, int64_t idx) {
     return kv->str_val ? kv->str_val : "";
 }
 
+/* Get KV value type by index. Returns GGUF type enum, or -1 on error. */
+int gguf_kv_type(const gguf_model_t *m, int64_t idx) {
+    if (!m || idx<0 || idx>=m->n_kv) return -1;
+    const struct kv_entry *kv = &m->kvs[idx];
+    if (kv->is_array) return kv->arr_type;
+    return kv->scalar.type;
+}
+
 /* --- Model-level queries --- */
 
 size_t    gguf_alignment(const gguf_model_t *m)     { return m ? m->alignment : GGUF_ALIGN; }
