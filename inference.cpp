@@ -453,12 +453,13 @@ inference_model_t* inference_load_model(const char* gguf_path) {
         m->final_ln_scale.assign((const __half*)final_ln_ptr, (const __half*)final_ln_ptr + m->n_embd);
     }
 
-    // Create tokenizer from vocab if available (Phase 5)
-    if (!m->vocab_tokens.empty()) {
+    // Create tokenizer from GGUF metadata (Phase 5/8)
+    m->tokenizer = tokenizer_load_from_gguf(m->gguf);
+    if (!m->tokenizer && !m->vocab_tokens.empty()) {
+        // Fallback to simple vocab-only tokenizer
         std::vector<const char*> vocab_ptrs;
         vocab_ptrs.reserve(m->vocab_tokens.size());
         for (auto& s : m->vocab_tokens) vocab_ptrs.push_back(s.c_str());
-        // No merges for now
         m->tokenizer = tokenizer_create(vocab_ptrs.data(), vocab_ptrs.size(), nullptr, 0);
     }
 

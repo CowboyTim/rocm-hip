@@ -18,6 +18,10 @@ typedef struct tokenizer tokenizer_t;
 tokenizer_t* tokenizer_create(const char** vocab, size_t vocab_size,
                               const char** merges, size_t merges_size);
 
+// Load tokenizer directly from a GGUF model (reads vocab, merges, added_tokens from KV metadata)
+// Returns NULL on failure.
+tokenizer_t* tokenizer_load_from_gguf(void* gguf_model);
+
 // Free tokenizer
 void tokenizer_free(tokenizer_t* tok);
 

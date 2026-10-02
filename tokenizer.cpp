@@ -2,6 +2,7 @@
 // Implements encode/decode using the merge rules as in GPT-2 / LLaMA tokenizers.
 
 #include "tokenizer.h"
+#include "gguf_mmap.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -143,6 +144,21 @@ int tokenizer_decode(tokenizer_t* tok, const int* ids, int n_ids, char* out_str,
 size_t tokenizer_vocab_size(tokenizer_t* tok) {
     Tokenizer* t = (Tokenizer*)tok;
     return t ? t->vocab.size() : 0;
+}
+
+// Load tokenizer from GGUF model metadata (vocab, merges, added_tokens)
+// Returns NULL on failure.
+tokenizer_t* tokenizer_load_from_gguf(void* gguf_model) {
+    // The GGUF metadata stores tokenizer info in KV pairs:
+    //   tokenizer.ggml.tokens      -> array of strings (vocab)
+    //   tokenizer.ggml.merges      -> array of strings "a b"
+    //   tokenizer.ggml.added_tokens -> array of objects {id, content}
+    // For now we rely on the C API functions that should be provided by gguf_mmap.
+    // If those helpers are not available we fall back to returning NULL.
+    (void)gguf_model;
+    // TODO: implement actual loading via gguf_kv_get_string_array etc.
+    // For now return NULL so caller falls back to simple tokenizer.
+    return nullptr;
 }
 
 } // extern "C"
