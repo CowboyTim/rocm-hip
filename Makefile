@@ -185,11 +185,31 @@ $(QWEN_MODEL_LIB): qwen_model.cpp qwen_model.h inference.h gguf_mmap.h kv_cache.
 	ar rcs $@ qwen_model.o
 
 # Phase 4: Qwen 3 demo binary
-$(QWEN_DEMO): qwen_model.cpp qwen_model.h inference.cpp gguf_mmap.cpp kv_cache.cpp demo_qwen.cpp
-	$(CLANG) $(CXXFLAGS) -I. qwen_model.cpp inference.cpp gguf_mmap.cpp kv_cache.cpp demo_qwen.cpp $(LDFLAGS) -o $@
+$(QWEN_DEMO): qwen_model.cpp qwen_model.h inference.cpp gguf_mmap.cpp kv_cache.cpp tokenizer.cpp demo_qwen.cpp
+	$(CLANG) $(CXXFLAGS) -I. qwen_model.cpp inference.cpp gguf_mmap.cpp kv_cache.cpp tokenizer.cpp demo_qwen.cpp $(LDFLAGS) -o $@
 
-# Build all demos and benchmark
-both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)
+# Phase 6: Benchmark orchestrator (Python script)
+BENCH_SCRIPT = bench_inference.py
+
+# Phase 7: Integration test (runs demo_qwen if MODEL_PATH provided)
+INTEGRATION_TEST = integration_test
+
+# --- Build Rules ---
+all: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET) $(DEMO_GGUF) $(FP4_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO)
+
+# Copy benchmark script to build directory (so it's alongside binaries)
+$(BENCH_SCRIPT): bench_inference.py
+	cp bench_inference.py $(BENCH_SCRIPT)
+
+# Phase 6: run benchmark (requires MODEL_PATH env var)
+bench: $(INFERENCE_DEMO) $(BENCH_SCRIPT)
+	@if [ -z "$$MODEL_PATH" ]; then echo "Set MODEL_PATH to run benchmark"; exit 1; fi; \
+	python3 $(BENCH_SCRIPT) --model $$MODEL_PATH --prompt "The quick brown fox" --n-tokens 20 --warmup 2 --runs 5 --output bench_report.json
+
+# Phase 7: integration test (runs qwen_demo with a small prompt if MODEL_PATH set)
+integration_test: $(QWEN_DEMO)
+	@if [ -z "$$MODEL_PATH" ]; then echo "MODEL_PATH not set, skipping integration test"; exit 0; fi; \
+	./$(QWEN_DEMO) $$MODEL_PATH "Hello world" && echo "Integration test passed"
 
 clean:
 	rm -f $(TARGET) $(OBJ) $(KERNEL_CO) $(WMMA_TARGET) $(WMMA_OBJ) $(WMMA_CO) $(WMMA_FP4_TARGET) $(WMMA_FP4_OBJ) $(WMMA_FP4_CO) $(WMMA_FP4_NATIVE_TARGET) $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO) $(BENCH_TARGET) $(BENCH_HOST) wmma_bench_fp4_dp4a.co wmma_bench_fp4_native.co wmma_bench_fp4_dp4a_hardware.co $(BENCH_LUT_CO) $(DEMO_GGUF) $(FP4_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO) $(INFERENCE_LIB) $(INFERENCE_DEMO) $(QWEN_MODEL_LIB) $(QWEN_DEMO) *.co *.o

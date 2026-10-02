@@ -53,8 +53,9 @@ int main(int argc, char** argv) {
     printf("\n");
 
     // Prefill
+    int vocab_size = inference_vocab_size(engine);
     for (int i = 0; i < n_tokens; ++i) {
-        float* logits = new float[engine->vocab_size];
+        float* logits = new float[vocab_size];
         if (qwen_model_forward(model, tokens[i], i, logits) != 0) {
             fprintf(stderr, "Forward failed at token %d: %s\n", i, inference_get_last_error());
             delete[] logits;
@@ -72,7 +73,7 @@ int main(int argc, char** argv) {
     // Generate a few continuation tokens
     int next = 0; // placeholder
     for (int i = 0; i < 5; ++i) {
-        float* logits = new float[engine->vocab_size];
+        float* logits = new float[vocab_size];
         if (qwen_model_forward(model, next, n_tokens + i, logits) != 0) {
             fprintf(stderr, "Generation failed: %s\n", inference_get_last_error());
             delete[] logits;
@@ -80,7 +81,7 @@ int main(int argc, char** argv) {
         }
         // Greedy sampling
         next = 0;
-        for (int v = 1; v < engine->vocab_size; ++v) {
+        for (int v = 1; v < vocab_size; ++v) {
             if (logits[v] > logits[next]) next = v;
         }
         printf("Generated token %d: %d\n", i, next);

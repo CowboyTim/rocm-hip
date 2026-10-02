@@ -52,6 +52,7 @@ int inference_get_logits(inference_model_t* model, int* vocab_ids, float* logits
 int inference_n_ctx(const inference_model_t* model);
 int inference_batch_size(const inference_model_t* model);  // always 1 for now
 const char* inference_model_name(const inference_model_t* model);
+int inference_vocab_size(const inference_model_t* model);
 
 // Direct tensor access for debugging/analysis
 // Returns pointer to tensor data in mapped memory (valid while model is alive)

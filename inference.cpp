@@ -530,6 +530,10 @@ const char* inference_model_name(const inference_model_t* m) {
     return m ? m->model_name.c_str() : nullptr;
 }
 
+int inference_vocab_size(const inference_model_t* m) {
+    return m ? m->vocab_size : 0;
+}
+
 const void* inference_get_tensor_ptr(const inference_model_t* m, const char* name, size_t* out_bytes) {
     clear_error();
     if (!m || !m->gguf || !name || !out_bytes) { set_error("Invalid args"); return nullptr; }
