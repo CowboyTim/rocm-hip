@@ -115,36 +115,36 @@ $(DEMO_GGUF): $(GGUF_MMAP_SRC) demo_gguf.cpp gguf_mmap.h
 		$(GGUF_MMAP_SRC) demo_gguf.cpp -o $@
 
 # Phase 2 verify: host harness loads both .co files at runtime, compares against CPU reference
-$(FP4_VERIFY): fp4_verify.cpp fp4_common.h fp4_matmul_kernel.co fp4_matmul_wmma.co
-	$(CLANG) $(CXXFLAGS) -I. fp4_verify.cpp $(LDFLAGS) -o $@
+$(FP4_VERIFY): tests/fp4_verify.cpp fp4_common.h fp4_matmul_kernel.co fp4_matmul_wmma.co
+	$(CLANG) $(CXXFLAGS) -I. tests/fp4_verify.cpp $(LDFLAGS) -o $@
 
 # Phase 3 verify: KV cache manager + zero-copy self-test (loads kv_cache_kernel.co at runtime)
-$(KV_VERIFY): kv_cache.cpp kv_verify.cpp kv_cache.h kv_cache_kernel.co
-	$(CLANG) $(CXXFLAGS) -I. kv_cache.cpp kv_verify.cpp $(LDFLAGS) -o $@
+$(KV_VERIFY): kv_cache.cpp tests/kv_verify.cpp kv_cache.h kv_cache_kernel.co
+	$(CLANG) $(CXXFLAGS) -I. kv_cache.cpp tests/kv_verify.cpp $(LDFLAGS) -o $@
 
 # Phase 3 verify: FP16 WMMA GEMM vs CPU reference over /dev/shm (loads fp16_gemm.co at runtime)
-$(GEMM_VERIFY): gemm_verify.cpp fp16_gemm.co
-	$(CLANG) $(CXXFLAGS) -I. gemm_verify.cpp $(LDFLAGS) -o $@
+$(GEMM_VERIFY): tests/gemm_verify.cpp fp16_gemm.co
+	$(CLANG) $(CXXFLAGS) -I. tests/gemm_verify.cpp $(LDFLAGS) -o $@
 
 # Phase 3 verify: RMSNorm kernel vs CPU reference (loads layernorm.co at runtime)
-$(LAYERNORM_VERIFY): layernorm_verify.cpp layernorm.co
-	$(CLANG) $(CXXFLAGS) -I. layernorm_verify.cpp $(LDFLAGS) -o $@
+$(LAYERNORM_VERIFY): tests/layernorm_verify.cpp layernorm.co
+	$(CLANG) $(CXXFLAGS) -I. tests/layernorm_verify.cpp $(LDFLAGS) -o $@
 
 # Phase 3 verify: RoPE rotate-half kernel vs CPU reference (loads rope_embedding.co at runtime)
-$(ROPE_VERIFY): rope_verify.cpp rope_embedding.co
-	$(CLANG) $(CXXFLAGS) -I. rope_verify.cpp $(LDFLAGS) -o $@
+$(ROPE_VERIFY): tests/rope_verify.cpp rope_embedding.co
+	$(CLANG) $(CXXFLAGS) -I. tests/rope_verify.cpp $(LDFLAGS) -o $@
 
 # Phase 3 verify: masked row-softmax vs CPU reference (loads softmax_masked.co at runtime)
-$(SOFTMAX_VERIFY): softmax_verify.cpp softmax_masked.co
-	$(CLANG) $(CXXFLAGS) -I. softmax_verify.cpp $(LDFLAGS) -o $@
+$(SOFTMAX_VERIFY): tests/softmax_verify.cpp softmax_masked.co
+	$(CLANG) $(CXXFLAGS) -I. tests/softmax_verify.cpp $(LDFLAGS) -o $@
 
 # Phase 3 verify: Act x FP4 GEMM vs CPU reference over /dev/shm (loads gemm_act_fp4.co at runtime)
-$(ACTFP4_VERIFY): actfp4_verify.cpp gemm_act_fp4.co
-	$(CLANG) $(CXXFLAGS) -I. actfp4_verify.cpp $(LDFLAGS) -o $@
+$(ACTFP4_VERIFY): tests/actfp4_verify.cpp gemm_act_fp4.co
+	$(CLANG) $(CXXFLAGS) -I. tests/actfp4_verify.cpp $(LDFLAGS) -o $@
 
 # Phase 3 verify: full attention block chain; loads layernorm/gemm_act_fp4/rope_embedding/kv_cache_store/fp16_gemm/softmax_masked .co files
-$(ATTN_VERIFY): attn_verify.cpp kv_cache.cpp kv_cache.h kv_cache_store.co gemm_act_fp4.co fp16_gemm.co layernorm.co rope_embedding.co softmax_masked.co
-	$(CLANG) $(CXXFLAGS) -I. attn_verify.cpp kv_cache.cpp $(LDFLAGS) -o $@
+$(ATTN_VERIFY): tests/attn_verify.cpp kv_cache.cpp kv_cache.h kv_cache_store.co gemm_act_fp4.co fp16_gemm.co layernorm.co rope_embedding.co softmax_masked.co
+	$(CLANG) $(CXXFLAGS) -I. tests/attn_verify.cpp kv_cache.cpp $(LDFLAGS) -o $@
 
 # Phase 4: SwiGLU kernel (.co for runtime loading)
 $(SWIGLU_CO): swiglu.hip
