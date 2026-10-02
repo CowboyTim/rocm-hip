@@ -15,7 +15,7 @@ SRCDIR     := src
 TESTSDIR   := tests
 
 # Host C++ flags (no offloading)
-CXXFLAGS  := -O3 -Wall -I$(ROCM_PATH)/include -D__HIP_PLATFORM_AMD__ -D__HIP_ENABLE_AMD_HSA__
+CXXFLAGS  := -O3 -Wall -I$(ROCM_PATH)/include -I$(SRCDIR) -D__HIP_PLATFORM_AMD__ -D__HIP_ENABLE_AMD_HSA__
 
 # Device/HIP kernel flags (with offloading)
 HIPFLAGS  := -Xarch_device -mno-wavefrontsize64 -isystem $(ROCM_PATH)/include --rocm-path=$(ROCM_PATH) -O3 --offload-arch=$(ARCH) --genco -D__HIP_PLATFORM_AMD__ -D__HIP_ENABLE_AMD_HSA__
@@ -88,9 +88,7 @@ QWEN_MODEL_LIB   = $(BUILDDIR)/libqwen.a
 QWEN_DEMO        = $(BINDIR)/qwen_demo
 
 # --- Build Rules ---
-all: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET) $(DEMO_GGUF) $(FP4_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO)
-
-	$(CLANG) $(OBJ) $(LDFLAGS) -o $@
+all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO) $(INFERENCE_LIB) $(QWEN_MODEL_LIB) $(QWEN_DEMO)
 
 $(WMMA_TARGET): $(WMMA_OBJ) $(WMMA_CO)
 	$(CLANG) $(WMMA_OBJ) $(LDFLAGS) -o $@
@@ -104,6 +102,8 @@ $(WMMA_FP4_NATIVE_TARGET): $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO)
 # Pre-compiled kernel objects (.hip -> .co)
 $(CODIR)/%.co: $(SRCDIR)/%.hip
 	$(HIPCC) $(HIPFLAGS) -c $< -o $@
+	cp $@ $(BINDIR)/
+	cp $@ .
 
 # Host C++ files (.cpp -> .o) -- compiled without device offloading
 $(OBJDIR)/%.o: $(SRCDIR)/%.cpp
@@ -134,8 +134,8 @@ $(FP4_VERIFY): $(SRCDIR)/fp4_verify.cpp $(SRCDIR)/fp4_common.h $(CODIR)/fp4_matm
 	$(CLANG) $(CXXFLAGS) -I. $(SRCDIR)/fp4_verify.cpp $(LDFLAGS) -o $@
 
 # Phase 3 verify: KV cache manager + zero-copy self-test (loads kv_cache_kernel.co at runtime)
-$(KV_VERIFY): $(SRCDIR)/kv_cache.cpp $(SRCDIR)/kv_verify.cpp $(SRCDIR)/kv_cache.h $(CODIR)/kv_cache_kernel.co
-	$(CLANG) $(CXXFLAGS) -I. $(SRCDIR)/kv_cache.cpp $(SRCDIR)/kv_verify.cpp $(LDFLAGS) -o $@
+$(KV_VERIFY): $(SRCDIR)/kv_cache.cpp $(TESTSDIR)/kv_verify.cpp $(SRCDIR)/kv_cache.h $(CODIR)/kv_cache_kernel.co
+	$(CLANG) $(CXXFLAGS) -I. $(SRCDIR)/kv_cache.cpp $(TESTSDIR)/kv_verify.cpp $(LDFLAGS) -o $@
 
 # Phase 3 verify: FP16 WMMA GEMM vs CPU reference over /dev/shm (loads fp16_gemm.co at runtime)
 $(GEMM_VERIFY): $(TESTSDIR)/gemm_verify.cpp $(CODIR)/fp16_gemm.co
@@ -181,9 +181,7 @@ $(INFERENCE_LIB): $(SRCDIR)/inference.cpp $(SRCDIR)/inference.h $(SRCDIR)/gguf_m
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/tokenizer.cpp -o $(OBJDIR)/tokenizer.o
 	ar rcs $@ $(OBJDIR)/inference.o $(OBJDIR)/gguf_mmap.o $(OBJDIR)/kv_cache.o $(OBJDIR)/tokenizer.o
 
-# Phase 4: Inference demo binary
-$(INFERENCE_DEMO): $(SRCDIR)/inference.cpp $(SRCDIR)/inference.h $(SRCDIR)/demo_inference.cpp
-	$(CLANG) $(CXXFLAGS) -I. $(SRCDIR)/inference.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/demo_inference.cpp $(LDFLAGS) -o $@
+
 
 # Phase 4: Qwen 3 model static library
 $(QWEN_MODEL_LIB): $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_model.h $(SRCDIR)/inference.h $(SRCDIR)/gguf_mmap.h $(SRCDIR)/kv_cache.h
@@ -191,8 +189,8 @@ $(QWEN_MODEL_LIB): $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_model.h $(SRCDIR)/inf
 	ar rcs $@ $(OBJDIR)/qwen_model.o
 
 # Phase 4: Qwen 3 demo binary
-$(QWEN_DEMO): $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_model.h $(SRCDIR)/inference.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/demo_qwen.cpp
-	$(CLANG) $(CXXFLAGS) -I. $(SRCDIR)/qwen_model.cpp $(SRCDIR)/inference.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/demo_qwen.cpp $(LDFLAGS) -o $@
+$(QWEN_DEMO): $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_model.h $(SRCDIR)/inference.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/demo_qwen.cpp $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) -I. $(SRCDIR)/qwen_model.cpp $(SRCDIR)/inference.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/demo_qwen.cpp $(INFERENCE_LIB) $(LDFLAGS) -o $@
 
 # Build all demos and benchmark
 both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)

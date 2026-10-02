@@ -149,40 +149,6 @@ struct inference_model {
     qwen_model_t* qwen = nullptr;
 };
 
-static bool load_quant_weight(gguf_model_t* gguf, const char* prefix, QuantWeight& w) {
-    // Tensors named like "blk.0.attn_q.weight", "blk.0.attn_q.scales", etc.
-    std::string p_name = std::string(prefix) + ".weight";
-    std::string s_name = std::string(prefix) + ".scales";
-
-    size_t w_sz, s_sz;
-    const void* w_ptr = gguf_get_tensor_ptr(gguf, p_name.c_str(), &w_sz);
-    const void* s_ptr = gguf_get_tensor_ptr(gguf, s_name.c_str(), &s_sz);
-    if (!w_ptr || !s_ptr) return false;
-
-    // Parse shape from GGUF metadata (simplified: assume known layout)
-    // Real implementation would read shape from tensor_info
-    w.N = w_sz / (w.K / 2);  // placeholder
-
-    w.packed.assign((unsigned char*)w_ptr, (unsigned char*)w_ptr + w_sz);
-    w.scales.assign((unsigned char*)s_ptr, (unsigned char*)s_ptr + s_sz);
-    w.true_v.resize((size_t)w.N * w.K);
-    // Reconstruct true_v for CPU reference (dequant)
-    const size_t strips = w.K / 16;
-    for (int n = 0; n < w.N; ++n) {
-        for (size_t s = 0; s < strips; ++s) {
-            float sc = ue4m3_to_float(w.scales[(size_t)n * strips + s]);
-            for (int i = 0; i < 16; ++i) {
-                int k = (int)s * 16 + i;
-                uint8_t wb = w.packed[(size_t)n * (w.K / 2) + (k >> 1)];
-                uint8_t nib = (k & 1) ? (wb >> 4) : (wb & 0x0F);
-                float code = dequant_code(nib);
-                w.true_v[(size_t)n * w.K + k] = code * sc;
-            }
-        }
-    }
-    return true;
-}
-
 static bool pin_model_memory(inference_model* m) {
     // Pin embedding table
     if (!m->embed_table.empty()) {
@@ -363,45 +329,6 @@ static bool load_model_weights(inference_model* m) {
         }
     }
     return true;
-}
-
-static int forward_pass(inference_model* m, int token_id, int pos, float* logits_out) {
-    ensure_kernels_loaded();
-
-    // Scratch buffer layout (simplified single-token version):
-    // We'll allocate a large unified buffer per forward pass
-    const int E = m->n_embd, HD = m->head_dim, HQ = m->n_head, HKV = m->n_head_kv;
-    const int DQ = HQ * HD, DKV = HKV * HD, GRP = HQ / HKV;
-    const float scale = 1.0f / sqrtf((float)HD);
-    const float eps = 1e-5f;
-
-    // For Phase 4, we implement the forward pass step by step using the verified kernels.
-    // This is a skeleton showing the structure; full implementation requires careful
-    // buffer management matching the attn_verify pattern.
-
-    // 1. Embedding lookup: token_id -> x [1 x E] FP16
-    __half* x;
-    // ... allocate in scratch ...
-
-    // 2. For each layer:
-    //    a) RMSNorm (attn_ln) -> h
-    //    b) Q/K/V projections via gemm_act_fp4 (h x Wq/Wk/Wv)
-    //    c) RoPE on Q/K per head
-    //    d) KV store into cache at position `pos`
-    //    e) Attention: scores = Q @ K^T (fp16_gemm), softmax, out = scores @ V (fp16_gemm)
-    //    f) O projection (gemm_act_fp4)
-    //    g) Residual add
-    //    h) RMSNorm (mlp_ln)
-    //    i) SwiGLU (gate_proj + up_proj -> silu(gate)*up -> down_proj)
-    //    j) Residual add
-
-    // 3. Final RMSNorm
-    // 4. LM head projection -> logits
-
-    // TODO: Full implementation with proper buffer layout matching attn_verify
-    // For now, return a placeholder error indicating not fully implemented
-    set_error("Phase 4 forward pass not yet fully implemented; kernel chain skeleton only");
-    return -1;
 }
 
 // ======================== C API IMPLEMENTATION ========================
