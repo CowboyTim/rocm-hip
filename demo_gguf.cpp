@@ -23,21 +23,21 @@ static const char *type_name(int t) {
     }
 }
 
-static void print_tensor_info(const inference_model_t *m, int64_t idx) {
+static void print_tensor_info(const gguf_model_t *m, int64_t idx) {
     printf("  [%3lld] %-50s %6s ne=", (long long)idx,
-           inference_tensor_name(m, idx), type_name(inference_tensor_type(m, idx)));
+           gguf_tensor_name(m, idx), type_name(gguf_tensor_type(m, idx)));
 
-    uint8_t nd = inference_tensor_dims(m, idx);
-    int64_t *ne = inference_tensor_ne(m, idx);
+    uint8_t nd = gguf_tensor_dims(m, idx);
+    int64_t *ne = gguf_tensor_ne(m, idx);
     for (uint8_t d = 0; d < nd; ++d) {
         if (d > 0) printf("x");
         printf("%lld", (long long)ne[d]);
     }
     printf(" bs=%zu ts=%zu offset=%llu nbytes=%zu\n",
-           (unsigned long)inference_tensor_block_size(m, idx),
-           (unsigned long)inference_tensor_type_size(m, idx),
-           (unsigned long long)inference_tensor_offset(m, idx),
-           (unsigned long)inference_tensor_nbytes(m, idx));
+           (unsigned long)gguf_tensor_block_size(m, idx),
+           (unsigned long)gguf_tensor_type_size(m, idx),
+           (unsigned long long)gguf_tensor_offset(m, idx),
+           (unsigned long)gguf_tensor_nbytes(m, idx));
 }
 
 int main(int argc, char **argv) {
@@ -55,7 +55,7 @@ int main(int argc, char **argv) {
 
     /* Load model via mmap() -- no fread(), no copy */
     printf("[1] Loading '%s' via mmap()...\n", path);
-    inference_model_t *model = inference_load_model(path);
+    gguf_model_t *model = gguf_mmap_open(path);
     if (!model) {
         fprintf(stderr, "Failed to load '%s'\n", path);
         return 1;
@@ -63,22 +63,22 @@ int main(int argc, char **argv) {
 
     /* Print basic metadata */
     printf("\n[2] Model metadata:\n");
-    printf("  Version:            %u\n",       inference_version(model));
-    printf("  Alignment:          %zu bytes\n",  inference_alignment(model));
-    printf("  Data blob offset:   %zu bytes\n",  inference_data_offset(model));
-    printf("  Tensors:            %lld\n",       (long long)inference_n_tensors(model));
-    printf("  KV pairs:           %lld\n",       (long long)inference_n_kv(model));
+    printf("  Version:            %u\n",       gguf_version(model));
+    printf("  Alignment:          %zu bytes\n",  gguf_alignment(model));
+    printf("  Data blob offset:   %zu bytes\n",  gguf_data_offset(model));
+    printf("  Tensors:            %lld\n",       (long long)gguf_n_tensors(model));
+    printf("  KV pairs:           %lld\n",       (long long)gguf_n_kv(model));
 
     /* Print KV metadata */
-    printf("\n[3] Key-value metadata (%lld pairs):\n", (long long)inference_n_kv(model));
-    int64_t nkv = inference_n_kv(model);
+    printf("\n[3] Key-value metadata (%lld pairs):\n", (long long)gguf_n_kv(model));
+    int64_t nkv = gguf_n_kv(model);
     for (int64_t i = 0; i < nkv && i < 80; ++i) {
-        const char *key = inference_kv_key(model, i);
+        const char *key = gguf_kv_key(model, i);
         if (strstr(key, "general.") || strstr(key, "attention.") ||
             strstr(key, "tokenizer.") || strstr(key, "embedding") ||
             strstr(key, "context_length")) {
             uint32_t val;
-            if (inference_kv_get_u32(model, i, &val) == 0) {
+            if (gguf_kv_get_u32(model, i, &val) == 0) {
                 printf("  %-40s = %u\n", key, val);
             } else {
                 printf("  %-40s = [non-scalar or array]\n", key);
@@ -88,22 +88,22 @@ int main(int argc, char **argv) {
 
     /* Model-level queries */
     printf("\n[4] Model-level queries:\n");
-    printf("  arch:              %s\n",       inference_arch(model));
-    printf("  vocab_name:        %s\n",       inference_vocab_name(model));
-    printf("  vocab_size:        %lld\n",     (long long)inference_vocab_size(model));
-    printf("  head_count:        %lld\n",     (long long)inference_head_count(model));
-    printf("  head_count_kv:     %lld\n",     (long long)inference_head_count_kv(model));
-    printf("  context_length:    %lld\n",     (long long)inference_context_length(model));
+    printf("  arch:              %s\n",       gguf_arch(model));
+    printf("  vocab_name:        %s\n",       gguf_vocab_name(model));
+    printf("  vocab_size:        %lld\n",     (long long)gguf_vocab_size(model));
+    printf("  head_count:        %lld\n",     (long long)gguf_head_count(model));
+    printf("  head_count_kv:     %lld\n",     (long long)gguf_head_count_kv(model));
+    printf("  context_length:    %lld\n",     (long long)gguf_context_length(model));
 
     /* Print all tensors */
-    int64_t nt = inference_n_tensors(model);
+    int64_t nt = gguf_n_tensors(model);
     printf("\n[5] Tensor listing (%lld total):\n", (long long)nt);
 
     if (nt > 100) {
         /* Show summary by type */
         int counts[43]; memset(counts, 0, sizeof(counts));
         for (int64_t i = 0; i < nt; ++i) {
-            int t = inference_tensor_type(model, i);
+            int t = gguf_tensor_type(model, i);
             if (t >= 0 && t < 43) counts[t]++;
         }
         printf("  Type breakdown:\n");
@@ -123,18 +123,18 @@ int main(int argc, char **argv) {
 
     /* Configure KV cache context length */
     printf("\n[6] KV cache configuration:\n");
-    printf("  Default n_ctx:       %lld\n", (long long)inference_get_n_ctx(model));
+    printf("  Default n_ctx:       %lld\n", (long long)gguf_get_n_ctx(model));
 
-    inference_set_n_ctx(model, n_ctx);
+    gguf_set_n_ctx(model, n_ctx);
     printf("  Set n_ctx to:      %lld\n", (long long)n_ctx);
 
-    int64_t stored_ctx = inference_get_n_ctx(model);
+    int64_t stored_ctx = gguf_get_n_ctx(model);
     printf("  Verified n_ctx:    %lld %s\n", (long long)stored_ctx,
            stored_ctx == n_ctx ? "OK" : "MISMATCH!");
 
     /* Free model -- unmaps the file and frees all metadata */
     printf("\n[7] Freeing model...\n");
-    inference_free_model(model);
+    gguf_mmap_close(model);
     printf("Done. File unmapped, all resources released.\n");
 
     return 0;

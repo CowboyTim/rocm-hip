@@ -149,8 +149,8 @@ static bool load_quant_weight(gguf_model_t* gguf, const char* prefix, QuantWeigh
     std::string s_name = std::string(prefix) + ".scales";
 
     size_t w_sz, s_sz;
-    const void* w_ptr = gguf_mmap_get_tensor(gguf, p_name.c_str(), &w_sz);
-    const void* s_ptr = gguf_mmap_get_tensor(gguf, s_name.c_str(), &s_sz);
+    const void* w_ptr = gguf_get_tensor_ptr(gguf, p_name.c_str(), &w_sz);
+    const void* s_ptr = gguf_get_tensor_ptr(gguf, s_name.c_str(), &s_sz);
     if (!w_ptr || !s_ptr) return false;
 
     // Parse shape from GGUF metadata (simplified: assume known layout)
@@ -320,7 +320,7 @@ inference_model_t* inference_load_model(const char* gguf_path) {
 
     // Load embedding table
     size_t sz;
-    const void* emb_ptr = gguf_mmap_get_tensor(m->gguf, "token_embd.weight", &sz);
+    const void* emb_ptr = gguf_get_tensor_ptr(m->gguf, "token_embd.weight", &sz);
     if (emb_ptr && sz == (size_t)m->vocab_size * m->n_embd * sizeof(__half)) {
         m->embed_table.assign((const __half*)emb_ptr, (const __half*)emb_ptr + m->vocab_size * m->n_embd);
     }
@@ -430,7 +430,7 @@ const void* inference_get_tensor_ptr(const inference_model_t* m, const char* nam
     clear_error();
     if (!m || !m->gguf || !name || !out_bytes) { set_error("Invalid args"); return nullptr; }
     size_t off, sz;
-    const void* ptr = gguf_mmap_get_tensor(m->gguf, name, &sz);
+    const void* ptr = gguf_get_tensor_ptr(m->gguf, name, &sz);
     if (!ptr) { set_error("Tensor not found: %s", name); return nullptr; }
     *out_bytes = sz;
     return ptr;

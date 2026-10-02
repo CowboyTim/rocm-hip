@@ -7,11 +7,13 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include "gguf_mmap.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// Opaque handle for the inference engine model
+typedef struct inference_model inference_model_t;
 
 // Model loading: mmap() the GGUF file, parse metadata, pin weight pages via hipHostRegister.
 // Returns NULL on failure (check inference_get_last_error()).
