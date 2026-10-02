@@ -66,6 +66,11 @@ int64_t      gguf_block_count(const gguf_model_t *model);  /* number of transfor
 /* Read scalar KV value as string. Returns NULL if not a string or key not found. */
 const char  *gguf_kv_str_val(const gguf_model_t *model, int64_t idx);
 
+/* Get string array from KV by key. Returns 0 on success, -1 if not found or not an array of strings.
+ * The caller must free the returned array and its strings with gguf_free_string_array(). */
+int32_t gguf_kv_get_string_array(const gguf_model_t *model, const char* key, const char*** out_strings, size_t* out_count);
+void gguf_free_string_array(const char** strings, size_t count);
+
 /* Get tensor data pointer by name. Returns NULL if not found.
  * out_bytes receives the tensor size in bytes. */
 const void* gguf_get_tensor_ptr(const gguf_model_t *model, const char* name, size_t* out_bytes);

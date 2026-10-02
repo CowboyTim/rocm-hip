@@ -88,6 +88,8 @@ struct kv_entry {
     struct kv_scalar scalar;      /* used only when !is_array */
     uint64_t         arr_n;       /* number of elements (only when is_array) */
     char             *str_val;    /* allocated string (for string-type scalars) */
+    char            **arr_strings;/* for string arrays: array of strings */
+    size_t           arr_str_n;   /* number of strings in arr_strings */
 };
 
 /* Opaque handle matching the public API declaration */
@@ -191,9 +193,16 @@ static gguf_model_t *load_gguf(const char *path) {
             memcpy(&arr_type, p, 4); p += 4;
             memcpy(&arr_n, p, 8); p += 8;
 
-            /* String arrays have variable-length elements -- skip each individually */
+            /* String arrays: store strings for tokenizer metadata */
             if ((enum gguf_type)arr_type == GGUF_TYPE_STRING) {
-                for (uint64_t j = 0; j < arr_n; ++j) { char *s = read_string(&p); free(s); }
+                kv->arr_strings = (char**)calloc(arr_n, sizeof(char*));
+                if (!kv->arr_strings) goto fail;
+                for (uint64_t j = 0; j < arr_n; ++j) {
+                    char *s = read_string(&p);
+                    if (!s) goto fail;
+                    kv->arr_strings[j] = s;
+                }
+                kv->arr_str_n = (size_t)arr_n;
             } else {
                 size_t elem_sz = 0; switch ((enum gguf_type)arr_type) {
                     case GGUF_TYPE_UINT8:   elem_sz=1; break; case GGUF_TYPE_INT8:    elem_sz=1; break;
@@ -267,7 +276,13 @@ static gguf_model_t *load_gguf(const char *path) {
 fail:
     fprintf(stderr, "gguf_mmap: corrupted structure in '%s'\n", path);
     munmap(mapped, st.st_size);
-    for (int64_t i = 0; i < n_kv; ++i) free(model->kvs[i].key);
+    for (int64_t i = 0; i < n_kv; ++i) {
+        free(model->kvs[i].key);
+        if (model->kvs[i].arr_strings) {
+            for (size_t j = 0; j < model->kvs[i].arr_str_n; ++j) free(model->kvs[i].arr_strings[j]);
+            free(model->kvs[i].arr_strings);
+        }
+    }
     free(model->tensors); free(model->kvs); free(model);
     return NULL;
 }
@@ -283,8 +298,14 @@ gguf_model_t *inference_load_model(const char *path) {
 
 void inference_free_model(gguf_model_t *model) {
     if (!model) return;
-    for (int64_t i = 0; i < model->n_kv; ++i) free(model->kvs[i].str_val);
-    for (int64_t i = 0; i < model->n_kv; ++i) free(model->kvs[i].key);
+    for (int64_t i = 0; i < model->n_kv; ++i) {
+        free(model->kvs[i].str_val);
+        if (model->kvs[i].arr_strings) {
+            for (size_t j = 0; j < model->kvs[i].arr_str_n; ++j) free(model->kvs[i].arr_strings[j]);
+            free(model->kvs[i].arr_strings);
+        }
+        free(model->kvs[i].key);
+    }
     free(model->tensors); free(model->kvs);
     if (model->map_ptr) munmap(model->map_ptr, model->map_size);
     free(model);
@@ -527,6 +548,23 @@ static int64_t find_kv_index(const gguf_model_t *m, const char *key) {
     return -1;
 }
 
+/* Get string array from KV by key. Returns 0 on success, -1 if not found or not a string array. */
+int32_t gguf_kv_get_string_array(const gguf_model_t *model, const char* key, const char*** out_strings, size_t* out_count) {
+    if (!model || !key || !out_strings || !out_count) return -1;
+    int64_t idx = find_kv_index(model, key);
+    if (idx < 0) return -1;
+    const struct kv_entry *kv = &model->kvs[idx];
+    if (!kv->is_array || kv->arr_type != GGUF_TYPE_STRING) return -1;
+    *out_strings = (const char**)kv->arr_strings;
+    *out_count = kv->arr_str_n;
+    return 0;
+}
+
+void gguf_free_string_array(const char** strings, size_t count) {
+    (void)strings; (void)count; /* strings are owned by the model; no separate free needed */
+}
+
+/* --- Model-level queries --- */
 const char *gguf_arch(const gguf_model_t *m) {
     /* Architecture stored as string in GGUF -- see implementation notes */
     return "(string value)";
