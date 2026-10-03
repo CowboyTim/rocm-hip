@@ -106,7 +106,6 @@ $(WMMA_FP4_NATIVE_TARGET): $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO)
 $(CODIR)/%.co: $(SRCDIR)/%.hip
 	$(HIPCC) $(HIPFLAGS) -c $< -o $@
 	cp $@ $(BINDIR)/
-	cp $@ .
 
 # Host C++ files (.cpp -> .o) -- compiled without device offloading
 $(OBJDIR)/%.o: $(SRCDIR)/%.cpp
@@ -133,39 +132,35 @@ $(DEMO_GGUF): $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/demo_gguf.cpp $(SRCDIR)/gguf_mma
 		$(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/demo_gguf.cpp -o $@
 
 # Phase 2 verify: host harness loads both .co files at runtime, compares against CPU reference
-$(FP4_VERIFY): $(SRCDIR)/fp4_verify.cpp $(SRCDIR)/fp4_common.h $(CODIR)/fp4_matmul_kernel.co $(CODIR)/fp4_matmul_wmma.co
+$(FP4_VERIFY): $(SRCDIR)/fp4_verify.cpp $(SRCDIR)/fp4_common.h $(CODIR)/fp4_matmul_kernel.co $(CODIR)/fp4_matmul_wmma.co copy_co_files
 	$(CLANG) $(CXXFLAGS) -I. $(SRCDIR)/fp4_verify.cpp $(LDFLAGS) -o $@
 
 # Phase 3 verify: KV cache manager + zero-copy self-test (loads kv_cache_kernel.co at runtime)
-$(KV_VERIFY): $(SRCDIR)/kv_cache.cpp $(TESTSDIR)/kv_verify.cpp $(SRCDIR)/kv_cache.h $(CODIR)/kv_cache_kernel.co
+$(KV_VERIFY): $(SRCDIR)/kv_cache.cpp $(TESTSDIR)/kv_verify.cpp $(SRCDIR)/kv_cache.h $(CODIR)/kv_cache_kernel.co copy_co_files
 	$(CLANG) $(CXXFLAGS) -I. $(SRCDIR)/kv_cache.cpp $(TESTSDIR)/kv_verify.cpp $(LDFLAGS) -o $@
 
 # Phase 3 verify: FP16 WMMA GEMM vs CPU reference over /dev/shm (loads fp16_gemm.co at runtime)
-$(GEMM_VERIFY): $(TESTSDIR)/gemm_verify.cpp $(CODIR)/fp16_gemm.co
+$(GEMM_VERIFY): $(TESTSDIR)/gemm_verify.cpp $(CODIR)/fp16_gemm.co copy_co_files
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/gemm_verify.cpp $(LDFLAGS) -o $@
 
 # Phase 3 verify: RMSNorm kernel vs CPU reference (loads layernorm.co at runtime)
-$(LAYERNORM_VERIFY): $(TESTSDIR)/layernorm_verify.cpp $(CODIR)/layernorm.co
+$(LAYERNORM_VERIFY): $(TESTSDIR)/layernorm_verify.cpp $(CODIR)/layernorm.co copy_co_files
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/layernorm_verify.cpp $(LDFLAGS) -o $@
 
 # Phase 3 verify: RoPE rotate-half kernel vs CPU reference (loads rope_embedding.co at runtime)
-$(ROPE_VERIFY): $(TESTSDIR)/rope_verify.cpp $(CODIR)/rope_embedding.co
+$(ROPE_VERIFY): $(TESTSDIR)/rope_verify.cpp $(CODIR)/rope_embedding.co copy_co_files
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/rope_verify.cpp $(LDFLAGS) -o $@
 
 # Phase 3 verify: masked row-softmax vs CPU reference (loads softmax_masked.co at runtime)
-$(SOFTMAX_VERIFY): $(TESTSDIR)/softmax_verify.cpp $(CODIR)/softmax_masked.co
+$(SOFTMAX_VERIFY): $(TESTSDIR)/softmax_verify.cpp $(CODIR)/softmax_masked.co copy_co_files
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/softmax_verify.cpp $(LDFLAGS) -o $@
 
 # Phase 3 verify: Act x FP4 GEMM vs CPU reference over /dev/shm (loads gemm_act_fp4.co at runtime)
-$(ACTFP4_VERIFY): $(TESTSDIR)/actfp4_verify.cpp $(CODIR)/gemm_act_fp4.co
+$(ACTFP4_VERIFY): $(TESTSDIR)/actfp4_verify.cpp $(CODIR)/gemm_act_fp4.co copy_co_files
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/actfp4_verify.cpp $(LDFLAGS) -o $@
 
-# Phase 9 verify: Tokenizer BPE encode/decode round‑trip
-$(TOKENIZER_VERIFY): $(TESTSDIR)/tokenizer_verify.cpp $(INFERENCE_LIB)
-	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/tokenizer_verify.cpp $(INFERENCE_LIB) $(LDFLAGS) -o $@
-
 # Phase 3 verify: full attention block chain; loads layernorm/gemm_act_fp4/rope_embedding/kv_cache_store/fp16_gemm/softmax_masked .co files
-$(ATTN_VERIFY): $(TESTSDIR)/attn_verify.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/kv_cache.h $(CODIR)/kv_cache_store.co $(CODIR)/gemm_act_fp4.co $(CODIR)/fp16_gemm.co $(CODIR)/layernorm.co $(CODIR)/rope_embedding.co $(CODIR)/softmax_masked.co
+$(ATTN_VERIFY): $(TESTSDIR)/attn_verify.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/kv_cache.h $(CODIR)/kv_cache_store.co $(CODIR)/gemm_act_fp4.co $(CODIR)/fp16_gemm.co $(CODIR)/layernorm.co $(CODIR)/rope_embedding.co $(CODIR)/softmax_masked.co copy_co_files
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/attn_verify.cpp $(SRCDIR)/kv_cache.cpp $(LDFLAGS) -o $@
 
 # Phase 4: SwiGLU kernel (.co for runtime loading)
@@ -243,6 +238,10 @@ both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BE
 clean:
 	rm -rf $(BUILDDIR)
 
-.PHONY: all clean both tokenizer_verify
+# Copy .co files to root for test execution (tests expect .co files in cwd)
+copy_co_files:
+	cp -f $(CODIR)/*.co .
 
-tokenizer_verify: $(TOKENIZER_VERIFY)
+.PHONY: all clean both tokenizer_verify copy_co_files
+
+tokenizer_verify: $(TOKENIZER_VERIFY) copy_co_files
