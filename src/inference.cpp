@@ -28,6 +28,9 @@
 
 using namespace rocmfp4;
 
+// Global RNG seed for reproducible sampling
+static std::atomic<uint32_t> g_rng_seed{0};
+
 // Thread-local error buffer
 static thread_local char g_last_error[1024] = {0};
 
@@ -413,7 +416,8 @@ void inference_kv_cache_free(inference_model_t* m) {
 }
 
 void inference_set_seed(inference_model_t* m, unsigned int seed) {
-    (void)m; (void)seed; // TODO: set RNG state
+    (void)m;
+    g_rng_seed.store(seed, std::memory_order_relaxed);
 }
 
 int inference_decode_token(inference_model_t* m, int token_id, int* next_token_out) {
@@ -506,7 +510,11 @@ int inference_sample_logits(inference_model_t* m, float temperature, int top_k, 
     }
 
     // Sample from distribution
-    static thread_local std::mt19937 rng((unsigned)std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    static thread_local std::mt19937 rng([](){
+        uint32_t seed = g_rng_seed.load(std::memory_order_relaxed);
+        if (seed != 0) return std::mt19937(seed);
+        return std::mt19937((unsigned)std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    }());
     std::discrete_distribution<int> dist(l.begin(), l.end());
     int sampled = dist(rng);
     *out_token = vocab_ids[sampled];
@@ -628,8 +636,7 @@ int inference_generate(inference_model_t* model,
         if (rc != 0) { delete[] logits; delete[] vocab_ids; return rc; }
         out_ids[generated++] = next;
         // feed next token back
-        int dummy = 0;
-        rc = inference_decode_token(model, next, &dummy);
+        rc = inference_decode_token(model, next, &next);
         if (rc != 0) { delete[] logits; delete[] vocab_ids; return rc; }
         if (next == tokenizer_eos_id(model->tokenizer)) break; // stop on EOS
     }

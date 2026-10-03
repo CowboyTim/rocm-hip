@@ -71,7 +71,7 @@ int main(int argc, char** argv) {
     inference_free_tokens(tokens, n_tokens);
 
     // Generate a few continuation tokens
-    int next = 0; // placeholder
+    int next = 0;
     for (int i = 0; i < 5; ++i) {
         float* logits = new float[vocab_size];
         if (qwen_model_forward(model, next, n_tokens + i, logits) != 0) {
