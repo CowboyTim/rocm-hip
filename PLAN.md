@@ -500,10 +500,10 @@ Goal: turn the batched forward placeholder into high‑performance kernels and o
 4. **Batched `kv_cache_store` kernel** – added batch dimension, per‑batch source/destination offsets.
 
 ### Remaining work
-1. **Host batched forward integration** – implement `inference_forward_batch` / `qwen_model_forward_batch` to launch the batched kernels with proper 3‑D grid (`gridDim.z = batch_size`).
-2. **Batched `softmax_masked` launch** – adjust launch configuration to include batch dimension; handle per‑batch `qpos`.
-3. **Autotuning script** – sweep tile sizes, block dims, LDS usage; pick optimal config per GPU.
-4. **Benchmark suite** – `bench_inference.py` extended with batch‑size sweep, latency/throughput plots, comparison vs. llama.cpp baseline.
+1. **Batched `softmax_masked` launch** – adjust launch configuration to include batch dimension; handle per‑batch `qpos`.
+2. **Autotuning script** – sweep tile sizes, block dims, LDS usage; pick optimal config per GPU.
+3. **Benchmark suite** – `bench_inference.py` extended with batch‑size sweep, latency/throughput plots, comparison vs. llama.cpp baseline.
+4. **Batched test** – extend `attn_verify` or add `batched_verify` to test `inference_forward_batch` with batch > 1.
 
 ---
 
