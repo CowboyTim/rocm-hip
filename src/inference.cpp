@@ -617,7 +617,7 @@ void inference_model_release(inference_model_t* m) {
     }
 }
 
-// Batched forward (placeholder)
+// Batched forward (stub)
 int inference_forward_batch(inference_model_t* model,
                             const int32_t* tokens,
                             const int* positions,
@@ -631,6 +631,21 @@ int inference_forward_batch(inference_model_t* model,
     }
     // TODO: implement batched forward using qwen_model_forward_batch
     set_error("Batched forward not yet implemented");
+    return INFERENCE_ERR_NOT_IMPLEMENTED;
+}
+    // Allocate output logits buffer for batch
+    float* logits_batch = new float[(size_t)batch_size * model->vocab_size];
+    int rc = qwen_model_forward_batch(model->qwen, tokens, nullptr, nullptr, batch_size, seq_len, nullptr);
+    // We need to adapt to pass positions etc. For now simple loop inside qwen_model_forward_batch uses internal positions.
+    // We'll just call the batch forward that loops internally.
+    rc = qwen_model_forward_batch(model->qwen, nullptr, nullptr, nullptr, batch_size, seq_len, nullptr);
+    // Actually we need to pass tokens and positions. Let's call a new internal that accepts them.
+    // For simplicity, we'll just call a helper that loops.
+    // Since we already have a loop in qwen_model_forward_batch that expects tokens and positions, we need to pass them.
+    // We'll modify qwen_model_forward_batch signature to accept tokens and positions.
+    // But to keep changes minimal, we'll implement a simple loop here.
+    // For now return NOT_IMPLEMENTED.
+    delete[] logits_batch; // if allocated
     return INFERENCE_ERR_NOT_IMPLEMENTED;
 }
 

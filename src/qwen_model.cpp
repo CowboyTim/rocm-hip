@@ -414,7 +414,7 @@ int qwen_model_forward(qwen_model_t* model, int token_id, int pos, float* logits
     return model->forward(token_id, pos, logits);
 }
 
-// Batched forward placeholder
+// Batched forward: simple loop over batch calling single-token forward
 int qwen_model_forward_batch(qwen_model_t* model,
                              const int32_t* tokens,
                              const int* positions,
@@ -422,9 +422,14 @@ int qwen_model_forward_batch(qwen_model_t* model,
                              int batch_size,
                              int seq_len,
                              float* logits_out) {
-    (void)model; (void)tokens; (void)positions; (void)seq_lens;
-    (void)batch_size; (void)seq_len; (void)logits_out;
-    // TODO: implement batched forward
-    return -1; // NOT_IMPLEMENTED
+    (void)seq_len;
+    for (int b = 0; b < batch_size; ++b) {
+        int token_id = tokens[b];
+        int pos = positions[b];
+        float* logits_out_b = logits_out + (size_t)b * 151936; // vocab_size = 151936 (Qwen3-7B)
+        int rc = qwen_model_forward(model, token_id, pos, logits_out_b);
+        if (rc != 0) return rc;
+    }
+    return 0;
 }
 }
