@@ -572,7 +572,7 @@ void inference_model_release(inference_model_t* m) {
     }
 }
 
-// Batched forward (stub)
+// Batched forward: runs forward pass for a batch of tokens to fill KV cache.
 int inference_forward_batch(inference_model_t* model,
                             const int32_t* tokens,
                             const int* positions,
@@ -580,13 +580,17 @@ int inference_forward_batch(inference_model_t* model,
                             int batch_size,
                             int seq_len) {
     clear_error();
-    if (!model || !tokens || !positions || !seq_lens || batch_size <= 0 || seq_len <= 0) {
+    if (!model || !model->qwen || !tokens || !positions || !seq_lens || batch_size <= 0 || seq_len <= 0) {
         set_error("Invalid arguments");
         return INFERENCE_ERR_INVALID_ARG;
     }
-    // TODO: implement batched forward using qwen_model_forward_batch
-    set_error("Batched forward not yet implemented");
-    return INFERENCE_ERR_NOT_IMPLEMENTED;
+    // Allocate logits buffer for batch
+    size_t logits_size = (size_t)batch_size * (size_t)model->vocab_size;
+    float* logits_batch = new float[logits_size];
+    int rc = qwen_model_forward_batch(model->qwen, tokens, nullptr, nullptr, batch_size, seq_len, logits_batch);
+    delete[] logits_batch;
+    (void)seq_len; // suppress unused warning for now
+    return rc;
 }
 
 // Generation loop helper
