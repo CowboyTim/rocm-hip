@@ -522,13 +522,57 @@ Goal: provide a Perl XS module that wraps the C API, enabling Perl applications 
 
 ### Planned
 1. **XS wrapper (`Inference.xs`)** – thin XS glue that declares the C functions from `inference.h` (`inference_load_model`, `inference_free_model`, `inference_tokenize`, `inference_decode_token`, `inference_generate`, `inference_get_logits`, `inference_sample_logits`, `inference_kv_cache_init`, `inference_kv_cache_free`, `inference_model_retain`, `inference_model_release`, `inference_get_last_error`, `inference_strerror`, `inference_get_tensor_ptr`, `inference_vocab_size`, `inference_model_name`, `inference_n_ctx`, `inference_batch_size`). XS typemaps will handle conversion between Perl scalars/arrays and the C types (`char*`, `int32_t*`, `float*`, opaque pointers).
-3. **Perl wrapper module (`ROCm::Inference`)** – thin OO wrapper that manages reference counting (`inference_model_retain`/`release`), converts Perl strings to UTF‑8 C strings for the tokenizer, returns Perl arrays of token IDs, and provides a high‑level `generate($prompt, %opts)` method that internally calls `inference_generate` with temperature/top‑k/top‑p.
-4. **CPAN packaging** – `Dist::Zilla` / `Module::Build` profile that builds the XS module, links against `libinference.so`, installs the shared library (`libinference.so.1`) into a private `lib/` directory, and generates a `Makefile.PL` / `Build.PL` for CPAN upload. The distribution will declare a dependency on `Alien::ROCm` (or similar) to locate the ROCm runtime at build time.
-5. **Test suite** – `t/00-load.t`, `t/01-load-model.t`, `t/02-tokenize.t`, `t/03-generate.t` using a tiny Qwen‑3 GGUF fixture placed under `t/data/`.
+2. **Perl wrapper module (`ROCm::Inference`)** – thin OO wrapper that manages reference counting (`inference_model_retain`/`release`), converts Perl strings to UTF‑8 C strings for the tokenizer, returns Perl arrays of token IDs, and provides a high‑level `generate($prompt, %opts)` method that internally calls `inference_generate` with temperature/top‑k/top‑p.
+3. **CPAN packaging** – `Dist::Zilla` / `Module::Build` profile that builds the XS module, links against `libinference.so`, installs the shared library (`libinference.so.1`) into a private `lib/` directory, and generates a `Makefile.PL` / `Build.PL` for CPAN upload. The distribution will declare a dependency on `Alien::ROCm` (or similar) to locate the ROCm runtime at build time.
+4. **Test suite** – `t/00-load.t`, `t/01-load-model.t`, `t/02-tokenize.t`, `t/03-generate.t` using a tiny Qwen‑3 GGUF fixture placed under `t/data/`.
 5. **Documentation** – POD in `lib/ROCm/Inference.pm` with SYNOPSIS showing a one‑liner: `my $m = ROCm::Inference->new("/dev/shm/models/qwen3.gguf"); say $m->generate("Hello, world!");`.
 
+---
+
+## Phase 14 – Batched forward host integration (NEXT)
+Goal: implement the host‑side batched forward launch glue so `inference_forward_batch` actually uses the batched kernels.
+
+### Remaining work
+1. **Implement `inference_forward_batch`** in `src/inference.cpp`:
+   - Launch `gemm_act_fp4` with 3‑D grid (`gridDim.z = batch_size`) for Q/K/V/O projections.
+   - Launch `fp16_gemm` for attention scores and output with 3‑D grid.
+   - Launch `softmax_masked` with `blockIdx.z = batch` and per‑batch `qpos`.
+   - Launch `kv_cache_store` with `blockIdx.z = batch`.
+   - Wire up per‑batch `qpos` and `seq_lens` to the kernels.
+   - Return `INFERENCE_ERR_NOT_IMPLEMENTED` until fully wired.
+2. **Implement `qwen_model_forward_batch`** in `qwen_model.cpp`:
+   - Loop over batch calling single‑token forward for now (as done).
+   - Later replace with direct batched kernel launches.
+3. **Update `inference_forward_batch`** to call `qwen_model_forward_batch` with proper arguments (tokens, positions, seq_lens).
+3. **Add batched test** – extend `attn_verify` or add `batched_verify` to test `inference_forward_batch` with batch > 1.
+
+---
+
+## Phase 13 – Multi‑GPU / Tensor Parallelism (future)
+Goal: scale inference across multiple Strix Halo GPUs via tensor parallelism.
+
+### Planned
+1. **Weight sharding** – split Q/K/V/O and MLP weights across GPUs; use NCCL/RCCL for all‑reduce.
+2. **Pipeline parallelism** – overlap compute/comm across layers.
+3. **Distributed KV cache** – each GPU holds its shard of KV cache.
+
+---
+
+## Phase 14 – Perl XS bindings & CPAN distribution (future)
+Goal: provide a Perl XS module that wraps the C API, enabling Perl applications to run inference with zero‑copy ROCmFP4 on Strix Halo.
+
+### Planned
+1. **XS wrapper (`Inference.xs`)** – thin XS glue that declares the C functions from `inference.h` (`inference_load_model`, `inference_free_model`, `inference_tokenize`, `inference_decode_token`, `inference_generate`, `inference_get_logits`, `inference_sample_logits`, `inference_kv_cache_init`, `inference_kv_cache_free`, `inference_model_retain`, `inference_model_release`, `inference_get_last_error`, `inference_strerror`, `inference_get_tensor_ptr`, `inference_vocab_size`, `inference_model_name`, `inference_n_ctx`, `inference_batch_size`). XS typemaps will handle conversion between Perl scalars/arrays and the C types (`char*`, `int32_t*`, `float*`, opaque pointers).
+2. **Perl wrapper module (`ROCm::Inference`)** – thin OO wrapper that manages reference counting (`inference_model_retain`/`release`), converts Perl strings to UTF‑8 C strings for the tokenizer, returns Perl arrays of token IDs, and provides a high‑level `generate($prompt, %opts)` method that internally calls `inference_generate` with temperature/top‑k/top‑p.
+3. **CPAN packaging** – `Dist::Zilla` / `Module::Build` profile that builds the XS module, links against `libinference.so`, installs the shared library (`libinference.so.1`) into a private `lib/` directory, and generates a `Makefile.PL` / `Build.PL` for CPAN upload. The distribution will declare a dependency on `Alien::ROCm` (or similar) to locate the ROCm runtime at build time.
+2. **Test suite** – `t/00-load.t`, `t/01-load-model.t`, `t/02-tokenize.t`, `t/03-generate.t` using a tiny Qwen‑3 GGUF fixture placed under `t/data/`.
+3. **Documentation** – POD in `lib/ROCm/Inference.pm` with SYNOPSIS showing a one‑liner: `my $m = ROCm::Inference->new("/dev/shm/models/qwen3.gguf"); say $m->generate("Hello, world!");`.
+
+---
+
 ## Next steps
-1. Begin Phase 12 – implement batched kernels (`gemm_act_fp4`, `fp16_gemm`, `softmax_masked`, `kv_cache_store`) and host‑side launch glue; add autotuning script.
-2. Profile `qwen_demo` with real Qwen‑3‑7B GGUF on Strix Halo; collect latency/throughput numbers for batch = 1 and batch > 1.
-3. Start Phase 13 design (multi‑GPU tensor parallelism) once batched kernels are stable.
-4. After Phase 13 stabilises, begin Phase 14 – Perl XS bindings, CPAN packaging, and documentation.
+1. **Implement host‑side batched launch glue** – `inference_forward_batch` in `src/inference.cpp` to launch batched kernels with 3‑D grid; update `inference_forward_batch` to call `qwen_model_forward_batch` with proper arguments (tokens, positions, seq_lens).
+2. **Profile `qwen_demo`** with real Qwen‑3‑7B GGUF on Strix Halo; collect latency/throughput numbers for batch = 1 and batch > 1.
+3. **Add batched test** – extend `attn_verify` or add `batched_verify` to test `inference_forward_batch` with batch > 1.
+4. Start Phase 13 design (multi‑GPU tensor parallelism) once batched kernels are stable.
+5. After Phase 12 stabilises, begin Phase 14 – Perl XS bindings, CPAN packaging, and documentation.

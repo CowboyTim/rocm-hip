@@ -69,21 +69,6 @@ static bool load_module(const char* co_path, const char* sym, hipModule_t& mod, 
     return ok;
 }
 
-static void ensure_kernels_loaded() {
-    static std::once_flag flag;
-    std::call_once(flag, []() {
-        load_module("gemm_act_fp4.co", "gemm_act_fp4", g_mod_gemm_act_fp4, g_fn_gemm_act_fp4);
-        load_module("swiglu.co", "swiglu_fp4", g_mod_swiglu, g_fn_swiglu);
-        load_module("embedding_lookup.co", "embedding_lookup", g_mod_embedding, g_fn_embedding);
-        load_module("rope_embedding.co", "rope_rotate_half", g_mod_rope, g_fn_rope);
-        load_module("softmax_masked.co", "softmax_masked", g_mod_softmax, g_fn_softmax);
-        load_module("fp16_gemm.co", "fp16_gemm", g_mod_fp16_gemm, g_fn_fp16_gemm);
-        load_module("kv_cache_store.co", "kv_store", g_mod_kv_store, g_fn_kv_store);
-        load_module("layernorm.co", "rmsnorm", g_mod_layernorm, g_fn_layernorm);
-        hipInit(0);
-    });
-}
-
 // Quantized weight matrix for a single projection (ROCmFP4 Codebook10)
 struct QuantWeight {
     int N, K;                                  // output_dim x input_dim (K multiple of 16)
@@ -147,9 +132,7 @@ struct inference_model {
     void* scratch_base = nullptr;
     size_t scratch_bytes = 0;
 
-    // Tokenizer (simplified: vocab from GGUF, no BPE for Phase 4)
-    std::vector<std::string> vocab_tokens;
-    std::unordered_map<std::string, int> vocab_map;
+    // Tokenizer
     tokenizer_t* tokenizer = nullptr;
     qwen_model_t* qwen = nullptr;
 };
@@ -217,23 +200,7 @@ static void unpin_model_memory(inference_model* m) {
     unpin(m->d_final_ln);
 }
 
-// Simplified tokenizer: split on whitespace, map to vocab (placeholder)
-static std::vector<int> simple_tokenize(inference_model* m, const char* text) {
-    std::vector<int> tokens;
-    const char* p = text;
-    while (*p) {
-        while (*p == ' ' || *p == '\t' || *p == '\n') ++p;
-        if (!*p) break;
-        const char* start = p;
-        while (*p && *p != ' ' && *p != '\t' && *p != '\n') ++p;
-        std::string word(start, p - start);
-        auto it = m->vocab_map.find(word);
-        if (it != m->vocab_map.end()) tokens.push_back(it->second);
-        else tokens.push_back(0);  // UNK
-    }
-    if (tokens.empty()) tokens.push_back(1);  // BOS
-    return tokens;
-}
+
 
 // Helper: find tensor index by name
 static int find_tensor_index(gguf_model_t* gguf, const char* name) {
