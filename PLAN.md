@@ -498,12 +498,14 @@ Goal: turn the batched forward placeholder into high‑performance kernels and o
 2. **Batched `fp16_gemm` kernel** – added batch dimension, batch offsets for A, B, C.
 3. **Batched `softmax_masked` kernel** – added batch dimension, per‑batch qpos, per‑batch score buffers.
 4. **Batched `kv_cache_store` kernel** – added batch dimension, per‑batch source/destination offsets.
+5. **Host‑side batched forward integration** – `inference_forward_batch` in `src/inference.cpp` now calls `qwen_model_forward_batch` with proper arguments (tokens, positions, seq_lens) and launches the batched kernels via the existing batched kernels (the kernels themselves are launched inside `qwen_model_forward_batch` which currently loops over batch calling single‑token forward; the batched kernels are ready for direct launch once the host glue is wired).
 
 ### Remaining work
 1. **Batched `softmax_masked` launch** – adjust launch configuration to include batch dimension; handle per‑batch `qpos`.
 2. **Autotuning script** – sweep tile sizes, block dims, LDS usage; pick optimal config per GPU.
 3. **Benchmark suite** – `bench_inference.py` extended with batch‑size sweep, latency/throughput plots, comparison vs. llama.cpp baseline.
 4. **Batched test** – extend `attn_verify` or add `batched_verify` to test `inference_forward_batch` with batch > 1.
+5. **True batched kernel launch** – replace the loop in `qwen_model_forward_batch` with direct launches of the batched kernels (`gemm_act_fp4`, `fp16_gemm`, `softmax_masked`, `kv_cache_store`) using 3‑D grid (`gridDim.z = batch_size`).
 
 ---
 
@@ -565,14 +567,14 @@ Goal: provide a Perl XS module that wraps the C API, enabling Perl applications 
 1. **XS wrapper (`Inference.xs`)** – thin XS glue that declares the C functions from `inference.h` (`inference_load_model`, `inference_free_model`, `inference_tokenize`, `inference_decode_token`, `inference_generate`, `inference_get_logits`, `inference_sample_logits`, `inference_kv_cache_init`, `inference_kv_cache_free`, `inference_model_retain`, `inference_model_release`, `inference_get_last_error`, `inference_strerror`, `inference_get_tensor_ptr`, `inference_vocab_size`, `inference_model_name`, `inference_n_ctx`, `inference_batch_size`). XS typemaps will handle conversion between Perl scalars/arrays and the C types (`char*`, `int32_t*`, `float*`, opaque pointers).
 2. **Perl wrapper module (`ROCm::Inference`)** – thin OO wrapper that manages reference counting (`inference_model_retain`/`release`), converts Perl strings to UTF‑8 C strings for the tokenizer, returns Perl arrays of token IDs, and provides a high‑level `generate($prompt, %opts)` method that internally calls `inference_generate` with temperature/top‑k/top‑p.
 3. **CPAN packaging** – `Dist::Zilla` / `Module::Build` profile that builds the XS module, links against `libinference.so`, installs the shared library (`libinference.so.1`) into a private `lib/` directory, and generates a `Makefile.PL` / `Build.PL` for CPAN upload. The distribution will declare a dependency on `Alien::ROCm` (or similar) to locate the ROCm runtime at build time.
-2. **Test suite** – `t/00-load.t`, `t/01-load-model.t`, `t/02-tokenize.t`, `t/03-generate.t` using a tiny Qwen‑3 GGUF fixture placed under `t/data/`.
-3. **Documentation** – POD in `lib/ROCm/Inference.pm` with SYNOPSIS showing a one‑liner: `my $m = ROCm::Inference->new("/dev/shm/models/qwen3.gguf"); say $m->generate("Hello, world!");`.
+4. **Test suite** – `t/00-load.t`, `t/01-load-model.t`, `t/02-tokenize.t`, `t/03-generate.t` using a tiny Qwen‑3 GGUF fixture placed under `t/data/`.
+5. **Documentation** – POD in `lib/ROCm/Inference.pm` with SYNOPSIS showing a one‑liner: `my $m = ROCm::Inference->new("/dev/shm/models/qwen3.gguf"); say $m->generate("Hello, world!");`.
 
 ---
 
 ## Next steps
-1. **Implement host‑side batched launch glue** – `inference_forward_batch` in `src/inference.cpp` to launch batched kernels with 3‑D grid; update `inference_forward_batch` to call `qwen_model_forward_batch` with proper arguments (tokens, positions, seq_lens).
+1. **Implement batched `softmax_masked` launch** – adjust launch configuration to include batch dimension; handle per‑batch `qpos`.
 2. **Profile `qwen_demo`** with real Qwen‑3‑7B GGUF on Strix Halo; collect latency/throughput numbers for batch = 1 and batch > 1.
 3. **Add batched test** – extend `attn_verify` or add `batched_verify` to test `inference_forward_batch` with batch > 1.
 4. Start Phase 13 design (multi‑GPU tensor parallelism) once batched kernels are stable.
-5. After Phase 12 stabilises, begin Phase 14 – Perl XS bindings, CPAN packaging, and documentation.
+6. After Phase 12 stabilises, begin Phase 14 – Perl XS bindings, CPAN packaging, and documentation.

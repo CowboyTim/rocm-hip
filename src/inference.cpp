@@ -594,10 +594,9 @@ int inference_forward_batch(inference_model_t* model,
     }
     // Allocate logits buffer for batch
     size_t logits_size = (size_t)batch_size * (size_t)model->vocab_size;
-    float* logits_batch = new float[logits_size];
-    int rc = qwen_model_forward_batch(model->qwen, tokens, nullptr, nullptr, batch_size, seq_len, logits_batch);
+    float* logits_batch = new float[(size_t)batch_size * (size_t)model->vocab_size];
+    int rc = qwen_model_forward_batch(model->qwen, tokens, positions, seq_lens, batch_size, seq_len, logits_batch);
     delete[] logits_batch;
-    (void)seq_len; // suppress unused warning for now
     return rc;
 }
 
