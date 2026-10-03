@@ -354,13 +354,6 @@ inference_model_t* inference_load_model(const char* gguf_path) {
 
     // Create tokenizer from GGUF metadata (Phase 5/8)
     m->tokenizer = tokenizer_load_from_gguf(m->gguf);
-    if (!m->tokenizer && !m->vocab_tokens.empty()) {
-        // Fallback to simple vocab-only tokenizer
-        std::vector<const char*> vocab_ptrs;
-        vocab_ptrs.reserve(m->vocab_tokens.size());
-        for (auto& s : m->vocab_tokens) vocab_ptrs.push_back(s.c_str());
-        m->tokenizer = tokenizer_create(vocab_ptrs.data(), vocab_ptrs.size(), nullptr, 0);
-    }
 
     if (!pin_model_memory(m)) {
         set_error("hipHostRegister failed");
@@ -385,20 +378,15 @@ void inference_free_model(inference_model_t* m) {
 int32_t* inference_tokenize(inference_model_t* m, const char* text, int* out_len) {
     clear_error();
     if (!m || !text || !out_len) { set_error("Invalid args"); return nullptr; }
-    std::vector<int> toks;
-    if (m->tokenizer) {
-        // allocate max possible tokens (len+2)
-        int max_toks = (int)strlen(text) + 2;
-        std::vector<int> buf(max_toks);
-        int n = tokenizer_encode(m->tokenizer, text, buf.data(), max_toks);
-        if (n < 0) { set_error("tokenizer_encode failed"); return nullptr; }
-        toks.assign(buf.begin(), buf.begin() + n);
-    } else {
-        toks = simple_tokenize(m, text);
-    }
-    int32_t* arr = new int32_t[toks.size()];
-    std::memcpy(arr, toks.data(), toks.size() * sizeof(int32_t));
-    *out_len = (int)toks.size();
+    if (!m->tokenizer) { set_error("No tokenizer available"); return nullptr; }
+    // allocate max possible tokens (len+2)
+    int max_toks = (int)strlen(text) + 2;
+    std::vector<int> buf(max_toks);
+    int n = tokenizer_encode(m->tokenizer, text, buf.data(), max_toks);
+    if (n < 0) { set_error("tokenizer_encode failed"); return nullptr; }
+    int32_t* arr = new int32_t[n];
+    std::memcpy(arr, buf.data(), n * sizeof(int32_t));
+    *out_len = n;
     return arr;
 }
 
@@ -598,21 +586,6 @@ int inference_forward_batch(inference_model_t* model,
     }
     // TODO: implement batched forward using qwen_model_forward_batch
     set_error("Batched forward not yet implemented");
-    return INFERENCE_ERR_NOT_IMPLEMENTED;
-}
-    // Allocate output logits buffer for batch
-    float* logits_batch = new float[(size_t)batch_size * model->vocab_size];
-    int rc = qwen_model_forward_batch(model->qwen, tokens, nullptr, nullptr, batch_size, seq_len, nullptr);
-    // We need to adapt to pass positions etc. For now simple loop inside qwen_model_forward_batch uses internal positions.
-    // We'll just call the batch forward that loops internally.
-    rc = qwen_model_forward_batch(model->qwen, nullptr, nullptr, nullptr, batch_size, seq_len, nullptr);
-    // Actually we need to pass tokens and positions. Let's call a new internal that accepts them.
-    // For simplicity, we'll just call a helper that loops.
-    // Since we already have a loop in qwen_model_forward_batch that expects tokens and positions, we need to pass them.
-    // We'll modify qwen_model_forward_batch signature to accept tokens and positions.
-    // But to keep changes minimal, we'll implement a simple loop here.
-    // For now return NOT_IMPLEMENTED.
-    delete[] logits_batch; // if allocated
     return INFERENCE_ERR_NOT_IMPLEMENTED;
 }
 
