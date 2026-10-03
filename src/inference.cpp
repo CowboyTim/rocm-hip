@@ -592,8 +592,8 @@ int inference_forward_batch(inference_model_t* model,
         set_error("Invalid arguments");
         return INFERENCE_ERR_INVALID_ARG;
     }
-    // TODO: implement batched softmax_masked launch with 3D grid (gridDim.z = batch_size)
-    // and per-batch qpos. Currently returns NOT_IMPLEMENTED.
+    // TODO: implement batched kernel launches (gemm_act_fp4, fp16_gemm, softmax_masked, kv_cache_store)
+    // with 3-D grid (gridDim.z = batch_size). Currently returns NOT_IMPLEMENTED.
     return INFERENCE_ERR_NOT_IMPLEMENTED;
 }
 
