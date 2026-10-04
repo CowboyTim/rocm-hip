@@ -532,25 +532,6 @@ Goal: provide a Perl XS module that wraps the C API, enabling Perl applications 
 
 ---
 
-## Phase 14 – Batched forward host integration (NEXT)
-Goal: implement the host‑side batched forward launch glue so `inference_forward_batch` actually uses the batched kernels.
-
-### Remaining work
-1. **Implement `inference_forward_batch`** in `src/inference.cpp`:
-   - Launch `gemm_act_fp4` with 3‑D grid (`gridDim.z = batch_size`) for Q/K/V/O projections.
-   - Launch `fp16_gemm` for attention scores and output with 3‑D grid.
-   - Launch `softmax_masked` with `blockIdx.z = batch` and per‑batch `qpos`.
-   - Launch `kv_cache_store` with `blockIdx.z = batch`.
-   - Wire up per‑batch `qpos` and `seq_lens` to the kernels.
-   - Return `INFERENCE_ERR_NOT_IMPLEMENTED` until fully wired.
-2. **Implement `qwen_model_forward_batch`** in `qwen_model.cpp`:
-   - Loop over batch calling single‑token forward for now (as done).
-   - Later replace with direct batched kernel launches.
-3. **Update `inference_forward_batch`** to call `qwen_model_forward_batch` with proper arguments (tokens, positions, seq_lens).
-3. **Add batched test** – extend `attn_verify` or add `batched_verify` to test `inference_forward_batch` with batch > 1.
-
----
-
 ## Phase 13 – Multi‑GPU / Tensor Parallelism (future)
 Goal: scale inference across multiple Strix Halo GPUs via tensor parallelism.
 
@@ -574,8 +555,7 @@ Goal: provide a Perl XS module that wraps the C API, enabling Perl applications 
 ---
 
 ## Next steps
-1. **Implement batched `softmax_masked` launch** – adjust launch configuration to include batch dimension; handle per‑batch `qpos`.
-2. **Profile `qwen_demo`** with real Qwen‑3‑7B GGUF on Strix Halo; collect latency/throughput numbers for batch = 1 and batch > 1.
-3. **Add batched test** – extend `attn_verify` or add `batched_verify` to test `inference_forward_batch` with batch > 1.
-4. Start Phase 13 design (multi‑GPU tensor parallelism) once batched kernels are stable.
-6. After Phase 12 stabilises, begin Phase 14 – Perl XS bindings, CPAN packaging, and documentation.
+1. **Profile `qwen_demo`** with real Qwen‑3‑7B GGUF on Strix Halo; collect latency/throughput numbers for batch = 1 and batch > 1.
+2. **Add batched test** – extend `attn_verify` or add `batched_verify` to test `inference_forward_batch` with batch > 1.
+3. Start Phase 13 design (multi‑GPU tensor parallelism) once batched kernels are stable.
+4. After Phase 12 stabilises, begin Phase 14 – Perl XS bindings, CPAN packaging, and documentation.
