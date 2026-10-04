@@ -66,13 +66,15 @@ int inference_decode_token(inference_model_t* model, int token_id, int* next_tok
 // tokens: array of token IDs of length batch_size * seq_len (row-major).
 // positions: array of sequence start positions in KV cache (length batch_size).
 // seq_lens: array of actual sequence lengths (length batch_size).
+// logits_out: optional output buffer for logits, size batch_size * vocab_size floats. If NULL, logits are not returned.
 // Returns 0 on success, negative on error.
 int inference_forward_batch(inference_model_t* model,
                             const int32_t* tokens,
                             const int* positions,
                             const int* seq_lens,
                             int batch_size,
-                            int seq_len);
+                            int seq_len,
+                            float* logits_out);
 
 // Generation loop helper: runs prefill + iterative decode to generate up to max_new_tokens.
 // prompt_ids: array of token IDs of length prompt_len.

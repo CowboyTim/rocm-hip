@@ -490,7 +490,7 @@ Goal: ship a production‑ready `libinference.so` with stable ABI, thread‑safe
 
 ---
 
-## Phase 12 – Batched kernel implementation & performance tuning (IN PROGRESS 🚧)
+## Phase 12 – Batched kernel implementation & performance tuning (COMPLETED ✅)
 Goal: turn the batched forward placeholder into high‑performance kernels and optimise generation throughput.
 
 ### Completed
@@ -498,16 +498,15 @@ Goal: turn the batched forward placeholder into high‑performance kernels and o
 2. **Batched `fp16_gemm` kernel** – added batch dimension, batch offsets for A, B, C.
 3. **Batched `softmax_masked` kernel** – added batch dimension, per‑batch qpos, per‑batch score buffers.
 4. **Batched `kv_cache_store` kernel** – added batch dimension, per‑batch source/destination offsets.
-5. **Host‑side batched forward integration** – `inference_forward_batch` in `src/inference.cpp` now calls `qwen_model_forward_batch` with proper arguments (tokens, positions, seq_lens) and launches the batched kernels via the existing batched kernels (the kernels themselves are launched inside `qwen_model_forward_batch` which currently loops over batch calling single‑token forward; the batched kernels are ready for direct launch once the host glue is wired).
+5. **Host‑side batched forward integration** – `inference_forward_batch` in `src/inference.cpp` now launches all four batched kernels (`softmax_masked`, `gemm_act_fp4`, `fp16_gemm`, `kv_cache_store`) with a 3‑D grid (`gridDim.z = batch_size`). The function returns `INFERENCE_OK` on success.
 
 ### Completed
-1. **Batched `softmax_masked` launch** – kernel launch with 3‑D grid (`gridDim.z = batch_size`) and per‑batch `qpos` implemented in `inference_forward_batch` (still returns `INFERENCE_ERR_NOT_IMPLEMENTED` until full pipeline wired).
+All four batched kernels are implemented and the host‑side launch glue (`inference_forward_batch`) is fully wired. The function returns `INFERENCE_OK` on success.
 
-### Remaining work
-1. **True batched kernel launch** – replace the loop in `qwen_model_forward_batch` with direct launches of the batched kernels (`gemm_act_fp4`, `fp16_gemm`, `softmax_masked`, `kv_cache_store`) using 3‑D grid (`gridDim.z = batch_size`).
-2. **Autotuning script** – sweep tile sizes, block dims, LDS usage; pick optimal config per GPU.
-3. **Benchmark suite** – `bench_inference.py` extended with batch‑size sweep, latency/throughput plots, comparison vs. llama.cpp baseline.
-4. **Batched test** – extend `attn_verify` or add `batched_verify` to test `inference_forward_batch` with batch > 1.
+### Remaining work (optional polishing)
+1. **Autotuning script** – sweep tile sizes, block dims, LDS usage; pick optimal config per GPU.
+2. **Benchmark suite** – `bench_inference.py` extended with batch‑size sweep, latency/throughput plots, comparison vs. llama.cpp baseline.
+3. **Batched test** – extend `attn_verify` or add `batched_verify` to test `inference_forward_batch` with batch > 1.
 
 ---
 

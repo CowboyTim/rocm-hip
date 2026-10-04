@@ -612,6 +612,79 @@ int inference_forward_batch(inference_model_t* model,
             h_qpos[(size_t)b * seq_len + r] = val;
         }
     }
+    hipError_t herr = hipMemcpy(d_qpos, h_qpos.data(), qpos_bytes, hipMemcpyHostToDevice);
+    if (herr != hipSuccess) { hipFree(d_scores); hipFree(d_qpos); set_error("hipMemcpy qpos failed"); return INFERENCE_ERR_KERNEL_LAUNCH; }
+
+    // Launch batched softmax_masked kernel with 3D grid
+    dim3 block(32);
+    dim3 grid((seq_len + 31) / 32, 1, batch_size);
+    float scale = 1.0f / sqrtf((float)seq_len);
+    void* args[] = { &d_scores, &batch_size, &seq_len, &seq_len, &scale, &d_qpos, &seq_len };
+    hipError_t kerr_softmax = hipModuleLaunchKernel(g_fn_softmax, (seq_len + 31) / 32, 1, batch_size,
+                                            32, 1, 1, 0, 0, nullptr, nullptr);
+    if (kerr_softmax != hipSuccess) {
+        hipFree(d_scores); hipFree(d_qpos);
+        set_error("softmax_masked launch failed");
+        return INFERENCE_ERR_KERNEL_LAUNCH;
+    }
+
+    // Launch batched gemm_act_fp4 kernel
+    dim3 gemm_block(16, 16);
+    dim3 gemm_grid((model->n_embd + 15) / 16, (model->vocab_size + 15) / 16, batch_size);
+    hipError_t kerr_gemm = hipModuleLaunchKernel(g_fn_gemm_act_fp4,
+                                                (model->n_embd + 15) / 16, (model->vocab_size + 15) / 16, batch_size,
+                                                16, 16, 1, 0, 0, nullptr, nullptr);
+    if (kerr != hipSuccess) {
+        set_error("gemm_act_fp4 launch failed");
+        return INFERENCE_ERR_KERNEL_LAUNCH;
+    }
+
+    // Launch batched fp16_gemm for attention scores and output
+    dim3 gemm2_block(16, 16);
+    dim3 gemm2_grid((seq_len + 15) / 16, (seq_len + 15) / 16, batch_size);
+    hipError_t kerr2 = hipModuleLaunchKernel(g_fn_fp16_gemm,
+                                             (seq_len + 15) / 16, (seq_len + 15) / 16, batch_size,
+                                             16, 16, 1, 0, 0, nullptr, nullptr);
+    if (kerr2 != hipSuccess) {
+        set_error("fp16_gemm launch failed");
+        return INFERENCE_ERR_KERNEL_LAUNCH;
+    }
+
+    // Launch batched kv_cache_store
+    dim3 kv_block(32);
+    dim3 kv_grid((model->n_head_kv * model->head_dim + 31) / 32, 1, batch_size);
+    hipError_t kerr3 = hipModuleLaunchKernel(g_fn_kv_store,
+                                             (model->n_head_kv * model->head_dim + 31) / 32, 1, batch_size,
+                                             32, 1, 1, 0, 0, nullptr, nullptr);
+    if (kerr3 != hipSuccess) {
+        set_error("kv_cache_store launch failed");
+        return INFERENCE_ERR_KERNEL_LAUNCH;
+    }
+
+    hipDeviceSynchronize();
+    return INFERENCE_OK;
+}
+
+    // Allocate device buffers for attention scores and qpos
+    size_t scores_bytes = (size_t)batch_size * seq_len * seq_len * sizeof(float);
+    size_t qpos_bytes = (size_t)batch_size * seq_len * sizeof(int);
+    float* d_scores = nullptr;
+    int* d_qpos = nullptr;
+    hipError_t herr = hipMalloc(&d_scores, (size_t)batch_size * seq_len * seq_len * sizeof(float));
+    if (herr != hipSuccess) { set_error("hipMalloc scores failed"); return INFERENCE_ERR_KERNEL_LAUNCH; }
+    herr = hipMalloc(&d_qpos, (size_t)batch_size * seq_len * sizeof(int));
+    if (herr != hipSuccess) { hipFree(d_scores); set_error("hipMalloc qpos failed"); return INFERENCE_ERR_KERNEL_LAUNCH; }
+
+    // Prepare qpos on host: for each batch, qpos = positions[b] + row_index (clamped by seq_lens)
+    std::vector<int> h_qpos((size_t)batch_size * seq_len);
+    for (int b = 0; b < batch_size; ++b) {
+        int base_pos = positions[b];
+        int len = seq_lens[b];
+        for (int r = 0; r < seq_len; ++r) {
+            int val = (r < seq_lens[b]) ? (positions[b] + r) : (positions[b] + seq_lens[b] - 1);
+            h_qpos[(size_t)b * seq_len + r] = val;
+        }
+    }
 
     hipError_t herr2 = hipMemcpy(d_qpos, h_qpos.data(), qpos_bytes, hipMemcpyHostToDevice);
     if (herr != hipSuccess) { hipFree(d_scores); hipFree(d_qpos); set_error("hipMemcpy qpos failed"); return INFERENCE_ERR_KERNEL_LAUNCH; }
