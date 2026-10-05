@@ -10,6 +10,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#pragma GCC diagnostic ignored "-Wpass-failed"
 
 extern "C" __global__ void rmsnorm(const __half* x, const __half* gamma, __half* y,
                                    int n_tokens, int n_embd, float eps)

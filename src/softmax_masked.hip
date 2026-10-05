@@ -13,6 +13,7 @@
 // position (sees full history incl. itself); a prefill chunk passes its absolute indices.
 
 #include <hip/hip_runtime.h>
+#pragma GCC diagnostic ignored "-Wpass-failed"
 
 extern "C" __global__ void softmax_masked(float* s, int n_rows, int n_cols, float scale,
                                           const int* qpos /* NULL disables causal masking */, int n_valid_kv)
