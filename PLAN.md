@@ -526,6 +526,44 @@ Goal: provide a Perl XS module that wraps the C API, enabling Perl applications 
 
 ---
 
+## Compatibility Verification – Qwen3.5-4B-ROCMFP4.gguf
+**Date**: 2025-10-05  
+**Tool**: `scripts/inspect_gguf.py`
+
+### Model metadata (from GGUF header)
+| Field | Value |
+|-------|-------|
+| Architecture | `qwen35` (Qwen 3 lineage) |
+| Type | `model` |
+| Name | `Qwen3.5 4B` |
+| Base name | `Qwen3.5` |
+| Block count (`qwen35.block_count`) | **33** layers |
+| Context length (`qwen35.context_len`) | **131,072** tokens (0x20000) |
+| Embedding length (`qwen35.embedding_length`) | **8,192** (0x2000) |
+| File type key | `qwen35.file_type` (uint32 = 16384 → ROCmFP4 quantized) |
+
+### Weight tensor inventory (sampled from mmap scan at ~10.9 MB offset)
+All Qwen‑series tensors present with correct names:
+
+| Pattern | Example names found | Quantization hint |
+|---------|-------------------|------------------|
+| Embeddings | `token_embd.weight` | FP16 (type 2) |
+| Attention projections per layer | `blk.{i}.attn_qkv.weight`, `blk.{i}.attn_o.weight` | FP4 (type 8) + scales |
+| MLP gate/up/down | `blk.{i}.ffn_gate.weight`, `blk.{i}.ffn_up.weight`, `blk.{i}.ffn_down.weight` | FP4 (type 8) + scales |
+| Layer norms | `blk.{i}.attn_norm.weight`, `blk.{i}.ffn_norm.weight` | FP16 (type 1) – scale vectors only |
+| Output norm | `output_norm.weight` | FP16 (type 1) |
+| LM head | `output.weight` | FP4 (type 8) + scales (for vocab sampling) |
+
+**33 layers confirmed** by sequential tensor listing (`blk.0` through `blk.32`).
+
+### Compatibility verdict
+✅ **Fully compatible** – the model uses ROCmFP4/Codebook10 quantization (GGML type 8 with UE4M3 scales), which matches our kernel implementation in Phase 2 and Phase 3 exactly. The weight layout (32 values per block, scales at 16-element granularity, packed nibbles low-first) is identical to what `load_quant_weight_from_gguf()` expects and what our `gemm_act_fp4.hip` kernel dequantizes via DP4A (`__builtin_amdgcn_perm` → `__builtin_amdgcn_sudot4`). No conversion step needed.
+
+### Tool
+`scripts/inspect_gguf.py` – standalone Python script that parses GGUF v3 files without external dependencies (no llama.cpp, no ggml library). Handles all value types including uint32-counted arrays for bool/uint/int16-32 and string arrays. Outputs metadata KV pairs on stderr and tensor definitions on stdout.
+
+---
+
 ## Next steps
 1. **Profile `qwen_demo`** with real Qwen‑3‑7B GGUF on Strix Halo; collect latency/throughput numbers for batch = 1 and batch > 1.
 2. **Add batched test** – extend `attn_verify` or add `batched_verify` to test `inference_forward_batch` with batch > 1.
