@@ -569,3 +569,36 @@ All Qwen‑series tensors present with correct names:
 2. **Add batched test** – extend `attn_verify` or add `batched_verify` to test `inference_forward_batch` with batch > 1.
 3. Start Phase 13 design (multi‑GPU tensor parallelism).
 4. Begin Phase 14 – Perl XS bindings, CPAN packaging, and documentation.
+
+---
+
+## Session Log: Qwen3.5-4B Compatibility Testing (2025-01-XX)
+
+### Objective
+Test the `Qwen3.5-4B-ROCMFP4.gguf` model file by running the `inspect_gguf.py` script on it to verify compatibility.
+
+### Actions Taken
+1. Created `./scripts/` directory at `/workdir/rocm-hip.git/scripts/`
+2. Moved `inspect_gguf.py` to `./scripts/inspect_gguf.py`
+3. Added Qwen3.5-4B compatibility analysis to `PLAN.md` (section after Phase 12)
+4. Committed changes as commit and pushed to `origin/main`
+5. Identified root cause: GGUF v3 uses uint32 counts for arrays (not uint64) and adds alignment padding between values
+6. Verified exact byte layout of header and early keys through hex dump analysis
+
+### Findings
+- The GGUF inspection tool has critical bugs in its value-skipping logic that prevent successful parsing
+- File structure confirmed: header (magic=GGUF, version=3), n_tensors=441, n_keys=42
+- Key metadata parsed correctly when traced byte-by-byte: architecture=qwen35, block_count=33, context_len=131072, embedding_length=8192
+- Script fails at key index 8 ("general.base_model.count") due to incorrect value-skipping logic
+- Multiple debugging attempts showed successful memory-based tracing but file-based reading produces misaligned positions
+
+### Tool Status
+`scripts/inspect_gguf.py` needs fixing before testing can succeed:
+- `skip_value()` function has bugs handling all value types correctly
+- String array type (vtype=20) needs special nested-length parsing  
+- Alignment requirements between metadata KV pairs and tensor definitions unclear
+- gguf Python library installed but fails with "np.uint32(100) is not a valid GGMLQuantizationType" error when building tensors
+
+### Next Steps
+1. Rewrite `/workdir/rocm-hip.git/scripts/inspect_gguf.py` with corrected skip logic that properly handles all GGUF v3 value types including alignment padding
+2. Run the fixed script on `Qwen3.5-4B-ROCMFP4.gguf` to verify it successfully parses all metadata keys and lists all 441 tensors
