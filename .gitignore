@@ -44,3 +44,4 @@ mandelbrot.ppm
 .idea/
 # CocoIndex Code (ccc)
 /.cocoindex_code/
+build/
