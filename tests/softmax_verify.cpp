@@ -137,7 +137,7 @@ static bool run_case(const Case& t, const char* label) {
         }
     }
 
-    printf("    zero-copy=%s  elements=%ld  failures=%ld  max_abs_diff=%.6f\n",
+    printf("    zero-copy=%s  elements=%d  failures=%ld  max_abs_diff=%.6f\n",
            (d_s == scores) ? "yes" : "NO(!)", t.rows * t.cols, failures, max_diff);
 
     HIP_CHECK(hipHostUnregister(base), "unpin");

@@ -124,7 +124,7 @@ static bool run_shape(int M, int N, int K) {
     }
 
     const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    printf("    zero-copy=%s  elements=%ld  failures=%ld  max_abs_diff=%.4f (atol=%.4f)  max_rel_vs_raw_ref=%.2f%%  (cpu ref %.1f ms)\n",
+    printf("    zero-copy=%s  elements=%d  failures=%ld  max_abs_diff=%.4f (atol=%.4f)  max_rel_vs_raw_ref=%.2f%%  (cpu ref %.1f ms)\n",
            zero_copy ? "yes" : "NO(!)", M * N, failures, max_abs, atol, max_rel_pct, ms);
 
     HIP_CHECK(hipHostUnregister(base), "unpin");

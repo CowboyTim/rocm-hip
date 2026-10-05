@@ -39,16 +39,63 @@ enum gguf_type {
 };
 
 /* Block sizes (elements per block for quantized types) */
-static const int64_t BLOCK_SIZES[] __attribute__((unused)) = {
-    [0] = 1,[1] = 1,[2] = 32,[3] = 32,[6] = 32,[7] = 32,[8] = 32,[9] = 32,
-    [10]=256,[11]=256,[12]=256,[13]=256,[14]=256,[15]=256,[39]=32,[40]=64,
+static const int64_t BLOCK_SIZES[] = {
+    1, 1, 32, 32,          // indices 0-3: Q8_0, Q8_1, ...
+    0, 0,                  // indices 4-5 (reserved)
+    32, 32, 32, 32,        // indices 6-9: FP8 types
+    256, 256, 256, 256, 256, 256,   // indices 10-15: QK types
+    0,                     // index 16
+    0,                     // index 17
+    0,                     // index 18
+    0,                     // index 19
+    0,                     // index 20
+    0,                     // index 21
+    0,                     // index 22
+    0,                     // index 23
+    0,                     // index 24
+    0,                     // index 25
+    0,                     // index 26
+    0,                     // index 27
+    0,                     // index 28
+    0,                     // index 29
+    0,                     // index 30
+    0,                     // index 31
+    0,                     // index 32
+    0,                     // index 33
+    0,                     // index 34
+    0,                     // index 35
+    0,                     // index 36
+    0,                     // index 37
+    0,                     // index 38
+    32,                   // index 39: MXFP4
+    64                    // index 40: MXFP4 scales
 };
 
 /* Type sizes (bytes per block) */
-static const size_t TYPE_SIZES[] __attribute__((unused)) = {
-    [0] /* F32 */=sizeof(float),[1] /* F16 */=sizeof(ggml_half),[2]=18,[3]=20,
-    [6]=22,[7]=24,[8]=34,[9]=36,[10]=62,[11]=70,[12]=134,[13]=154,
-    [14]=176,[15]=290,[39]=17,[40]=36,
+static const size_t TYPE_SIZES[] = {
+    sizeof(float),          // index 0: F32
+    sizeof(ggml_half),      // index 1: F16
+    18,                     // index 2: Q8_0 block
+    20,                     // index 3: Q8_1 block
+    0,                      // index 4 (reserved)
+    0,                      // index 5 (reserved)
+    22,                     // index 6: FP8_E4M3 block
+    24,                     // index 7: FP8_E5M2 block  
+    34,                     // index 8: FP8 block
+    36,                     // index 9: FP8 block
+    62,                     // index 10: QK type
+    70,                     // index 11: QK type
+    134,                    // index 12: QK type
+    154,                    // index 13: QK type
+    176,                    // index 14: QK type
+    290,                    // index 15: QK type
+    0,                      // indices 16-38 (unused/reserved)
+    0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0,
+    0, 0, 0,
+    17,                    // index 39: MXFP4 block (32 values + scales)
+    36                     // index 40: MXFP4 scales block
 };
 
 static inline int64_t get_block_size(int type) {

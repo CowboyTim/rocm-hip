@@ -86,7 +86,7 @@ static bool load_module(const char* co, const char* sym, hipModule_t& m, hipFunc
 }
 
 static bool load_all_kernels() {
-    hipInit(0);
+    (void)hipInit(0);
     return load_module("gemm_act_fp4.co", "gemm_act_fp4", mod_gemm_act_fp4, fn_gemm_act_fp4) &&
            load_module("swiglu.co", "swiglu_fp4", mod_swiglu, fn_swiglu) &&
            load_module("fp16_gemm.co", "fp16_gemm", mod_fp16_gemm, fn_fp16_gemm) &&
@@ -98,14 +98,14 @@ static bool load_all_kernels() {
 }
 
 static void unload_all_kernels() {
-    if (mod_gemm_act_fp4) hipModuleUnload(mod_gemm_act_fp4);
-    if (mod_swiglu) hipModuleUnload(mod_swiglu);
-    if (mod_fp16_gemm) hipModuleUnload(mod_fp16_gemm);
-    if (mod_rope) hipModuleUnload(mod_rope);
-    if (mod_softmax) hipModuleUnload(mod_softmax);
-    if (mod_layernorm) hipModuleUnload(mod_layernorm);
-    if (mod_kv_store) hipModuleUnload(mod_kv_store);
-    if (mod_embedding) hipModuleUnload(mod_embedding);
+    if (mod_gemm_act_fp4) (void)hipModuleUnload(mod_gemm_act_fp4);
+    if (mod_swiglu) (void)hipModuleUnload(mod_swiglu);
+    if (mod_fp16_gemm) (void)hipModuleUnload(mod_fp16_gemm);
+    if (mod_rope) (void)hipModuleUnload(mod_rope);
+    if (mod_softmax) (void)hipModuleUnload(mod_softmax);
+    if (mod_layernorm) (void)hipModuleUnload(mod_layernorm);
+    if (mod_kv_store) (void)hipModuleUnload(mod_kv_store);
+    if (mod_embedding) (void)hipModuleUnload(mod_embedding);
 }
 
 // ==================== Per-Layer Scratch Buffers ====================
@@ -167,7 +167,7 @@ struct LayerScratch {
         auto get = [&](size_t sz, void** hptr, void** dptr) {
             off = (off + 127) & ~127;
             *hptr = (char*)base + off;
-            hipHostGetDevicePointer(dptr, *hptr, 0);
+            (void)hipHostGetDevicePointer(dptr, *hptr, 0);
             off += sz;
         };
         get(layout[0], (void**)&h, &d_h);
@@ -189,11 +189,11 @@ struct LayerScratch {
         get(layout[16], (void**)&down_fp32, &d_down);
         get(layout[17], (void**)&vexpB, &d_vb2);
 
-        hipHostRegister(base, total, hipHostRegisterDefault);
+        (void)hipHostRegister(base, total, hipHostRegisterDefault);
         return true;
     }
     void free() {
-        if (base) { hipHostUnregister(base); munmap(base, total); }
+        if (base) { (void)hipHostUnregister(base); munmap(base, total); }
         if (fd >= 0) close(fd);
     }
 };
@@ -245,7 +245,7 @@ struct QwenModel {
         const float scale = 1.0f / sqrtf((float)HD);
         // Local copies for kernel args (avoid rvalue address issues)
         int one = 1;
-        int E_local = E, DQ_local = DQ, DKV_local = DKV, CTX_local = CTX, pos_local = pos;
+        int E_local = E, DQ_local = DQ, DKV_local = DKV;
         int vocab_local = vocab_size;
         float eps_f = (float)eng_model->eps;
 
@@ -253,8 +253,8 @@ struct QwenModel {
         int32_t tid = token_id;
         void* emb_args[] = { &tid, &eng_model->d_embed_table, &layer_scratch[0].d_h,
                             &one, &E_local, &vocab_local };
-        hipModuleLaunchKernel(fn_embedding, 1, 1, 1, 256, 1, 1, 0, 0, emb_args, nullptr);
-        hipDeviceSynchronize();
+        (void)hipModuleLaunchKernel(fn_embedding, 1, 1, 1, 256, 1, 1, 0, 0, emb_args, nullptr);
+        (void)hipDeviceSynchronize();
 
         // Residual starts as embedding output
         __half* residual = layer_scratch[0].h;
@@ -269,21 +269,21 @@ struct QwenModel {
                 &residual, &L.d_attn_ln, &s.d_h,
                 &E_local, &E_local, (void*)&eps_f
             };
-            hipModuleLaunchKernel(fn_layernorm, E, 1, 1, 32, 1, 1, 0, 0, ln_args, nullptr);
-            hipDeviceSynchronize();
+            (void)hipModuleLaunchKernel(fn_layernorm, E, 1, 1, 32, 1, 1, 0, 0, ln_args, nullptr);
+            (void)hipDeviceSynchronize();
 
             // --- b) Q/K/V Projections (gemm_act_fp4, M=1) ---
             // Q: [1 x DQ] = h[1 x E] @ Wq^T
             void* g4_args[] = { &s.d_h, &L.Wq.d_packed, &L.Wq.d_scales, &s.d_q,
                                &one, &DQ_local, &E_local };
-            hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DQ+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
+            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DQ+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
             // K: [1 x DKV] = h[1 x E] @ Wk^T
             g4_args[1] = &L.Wk.d_packed; g4_args[2] = &L.Wk.d_scales; g4_args[3] = &s.d_k; g4_args[5] = &DKV_local;
-            hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DKV+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
+            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DKV+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
             // V: [1 x DKV] = h[1 x E] @ Wv^T
             g4_args[1] = &L.Wv.d_packed; g4_args[2] = &L.Wv.d_scales; g4_args[3] = &s.d_v; g4_args[5] = &DKV_local;
-            hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DKV+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
-            hipDeviceSynchronize();
+            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DKV+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
+            (void)hipDeviceSynchronize();
 
             // --- c) Per-head staging (FP32 -> FP16) ---
             for (int h = 0; h < HQ; ++h)
@@ -292,31 +292,31 @@ struct QwenModel {
             for (int h = 0; h < HKV; ++h)
                 for (int d = 0; d < HD; ++d)
                     s.kh[h*HD + d] = __float2half(s.k_fp32[h*HD + d]);
-            hipHostGetDevicePointer(&s.d_qh, s.qh, 0);
-            hipHostGetDevicePointer(&s.d_kh, s.kh, 0);
+            (void)hipHostGetDevicePointer(&s.d_qh, s.qh, 0);
+            (void)hipHostGetDevicePointer(&s.d_kh, s.kh, 0);
 
             // --- d) RoPE on Q/K ---
             build_rope_tables(pos, s);
             int HQ_local = HQ, HD2_local = HD/2;
             void* rope_args[] = { &s.d_qh, &s.d_rc, &s.d_rs, &s.d_qh, &HQ_local, &HD2_local };
-            hipModuleLaunchKernel(fn_rope, HQ, 1, 1, 32, 1, 1, 0, 0, rope_args, nullptr);
-            hipModuleLaunchKernel(fn_rope, HKV, 1, 1, 32, 1, 1, 0, 0, rope_args, nullptr);
-            hipDeviceSynchronize();
+            (void)hipModuleLaunchKernel(fn_rope, HQ, 1, 1, 32, 1, 1, 0, 0, rope_args, nullptr);
+            (void)hipModuleLaunchKernel(fn_rope, HKV, 1, 1, 32, 1, 1, 0, 0, rope_args, nullptr);
+            (void)hipDeviceSynchronize();
 
             // --- e) KV Store ---
             // Flatten roped K from per-head to token-major rks
             for (int h = 0; h < HKV; ++h)
                 for (int d = 0; d < HD; ++d)
                     s.rks[h*HD + d] = s.kh[h*HD + d];
-            hipHostGetDevicePointer(&s.d_rks, s.rks, 0);
+            (void)hipHostGetDevicePointer(&s.d_rks, s.rks, 0);
 
             __half* kdst_base = kv_cache_k_row(eng_model->kvc, l, 0);
             __half* vdst_base = kv_cache_v_row(eng_model->kvc, l, 0);
             int pos_local = pos, CTX_local2 = CTX;
             void* kvs_args[] = { &s.d_rks, &s.d_v, &kdst_base, &vdst_base,
                                 &one, &DKV_local, &pos_local, &CTX_local2 };
-            hipModuleLaunchKernel(fn_kv_store, 8, 1, 1, 32, 1, 1, 0, 0, kvs_args, nullptr);
-            hipDeviceSynchronize();
+            (void)hipModuleLaunchKernel(fn_kv_store, 8, 1, 1, 32, 1, 1, 0, 0, kvs_args, nullptr);
+            (void)hipDeviceSynchronize();
 
 // --- f) Attention per head ---
             const __half* kc = kv_cache_k_row_const(eng_model->kvc, l, 0);
@@ -337,14 +337,13 @@ struct QwenModel {
                 void* gemm_args[] = {
                     (void*)((char*)s.d_qh + h*HD*sizeof(__half)), &s.d_vb2, &s.d_sc,
                     &one, &CTX_local3, &HD_local };
-                hipModuleLaunchKernel(fn_fp16_gemm, 1, (CTX+15)/16, 1, 32, 1, 1, 0, 0, gemm_args, nullptr);
+                (void)hipModuleLaunchKernel(fn_fp16_gemm, 1, (CTX+15)/16, 1, 32, 1, 1, 0, 0, gemm_args, nullptr);
 
                 // Softmax (causal)
-                int qpos = pos;
                 void* sm_args[] = { &s.d_sc, &one, &CTX_local3, (void*)&scale,
                                    &qpos_local, &pos1_local };
-                hipModuleLaunchKernel(fn_softmax, 1, 1, 1, 32, 1, 1, 0, 0, sm_args, nullptr);
-                hipDeviceSynchronize();
+                (void)hipModuleLaunchKernel(fn_softmax, 1, 1, 1, 32, 1, 1, 0, 0, sm_args, nullptr);
+                (void)hipDeviceSynchronize();
 
                 // Probs to FP16
                 for (int p = 0; p <= pos; ++p)
@@ -353,21 +352,21 @@ struct QwenModel {
                 // Out: [1 x HD] = probs @ vexpB
                 void* gemm2_args[] = { s.d_pf, s.d_vb2, (void*)((char*)s.d_oh + h*HD*sizeof(float)),
                                        &one, &HD_local, &CTX_local3 };
-                hipModuleLaunchKernel(fn_fp16_gemm, 1, (HD+15)/16, 1, 32, 1, 1, 0, 0, gemm2_args, nullptr);
+                (void)hipModuleLaunchKernel(fn_fp16_gemm, 1, (HD+15)/16, 1, 32, 1, 1, 0, 0, gemm2_args, nullptr);
             }
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             // --- g) Flatten heads -> oin (FP16) ---
             for (int h = 0; h < HQ; ++h)
                 for (int d = 0; d < HD; ++d)
                     s.oin[h*HD + d] = __float2half(s.oh[h*HD + d]);
-            hipHostGetDevicePointer(&s.d_oin, s.oin, 0);
+            (void)hipHostGetDevicePointer(&s.d_oin, s.oin, 0);
 
             // --- h) O-Projection ---
             void* o_args[] = { &s.d_oin, &L.Wo.d_packed, &L.Wo.d_scales, &s.d_down,
                               &one, &E_local, &DQ_local };
-            hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (E+15)/16, 1, 32, 1, 1, 0, 0, o_args, nullptr);
-            hipDeviceSynchronize();
+            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (E+15)/16, 1, 32, 1, 1, 0, 0, o_args, nullptr);
+            (void)hipDeviceSynchronize();
 
             // --- i) Residual add (attention output) ---
             for (int i = 0; i < E; ++i)
@@ -376,8 +375,8 @@ struct QwenModel {
             // --- j) RMSNorm (MLP) ---
             void* ln2_args[] = { &residual, &L.d_mlp_ln, &s.d_hmlp,
                                 &E_local, &E_local, (void*)&eng_model->eps };
-            hipModuleLaunchKernel(fn_layernorm, E, 1, 1, 32, 1, 1, 0, 0, ln2_args, nullptr);
-            hipDeviceSynchronize();
+            (void)hipModuleLaunchKernel(fn_layernorm, E, 1, 1, 32, 1, 1, 0, 0, ln2_args, nullptr);
+            (void)hipDeviceSynchronize();
 
             // --- k) SwiGLU (gate/up/down) ---
             void* swiglu_args[] = { &s.d_hmlp,
@@ -385,8 +384,8 @@ struct QwenModel {
                                    &L.Wup.d_packed, &L.Wup.d_scales,
                                    &s.d_down,
                                    &one, &E_local, &E_local };
-            hipModuleLaunchKernel(fn_swiglu, 1, (E+15)/16, 1, 32, 1, 1, 0, 0, swiglu_args, nullptr);
-            hipDeviceSynchronize();
+            (void)hipModuleLaunchKernel(fn_swiglu, 1, (E+15)/16, 1, 32, 1, 1, 0, 0, swiglu_args, nullptr);
+            (void)hipDeviceSynchronize();
 
             // --- l) Residual add (MLP output) ---
             for (int i = 0; i < E; ++i)
@@ -396,15 +395,15 @@ struct QwenModel {
         // ---- 3) Final LayerNorm ----
         void* lnf_args[] = { &residual, &eng_model->d_final_ln, &layer_scratch[0].d_h,
                             &E_local, &E_local, (void*)&eng_model->eps };
-        hipModuleLaunchKernel(fn_layernorm, E, 1, 1, 32, 1, 1, 0, 0, lnf_args, nullptr);
-        hipDeviceSynchronize();
+        (void)hipModuleLaunchKernel(fn_layernorm, E, 1, 1, 32, 1, 1, 0, 0, lnf_args, nullptr);
+        (void)hipDeviceSynchronize();
 
         // ---- 4) LM Head (gemm_act_fp4, M=1, N=vocab_size) ----
         void* lm_args[] = { &layer_scratch[0].d_h, &eng_model->d_lm_head_packed,
                            &eng_model->d_lm_head_scales, logits_out,
                            &one, &vocab_local, &E_local };
-        hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (vocab_size+15)/16, 1, 32, 1, 1, 0, 0, lm_args, nullptr);
-        hipDeviceSynchronize();
+        (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (vocab_size+15)/16, 1, 32, 1, 1, 0, 0, lm_args, nullptr);
+        (void)hipDeviceSynchronize();
 
         return 0;
     }
@@ -454,9 +453,9 @@ int qwen_model_forward_batch(qwen_model_t* model,
     hipError_t herr = hipMalloc(&d_scores_batch, scores_bytes);
     if (herr != hipSuccess) { qwen_set_error("hipMalloc scores batch failed"); return INFERENCE_ERR_KERNEL_LAUNCH; }
     herr = hipMalloc(&d_qpos_batch, qpos_bytes);
-    if (herr != hipSuccess) { hipFree(d_scores_batch); qwen_set_error("hipMalloc qpos batch failed"); return INFERENCE_ERR_KERNEL_LAUNCH; }
+    if (herr != hipSuccess) { (void)hipFree(d_scores_batch); qwen_set_error("hipMalloc qpos batch failed"); return INFERENCE_ERR_KERNEL_LAUNCH; }
     herr = hipMalloc(&d_logits_batch, logits_bytes);
-    if (herr != hipSuccess) { hipFree(d_scores_batch); hipFree(d_qpos_batch); qwen_set_error("hipMalloc logits batch failed"); return INFERENCE_ERR_KERNEL_LAUNCH; }
+    if (herr != hipSuccess) { (void)hipFree(d_scores_batch); (void)hipFree(d_qpos_batch); qwen_set_error("hipMalloc logits batch failed"); return INFERENCE_ERR_KERNEL_LAUNCH; }
 
     // Prepare per-sequence qpos on host: for each batch, qpos[seq] starts at positions[b]
     std::vector<int> h_qpos((size_t)batch_size * seq_len);
@@ -470,7 +469,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
     }
     herr = hipMemcpy(d_qpos_batch, h_qpos.data(), qpos_bytes, hipMemcpyHostToDevice);
     if (herr != hipSuccess) {
-        hipFree(d_scores_batch); hipFree(d_qpos_batch); hipFree(d_logits_batch);
+        (void)hipFree(d_scores_batch); (void)hipFree(d_qpos_batch); (void)hipFree(d_logits_batch);
         qwen_set_error("hipMemcpy qpos batch failed"); return INFERENCE_ERR_KERNEL_LAUNCH;
     }
 
@@ -485,9 +484,9 @@ int qwen_model_forward_batch(qwen_model_t* model,
     void* emb_args[] = { &h_tokens[0], &eng->d_embed_table, m->layer_scratch[0].d_h, 
                          (void*)&one_int, (void*)&E, (void*)&vocab_local };
     // Embedding lookup is inherently per-token (different indices), so single-launch with grid-stride over batch
-    hipModuleLaunchKernel(fn_embedding, 1, 1, batch_size, 256, 1, 1, 0, 0, emb_args, nullptr);
+    (void)hipModuleLaunchKernel(fn_embedding, 1, 1, batch_size, 256, 1, 1, 0, 0, emb_args, nullptr);
     if (hipGetLastError() != hipSuccess) {
-        hipFree(d_scores_batch); hipFree(d_qpos_batch); hipFree(d_logits_batch);
+        (void)hipFree(d_scores_batch); (void)hipFree(d_qpos_batch); (void)hipFree(d_logits_batch);
         qwen_set_error("embedding lookup failed"); return INFERENCE_ERR_KERNEL_LAUNCH;
     }
 
@@ -509,7 +508,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
             &E_local, &E_local, (void*)&eps_f
         };
         dim3 ln_grid((E + 31) / 32, 1, batch_size);
-        hipModuleLaunchKernel(fn_layernorm, ln_grid.x, ln_grid.y, ln_grid.z, 32, 1, 1, 0, 0, ln_args, nullptr);
+        (void)hipModuleLaunchKernel(fn_layernorm, ln_grid.x, ln_grid.y, ln_grid.z, 32, 1, 1, 0, 0, ln_args, nullptr);
         if (hipGetLastError() != hipSuccess) {
             qwen_set_error("RMSNorm attn failed"); goto cleanup;
         }
@@ -530,7 +529,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
             void* g4_args[] = { &d_input_arr[0], &w_packed, &w_scales, &d_output_arr[0],
                                &one_int, &DQ_b, &E_local };
             dim3 gemm_grid(1, (DQ + 15) / 16, batch_size);
-            hipModuleLaunchKernel(fn_gemm_act_fp4, gemm_grid.x, gemm_grid.y, gemm_grid.z, 
+            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, gemm_grid.x, gemm_grid.y, gemm_grid.z, 
                                  32, 16, 1, 0, 0, g4_args, nullptr);
             if (hipGetLastError() != hipSuccess) {
                 qwen_set_error("gemm Q failed"); goto cleanup;
@@ -543,7 +542,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
             void* k4_args[] = { &d_input_arr[0], &w_packed, &w_scales, &d_output_arr[0],
                                 &one_int, &DKV_b, &E_local };
             dim3 k_grid(1, (DKV + 15) / 16, batch_size);
-            hipModuleLaunchKernel(fn_gemm_act_fp4, k_grid.x, k_grid.y, k_grid.z, 
+            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, k_grid.x, k_grid.y, k_grid.z, 
                                  32, 16, 1, 0, 0, k4_args, nullptr);
             if (hipGetLastError() != hipSuccess) {
                 qwen_set_error("gemm K failed"); goto cleanup;
@@ -554,7 +553,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
             for (int b = 0; b < batch_size; ++b) d_output_arr[b] = m->layer_scratch[l].d_v;
             void* v4_args[] = { &d_input_arr[0], &w_packed, &w_scales, &d_output_arr[0],
                                &one_int, &DKV_b, &E_local };
-            hipModuleLaunchKernel(fn_gemm_act_fp4, k_grid.x, k_grid.y, k_grid.z, 
+            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, k_grid.x, k_grid.y, k_grid.z, 
                                  32, 16, 1, 0, 0, v4_args, nullptr);
             if (hipGetLastError() != hipSuccess) {
                 qwen_set_error("gemm V failed"); goto cleanup;
@@ -583,7 +582,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
         void* rope_args[] = { &m->layer_scratch[l].d_qh, &unique_positions[0], &pos_to_seq[0], 
                              &batch_size, &HQ_local, &HD2_local };
         dim3 rope_grid(HQ, 1, unique_positions.size());
-        hipModuleLaunchKernel(fn_rope, rope_grid.x, rope_grid.y, rope_grid.z, 
+        (void)hipModuleLaunchKernel(fn_rope, rope_grid.x, rope_grid.y, rope_grid.z, 
                              32, 1, 1, 0, 0, rope_args, nullptr);
         if (hipGetLastError() != hipSuccess) {
             qwen_set_error("RoPE failed"); goto cleanup;
@@ -609,7 +608,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
                                  &k_dst_arr[0], &v_dst_arr[0],
                                  &batch_size, &DKV_b, &pos_arr[0], &ctx_arr[0] };
             dim3 kv_grid((HKV + 7) / 8, 1, batch_size);
-            hipModuleLaunchKernel(fn_kv_store, kv_grid.x, kv_grid.y, kv_grid.z, 
+            (void)hipModuleLaunchKernel(fn_kv_store, kv_grid.x, kv_grid.y, kv_grid.z, 
                                  32, 1, 1, 0, 0, kvs_args, nullptr);
             if (hipGetLastError() != hipSuccess) {
                 qwen_set_error("kv_store failed"); goto cleanup;
@@ -625,7 +624,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
             void* sm_args[] = { &d_scores_batch, &batch_size, &CTX_b, &scale_f, 
                                &d_qpos_batch[0], &seq_len };
             dim3 softmax_grid(1, 1, batch_size);
-            hipModuleLaunchKernel(fn_softmax, (seq_len + 31) / 32, 1, batch_size,
+            (void)hipModuleLaunchKernel(fn_softmax, (seq_len + 31) / 32, 1, batch_size,
                                  32, 1, 1, 0, 0, sm_args, nullptr);
             if (hipGetLastError() != hipSuccess) {
                 qwen_set_error("softmax failed"); goto cleanup;
@@ -638,7 +637,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
                                        d_logits_batch,              // output logits buffer
                                        &batch_size, &HD_b, &CTX_b };
             dim3 attn_grid((HQ + 15) / 16, (HD + 15) / 16, batch_size);
-            hipModuleLaunchKernel(fn_fp16_gemm, attn_grid.x, attn_grid.y, attn_grid.z,
+            (void)hipModuleLaunchKernel(fn_fp16_gemm, attn_grid.x, attn_grid.y, attn_grid.z,
                                  16, 16, 1, 0, 0, attn_gemm_args, nullptr);
             if (hipGetLastError() != hipSuccess) {
                 qwen_set_error("attention GEMM failed"); goto cleanup;
@@ -656,7 +655,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
             void* o_args[] = { &inp_arr[0], &L.Wo.d_packed, &L.Wo.d_scales, &out_arr[0],
                               &one_int, &E_local, &DQ_local };
             dim3 o_grid(1, (E + 15) / 16, batch_size);
-            hipModuleLaunchKernel(fn_gemm_act_fp4, o_grid.x, o_grid.y, o_grid.z, 
+            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, o_grid.x, o_grid.y, o_grid.z, 
                                  32, 16, 1, 0, 0, o_args, nullptr);
             if (hipGetLastError() != hipSuccess) {
                 qwen_set_error("O projection failed"); goto cleanup;
@@ -674,7 +673,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
             void* ln_mlp_args[] = { &m->layer_scratch[l].h, &L.d_mlp_ln, &m->layer_scratch[l].d_hmlp,
                                    &E_local, &E_local, (void*)&eps_f };
             dim3 mlp_norm_grid((E + 31) / 32, 1, batch_size);
-            hipModuleLaunchKernel(fn_layernorm, mlp_norm_grid.x, mlp_norm_grid.y, mlp_norm_grid.z, 
+            (void)hipModuleLaunchKernel(fn_layernorm, mlp_norm_grid.x, mlp_norm_grid.y, mlp_norm_grid.z, 
                                  32, 1, 1, 0, 0, ln_mlp_args, nullptr);
             if (hipGetLastError() != hipSuccess) {
                 qwen_set_error("RMSNorm MLP failed"); goto cleanup;
@@ -694,7 +693,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
                                    m->layer_scratch[l].d_down,    // down projection output (residual destination)
                                    &batch_size, &E_local, &E_local };
             dim3 swiglu_grid(1, (E + 15) / 16, batch_size);
-            hipModuleLaunchKernel(fn_swiglu, swiglu_grid.x, swiglu_grid.y, swiglu_grid.z, 
+            (void)hipModuleLaunchKernel(fn_swiglu, swiglu_grid.x, swiglu_grid.y, swiglu_grid.z, 
                                  32, 16, 1, 0, 0, swiglu_args, nullptr);
             if (hipGetLastError() != hipSuccess) {
                 qwen_set_error("SwiGLU failed"); goto cleanup;
@@ -715,7 +714,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
         void* lnf_args[] = { &m->layer_scratch[0].h, &eng->d_final_ln, m->layer_scratch[0].d_h,
                             &E_local, &E_local, (void*)&eps_f };
         dim3 final_norm_grid((E + 31) / 32, 1, batch_size);
-        hipModuleLaunchKernel(fn_layernorm, final_norm_grid.x, final_norm_grid.y, final_norm_grid.z, 
+        (void)hipModuleLaunchKernel(fn_layernorm, final_norm_grid.x, final_norm_grid.y, final_norm_grid.z, 
                              32, 1, 1, 0, 0, lnf_args, nullptr);
         if (hipGetLastError() != hipSuccess) {
             qwen_set_error("final layer norm failed"); goto cleanup;
@@ -733,7 +732,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
                            &eng->d_lm_head_scales, &out_arr[0],
                            &one_int, &vocab_b, &E_local };
         dim3 lm_grid(1, (vocab_b + 15) / 16, batch_size);
-        hipModuleLaunchKernel(fn_gemm_act_fp4, lm_grid.x, lm_grid.y, lm_grid.z, 
+        (void)hipModuleLaunchKernel(fn_gemm_act_fp4, lm_grid.x, lm_grid.y, lm_grid.z, 
                              32, 16, 1, 0, 0, lm_args, nullptr);
         if (hipGetLastError() != hipSuccess) {
             qwen_set_error("LM head failed"); goto cleanup;
@@ -746,12 +745,12 @@ int qwen_model_forward_batch(qwen_model_t* model,
         }
     }
 
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
     
 cleanup:
-    hipFree(d_scores_batch);
-    hipFree(d_qpos_batch); 
-    hipFree(d_logits_batch);
+    (void)hipFree(d_scores_batch);
+    (void)hipFree(d_qpos_batch); 
+    (void)hipFree(d_logits_batch);
     return hipGetLastError() == hipSuccess ? 0 : INFERENCE_ERR_KERNEL_LAUNCH;
 }
 }

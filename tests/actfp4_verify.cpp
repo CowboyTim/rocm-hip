@@ -140,7 +140,7 @@ static bool run_shape(int M, int N, int K) {
         if (bad) failures++;
     }
 
-    printf("    zero-copy=%s  elements=%ld  failures=%ld  max_abs_diff=%.5f (atol=%.4f)\n",
+    printf("    zero-copy=%s  elements=%d  failures=%ld  max_abs_diff=%.5f (atol=%.4f)\n",
            (d_A == A && d_C == Cgpu) ? "yes" : "NO(!)", M * N, failures, max_abs, atol);
 
     HIP_CHECK(hipHostUnregister(base), "unpin");

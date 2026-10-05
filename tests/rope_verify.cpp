@@ -126,7 +126,7 @@ static bool run_shape(int rows, int dim, const std::vector<int>& positions) {
         }
     }
 
-    printf("    zero-copy=%s  elements=%ld  failures=%ld  max_abs_diff=%.7f\n",
+    printf("    zero-copy=%s  elements=%d  failures=%ld  max_abs_diff=%.7f\n",
            (d_x == x && d_y == y_gpu) ? "yes" : "NO(!)", rows * dim, failures, max_diff);
 
     HIP_CHECK(hipHostUnregister(base), "unpin");
@@ -167,11 +167,11 @@ int main(int argc, char* argv[]) {
     }
 
     int failed = 0;
-    int idx = 0;
+    
     for (const auto& s : shapes) {
         std::vector<int> pos(positions.begin(), positions.begin() + s.rows);
         if (!run_shape(s.rows, s.dim, pos)) failed++;
-        idx++;
+        
     }
 
     if (failed == 0) { printf("\n  ROPE VERIFICATION PASSED (%zu shape%s)\n\n", shapes.size(), shapes.size() > 1 ? "s" : ""); return 0; }

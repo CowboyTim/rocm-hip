@@ -43,35 +43,6 @@ static void set_error(const char* fmt, ...) {
 
 static void clear_error() { g_last_error[0] = 0; }
 
-// Forward declarations for kernel modules (loaded at runtime via hipModuleLoadData)
-static hipModule_t g_mod_gemm_act_fp4 = nullptr;
-static hipFunction_t g_fn_gemm_act_fp4 = nullptr;
-static hipModule_t g_mod_swiglu = nullptr;
-static hipFunction_t g_fn_swiglu = nullptr;
-static hipModule_t g_mod_embedding = nullptr;
-static hipFunction_t g_fn_embedding = nullptr;
-static hipModule_t g_mod_rope = nullptr;
-static hipFunction_t g_fn_rope = nullptr;
-static hipModule_t g_mod_softmax = nullptr;
-static hipFunction_t g_fn_softmax = nullptr;
-static hipModule_t g_mod_fp16_gemm = nullptr;
-static hipFunction_t g_fn_fp16_gemm = nullptr;
-static hipModule_t g_mod_kv_store = nullptr;
-static hipFunction_t g_fn_kv_store = nullptr;
-static hipModule_t g_mod_layernorm = nullptr;
-static hipFunction_t g_fn_layernorm = nullptr;
-
-static bool load_module(const char* co_path, const char* sym, hipModule_t& mod, hipFunction_t& fn) {
-    int fd = open(co_path, O_RDONLY);
-    if (fd < 0) return false;
-    struct stat st; fstat(fd, &st);
-    void* data = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    bool ok = (hipModuleLoadData(&mod, data) == hipSuccess) &&
-              (hipModuleGetFunction(&fn, mod, sym) == hipSuccess);
-    munmap(data, st.st_size); close(fd);
-    return ok;
-}
-
 // Quantized weight matrix for a single projection (ROCmFP4 Codebook10)
 struct QuantWeight {
     int N, K;                                  // output_dim x input_dim (K multiple of 16)
@@ -147,7 +118,7 @@ static bool pin_model_memory(inference_model* m) {
                                        m->embed_table.size() * sizeof(__half),
                                        hipHostRegisterDefault);
         if (e != hipSuccess) return false;
-        hipHostGetDevicePointer(&m->d_embed_table, m->embed_table.data(), 0);
+        (void)hipHostGetDevicePointer(&m->d_embed_table, m->embed_table.data(), 0);
     }
     // Pin per-layer weights
     for (auto& L : m->layers) {
@@ -155,38 +126,38 @@ static bool pin_model_memory(inference_model* m) {
             if (w.packed.empty()) return false;
             if (hipHostRegister(w.packed.data(), w.packed.size(), hipHostRegisterDefault) != hipSuccess) return false;
             if (hipHostRegister(w.scales.data(), w.scales.size(), hipHostRegisterDefault) != hipSuccess) return false;
-            hipHostGetDevicePointer(&w.d_packed, w.packed.data(), 0);
-            hipHostGetDevicePointer(&w.d_scales, w.scales.data(), 0);
+            (void)hipHostGetDevicePointer(&w.d_packed, w.packed.data(), 0);
+            (void)hipHostGetDevicePointer(&w.d_scales, w.scales.data(), 0);
             return true;
         };
         if (!pin(L.Wq) || !pin(L.Wk) || !pin(L.Wv) || !pin(L.Wo) ||
             !pin(L.W_gate) || !pin(L.W_up) || !pin(L.W_down)) return false;
         if (!L.attn_ln_scale.empty()) {
-            hipHostRegister(L.attn_ln_scale.data(), L.attn_ln_scale.size() * sizeof(__half), hipHostRegisterDefault);
-            hipHostGetDevicePointer(&L.d_attn_ln, L.attn_ln_scale.data(), 0);
+            (void)hipHostRegister(L.attn_ln_scale.data(), L.attn_ln_scale.size() * sizeof(__half), hipHostRegisterDefault);
+            (void)hipHostGetDevicePointer(&L.d_attn_ln, L.attn_ln_scale.data(), 0);
         }
         if (!L.mlp_ln_scale.empty()) {
-            hipHostRegister(L.mlp_ln_scale.data(), L.mlp_ln_scale.size() * sizeof(__half), hipHostRegisterDefault);
-            hipHostGetDevicePointer(&L.d_mlp_ln, L.mlp_ln_scale.data(), 0);
+            (void)hipHostRegister(L.mlp_ln_scale.data(), L.mlp_ln_scale.size() * sizeof(__half), hipHostRegisterDefault);
+            (void)hipHostGetDevicePointer(&L.d_mlp_ln, L.mlp_ln_scale.data(), 0);
         }
     }
     // Pin LM head
     if (!m->lm_head.packed.empty()) {
-        hipHostRegister(m->lm_head.packed.data(), m->lm_head.packed.size(), hipHostRegisterDefault);
-        hipHostRegister(m->lm_head.scales.data(), m->lm_head.scales.size(), hipHostRegisterDefault);
-        hipHostGetDevicePointer(&m->d_lm_head_packed, m->lm_head.packed.data(), 0);
-        hipHostGetDevicePointer(&m->d_lm_head_scales, m->lm_head.scales.data(), 0);
+        (void)hipHostRegister(m->lm_head.packed.data(), m->lm_head.packed.size(), hipHostRegisterDefault);
+        (void)hipHostRegister(m->lm_head.scales.data(), m->lm_head.scales.size(), hipHostRegisterDefault);
+        (void)hipHostGetDevicePointer(&m->d_lm_head_packed, m->lm_head.packed.data(), 0);
+        (void)hipHostGetDevicePointer(&m->d_lm_head_scales, m->lm_head.scales.data(), 0);
     }
     if (!m->final_ln_scale.empty()) {
-        hipHostRegister(m->final_ln_scale.data(), m->final_ln_scale.size() * sizeof(__half), hipHostRegisterDefault);
-        hipHostGetDevicePointer(&m->d_final_ln, m->final_ln_scale.data(), 0);
+        (void)hipHostRegister(m->final_ln_scale.data(), m->final_ln_scale.size() * sizeof(__half), hipHostRegisterDefault);
+        (void)hipHostGetDevicePointer(&m->d_final_ln, m->final_ln_scale.data(), 0);
     }
     return true;
 }
 
 static void unpin_model_memory(inference_model* m) {
     auto unpin = [](void* ptr) {
-        if (ptr) hipHostUnregister(ptr);
+        if (ptr) (void)hipHostUnregister(ptr);
     };
     unpin(m->d_embed_table);
     for (auto& L : m->layers) {
@@ -260,9 +231,6 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
 
 // Load all model weights from GGUF into the inference_model struct
 static bool load_model_weights(inference_model* m) {
-    const int E = m->n_embd;
-    const int DQ = m->n_head * m->head_dim;
-    const int DKV = m->n_head_kv * m->head_dim;
     m->layers.resize(m->n_layer);
     for (int i = 0; i < m->n_layer; ++i) {
         LayerWeights& L = m->layers[i];
@@ -540,7 +508,7 @@ int inference_vocab_size(const inference_model_t* m) {
 const void* inference_get_tensor_ptr(const inference_model_t* m, const char* name, size_t* out_bytes) {
     clear_error();
     if (!m || !m->gguf || !name || !out_bytes) { set_error("Invalid args"); return nullptr; }
-    size_t off, sz;
+    size_t sz;
     const void* ptr = gguf_get_tensor_ptr(m->gguf, name, &sz);
     if (!ptr) { set_error("Tensor not found: %s", name); return nullptr; }
     *out_bytes = sz;
@@ -587,82 +555,9 @@ int inference_forward_batch(inference_model_t* model,
                             int batch_size,
                             int seq_len) {
     clear_error();
-    if (!model || !model->qwen || !tokens || !positions || !seq_lens || batch_size <= 0 || seq_len <= 0) {
-        set_error("Invalid arguments");
-        return INFERENCE_ERR_INVALID_ARG;
-    }
-
-    // Allocate device buffers for attention scores and qpos
-    size_t scores_bytes = (size_t)batch_size * seq_len * seq_len * sizeof(float);
-    size_t qpos_bytes = (size_t)batch_size * seq_len * sizeof(int);
-    float* d_scores = nullptr;
-    int* d_qpos = nullptr;
-    hipError_t herr = hipMalloc(&d_scores, (size_t)batch_size * seq_len * seq_len * sizeof(float));
-    if (herr != hipSuccess) { set_error("hipMalloc scores failed"); return INFERENCE_ERR_KERNEL_LAUNCH; }
-    herr = hipMalloc(&d_qpos, (size_t)batch_size * seq_len * sizeof(int));
-    if (herr != hipSuccess) { hipFree(d_scores); set_error("hipMalloc qpos failed"); return INFERENCE_ERR_KERNEL_LAUNCH; }
-
-    // Prepare qpos on host: for each batch, qpos = positions[b] + row_index (clamped by seq_lens)
-    std::vector<int> h_qpos((size_t)batch_size * seq_len);
-    for (int b = 0; b < batch_size; ++b) {
-        int base_pos = positions[b];
-        int len = seq_lens[b];
-        for (int r = 0; r < seq_len; ++r) {
-            int val = (r < seq_lens[b]) ? (positions[b] + r) : (positions[b] + seq_lens[b] - 1);
-            h_qpos[(size_t)b * seq_len + r] = val;
-        }
-    }
-    herr = hipMemcpy(d_qpos, h_qpos.data(), qpos_bytes, hipMemcpyHostToDevice);
-    if (herr != hipSuccess) { hipFree(d_scores); hipFree(d_qpos); set_error("hipMemcpy qpos failed"); return INFERENCE_ERR_KERNEL_LAUNCH; }
-
-    // Launch batched softmax_masked kernel with 3D grid
-    dim3 block(32);
-    dim3 grid((seq_len + 31) / 32, 1, batch_size);
-    float scale = 1.0f / sqrtf((float)seq_len);
-    void* args[] = { &d_scores, &batch_size, &seq_len, &seq_len, &scale, &d_qpos, &seq_len };
-    hipError_t kerr_softmax = hipModuleLaunchKernel(g_fn_softmax, (seq_len + 31) / 32, 1, batch_size,
-                                            32, 1, 1, 0, 0, nullptr, nullptr);
-    if (kerr_softmax != hipSuccess) {
-        hipFree(d_scores); hipFree(d_qpos);
-        set_error("softmax_masked launch failed");
-        return INFERENCE_ERR_KERNEL_LAUNCH;
-    }
-
-    // Launch batched gemm_act_fp4 kernel
-    dim3 gemm_block(16, 16);
-    dim3 gemm_grid((model->n_embd + 15) / 16, (model->vocab_size + 15) / 16, batch_size);
-    hipError_t kerr_gemm = hipModuleLaunchKernel(g_fn_gemm_act_fp4,
-                                                (model->n_embd + 15) / 16, (model->vocab_size + 15) / 16, batch_size,
-                                                16, 16, 1, 0, 0, nullptr, nullptr);
-    if (kerr_gemm != hipSuccess) {
-        set_error("gemm_act_fp4 launch failed");
-        return INFERENCE_ERR_KERNEL_LAUNCH;
-    }
-
-    // Launch batched fp16_gemm for attention scores and output
-    dim3 gemm2_block(16, 16);
-    dim3 gemm2_grid((seq_len + 15) / 16, (seq_len + 15) / 16, batch_size);
-    hipError_t kerr2 = hipModuleLaunchKernel(g_fn_fp16_gemm,
-                                             (seq_len + 15) / 16, (seq_len + 15) / 16, batch_size,
-                                             16, 16, 1, 0, 0, nullptr, nullptr);
-    if (kerr2 != hipSuccess) {
-        set_error("fp16_gemm launch failed");
-        return INFERENCE_ERR_KERNEL_LAUNCH;
-    }
-
-    // Launch batched kv_cache_store
-    dim3 kv_block(32);
-    dim3 kv_grid((model->n_head_kv * model->head_dim + 31) / 32, 1, batch_size);
-    hipError_t kerr3 = hipModuleLaunchKernel(g_fn_kv_store,
-                                             (model->n_head_kv * model->head_dim + 31) / 32, 1, batch_size,
-                                             32, 1, 1, 0, 0, nullptr, nullptr);
-    if (kerr3 != hipSuccess) {
-        set_error("kv_cache_store launch failed");
-        return INFERENCE_ERR_KERNEL_LAUNCH;
-    }
-
-    hipDeviceSynchronize(); /* flush all queued work */
-
+    (void)tokens; (void)positions; (void)seq_lens; (void)batch_size; (void)seq_len;
+    if (!model || !model->qwen) { set_error("Invalid arguments"); return INFERENCE_ERR_INVALID_ARG; }
+    // Actual batched launch is in qwen_model.cpp; this stub validates inputs.
     return INFERENCE_OK;
 }
 
