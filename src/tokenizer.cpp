@@ -196,16 +196,12 @@ static int gguf_kv_get_u32_by_key(const gguf_model_t* model, const char* key, ui
         if (k && strcmp(k, key) == 0) {
             int type = gguf_kv_type(model, i);
             if (type == 4) { // GGUF_TYPE_UINT32
-                uint32_t val;
                 if (gguf_kv_get_u32(model, i, out) == 0) return 0;
             } else if (type == 5) { // GGUF_TYPE_INT32
-                int32_t v;
                 if (gguf_kv_get_i32(model, i, (int32_t*)out) == 0) return 0;
             } else if (type == 10) { // GGUF_TYPE_UINT64
-                uint64_t v;
                 if (gguf_kv_get_u64(model, i, (uint64_t*)out) == 0) return 0;
             } else if (type == 11) { // GGUF_TYPE_INT64
-                int64_t v;
                 if (gguf_kv_get_i64(model, i, (int64_t*)out) == 0) return 0;
             }
             return -1;

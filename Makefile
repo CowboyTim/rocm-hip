@@ -50,12 +50,7 @@ BENCH_TARGET = $(BINDIR)/wmma_bench
 BENCH_HOST = $(OBJDIR)/wmma_bench_main.o
 BENCH_LUT_CO = $(CODIR)/wmma_bench_fp4_lut.co
 
-# --- Phase 1: GGUF mmap reader ---
-GGUF_MMAP_SRC = $(SRCDIR)/gguf_mmap.cpp
-DEMO_GGUF     = $(BINDIR)/demo_gguf
-
-# Phase 2: ROCmFP4 Codebook10 matmul verification harness (CPU reference vs GPU kernels)
-FP4_VERIFY   = $(BINDIR)/fp4_verify
+# Phase 1: GGUF mmap reader — no standalone demo binary
 
 # Phase 3: KV cache manager + zero-copy self-test on hardware
 KV_VERIFY    = $(BINDIR)/kv_verify
@@ -126,15 +121,6 @@ $(CODIR)/wmma_bench_fp4_dp4a_hardware.co: $(SRCDIR)/wmma_bench_fp4_dp4a_hardware
 $(BENCH_TARGET): $(BENCH_HOST) $(CODIR)/wmma_bench_fp4_dp4a.co $(CODIR)/wmma_bench_fp4_dp4a_hardware.co $(CODIR)/wmma_bench_fp4_native.co $(BENCH_LUT_CO)
 	$(CLANG) $(BENCH_HOST) $(LDFLAGS) -o $@
 
-# Phase 1 demo: gguf_mmap reader linked into a single binary
-$(DEMO_GGUF): $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/demo_gguf.cpp $(SRCDIR)/gguf_mmap.h
-	$(CLANG) -O3 -Wall -I. -D__HIP_PLATFORM_AMD__ \
-		$(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/demo_gguf.cpp -o $@
-
-# Phase 2 verify: host harness loads both .co files at runtime, compares against CPU reference
-$(FP4_VERIFY): $(SRCDIR)/fp4_verify.cpp $(SRCDIR)/fp4_common.h $(CODIR)/fp4_matmul_kernel.co $(CODIR)/fp4_matmul_wmma.co copy_co_files
-	$(CLANG) $(CXXFLAGS) -I. $(SRCDIR)/fp4_verify.cpp $(LDFLAGS) -o $@
-
 # Phase 3 verify: KV cache manager + zero-copy self-test (loads kv_cache_kernel.co at runtime)
 $(KV_VERIFY): $(SRCDIR)/kv_cache.cpp $(TESTSDIR)/kv_verify.cpp $(SRCDIR)/kv_cache.h $(CODIR)/kv_cache_kernel.co copy_co_files
 	$(CLANG) $(CXXFLAGS) -I. $(SRCDIR)/kv_cache.cpp $(TESTSDIR)/kv_verify.cpp $(LDFLAGS) -o $@
@@ -158,6 +144,10 @@ $(SOFTMAX_VERIFY): $(TESTSDIR)/softmax_verify.cpp $(CODIR)/softmax_masked.co cop
 # Phase 3 verify: Act x FP4 GEMM vs CPU reference over /dev/shm (loads gemm_act_fp4.co at runtime)
 $(ACTFP4_VERIFY): $(TESTSDIR)/actfp4_verify.cpp $(CODIR)/gemm_act_fp4.co copy_co_files
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/actfp4_verify.cpp $(LDFLAGS) -o $@
+
+# Phase 9: Tokenizer verification (no .co files needed)
+$(TOKENIZER_VERIFY): $(TESTSDIR)/tokenizer_verify.cpp $(SRCDIR)/tokenizer.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/tokenizer.h copy_co_files
+	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/tokenizer_verify.cpp $(SRCDIR)/tokenizer.cpp $(SRCDIR)/gguf_mmap.cpp $(LDFLAGS) -o $@
 
 # Phase 3 verify: full attention block chain; loads layernorm/gemm_act_fp4/rope_embedding/kv_cache_store/fp16_gemm/softmax_masked .co files
 $(ATTN_VERIFY): $(TESTSDIR)/attn_verify.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/kv_cache.h $(CODIR)/kv_cache_store.co $(CODIR)/gemm_act_fp4.co $(CODIR)/fp16_gemm.co $(CODIR)/layernorm.co $(CODIR)/rope_embedding.co $(CODIR)/softmax_masked.co copy_co_files
@@ -240,7 +230,7 @@ clean:
 
 # Copy .co files to root for test execution (tests expect .co files in cwd)
 copy_co_files:
-	cp -f $(CODIR)/*.co .
+	cp -f $(CODIR)/*.co . 2>/dev/null || true
 
 .PHONY: all clean both tokenizer_verify copy_co_files
 

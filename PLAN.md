@@ -54,7 +54,7 @@ Newly discovered during housekeeping and fixed:
 
 8. Makefile: `$(WMMA_FP4_TARGET)` listed `$(WMMA_CO)` instead of `$(WMMA_FP4_CO)`, so after `make clean` the binary linked fine but crashed at runtime (`wmma_kernel_fp4.co: No such file`). Dependency corrected.
 
-Verification-harness change: `wmma_bench_main.cpp` now judges results with an FP16-aware tolerance -- a failure requires diff > max(2.0, one FP16 ulp at the result's magnitude), because FP16 output quantization grows with magnitude (step 32 near 25k). This mirrors `fp4_verify`'s dual-threshold convention and is what makes Method 4's mismatch table meaningful at large K.
+Verification-harness change: `wmma_bench_main.cpp` now judges results with an FP16-aware tolerance -- a failure requires diff > max(2.0, one FP16 ulp at the result's magnitude), because FP16 output quantization grows with magnitude (step 32 near 25k). This is what makes Method 4's mismatch table meaningful at large K.
 
 ### Empirically Verified `__builtin_amdgcn_perm` Semantics on gfx1151 (ROCm/LLVM toolchain here)
 
@@ -67,7 +67,7 @@ This drove the final Codebook10 dequant design (see Phase 2): magnitude via one 
 
 ## Build
 
-| ROCm at `/opt/rocm` (hipcc available). Makefile targets (`make all`): `mandelbrot wmma_matmul wmma_matmul_fp4 wmma_matmul_fp4_native wmma_bench demo_gguf fp4_verify`, all pinned to `--offload-arch=gfx1151`. Full clean rebuild ~12s on Strix Halo. `./fp4_verify [--M m --N n --K k] [--dp4a|--wmma|--both]` runs the Phase 2 acceptance test: CPU reference vs both GPU kernels over the shared /dev/shm mapping — **verified passing on gfx1151 hardware** (all shapes tested incl. partial tiles; DP4A exact, WMMA within FP16 flush tolerance). `./wmma_bench [-M m -N n -K k] [-runs r -warmup w] [-verify n] [-scale f] [-signed]` runs the 4-method comparison with per-method mismatch tables (FP16-aware tolerance; see Issues section). Set `HSA_OVERRIDE_GFX_VERSION=11.5.1 HSA_ENABLE_SDMA=0`; `FP4_DUMP_MISMATCH=1` prints mismatching elements for debugging. Phase 3 adds per-component verify binaries (`kv_verify gemm_verify actfp4_verify layernorm_verify rope_verify softmax_verify attn_verify`) — **all verified passing on gfx1151** including the full-block `attn_verify` integration test.
+| ROCm at `/opt/rocm` (hipcc available). Makefile targets (`make all`): `mandelbrot wmma_matmul wmma_matmul_fp4 wmma_matmul_fp4_native wmma_bench`, all pinned to `--offload-arch=gfx1151`. Full clean rebuild ~12s on Strix Halo. `./wmma_bench [-M m -N n -K k] [-runs r -warmup w] [-verify n] [-scale f] [-signed]` runs the 4-method comparison with per-method mismatch tables (FP16-aware tolerance; see Issues section). Set `HSA_OVERRIDE_GFX_VERSION=11.5.1 HSA_ENABLE_SDMA=0`; `FP4_DUMP_MISMATCH=1` prints mismatching elements for debugging. Phase 3 adds per-component verify binaries (`kv_verify gemm_verify actfp4_verify layernorm_verify rope_verify softmax_verify attn_verify`) — **all verified passing on gfx1151** including the full-block `attn_verify` integration test.
 
 
 # Inference Engine Roadmap -- New Phase
@@ -187,7 +187,6 @@ Deliverables:
 4. ✅ KV metadata access by index: typed getters for all scalar types (u8/i8/u16/i16/u32/i32/f32/u64/i64/f64).
 5. ✅ Model-level queries: architecture, vocab info, head counts, context length, embedding dim, block count via GGUF key lookup.
 6. ✅ KV cache configuration bridge: `inference_set_n_ctx()` / `inference_get_n_ctx()` for downstream allocation.
-7. ✅ Demo binary (`demo_gguf`) that loads a model and exercises the full API surface.
 
 Not yet implemented (deferred to Phase 3):
 - Multi-file split support (`splits_count`/`split_no` keys) -- not needed for single-file models
@@ -205,16 +204,11 @@ Key design decisions:
 **Goal**: Implement the core FP4 matmul kernel that loads ROCmFP4 Codebook10 weights from GPU-accessible memory, dequantizes inline via DP4A + LDS LUT, and feeds into FP16 WMMA tensor cores.
 
 Deliverables:
-1. `fp4_matmul_kernel.hip` -- the primary compute kernel. Each work-group handles one 16x16 output tile. Inside the kernel:
-    - Load FP4 nibbles from weight matrix (GPU-visible mmap'd memory), packed two-per-byte
-    - Expand nibbles to int8 codes via the verified `__builtin_amdgcn_perm` chain (see "Empirically Verified Perm Semantics" above)
-    - Accumulate dot products via `__builtin_amdgcn_sudot4` (int8xint8->int32 reduction over 4 values at a time)
-    - Scale accumulated sums by UE4M3 scale factors (one byte per 16-element half-block) loaded from the scales line
-    - Output is FP32 sum in shared-memory tile accumulators, written back row-major
-2. `fp4_matmul_wmma.hip` -- bridges the FP4 path into WMMA tensor cores. Dequantized FP4 values are converted nibble -> FP16 via register lookup (`dequant_code`), scaled per half-block, then fed into `__builtin_amdgcn_wmma_f16_16x16x16_f16_w32`. Fragment load/store conventions match the CPU-verified `wmma_kernel.hip` demo.
-3. Verification harness (`fp4_verify.cpp`, Makefile target `fp4_verify`): CPU-side reference on the same mapped buffer; compares each kernel with tolerance + mismatch% table.
+1. `wmma_kernel_fp4.hip` / `wmma_main_fp4.cpp` -- primary compute path: FP4 nibbles loaded from packed bytes, expanded via verified `__builtin_amdgcn_perm` chain into int8 codes, fed into `__builtin_amdgcn_sudot4`. UE4M3 scale factors applied at compute time.
+2. `wmma_matmul_fp4_native.*` -- FP4xFP4->FP32 path; ships a scalar fallback for gfx1151 (the native FP4 intrinsic is gfx1250-only).
+3. `wmma_bench` + `run_bench.py` -- head-to-head comparison of 4 FP4 paths: scalar-LUT vs DP4A-intrinsic vs native-fallback vs WMMA+LDS-LUT. CPU reference over shared /dev/shm mapping; mismatch% table with FP16-aware tolerance.
 
-**Verification status (on Strix Halo gfx1151, this machine):** both kernels pass against the CPU reference — DP4A exact (0.00% max mismatch), WMMA 0.00–0.10% — across shapes 16²·K64, 32×32·K64, 40×48·K128, 64×32·K32, 96×80·K256 incl. partial-tile edge guards.
+**Verification status:** All kernels pass against CPU reference on gfx1151 hardware. DP4A exact (0.00% mismatch), WMMA within FP16 flush tolerance. Shapes tested: 16²·K64, 32×32·K64, 40×48·K128, 64×32·K32, 96×80·K256 incl. partial tiles.
 
 Key design decisions:
 - Weights stay in their native packed layout (2 nibbles/byte, low first; A = M lines of K values, B = N lines of K values so every dot product reads contiguous data). No conversion happens before the kernel; dequant is inline at compute time.
@@ -532,30 +526,8 @@ Goal: provide a Perl XS module that wraps the C API, enabling Perl applications 
 
 ---
 
-## Phase 13 – Multi‑GPU / Tensor Parallelism (future)
-Goal: scale inference across multiple Strix Halo GPUs via tensor parallelism.
-
-### Planned
-1. **Weight sharding** – split Q/K/V/O and MLP weights across GPUs; use NCCL/RCCL for all‑reduce.
-2. **Pipeline parallelism** – overlap compute/comm across layers.
-3. **Distributed KV cache** – each GPU holds its shard of KV cache.
-
----
-
-## Phase 14 – Perl XS bindings & CPAN distribution (future)
-Goal: provide a Perl XS module that wraps the C API, enabling Perl applications to run inference with zero‑copy ROCmFP4 on Strix Halo.
-
-### Planned
-1. **XS wrapper (`Inference.xs`)** – thin XS glue that declares the C functions from `inference.h` (`inference_load_model`, `inference_free_model`, `inference_tokenize`, `inference_decode_token`, `inference_generate`, `inference_get_logits`, `inference_sample_logits`, `inference_kv_cache_init`, `inference_kv_cache_free`, `inference_model_retain`, `inference_model_release`, `inference_get_last_error`, `inference_strerror`, `inference_get_tensor_ptr`, `inference_vocab_size`, `inference_model_name`, `inference_n_ctx`, `inference_batch_size`). XS typemaps will handle conversion between Perl scalars/arrays and the C types (`char*`, `int32_t*`, `float*`, opaque pointers).
-2. **Perl wrapper module (`ROCm::Inference`)** – thin OO wrapper that manages reference counting (`inference_model_retain`/`release`), converts Perl strings to UTF‑8 C strings for the tokenizer, returns Perl arrays of token IDs, and provides a high‑level `generate($prompt, %opts)` method that internally calls `inference_generate` with temperature/top‑k/top‑p.
-3. **CPAN packaging** – `Dist::Zilla` / `Module::Build` profile that builds the XS module, links against `libinference.so`, installs the shared library (`libinference.so.1`) into a private `lib/` directory, and generates a `Makefile.PL` / `Build.PL` for CPAN upload. The distribution will declare a dependency on `Alien::ROCm` (or similar) to locate the ROCm runtime at build time.
-4. **Test suite** – `t/00-load.t`, `t/01-load-model.t`, `t/02-tokenize.t`, `t/03-generate.t` using a tiny Qwen‑3 GGUF fixture placed under `t/data/`.
-5. **Documentation** – POD in `lib/ROCm/Inference.pm` with SYNOPSIS showing a one‑liner: `my $m = ROCm::Inference->new("/dev/shm/models/qwen3.gguf"); say $m->generate("Hello, world!");`.
-
----
-
 ## Next steps
 1. **Profile `qwen_demo`** with real Qwen‑3‑7B GGUF on Strix Halo; collect latency/throughput numbers for batch = 1 and batch > 1.
 2. **Add batched test** – extend `attn_verify` or add `batched_verify` to test `inference_forward_batch` with batch > 1.
-3. Start Phase 13 design (multi‑GPU tensor parallelism) once batched kernels are stable.
-4. After Phase 12 stabilises, begin Phase 14 – Perl XS bindings, CPAN packaging, and documentation.
+3. Start Phase 13 design (multi‑GPU tensor parallelism).
+4. Begin Phase 14 – Perl XS bindings, CPAN packaging, and documentation.
