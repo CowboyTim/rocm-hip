@@ -24,3 +24,14 @@ All binaries use the same zero-copy approach:
 2. `hipHostRegister(ptr, size, hipHostRegisterMapped/Default)` to pin pages
 3. Launch kernel with **no `hipMemcpy`** — GPU reads/writes CPU-visible file-backed RAM directly
 4. Kernels pre-compiled to `.co` objects (`hipcc --genco`) loaded at runtime via `hipModuleLoadData`
+
+## Temp Snippets and Debugging
+
+For temporary code snippets, test scripts, and debugging runs, use files in `/tmp/`. On error or syntax issues, update the temp file using the **Edit tool** rather than rewriting it via `cat`, `echo`, or `bash` heredocs. File edit tools are preferred over inline command-line scripts because:
+
+- Syntax errors are easier to spot and fix when editing a named file
+- Long bash/python one-liners tend to accumulate escape-quote issues
+- The Edit tool preserves surrounding context and indentation correctly
+- Iterative fixes (e.g., wrapping blocks in conditionals, adding braces) are safer with file-based editing
+
+Pattern: write initial snippet to `/tmp/snippet_name.cpp` or `/tmp/debug_script.py`, run it, then use Edit to fix any errors before re-running.
