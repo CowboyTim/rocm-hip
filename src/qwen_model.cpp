@@ -53,6 +53,9 @@ struct inference_model {
     void* d_lm_head_scales = nullptr;
     void* d_final_ln = nullptr;
     inference_kv_cache_t* kvc = nullptr;
+
+    // Phase 15.4: hybrid architecture support (read from GGUF KV)
+    int full_attention_interval = 0;  // SSM-only layers every N layers (0=disabled)
 };
 
 using namespace rocmfp4;
@@ -210,12 +213,56 @@ struct QwenModel {
         unload_all_kernels();
     }
 
+    // Phase 15.4 helpers: find KV index by key, extract int64 value, read tensor type by name
+    
+    static int64_t find_kv_idx_gguf(gguf_model_t* m, const char* key) {
+        if (!m || !key) return -1;
+        for (int64_t i = 0; i < gguf_n_kv(m); ++i) {
+            if (strcmp(gguf_kv_key(m, i), key) == 0) return i;
+        }
+        return -1;
+    }
+
+    static int64_t kv_as_int64_from_gguf(gguf_model_t* m, int64_t idx) {
+        if (!m || idx < 0) return 0;
+        uint8_t u8v; int8_t i8v; uint16_t u16v; int16_t i16v;
+        uint32_t u32v; int32_t i32v; uint64_t u64v; int64_t i64v;
+        switch (gguf_kv_type(m, idx)) {
+            case 0:  (void)gguf_kv_get_u8(m, idx, &u8v);     return u8v;
+            case 1:  (void)gguf_kv_get_i8(m, idx, &i8v);     return i8v;
+            case 2:  (void)gguf_kv_get_u16(m, idx, &u16v);   return u16v;
+            case 3:  (void)gguf_kv_get_i16(m, idx, &i16v);   return i16v;
+            case 4:  (void)gguf_kv_get_u32(m, idx, &u32v);   return u32v;
+            case 5:  (void)gguf_kv_get_i32(m, idx, &i32v);   return i32v;
+            case 10: (void)gguf_kv_get_u64(m, idx, &u64v);   return u64v;
+            case 11: (void)gguf_kv_get_i64(m, idx, &i64v);   return i64v;
+            default: return 0;
+        }
+    }
+
     bool init(inference_model* model) {
         eng_model = model;
         if (!load_all_kernels()) return false;
 
-        const int E = n_embd, HD = head_dim, HQ = n_head, HKV = n_head_kv, CTX = n_ctx;
+        // Phase 15.4: Read full_attention_interval from GGUF KV for hybrid architecture support
+        const char* fa_keys[] = {"qwen35.full_attention_interval", "ssm.full_attention_interval"};
+        int64_t fa_idx = -1;
+        for (int i = 0; i < 2 && fa_idx < 0; ++i) {
+            fa_idx = find_kv_idx_gguf(model->gguf, fa_keys[i]);
+        }
+        model->full_attention_interval = (fa_idx >= 0) ? (int)kv_as_int64_from_gguf(model->gguf, fa_idx) : 0;
+
+        // Use dynamic dimensions from engine model (Phase 15.1)
+        const int E = model->n_embd, HD = model->head_dim, HQ = model->n_head, HKV = model->n_head_kv, CTX = model->n_ctx;
         const int DQ = HQ * HD, DKV = HKV * HD;
+
+        n_layer = model->n_layer;
+        n_embd = model->n_embd;
+        n_head = model->n_head;
+        n_head_kv = model->n_head_kv;
+        head_dim = model->head_dim;
+        vocab_size = model->vocab_size;
+        n_ctx = model->n_ctx;
 
         layer_scratch.resize(n_layer);
         for (int i = 0; i < n_layer; ++i) {
@@ -260,7 +307,13 @@ struct QwenModel {
         __half* residual = layer_scratch[0].h;
 
         // ---- 2) Decoder layers ----
+        const bool has_ssm = eng_model->full_attention_interval > 0;
         for (int l = 0; l < n_layer; ++l) {
+            // Phase 15.4: Skip SSM-only layers in hybrid architecture
+            if (has_ssm && l % eng_model->full_attention_interval != 0) {
+                continue;  // SSM layer — skip during inference (not yet implemented)
+            }
+
             LayerScratch& s = layer_scratch[l];
             inference_model::LayerWeights& L = eng_model->layers[l];
 

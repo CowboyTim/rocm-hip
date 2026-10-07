@@ -116,6 +116,28 @@ static inline size_t get_type_size(int type) {
     }
 }
 
+/* Check if a tensor type stores scales internally within each block.
+ * Returns 1 for self-contained types (Q4_0, Q4_1, Q8_0, TYPE100).
+ * Returns 0 for types requiring external .scales companion tensors. */
+
+int gguf_type_is_self_contained(int type) {
+    switch (type) {
+        /* Standard llama.cpp quantization types - all self-contained */
+        case 2:  /* Q4_0: {half scale, uint8[16]} per 32 values */
+        case 3:  /* Q4_1: {half scale, half min, uint8[16]} per 32 values */  
+        case 8:  /* Q8_0: {half scale, int8[32]} per 32 values */
+        case 13: /* Qwen3.5 custom type (Q4_K-like): block_size=256, scales embedded in blocks */
+            return 1;
+        
+        /* Extended/custom types */
+        case 100: /* TYPE100 = ROCmFP4 Codebook10: UE4M3 scale + nibbles per block */
+            return 1;
+            
+        default:
+            return 0;
+    }
+}
+
 /* ---------------------------------------------------------------------------
  * Internal structures
  * --------------------------------------------------------------------------- */

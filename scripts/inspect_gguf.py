@@ -95,8 +95,7 @@ def parse_gguf(path):
             19:"Q5_1", 20:"Q5_K", 21:"Q6_K", 22:"Q8_0_K",
             23:"IQ4_NL", 24:"IQ4_XS", 25:"IQ3_XS",
             27: "FP4(MX)", 
-            # ROCm-specific types (from rocm-hip fork)
-            # ftype 100 = ROCmFP4 (Codebook10) quantization, the custom type used in our fork
+            99:"ROCmFP4(Codebook10)", # ftype 99 = ROCmFP4 Codebook10, the custom type used in our fork
         }
 
         print("=" * 120)

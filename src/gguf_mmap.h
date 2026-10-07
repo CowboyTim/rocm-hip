@@ -78,9 +78,12 @@ int32_t gguf_kv_get_added_tokens(const gguf_model_t *model, const char* key, con
  * out_bytes receives the tensor size in bytes. */
 const void* gguf_get_tensor_ptr(const gguf_model_t *model, const char* name, size_t* out_bytes);
 
-/* --- KV cache configuration (Phase 1/3 bridge) --- */
-void         gguf_set_n_ctx(gguf_model_t *model, int64_t n_ctx);
-int64_t      gguf_get_n_ctx(const gguf_model_t *model);
+/* --- Quantization type helpers --- */
+
+/* Check if a tensor type stores scales internally (self-contained).
+ * Returns 1 for Q4_0, Q4_1, Q8_0, TYPE100 etc. where scales are 
+ * embedded within each block structure. Returns 0 for external-scales types. */
+int          gguf_type_is_self_contained(int type);
 
 #ifdef __cplusplus
 }
