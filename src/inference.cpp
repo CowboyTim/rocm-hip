@@ -8,7 +8,7 @@
 #include "tokenizer.h"
 #include "qwen_model.h"
 #include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
+
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -202,6 +202,94 @@ static bool has_tensor(gguf_model_t* gguf, const char* name) {
     return false;
 }
 
+// ======================== SCALE EXTRACTION HELPERS ========================
+
+// Extract UE4M3 scales from TYPE100 blocks (block_size=32, 2 scales per block at offset 16).
+// Layout: [scale_lo(1B), scale_hi(1B), data(16B)] × Nblocks
+static void extract_scales_type100(const uint8_t* data, size_t nbytes, uint8_t* scales_out, int64_t N) {
+    const size_t block_bytes = 17; // 2 scale bytes + 16 packed data bytes
+    const size_t scales_per_block = 2;
+    const size_t blocks_per_row = nbytes / block_bytes;
+    
+    for (int64_t row = 0; row < N; ++row) {
+        size_t row_blocks = blocks_per_row;
+        for (size_t b = 0; b < row_blocks; ++b) {
+            const uint8_t* blk = data + row * row_blocks * block_bytes + b * block_bytes;
+            for (size_t s = 0; s < scales_per_block; ++s) {
+                scales_out[row * (row_blocks * scales_per_block) + b * scales_per_block + s] = blk[16 + s];
+            }
+        }
+    }
+}
+
+// Extract UE4M3 scales from TYPE13 blocks (block_size=256, 16 UE4M3 scales per block).
+// Layout: [scale_0(1B), scale_1(1B), ..., scale_15(1B), data(128B)] × Nblocks
+// Each scale covers 16 elements within the 256-element block.
+static void extract_scales_type13(const uint8_t* data, size_t nbytes, uint8_t* scales_out, int64_t N) {
+    const size_t block_bytes = 144; // 16 scale bytes + 128 packed data bytes
+    const size_t scales_per_block = 16;
+    const size_t blocks_per_row = nbytes / block_bytes;
+    
+    for (int64_t row = 0; row < N; ++row) {
+        size_t row_blocks = blocks_per_row;
+        for (size_t b = 0; b < row_blocks; ++b) {
+            const uint8_t* blk = data + row * row_blocks * block_bytes + b * block_bytes;
+            for (size_t s = 0; s < scales_per_block; ++s) {
+                scales_out[row * (row_blocks * scales_per_block) + b * scales_per_block + s] = blk[s];
+            }
+        }
+    }
+}
+
+// Extract FP16 delta from Q8_0 blocks (block_size=32).
+// Layout: [delta_fp16(2B), values_int8(32B)] per block.
+static void extract_scales_q8_0(const uint8_t* data, size_t nbytes, float* scales_out, int64_t N) {
+    const size_t block_bytes = 34; // 2 byte delta + 32 bytes int8 values
+    const size_t blocks_per_row = nbytes / block_bytes;
+    
+    for (int64_t row = 0; row < N; ++row) {
+        size_t row_blocks = blocks_per_row;
+        for (size_t b = 0; b < row_blocks; ++b) {
+            const uint8_t* blk = data + row * row_blocks * block_bytes + b * block_bytes;
+            float d; memcpy(&d, blk, sizeof(float)); // FP16 stored as half-precision but we read raw
+            __half h; memcpy(&h, blk, sizeof(__half));
+            scales_out[row * row_blocks + b] = __half_to_float(h);
+        }
+    }
+}
+
+// Extract FP16 delta from Q4_0 blocks (block_size=32).
+// Layout: [delta_fp16(2B), min_fp16(2B), packed_data(16B)] per block.
+static void extract_scales_q4_0(const uint8_t* data, size_t nbytes, float* scales_out, int64_t N) {
+    const size_t block_bytes = 20; // 2 byte scale + 2 byte min + 16 bytes packed
+    const size_t blocks_per_row = nbytes / block_bytes;
+    
+    for (int64_t row = 0; row < N; ++row) {
+        size_t row_blocks = blocks_per_row;
+        for (size_t b = 0; b < row_blocks; ++b) {
+            const uint8_t* blk = data + row * row_blocks * block_bytes + b * block_bytes;
+            __half h; memcpy(&h, blk, sizeof(__half));
+            scales_out[row * row_blocks + b] = __half_to_float(h);
+        }
+    }
+}
+
+// Extract FP16 scale from Q4_1 blocks (block_size=32).
+// Layout: [scale_fp16(2B), min_fp16(2B), packed_data(16B)] per block.
+static void extract_scales_q4_1(const uint8_t* data, size_t nbytes, float* scales_out, int64_t N) {
+    const size_t block_bytes = 20; // same layout as Q4_0
+    const size_t blocks_per_row = nbytes / block_bytes;
+    
+    for (int64_t row = 0; row < N; ++row) {
+        size_t row_blocks = blocks_per_row;
+        for (size_t b = 0; b < row_blocks; ++b) {
+            const uint8_t* blk = data + row * row_blocks * block_bytes + b * block_bytes;
+            __half h; memcpy(&h, blk, sizeof(__half));
+            scales_out[row * row_blocks + b] = __half_to_float(h);
+        }
+    }
+}
+
 // Load quantized weight by name from GGUF (for non-QKV tensors)
 static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_name, const char* scales_name, QuantWeight& w) {
     size_t w_sz, s_sz;
@@ -220,12 +308,12 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
     int t = gguf_tensor_type(gguf, idx);
     int self_contained = gguf_type_is_self_contained(t);
     
-    // For self-contained types, external .scales tensor is optional — fill with placeholder
+    // For self-contained types, external .scales tensor is optional — extract from blocks or fill with placeholder
     if (!s_ptr && !self_contained) {
         fprintf(stderr, "Missing scales tensor %s (type %d requires external scales)\n", scales_name, t);
         return false;
     } else if (!s_ptr && self_contained) {
-        fprintf(stderr, "[load_quant_weight] %s: self-contained type %d, no external scales — filling placeholder\n", 
+        fprintf(stderr, "[load_quant_weight] %s: self-contained type %d, no external scales — extracting from blocks\n", 
                 weight_name, t);
     }
     
@@ -243,12 +331,112 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
         // External scales tensor found — use it normally
         w.scales.assign((const unsigned char*)s_ptr, (const unsigned char*)s_ptr + s_sz);
     } else {
-        // Self-contained type with no external scales — fill placeholder at known layout
-        size_t scales_per_row = ((size_t)in_dim + 15) >> 4;  // UE4M3 scale per 16 elements
+        // Self-contained type with no external scales — extract actual scales from within each block
+        size_t scales_per_row = ((size_t)in_dim + 15) >> 4;  // UE4M3 scale per 16 elements (standard layout)
         w.scales.resize((size_t)out_dim * scales_per_row);
-        for (int64_t row = 0; row < out_dim; ++row) {
-            for (size_t s = 0; s < scales_per_row; ++s) {
-                w.scales[row * scales_per_row + s] = 1;  // placeholder: unity scale (= 1.0f UE4M3 encoded as uint8(0x60))
+        
+        // Determine extraction strategy based on type
+        switch (t) {
+            case 100: {
+                // TYPE100/MXFP4: UE4M3 scales embedded in blocks alongside packed data.
+                // Block layout (17 bytes): [scale_0(1B), scale_1(1B), data(16B)] for 32 values.
+                // Total blob = w_sz; blocks per row = K / 32; scales per block = 2.
+                // Repack to standard layout: one UE4M3 scale byte per 16 elements.
+                fprintf(stderr, "[load_quant_weight] extracting TYPE100 scales\n");
+                
+                const uint8_t* data = w.packed.data();
+                size_t total_blocks = w_sz / 17;
+                size_t blocks_per_row = (size_t)in_dim / 32;
+                size_t tmp_scales_per_row = blocks_per_row * 2;
+                
+                std::vector<uint8_t> tmp_scales((size_t)out_dim * tmp_scales_per_row);
+                
+                for (int64_t row = 0; row < out_dim; ++row) {
+                    int64_t row_start_elem = row * in_dim;
+                    size_t row_start_block = (size_t)row_start_elem / 32;
+                    
+                    for (size_t b = 0; b < blocks_per_row; ++b) {
+                        size_t blk_idx = row_start_block + b;
+                        size_t src_off = blk_idx * 17;
+                        
+                        for (size_t s = 0; s < 2; ++s) {
+                            size_t global_si = (size_t)(row * blocks_per_row * 2) + b * 2 + s;
+                            if (global_si < tmp_scales.size()) {
+                                tmp_scales[global_si] = data[src_off + 16 + s]; // UE4M3 at offset 16+within block
+                            }
+                        }
+                    }
+                }
+                
+                // Repack: map extracted scales to standard per-row layout (K/16 scale bytes per row)
+                for (int64_t row = 0; row < out_dim; ++row) {
+                    size_t src_row_off = (size_t)row * tmp_scales_per_row;
+                    for (size_t s = 0; s < scales_per_row; ++s) {
+                        w.scales[row * scales_per_row + s] = 
+                            (s < tmp_scales_per_row) ? tmp_scales[src_row_off + s] : 0x60;
+                    }
+                }
+                break;
+            }
+            case 13: {
+                // TYPE13: UE4M3 scales embedded in each 256-value block.
+                // Block layout (144 bytes): [scale_0..scale_15(16B), packed_data(128B)].
+                // Each scale covers 16 elements within the block.
+                fprintf(stderr, "[load_quant_weight] extracting TYPE13 scales\n");
+                
+                const uint8_t* data = w.packed.data();
+                size_t total_blocks = w_sz / 144;
+                size_t blocks_per_row = (size_t)in_dim / 256;
+                size_t tmp_scales_per_row = blocks_per_row * 16;
+                
+                std::vector<uint8_t> tmp_scales((size_t)out_dim * tmp_scales_per_row);
+                
+                for (int64_t row = 0; row < out_dim; ++row) {
+                    int64_t row_start_elem = row * in_dim;
+                    size_t row_start_block = (size_t)row_start_elem / 256;
+                    
+                    for (size_t b = 0; b < blocks_per_row; ++b) {
+                        size_t blk_idx = row_start_block + b;
+                        const uint8_t* blk = data + blk_idx * 144;
+                        
+                        for (size_t s = 0; s < 16; ++s) {
+                            size_t global_si = (size_t)(row * tmp_scales_per_row) + b * 16 + s;
+                            if (global_si < tmp_scales.size()) {
+                                tmp_scales[global_si] = blk[s]; // UE4M3 scale at offset s within block
+                            }
+                        }
+                    }
+                }
+                
+                // Repack: map extracted scales to standard per-row layout
+                for (int64_t row = 0; row < out_dim; ++row) {
+                    size_t src_row_off = (size_t)row * tmp_scales_per_row;
+                    for (size_t s = 0; s < scales_per_row; ++s) {
+                        w.scales[row * scales_per_row + s] = 
+                            (s < tmp_scales_per_row) ? tmp_scales[src_row_off + s] : 0x60;
+                    }
+                }
+                break;
+            }
+            case 2: case 3: case 7: case 8: {
+                // Q4_0/Q4_1/Q8_0: FP16 deltas embedded in blocks — use placeholder until proper dequant path added
+                fprintf(stderr, "[load_quant_weight] type %d self-contained: FP16 delta extraction not yet wired\n", t);
+                for (int64_t row = 0; row < out_dim; ++row) {
+                    for (size_t s = 0; s < scales_per_row; ++s) {
+                        w.scales[row * scales_per_row + s] = 0x60; // unity UE4M3 placeholder
+                    }
+                }
+                break;
+            }
+            default: {
+                // Unknown self-contained type — fill with unity scale as safe fallback
+                fprintf(stderr, "[load_quant_weight] unknown type %d, filling unity scale placeholder\n", t);
+                for (int64_t row = 0; row < out_dim; ++row) {
+                    for (size_t s = 0; s < scales_per_row; ++s) {
+                        w.scales[row * scales_per_row + s] = 0x60; // unity UE4M3 = 1.0f
+                    }
+                }
+                break;
             }
         }
     }
@@ -476,8 +664,8 @@ static bool load_model_weights(inference_model* m) {
                 }
             } else {
                 // Self-contained quantization — no external scales tensor exists.
-                // Fill with placeholder scale value 1.0f so model can load (correctness depends on kernel tolerating unity scales).
-                fprintf(stderr, "blk.%d: self-contained type, filling placeholder scales\n", i);
+                // Extract actual scales from within blocks based on tensor type.
+                fprintf(stderr, "blk.%d: self-contained type %d, extracting scales from blocks\n", i, qkv_type >= 0 ? gguf_tensor_type(m->gguf, qkv_type) : -1);
                 
                 size_t q_scales_per_row = ((size_t)DQ + 15) >> 4;
                 size_t k_scales_per_row = ((size_t)DKV + 15) >> 4;
@@ -487,15 +675,75 @@ static bool load_model_weights(inference_model* m) {
                 L.Wk.scales.resize((size_t)E * k_scales_per_row);
                 L.Wv.scales.resize((size_t)E * v_scales_per_row);
                 
-                for (int64_t row = 0; row < E; ++row) {
-                    for (size_t s = 0; s < q_scales_per_row; ++s) {
-                        L.Wq.scales[row * q_scales_per_row + s] = 1;
+                int t = (qkv_type >= 0) ? gguf_tensor_type(m->gguf, qkv_type) : -1;
+                
+                if (t == 13) {
+                    // TYPE13: block_size=256 values/block, UE4M3 scales embedded in each block.
+                    // Block layout: [scale_0..scale_15 (16 bytes), packed_data (128 bytes)] = 144 bytes per block.
+                    // Each scale covers 16 elements within the block.
+                    // For combined QKV with total_cols columns:
+                    //   blocks_per_row = ceil(total_cols / 256)
+                    //   total_scales_per_row = blocks_per_row * 16
+                    
+                    size_t blocks_per_row = (total_cols + 255) / 256;
+                    size_t total_scales_per_row = blocks_per_row * 16;
+                    
+                    for (int64_t row = 0; row < E; ++row) {
+                        const unsigned char* src_row = pk + row * blocks_per_row * 144;
+                        
+                        // --- Extract all scales from this row's blocks into a temp buffer ---
+                        std::vector<uint8_t> all_scales(total_scales_per_row);
+                        for (size_t b = 0; b < blocks_per_row; ++b) {
+                            const uint8_t* blk = src_row + b * 144;
+                            for (size_t s = 0; s < 16; ++s) {
+                                all_scales[b * 16 + s] = blk[s]; // UE4M3 scale at offset s within block
+                            }
+                        }
+                        
+                        // Map scales to projection-specific arrays.
+                        // Column c maps to scale_index = c / 16, and scale comes from block (c/256).
+                        // Q: columns [0 .. DQ-1], K: columns [DQ .. DQ+DKV-1], V: columns [DQ+DKV .. DQ+2*DKV-1]
+                        
+                        size_t q_scale_count = (DQ + 15) >> 4; // ceil(DQ/16), but may exceed available scales
+                        if (q_scale_count > total_scales_per_row) q_scale_count = total_scales_per_row;
+                        for (size_t s = 0; s < q_scales_per_row; ++s) {
+                            L.Wq.scales[row * q_scales_per_row + s] = 
+                                (s < q_scale_count) ? all_scales[s] : 0x60;
+                        }
+                        
+                        // K starts after Q's column range in terms of which scales apply.
+                        // Scale index for column (DQ + k) is (DQ + k) / 16.
+                        // But we need the scale that covers column (DQ + k), which comes from block ((DQ+k)/256).
+                        size_t k_start_col = DQ;
+                        for (size_t s = 0; s < k_scales_per_row; ++s) {
+                            int col = (int)(k_start_col + s * 16);
+                            size_t si = col / 16;
+                            L.Wk.scales[row * k_scales_per_row + s] = 
+                                (si < total_scales_per_row) ? all_scales[si] : 0x60;
+                        }
+                        
+                        // V: columns [DQ+DKV .. DQ+2*DKV-1]
+                        size_t v_start_col = DQ + DKV;
+                        for (size_t s = 0; s < v_scales_per_row; ++s) {
+                            int col = (int)(v_start_col + s * 16);
+                            size_t si = col / 16;
+                            L.Wv.scales[row * v_scales_per_row + s] = 
+                                (si < total_scales_per_row) ? all_scales[si] : 0x60;
+                        }
                     }
-                    for (size_t s = 0; s < k_scales_per_row; ++s) {
-                        L.Wk.scales[row * k_scales_per_row + s] = 1;
-                    }
-                    for (size_t s = 0; s < v_scales_per_row; ++s) {
-                        L.Wv.scales[row * v_scales_per_row + s] = 1;
+                } else {
+                    // Unknown self-contained type — fill with unity scale as safe fallback
+                    fprintf(stderr, "blk.%d: unknown type %d in combined QKV, filling unity placeholder\n", i, t);
+                    for (int64_t row = 0; row < E; ++row) {
+                        for (size_t s = 0; s < q_scales_per_row; ++s) {
+                            L.Wq.scales[row * q_scales_per_row + s] = 0x60; // unity UE4M3 = 1.0f
+                        }
+                        for (size_t s = 0; s < k_scales_per_row; ++s) {
+                            L.Wk.scales[row * k_scales_per_row + s] = 0x60;
+                        }
+                        for (size_t s = 0; s < v_scales_per_row; ++s) {
+                            L.Wv.scales[row * v_scales_per_row + s] = 0x60;
+                        }
                     }
                 }
             }
@@ -620,11 +868,170 @@ inference_model_t* inference_load_model(const char* gguf_path) {
     m->vocab_size = (int)vs;
     m->n_ctx = (int)ctx_len;
 
-    // Load embedding table
-    size_t sz;
-    const void* emb_ptr = gguf_get_tensor_ptr(m->gguf, "token_embd.weight", &sz);
-    if (emb_ptr && sz == (size_t)m->vocab_size * m->n_embd * sizeof(__half)) {
-        m->embed_table.assign((const __half*)emb_ptr, (const __half*)emb_ptr + m->vocab_size * m->n_embd);
+    // Load embedding table — detect quantized types and route accordingly
+    {
+        int emb_idx = find_tensor_index(m->gguf, "token_embd.weight");
+        size_t sz;
+        const void* emb_ptr = gguf_get_tensor_ptr(m->gguf, "token_embd.weight", &sz);
+        if (emb_ptr) {
+            int emb_type = -1;
+            if (emb_idx >= 0) {
+                emb_type = gguf_tensor_type(m->gguf, emb_idx);
+            }
+            
+            if (emb_type == -1 || emb_type == 1 /* F16 */) {
+                // FP16 embedding table — load directly as before
+                if (sz == (size_t)m->vocab_size * m->n_embd * sizeof(__half)) {
+                    m->embed_table.assign((const __half*)emb_ptr, (const __half*)emb_ptr + m->vocab_size * m->n_embd);
+                    fprintf(stderr, "[load_model] token_embd: FP16 (%zu bytes, %dx%d)\n", 
+                            sz, m->vocab_size, m->n_embd);
+                } else {
+                    fprintf(stderr, "[load_model] WARNING: token_embd exists but size mismatch for FP16 (%zu vs expected %zu)\n",
+                            sz, (size_t)m->vocab_size * m->n_embd * sizeof(__half));
+                }
+            } else {
+                // Quantized embedding — load via QuantWeight path with dequant at runtime
+                fprintf(stderr, "[load_model] token_embd: quantized type %d (%zu bytes), loading through QuantWeight path\n", 
+                        emb_type, sz);
+                
+                int64_t* ne = gguf_tensor_ne(m->gguf, emb_idx);
+                if (ne && ne[0] == m->vocab_size && ne[1] == m->n_embd) {
+                    // Load packed data and scales into temp storage
+                    std::vector<unsigned char> packed((const unsigned char*)emb_ptr, 
+                                                       (const unsigned char*)emb_ptr + sz);
+                    
+                    // Determine scale tensor name based on type
+                    char sname[128];
+                    snprintf(sname, sizeof(sname), "token_embd.scales");
+                    size_t s_sz;
+                    const void* s_ptr = gguf_get_tensor_ptr(m->gguf, sname, &s_sz);
+                    
+                    if (s_ptr && s_sz > 0) {
+                        // External scales exist — could store these for later use
+                        fprintf(stderr, "[load_model] token_embd: has external scales (%zu bytes)\n", s_sz);
+                    } else if (gguf_type_is_self_contained(emb_type)) {
+                        // Self-contained — scales embedded in blocks, will extract at runtime
+                        fprintf(stderr, "[load_model] token_embd: self-contained type %d, scales embedded in blocks\n", 
+                                emb_type);
+                    } else {
+                        fprintf(stderr, "[load_model] WARNING: token_embd is quantized but no scales available (type %d)\n", 
+                                emb_type);
+                    }
+                    
+                    // For now: dequantize to FP16 for embedding lookup compatibility.
+                    // At Q4_1 with vocab=248320, n_embd=2560 → ~635M values → ~1.2GB dequantized FP16.
+                    // This is acceptable on 128GB UMA systems.
+                    size_t total_elements = (size_t)m->vocab_size * m->n_embd;
+                    m->embed_table.resize(total_elements);
+                    
+                    // Dequantize based on type using scale extraction
+                    switch (emb_type) {
+                        case 100: {
+                            // TYPE100 / MXFP4: UE4M3 scales per block of 32 values
+                            {
+                                const uint8_t* data = packed.data();
+                                size_t bytes_per_block = 17; // 2 scale + 16 data
+                                size_t total_blocks = total_elements / 32;
+                                
+                                for (int vi = 0; vi < m->vocab_size; ++vi) {
+                                    int64_t row_offset = (int64_t)vi * m->n_embd;
+                                    size_t row_blocks = m->n_embd / 32;
+                                    
+                                    for (int ei = 0; ei < m->n_embd; ++ei) {
+                                        int bi = ei / 32;
+                                        int val_in_block = ei % 32;
+                                        size_t blk_idx = (size_t)row_offset / 32 + bi;
+                                        
+                                        float sc;
+                                        if (val_in_block < 16) {
+                                            sc = ue4m3_to_float(data[blk_idx * 17 + 16]); // first half-block scale
+                                        } else {
+                                            sc = ue4m3_to_float(data[blk_idx * 17 + 17]); // second half-block scale  
+                                        }
+                                        
+                                        uint8_t nibble = (data[blk_idx * 17 + 16 + (val_in_block >> 1)] >> ((val_in_block & 1) << 2)) & 0x0F;
+                                        m->embed_table[(size_t)vi * m->n_embd + ei] = __half(dequant_code(nibble) * sc);
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        case 3: { // Q4_1
+                            // Q4_1 block layout: [scale_fp16(2B), min_fp16(2B), packed_data(16B)] = 20 bytes per 32 values
+                            {
+                                const uint8_t* data = packed.data();
+                                size_t bytes_per_block = 20; // 2 scale + 2 min + 16 packed
+                                size_t total_blocks = total_elements / 32;
+                                
+                                for (int vi = 0; vi < m->vocab_size; ++vi) {
+                                    int64_t row_offset = (int64_t)vi * m->n_embd;
+                                    size_t row_blocks = m->n_embd / 32;
+                                    
+                                    for (int ei = 0; ei < m->n_embd; ++ei) {
+                                        int bi = ei / 32;
+                                        int val_in_block = ei % 32;
+                                        size_t blk_idx = (size_t)row_offset / 32 + bi;
+                                        
+                                        __half h_scale, h_min;
+                                        memcpy(&h_scale, &data[blk_idx * bytes_per_block], sizeof(__half));
+                                        memcpy(&h_min, &data[blk_idx * bytes_per_block + 2], sizeof(__half));
+                                        
+                                        float scale_f = __half_to_float(h_scale);
+                                        float min_f = __half_to_float(h_min);
+                                        
+                                        uint8_t nibble = (data[blk_idx * bytes_per_block + 4 + (val_in_block >> 1)] >> ((val_in_block & 1) << 2)) & 0x0F;
+                                        // Q4_1: value = scale * codebook[nibble] + min
+                                        float val = scale_f * dequant_code(nibble) + min_f;
+                                        m->embed_table[(size_t)vi * m->n_embd + ei] = __half(val);
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        case 2: { // Q4_0
+                            // Q4_0 block layout: [delta_fp16(2B), packed_data(16B)] = 18 bytes per 32 values
+                            {
+                                const uint8_t* data = packed.data();
+                                size_t bytes_per_block = 18; 
+                                size_t total_blocks = total_elements / 32;
+                                
+                                for (int vi = 0; vi < m->vocab_size; ++vi) {
+                                    int64_t row_offset = (int64_t)vi * m->n_embd;
+                                    size_t row_blocks = m->n_embd / 32;
+                                    
+                                    for (int ei = 0; ei < m->n_embd; ++ei) {
+                                        int bi = ei / 32;
+                                        int val_in_block = ei % 32;
+                                        size_t blk_idx = (size_t)row_offset / 32 + bi;
+                                        
+                                        __half h_delta;
+                                        memcpy(&h_delta, &data[blk_idx * bytes_per_block], sizeof(__half));
+                                        
+                                        float delta_f = __half_to_float(h_delta);
+                                        
+                                        uint8_t nibble = (data[blk_idx * bytes_per_block + 2 + (val_in_block >> 1)] >> ((val_in_block & 1) << 2)) & 0x0F;
+                                        // Q4_0: value = delta * codebook[nibble] - min (min encoded in data)
+                                        float val = delta_f * dequant_code(nibble);
+                                        m->embed_table[(size_t)vi * m->n_embd + ei] = __half(val);
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        default: {
+                            fprintf(stderr, "[load_model] WARNING: quantized embedding type %d not supported for dequant\n", 
+                                    emb_type);
+                            // Fall through to keep model loading — embeddings will be zeroed
+                            break;
+                        }
+                    }
+                } else {
+                    fprintf(stderr, "[load_model] WARNING: token_embd dimensions don't match vocab_size×n_embd\n");
+                }
+            }
+        } else {
+            fprintf(stderr, "[load_model] WARNING: token_embd.weight not found in GGUF file\n");
+        }
     }
 
     // Load per-layer weights from GGUF tensors
@@ -664,8 +1071,9 @@ inference_model_t* inference_load_model(const char* gguf_path) {
     }
 
     // Load final LN scale
-    const void* final_ln_ptr = gguf_get_tensor_ptr(m->gguf, "output_norm.weight", &sz);
-    if (final_ln_ptr && sz == (size_t)m->n_embd * sizeof(__half)) {
+    size_t ln_sz;
+    const void* final_ln_ptr = gguf_get_tensor_ptr(m->gguf, "output_norm.weight", &ln_sz);
+    if (final_ln_ptr && ln_sz == (size_t)m->n_embd * sizeof(__half)) {
         m->final_ln_scale.assign((const __half*)final_ln_ptr, (const __half*)final_ln_ptr + m->n_embd);
     }
 
