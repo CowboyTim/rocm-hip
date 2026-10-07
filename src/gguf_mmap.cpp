@@ -67,8 +67,8 @@ static const int64_t BLOCK_SIZES[] = {
     0,                     // index 36
     0,                     // index 37
     0,                     // index 38
-    32,                   // index 39: MXFP4
-    64                    // index 40: MXFP4 scales
+    32,                   // index 39: MXFP4 (ROCmFP4)
+    64                    // index 40: MXFP4 scales (not a weight type)
 };
 
 /* Type sizes (bytes per block) */
@@ -99,11 +99,21 @@ static const size_t TYPE_SIZES[] = {
 };
 
 static inline int64_t get_block_size(int type) {
-    return (type >= 0 && type < 43) ? BLOCK_SIZES[type] : -1;
+    if (type >= 0 && type < 43) return BLOCK_SIZES[type];
+    /* Extended types beyond fixed array */
+    switch (type) {
+        case 100: return 32;   /* TYPE100 = ROCmFP4 Codebook10 */
+        default: return -1;
+    }
 }
 
 static inline size_t get_type_size(int type) {
-    return (type >= 0 && type < 43) ? TYPE_SIZES[type] : (size_t)-1;
+    if (type >= 0 && type < 43) return TYPE_SIZES[type];
+    /* Extended types beyond fixed array */
+    switch (type) {
+        case 100: return 17;   /* TYPE100 = ROCmFP4 Codebook10: 32 nibbles + scale */
+        default: return (size_t)-1;
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -590,12 +600,7 @@ int gguf_kv_type(const gguf_model_t *m, int64_t idx) {
 
 /* --- Model-level queries --- */
 
-size_t    gguf_alignment(const gguf_model_t *m)     { return m ? m->alignment : GGUF_ALIGN; }
-size_t    gguf_data_offset(const gguf_model_t *m)   { return m ? m->data_off : 0; }
-uint32_t  gguf_version(const gguf_model_t *m)       { return m ? m->version : 0; }
-
-/* Helper: find a key index by name. Returns -1 if not found. */
-static int64_t find_kv_index(const gguf_model_t *m, const char *key) {
+static int64_t find_kv_idx(const gguf_model_t *m, const char *key) {
     if (!m || !key) return -1;
     for (int64_t i = 0; i < m->n_kv; ++i) {
         if (strcmp(m->kvs[i].key, key) == 0) return i;
@@ -603,10 +608,151 @@ static int64_t find_kv_index(const gguf_model_t *m, const char *key) {
     return -1;
 }
 
+static int64_t kv_as_int64(const gguf_model_t *m, int64_t idx) {
+    if (!m || idx < 0) return 0;
+    const struct kv_entry *kv = &m->kvs[idx];
+    if (kv->is_array) return 0;
+    switch (kv->scalar.type) {
+        case GGUF_TYPE_UINT8:  return (int64_t)kv->scalar.v_u8;
+        case GGUF_TYPE_INT8:   return (int64_t)kv->scalar.v_i8;
+        case GGUF_TYPE_UINT16: return (int64_t)kv->scalar.v_u16;
+        case GGUF_TYPE_INT16:  return (int64_t)kv->scalar.v_i16;
+        case GGUF_TYPE_UINT32: return (int64_t)kv->scalar.v_u32;
+        case GGUF_TYPE_INT32:  return (int64_t)kv->scalar.v_i32;
+        case GGUF_TYPE_UINT64: return (int64_t)kv->scalar.v_u64;
+        case GGUF_TYPE_INT64:  return kv->scalar.v_i64;
+        default:               return 0;
+    }
+}
+
+static int64_t find_kv_or(const gguf_model_t *m, const char *const *keys, int n_keys) {
+    for (int i = 0; i < n_keys; ++i) {
+        int64_t idx = find_kv_idx(m, keys[i]);
+        if (idx >= 0) return idx;
+    }
+    return -1;
+}
+
+const char *gguf_arch(const gguf_model_t *m) {
+    static char arch_buf[128] = {0};
+    /* Architecture key varies by model family */
+    int64_t idx = find_kv_idx(m, "general.architecture");
+    if (idx >= 0 && m->kvs[idx].str_val && m->kvs[idx].str_val[0]) {
+        strncpy(arch_buf, m->kvs[idx].str_val, sizeof(arch_buf)-1);
+        return arch_buf;
+    }
+    /* Check common architecture KV keys */
+    const char *cand[] = {
+        "tokenizer.ggml.model", "llmark", "backpack"
+    };
+    idx = find_kv_or(m, cand, 3);
+    if (idx >= 0 && m->kvs[idx].str_val && m->kvs[idx].str_val[0]) {
+        strncpy(arch_buf, m->kvs[idx].str_val, sizeof(arch_buf)-1);
+        return arch_buf;
+    }
+    return "(unknown)";
+}
+
+const char *gguf_vocab_name(const gguf_model_t *m) {
+    static char vname_buf[128] = {0};
+    int64_t idx = find_kv_idx(m, "tokenizer.ggml.model");
+    if (idx >= 0 && m->kvs[idx].str_val && m->kvs[idx].str_val[0]) {
+        strncpy(vname_buf, m->kvs[idx].str_val, sizeof(vname_buf)-1);
+        return vname_buf;
+    }
+    return "";
+}
+
+const char *gguf_tokenizer_type(const gguf_model_t *m) {
+    /* Tokenizer type is the model name (e.g. "bpe", "gpt2") */
+    return gguf_vocab_name(m);
+}
+
+const char *gguf_pre_type(const gguf_model_t *m) {
+    static char pre_buf[128] = {0};
+    int64_t idx = find_kv_idx(m, "tokenizer.ggml.pre");
+    if (idx < 0) idx = find_kv_idx(m, "preprocessing"); 
+    if (idx >= 0 && m->kvs[idx].str_val && m->kvs[idx].str_val[0]) {
+        strncpy(pre_buf, m->kvs[idx].str_val, sizeof(pre_buf)-1);
+        return pre_buf;
+    }
+    return "";
+}
+
+int64_t gguf_vocab_size(const gguf_model_t *m) {
+    /* Try multiple vocab size keys */
+    const char *keys[] = {
+        "tokenizer.ggml.vocab_size", "tokenizer_vocab_size", "vocab_size"
+    };
+    int64_t idx = find_kv_or(m, keys, 3);
+    if (idx < 0) return 0;
+    return kv_as_int64(m, idx);
+}
+
+int64_t gguf_head_count(const gguf_model_t *m) {
+    const char *keys[] = {
+        "attention.head_count", "qwen35.attention.head_count", 
+        "llama.attention.heads"
+    };
+    int64_t idx = find_kv_or(m, keys, 3);
+    if (idx < 0) return 0;
+    return kv_as_int64(m, idx);
+}
+
+int64_t gguf_head_count_kv(const gguf_model_t *m) {
+    const char *keys[] = {
+        "attention.head_count_kv", "qwen35.attention.head_count_kv",
+        "llama.attention.heads_kv", "attention.kv_heads"
+    };
+    int64_t idx = find_kv_or(m, keys, 4);
+    if (idx < 0) return 0;
+    return kv_as_int64(m, idx);
+}
+
+int64_t gguf_context_length(const gguf_model_t *m) {
+    const char *keys[] = {
+        "general.context_length", "qwen35.context_length", "qwen2.context_length",
+        "context_length", "llama.context_length"
+    };
+    int64_t idx = find_kv_or(m, keys, 5);
+    if (idx < 0) return 0;
+    return kv_as_int64(m, idx);
+}
+
+int64_t gguf_embedding_length(const gguf_model_t *m) {
+    const char *keys[] = {
+        "embedding_length", "qwen35.embedding_length", "qwen2.embedding_length",
+        "llama.embedding_length", "model_dim" 
+    };
+    int64_t idx = find_kv_or(m, keys, 5);
+    if (idx < 0) return 0;
+    return kv_as_int64(m, idx);
+}
+
+int64_t gguf_block_count(const gguf_model_t *m) {
+    const char *keys[] = {
+        "block_count", "qwen35.block_count", "qwen2.block_count", 
+        "llama.n_layer", "n_layer"
+    };
+    int64_t idx = find_kv_or(m, keys, 5);
+    if (idx < 0) return 0;
+    return kv_as_int64(m, idx);
+}
+
+/* --- KV cache configuration (bridge to Phase 3) --- */
+
+void      gguf_set_n_ctx(gguf_model_t *m, int64_t n_ctx) {
+    if (m && n_ctx > 0) m->n_ctx = n_ctx;
+}
+
+int64_t   gguf_get_n_ctx(const gguf_model_t *m)         {
+    return m ? m->n_ctx : 512;
+}
+
 /* Get string array from KV by key. Returns 0 on success, -1 if not found or not a string array. */
 int32_t gguf_kv_get_string_array(const gguf_model_t *model, const char* key, const char*** out_strings, size_t* out_count) {
     if (!model || !key || !out_strings || !out_count) return -1;
-    int64_t idx = find_kv_index(model, key);
+    int64_t idx = find_kv_idx(model, key);
     if (idx < 0) return -1;
     const struct kv_entry *kv = &model->kvs[idx];
     if (!kv->is_array || kv->arr_type != GGUF_TYPE_STRING) return -1;
@@ -622,7 +768,7 @@ void gguf_free_string_array(const char** strings, size_t count) {
 /* Get added_tokens array from KV by key. Returns 0 on success, -1 if not found or not a string array. */
 int32_t gguf_kv_get_added_tokens(const gguf_model_t *model, const char* key, const char*** out_strings, size_t* out_count) {
     if (!model || !key || !out_strings || !out_count) return -1;
-    int64_t idx = find_kv_index(model, key);
+    int64_t idx = find_kv_idx(model, key);
     if (idx < 0) return -1;
     const struct kv_entry *kv = &model->kvs[idx];
     if (!kv->is_array || kv->arr_type != GGUF_TYPE_STRING) return -1;
@@ -631,128 +777,9 @@ int32_t gguf_kv_get_added_tokens(const gguf_model_t *model, const char* key, con
     return 0;
 }
 
-/* --- Model-level queries --- */
-const char *gguf_arch(const gguf_model_t *m) {
-    /* Architecture stored as string in GGUF -- see implementation notes */
-    return "(string value)";
-}
-
-const char *gguf_vocab_name(const gguf_model_t *m) {
-    /* Tokenizer name stored as string */
-    return "(string value)";
-}
-
-const char *gguf_tokenizer_type(const gguf_model_t *m) {
-    int64_t idx = find_kv_index(m, "tokenizer.ggml.model");
-    if (idx < 0) return "";
-    /* tokenizer model is a string like "gpt2", "bpe", etc. */
-    return "(string value)";
-}
-
-const char *gguf_pre_type(const gguf_model_t *m) {
-    int64_t idx = find_kv_index(m, "tokenizer.ggml.pre");
-    if (idx < 0) return "";
-    /* pre-processing type is a string like "default", "qwen35" */
-    return "(string value)";
-}
-
-int64_t gguf_vocab_size(const gguf_model_t *m) {
-    int64_t idx = find_kv_index(m, "tokenizer.ggml.vocab_size");
-    if (idx < 0) return 0;
-    const struct kv_entry *kv = &m->kvs[idx];
-    if (!kv || kv->is_array) return 0;
-    switch (kv->scalar.type) {
-        case GGUF_TYPE_UINT32: return (int64_t)kv->scalar.v_u32;
-        case GGUF_TYPE_INT32:  return (int64_t)kv->scalar.v_i32;
-        case GGUF_TYPE_UINT64: return (int64_t)kv->scalar.v_u64;
-        case GGUF_TYPE_INT64:  return (int64_t)kv->scalar.v_i64;
-        default: return 0;
-    }
-}
-
-int64_t gguf_head_count(const gguf_model_t *m) {
-    int64_t idx = find_kv_index(m, "attention.head_count");
-    if (idx < 0) return 0;
-    const struct kv_entry *kv = &m->kvs[idx];
-    if (!kv || kv->is_array) return 0;
-    switch (kv->scalar.type) {
-        case GGUF_TYPE_UINT32: return (int64_t)kv->scalar.v_u32;
-        case GGUF_TYPE_INT32:  return (int64_t)kv->scalar.v_i32;
-        case GGUF_TYPE_UINT64: return (int64_t)kv->scalar.v_u64;
-        case GGUF_TYPE_INT64:  return (int64_t)kv->scalar.v_i64;
-        default: return 0;
-    }
-}
-
-int64_t gguf_head_count_kv(const gguf_model_t *m) {
-    int64_t idx = find_kv_index(m, "attention.head_count_kv");
-    if (idx < 0) return 0; /* Some models use attention.head_count for MQA */
-    const struct kv_entry *kv = &m->kvs[idx];
-    if (!kv || kv->is_array) return 0;
-    switch (kv->scalar.type) {
-        case GGUF_TYPE_UINT32: return (int64_t)kv->scalar.v_u32;
-        case GGUF_TYPE_INT32:  return (int64_t)kv->scalar.v_i32;
-        case GGUF_TYPE_UINT64: return (int64_t)kv->scalar.v_u64;
-        case GGUF_TYPE_INT64:  return (int64_t)kv->scalar.v_i64;
-        default: return 0;
-    }
-}
-
-int64_t gguf_context_length(const gguf_model_t *m) {
-    int64_t idx = find_kv_index(m, "general.context_length");
-    if (idx < 0) idx = find_kv_index(m, "context_length");
-    if (idx < 0) idx = find_kv_index(m, "qwen2.context_length"); /* Qwen2-specific key */
-    if (idx < 0) return 0;
-    const struct kv_entry *kv = &m->kvs[idx];
-    if (!kv || kv->is_array) return 0;
-    switch (kv->scalar.type) {
-        case GGUF_TYPE_UINT32: return (int64_t)kv->scalar.v_u32;
-        case GGUF_TYPE_INT32:  return (int64_t)kv->scalar.v_i32;
-        case GGUF_TYPE_UINT64: return (int64_t)kv->scalar.v_u64;
-        case GGUF_TYPE_INT64:  return (int64_t)kv->scalar.v_i64;
-        default: return 0;
-    }
-}
-
-int64_t gguf_embedding_length(const gguf_model_t *m) {
-    int64_t idx = find_kv_index(m, "embedding_length");
-    if (idx < 0) idx = find_kv_index(m, "qwen2.embedding_length"); /* Qwen2-specific key */
-    if (idx < 0) return 0;
-    const struct kv_entry *kv = &m->kvs[idx];
-    if (!kv || kv->is_array) return 0;
-    switch (kv->scalar.type) {
-        case GGUF_TYPE_UINT32: return (int64_t)kv->scalar.v_u32;
-        case GGUF_TYPE_INT32:  return (int64_t)kv->scalar.v_i32;
-        case GGUF_TYPE_UINT64: return (int64_t)kv->scalar.v_u64;
-        case GGUF_TYPE_INT64:  return (int64_t)kv->scalar.v_i64;
-        default: return 0;
-    }
-}
-
-int64_t gguf_block_count(const gguf_model_t *m) {
-    int64_t idx = find_kv_index(m, "block_count");
-    if (idx < 0) idx = find_kv_index(m, "qwen2.block_count"); /* Qwen2-specific key */
-    if (idx < 0) return 0;
-    const struct kv_entry *kv = &m->kvs[idx];
-    if (!kv || kv->is_array) return 0;
-    switch (kv->scalar.type) {
-        case GGUF_TYPE_UINT32: return (int64_t)kv->scalar.v_u32;
-        case GGUF_TYPE_INT32:  return (int64_t)kv->scalar.v_i32;
-        case GGUF_TYPE_UINT64: return (int64_t)kv->scalar.v_u64;
-        case GGUF_TYPE_INT64:  return (int64_t)kv->scalar.v_i64;
-        default: return 0;
-    }
-}
-
-/* --- KV cache configuration (bridge to Phase 3) --- */
-
-void      gguf_set_n_ctx(gguf_model_t *m, int64_t n_ctx) {
-    if (m && n_ctx > 0) m->n_ctx = n_ctx;
-}
-
-int64_t   gguf_get_n_ctx(const gguf_model_t *m)         {
-    return m ? m->n_ctx : 512;
-}
+size_t    gguf_alignment(const gguf_model_t *m)     { return m ? m->alignment : GGUF_ALIGN; }
+size_t    gguf_data_offset(const gguf_model_t *m)   { return m ? m->data_off : 0; }
+uint32_t  gguf_version(const gguf_model_t *m)       { return m ? m->version : 0; }
 
 /* Get tensor data pointer by name */
 const void* gguf_get_tensor_ptr(const gguf_model_t *m, const char* name, size_t* out_bytes) {
@@ -762,9 +789,27 @@ const void* gguf_get_tensor_ptr(const gguf_model_t *m, const char* name, size_t*
     size_t n_tensors = model->n_tensors;
     for (size_t i = 0; i < n_tensors; ++i) {
         if (strcmp(model->tensors[i].name, name) == 0) {
-            *out_bytes = (size_t)model->tensors[i].ne[0] * model->tensors[i].ne[1] *
-                         model->tensors[i].ne[2] * model->tensors[i].ne[3] * get_type_size(model->tensors[i].type);
-            return (const char*)model->map_ptr + model->data_off + model->tensors[i].data_offset;
+            const struct tensor_meta *tm = &model->tensors[i];
+            
+            /* Calculate total elements */
+            int64_t total_elems = tm->ne[0];
+            for (uint8_t d = 1; d < tm->n_dims; ++d) total_elems *= tm->ne[d];
+            
+            /* For quantized types, compute based on blocks */
+            int64_t bs = get_block_size(tm->type);
+            size_t ts = get_type_size(tm->type);
+            
+            if (bs > 0 && ts != (size_t)-1) {
+                /* Quantized: ceil(total_elements / block_size) × bytes_per_block */
+                int64_t total_blocks = total_elems / bs;
+                if (total_elems % bs != 0) ++total_blocks;
+                *out_bytes = (size_t)total_blocks * ts;
+            } else {
+                /* Unquantized: total_elements × element_size */
+                *out_bytes = (size_t)total_elems * ts;
+            }
+            
+            return (const char*)model->map_ptr + model->data_off + tm->data_offset;
         }
     }
     return nullptr;

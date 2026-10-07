@@ -186,7 +186,16 @@ static int find_tensor_index(gguf_model_t* gguf, const char* name) {
     return -1;
 }
 
-// Load a quantized weight matrix (packed + scales) from GGUF by weight and scales tensor names
+// Check if a tensor exists by name in the GGUF file
+static bool has_tensor(gguf_model_t* gguf, const char* name) {
+    int64_t n = gguf_n_tensors(gguf);
+    for (int64_t i = 0; i < n; ++i) {
+        if (strcmp(gguf_tensor_name(gguf, i), name) == 0) return true;
+    }
+    return false;
+}
+
+// Load quantized weight by name from GGUF (for non-QKV tensors)
 static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_name, const char* scales_name, QuantWeight& w) {
     size_t w_sz, s_sz;
     const void* w_ptr = gguf_get_tensor_ptr(gguf, weight_name, &w_sz);
@@ -234,17 +243,203 @@ static bool load_model_weights(inference_model* m) {
     m->layers.resize(m->n_layer);
     for (int i = 0; i < m->n_layer; ++i) {
         LayerWeights& L = m->layers[i];
-        char wname[64], sname[64];
-        // Attention Q,K,V,O
-        snprintf(wname, sizeof(wname), "blk.%d.attn_q.weight", i);
-        snprintf(sname, sizeof(sname), "blk.%d.attn_q.scales", i);
-        if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wq)) return false;
-        snprintf(wname, sizeof(wname), "blk.%d.attn_k.weight", i);
-        snprintf(sname, sizeof(sname), "blk.%d.attn_k.scales", i);
-        if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wk)) return false;
-        snprintf(wname, sizeof(wname), "blk.%d.attn_v.weight", i);
-        snprintf(sname, sizeof(sname), "blk.%d.attn_v.scales", i);
-        if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wv)) return false;
+        char wname[128], sname[128];
+
+        // --- Attention Q,K,V,O projections ---
+        // Phase 15.4: Detect SSM-only layers in hybrid architecture and skip them.
+        // Check if ANY attention tensors exist for this layer. If not, it's an SSM layer.
+        bool is_ssm_layer = false;
+        {
+            char ssm_check[128];
+            snprintf(ssm_check, sizeof(ssm_check), "blk.%d.ssm_alpha", i);
+            if (has_tensor(m->gguf, ssm_check)) {
+                // This is an SSM layer — skip entirely (Phase 15.4)
+                is_ssm_layer = true;
+                fprintf(stderr, "[load_model_weights] blk.%d: SSM layer detected, skipping\n", i);
+            }
+        }
+        
+        if (is_ssm_layer) continue;  // Skip SSM-only layers entirely
+        
+        // Check if we have a combined QKV tensor (Qwen3.5-4B pattern) or separate ones (Qwen3-7B)
+        snprintf(wname, sizeof(wname), "blk.%d.attn_qkv.weight", i);
+        snprintf(sname, sizeof(sname), "blk.%d.attn_qkv.scales", i);
+        
+        size_t qkv_w_sz = 0;
+        const void* qkv_ptr = gguf_get_tensor_ptr(m->gguf, wname, &qkv_w_sz);
+        
+        if (qkv_ptr && qkv_w_sz > 0) {
+            // Combined QKV tensor found — load and split into Wq/Wk/Wv
+            fprintf(stderr, "[load_model_weights] blk.%d: using combined attn_qkv weight [%ld x %ld]\n", 
+                    i, (long)m->layers[i].Wq.N, (long)(m->n_head * m->head_dim + 2 * m->n_head_kv * m->head_dim));
+            
+            int qidx = find_tensor_index(m->gguf, wname);
+            if (qidx < 0) return false;
+            int64_t* ne = gguf_tensor_ne(m->gguf, qidx);
+            if (!ne) return false;
+            
+            int64_t E = ne[0];              // embedding length (rows)
+            int64_t DQ = (int64_t)m->n_head * m->head_dim;   // Q columns
+            int64_t DKV = (int64_t)m->n_head_kv * m->head_dim; // K/V columns
+            
+            size_t total_cols = DQ + 2 * DKV;
+            size_t packed_bytes_per_row = total_cols >> 1;  // 2 nibbles per byte
+            
+            L.Wq.N = (int)E; L.Wq.K = (int)DQ;
+            L.Wk.N = (int)E; L.Wk.K = (int)DKV;
+            L.Wv.N = (int)E; L.Wv.K = (int)DKV;
+            
+            // Load scales tensor  
+            size_t s_sz;
+            const void* s_ptr = gguf_get_tensor_ptr(m->gguf, sname, &s_sz);
+            if (!s_ptr) {
+                fprintf(stderr, "blk.%d: combined qkv scales tensor not found\n", i);
+                return false;
+            }
+            
+            const unsigned char* pk = (const unsigned char*)qkv_ptr;
+            
+            // Allocate packed arrays for each projection
+            size_t q_packed_bytes = (size_t)E * ((size_t)DQ >> 1);
+            size_t k_packed_bytes = (size_t)E * ((size_t)DKV >> 1);
+            size_t v_packed_bytes = (size_t)E * ((size_t)DKV >> 1);
+            
+            L.Wq.packed.resize(q_packed_bytes);
+            L.Wk.packed.resize(k_packed_bytes);
+            L.Wv.packed.resize(v_packed_bytes);
+            
+            // Extract packed data row by row
+            for (int64_t row = 0; row < E; ++row) {
+                const unsigned char* src_row = pk + row * packed_bytes_per_row;
+                
+                // Q: columns [0 .. DQ-1] → packed cols [0 .. DQ/2-1]
+                for (int c = 0; c < (int)DQ - 1; c += 2) {
+                    size_t dst_off = (size_t)(c >> 1);
+                    size_t src_off = (size_t)(c >> 1);
+                    L.Wq.packed[(size_t)row * q_packed_bytes / E + dst_off] = src_row[src_off];
+                }
+                // Handle odd column at end of Q if DQ is odd
+                if (DQ & 1) {
+                    int last_c = (int)(DQ - 1);
+                    size_t src_off = (size_t)(last_c >> 1);
+                    size_t dst_off = (size_t)(last_c >> 1);
+                    unsigned char b = src_row[src_off];
+                    L.Wq.packed[(size_t)row * q_packed_bytes / E + dst_off] = (unsigned char)(b & 0x0F);
+                }
+                
+                // K: columns [DQ .. DQ+DKV-1] → packed cols [0 .. DKV/2-1]
+                for (int c = 0; c < (int)DKV - 1; c += 2) {
+                    int global_col = (int)DQ + c;
+                    size_t src_off = (size_t)(global_col >> 1);
+                    size_t dst_off = (size_t)(c >> 1);
+                    L.Wk.packed[(size_t)row * k_packed_bytes / E + dst_off] = src_row[src_off];
+                }
+                if (DKV & 1) {
+                    int last_c = (int)(DKV - 1);
+                    int global_col = (int)DQ + last_c;
+                    size_t src_off = (size_t)(global_col >> 1);
+                    size_t dst_off = (size_t)(last_c >> 1);
+                    unsigned char b = src_row[src_off];
+                    L.Wk.packed[(size_t)row * k_packed_bytes / E + dst_off] = (unsigned char)(b & 0x0F);
+                }
+                
+                // V: columns [DQ+DKV .. DQ+2*DKV-1] → packed cols [0 .. DKV/2-1]  
+                for (int c = 0; c < (int)DKV - 1; c += 2) {
+                    int global_col = (int)DQ + (int)DKV + c;
+                    size_t src_off = (size_t)(global_col >> 1);
+                    size_t dst_off = (size_t)(c >> 1);
+                    L.Wv.packed[(size_t)row * v_packed_bytes / E + dst_off] = src_row[src_off];
+                }
+                if (DKV & 1) {
+                    int last_c = (int)(DKV - 1);
+                    int global_col = (int)DQ + (int)DKV + last_c;
+                    size_t src_off = (size_t)(global_col >> 1);
+                    size_t dst_off = (size_t)(last_c >> 1);
+                    unsigned char b = src_row[src_off];
+                    L.Wv.packed[(size_t)row * v_packed_bytes / E + dst_off] = (unsigned char)(b & 0x0F);
+                }
+            }
+            
+            // Load scales — try per-projection first, then combined fallback  
+            char sname_q[128], sname_k[128], sname_v[128];
+            snprintf(sname_q, sizeof(sname_q), "blk.%d.attn_q.scales", i);
+            snprintf(sname_k, sizeof(sname_k), "blk.%d.attn_k.scales", i);
+            snprintf(sname_v, sizeof(sname_v), "blk.%d.attn_v.scales", i);
+            
+            size_t sq_sz;
+            const void* sq_ptr = gguf_get_tensor_ptr(m->gguf, sname_q, &sq_sz);
+            
+            if (sq_ptr && sq_sz > 0) {
+                // Separate scales for each projection (Qwen3-7B style)
+                const void* sk_p = gguf_get_tensor_ptr(m->gguf, sname_k, &sq_sz);
+                const void* sv_p = gguf_get_tensor_ptr(m->gguf, sname_v, &sq_sz);
+                
+                L.Wq.scales.assign((const unsigned char*)sq_ptr, (const unsigned char*)sq_ptr + sq_sz);
+                L.Wk.scales.assign((const unsigned char*)sk_p, (const unsigned char*)sk_p + sq_sz);
+                L.Wv.scales.assign((const unsigned char*)sv_p, (const unsigned char*)sv_p + sq_sz);
+            } else {
+                // Combined scales tensor — split by row index and scale column offset
+                int sc_idx = find_tensor_index(m->gguf, sname);
+                if (sc_idx < 0) return false;
+                
+                int64_t* ne_sc = gguf_tensor_ne(m->gguf, sc_idx);
+                if (!ne_sc) return false;
+                size_t total_scale_cols = (size_t)ne_sc[1];
+                
+                // Scales per row for Q/K/V projections: ceil(DQ/16), ceil(DKV/16), ceil(DKV/16)
+                size_t q_scales_per_row = ((size_t)DQ + 15) >> 4;
+                size_t k_scales_per_row = ((size_t)DKV + 15) >> 4;
+                size_t v_scales_per_row = ((size_t)DKV + 15) >> 4;
+                
+                L.Wq.scales.resize((size_t)E * q_scales_per_row);
+                L.Wk.scales.resize((size_t)E * k_scales_per_row);
+                L.Wv.scales.resize((size_t)E * v_scales_per_row);
+                
+                const unsigned char* src_sc = (const unsigned char*)s_ptr;
+                size_t scales_per_row_total = total_scale_cols;
+                
+                for (int64_t row = 0; row < E; ++row) {
+                    size_t src_row_off = row * scales_per_row_total;
+                    
+                    // Q scales: first q_scales_per_row entries in this row
+                    for (size_t s = 0; s < q_scales_per_row; ++s) {
+                        L.Wq.scales[row * q_scales_per_row + s] = src_sc[src_row_off + s];
+                    }
+                    
+                    // K scales: next k_scales_per_row entries 
+                    int k_start = (int)q_scales_per_row;
+                    for (size_t s = 0; s < k_scales_per_row; ++s) {
+                        if ((size_t)(k_start + s) < scales_per_row_total) {
+                            L.Wk.scales[row * k_scales_per_row + s] = src_sc[src_row_off + (size_t)k_start + s];
+                        }
+                    }
+                    
+                    // V scales: next v_scales_per_row entries
+                    int v_start = (int)(q_scales_per_row + k_scales_per_row);
+                    for (size_t s = 0; s < v_scales_per_row; ++s) {
+                        if ((size_t)(v_start + s) < scales_per_row_total) {
+                            L.Wv.scales[row * v_scales_per_row + s] = src_sc[src_row_off + (size_t)v_start + s];
+                        }
+                    }
+                }
+            }
+            
+        } else {
+            // Separate Q/K/V tensors — original path (backward compatible with Qwen3-7B)
+            snprintf(wname, sizeof(wname), "blk.%d.attn_q.weight", i);
+            snprintf(sname, sizeof(sname), "blk.%d.attn_q.scales", i);
+            if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wq)) return false;
+            
+            snprintf(wname, sizeof(wname), "blk.%d.attn_k.weight", i);
+            snprintf(sname, sizeof(sname), "blk.%d.attn_k.scales", i);
+            if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wk)) return false;
+            
+            snprintf(wname, sizeof(wname), "blk.%d.attn_v.weight", i);
+            snprintf(sname, sizeof(sname), "blk.%d.attn_v.scales", i);
+            if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wv)) return false;
+        }
+
+        // Attention O projection (always separate)
         snprintf(wname, sizeof(wname), "blk.%d.attn_o.weight", i);
         snprintf(sname, sizeof(sname), "blk.%d.attn_o.scales", i);
         if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wo)) return false;
@@ -284,15 +479,43 @@ inference_model_t* inference_load_model(const char* gguf_path) {
     m->gguf = gguf_mmap_open(gguf_path);
     if (!m->gguf) { set_error("gguf_mmap_open failed"); delete m; return nullptr; }
 
-    // Read metadata (simplified - real impl queries GGUF keys)
-    m->model_name = "qwen3-unknown";
-    m->n_layer = 28;    // Qwen3-7B
-    m->n_embd = 4096;
-    m->n_head = 32;
-    m->n_head_kv = 8;
-    m->head_dim = 128;
-    m->vocab_size = 151936;
-    m->n_ctx = 4096;
+    // Read model metadata from GGUF (Phase 15.1)
+    int64_t n_layer = gguf_block_count(m->gguf);
+    if (n_layer <= 0) { set_error("block_count not found in GGUF"); delete m; return nullptr; }
+    
+    int64_t n_embd = gguf_embedding_length(m->gguf);
+    if (n_embd <= 0) { set_error("embedding_length not found in GGUF"); delete m; return nullptr; }
+    
+    int64_t n_head = gguf_head_count(m->gguf);
+    int64_t n_head_kv = gguf_head_count_kv(m->gguf);
+    
+    // head_dim = embedding_length / head_count (derived, not stored)
+    int64_t hd = n_embd / n_head;
+    
+    // vocab_size: prefer tokenizer.ggml.vocab_size or array length
+    int64_t vs = gguf_vocab_size(m->gguf);
+    if (vs <= 0) {
+        const char** tok_arr = nullptr; size_t tok_cnt = 0;
+        if (gguf_kv_get_string_array(m->gguf, "tokenizer.ggml.tokens", &tok_arr, &tok_cnt) == 0) {
+            vs = (int64_t)tok_cnt;
+        }
+    }
+    if (vs <= 0) { set_error("vocab_size not found in GGUF"); delete m; return nullptr; }
+    
+    int64_t ctx_len = gguf_context_length(m->gguf);
+    if (ctx_len <= 0) ctx_len = 4096;  // fallback default
+    
+    // Read architecture string from GGUF
+    const char* arch = gguf_arch(m->gguf);
+    m->model_name = arch ? arch : "qwen3-unknown";
+    
+    m->n_layer = (int)n_layer;
+    m->n_embd = (int)n_embd;
+    m->n_head = (int)n_head;
+    m->n_head_kv = (int)n_head_kv;
+    m->head_dim = (int)hd;
+    m->vocab_size = (int)vs;
+    m->n_ctx = (int)ctx_len;
 
     // Load embedding table
     size_t sz;
