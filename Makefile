@@ -1,7 +1,8 @@
 # --- Configuration ---
 ROCM_PATH ?= /opt/rocm
 HIPCC     := $(ROCM_PATH)/bin/hipcc
-CLANG     := $(ROCM_PATH)/lib/llvm/bin/clang++
+CLANG     := $(wildcard $(ROCM_PATH)/core-*/lib/llvm/bin/clang++) $(ROCM_PATH)/lib/llvm/bin/clang++
+CLANG     := $(firstword $(CLANG))
 
 ARCH      := gfx1151
 

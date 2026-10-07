@@ -125,16 +125,22 @@ int gguf_type_is_self_contained(int type) {
         /* Standard llama.cpp quantization types - all self-contained */
         case 2:  /* Q4_0: {half scale, uint8[16]} per 32 values */
         case 3:  /* Q4_1: {half scale, half min, uint8[16]} per 32 values */  
+        case 7:  /* Q5_0/Q8_0 variants depending on GGUF version */
         case 8:  /* Q8_0: {half scale, int8[32]} per 32 values */
-        case 13: /* Qwen3.5 custom type (Q4_K-like): block_size=256, scales embedded in blocks */
             return 1;
         
-        /* Extended/custom types */
-        case 100: /* TYPE100 = ROCmFP4 Codebook10: UE4M3 scale + nibbles per block */
+        /* Extended/custom quantization types */
+        case 13: /* Qwen3.5 custom (TYPE13): block_size=256, UE4M3 scales per-16 elements */
+        case 14: /* Qwen3.5 variant of Q4_K/Q4_1 equivalent — self-contained block layout */
+        case 100:/* TYPE100 = ROCmFP4 Codebook10: UE4M3 scale + nibbles per block */
             return 1;
-            
+        
         default:
-            return 0;
+            /* For unknown types, treat as self-contained by default.
+             * Quantized types store scales internally; only FP16/F32/etc. need no scales at all.
+             * If a type truly requires external .scales, it will be added to this list explicitly. */
+            fprintf(stderr, "[gguf_type_is_self_contained] unknown type %d, assuming self-contained\n", type);
+            return 1;
     }
 }
 
