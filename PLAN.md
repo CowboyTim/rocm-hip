@@ -567,10 +567,177 @@ All Qwen-series tensor names present: `blk.{i}.attn_qkv.weight`, `blk.{i}.attn_o
 
 ## Next steps
 1. **Add TYPE100 to GGUF type map** — extend `type_names_tensor` dict in `inspect_gguf.py` and update GGUF loader to recognize ROCmFP4 custom type alongside standard llama.cpp types.
-2. **Profile `qwen_demo`** with real Qwen‑3‑7B GGUF on Strix Halo; collect latency/throughput numbers for batch = 1 and batch > 1.
+2. **Profile `qwen_demo`** with real Qwen‑3‑7B GGUF on Strix Halo; collect latency/throughput numbers for batch = 1 and batch > 1.
 3. **Add batched test** – extend `attn_verify` or add `batched_verify` to test `inference_forward_batch` with batch > 1.
-4. Start Phase 13 design (multi‑GPU tensor parallelism).
-5. Begin Phase 14 – Perl XS bindings, CPAN packaging, and documentation.
+4. Start Phase 13 design (multi‑GPU tensor parallelism).
+5. Begin Phase 14 – Perl XS bindings, CPAN packaging, and documentation.
+
+
+---
+
+## Phase 15: Support Qwen3.5-4B Hybrid SSM Architecture — DESIGN
+
+The model `Qwen3.5-4B-ROCMFP4.gguf` is a **hybrid SSM-transformer**, not a pure dense model.  
+Current engine fails at load because it expects separate `attn_q/k/v.weight` tensors and hardcodes Qwen3-7B metadata.
+
+### Problem Summary
+
+| Issue | Current Code | Model Provides |
+|-------|-------------|----------------|
+| QKV weights | Separate `blk.{i}.attn_q.weight`, `.attn_k.weight`, `.attn_v.weight` | Combined `blk.{i}.attn_qkv.weight` [E × (DQ+DKV+DKV)] |
+| Metadata | Hardcoded: n_layer=28, n_embd=4096, vocab=151936 | GGUF KV: block_count=33, embedding_length=2560, vocab=248320 |
+| Architecture | Pure dense transformer with SwiGLU MLP | Hybrid: SSM blocks + periodic full attention (`full_attention_interval=4`) |
+| SSM tensors | Not loaded or handled | `ssm_alpha`, `ssm_beta`, `ssm_out`, `ssm_dt`, `ssm_a`, `ssm_conv1d`, etc. |
+| FFN types | All FFN are TYPE100 (ROCmFP4) | Some FFN use Q4_0/Q4_1 instead of TYPE100 — needs type dispatch |
+
+### Design Principles
+
+- **Backward compatible**: pure dense models continue to work; hybrid mode is opt-in via architecture detection.
+- **No kernel changes required**: combined QKV tensor split happens on the host side during weight loading; kernels see the same interface.
+- **TYPE100 recognition**: GGUF loader must recognize ROCmFP4 custom type alongside standard llama.cpp types.
+- **SSM deferred**: SSM/nextn components are detected and skipped for now (return identity or zero), enabling baseline correctness before implementing state-space dynamics.
+
+---
+
+## Phase 15 – Phased Implementation Plan
+
+### Phase 15.1: Model Metadata from GGUF — DESIGN ONLY
+
+**Goal**: Read all model configuration from GGUF KV metadata, eliminate hardcoded values.
+
+**Changes:**
+1. Extend `gguf_mmap.h` with new query functions for Qwen3.5-specific KV keys.
+2. In `inference_load_model()`, read actual values:
+   - `qwen35.block_count` → `m->n_layer` (33)
+   - `qwen35.embedding_length` → `m->n_embd` (2560)
+   - `qwen35.attention.head_count` → `m->n_head` (16)
+   - `qwen35.attention.head_count_kv` → `m->n_head_kv` (4)
+   - `qwen35.attention.key_length` → `m->head_dim` (256)
+   - `general.vocab_size` / tokenizer tokens array length → `m->vocab_size` (248320)
+   - `qwen35.rope.dimension_sections` → RoPE config (array of 4 values per section)
+   - `qwen35.full_attention_interval` → SSM/attention alternation pattern
+   - `qwen35.attention.layer_norm_rms_epsilon` → LN epsilon
+
+**Files:**
+- `gguf_mmap.h/.cpp`: add `gguf_qwen35_block_count()`, `gguf_qwen35_embedding_length()`, etc. or extend existing queries to handle qwen35-prefixed keys.
+- `inference.cpp::inference_load_model()`: replace hardcoded metadata with GGUF reads.
+
+**Verification**: Verify with a known Qwen3-7B model — metadata should match expected values for that model too.
+
+---
+
+### Phase 15.2: Combined QKV Weight Loading — DESIGN ONLY
+
+**Goal**: Support both combined (`attn_qkv.weight`) and separated (`attn_q.weight` + `attn_k.weight` + `attn_v.weight`) tensor naming conventions.
+
+**Strategy**:
+The combined tensor is stored as [E × D_total] where `D_total = n_head*head_dim + 2*n_head_kv*head_dim`.  
+Split on the **host side during weight loading** (not in kernels) into three separate QuantWeight structs, each pinned independently. This avoids kernel changes and extra memory copies — the split reads directly from the mmap'd GGUF data into host vectors, then pins them.
+
+**QKV layout within combined tensor** (row-major, contiguous):
+```
+[ Q_output | K_output | V_output ]
+  E×DQ       E×DKV      E×DKV
+```
+Where DQ = n_head * head_dim, DKV = n_head_kv * head_dim.
+
+**Tensor name detection order:**
+1. Try `blk.{i}.attn_qkv.weight` → if found, load and split
+2. Fall back to `blk.{i}.attn_q.weight` + `blk.{i}.attn_k.weight` + `blk.{i}.attn_v.weight` → existing path
+
+**Scales handling:** Scales tensor may also be combined (`attn_qkv.scales`) or separated. Handle both cases similarly: try combined first, fall back to separated.
+
+**Files:**
+- `inference.cpp::load_model_weights()`: add QKV detection logic before loading attention weights.
+- New helper: `split_qkv_tensor(QuantWeight& qkv, QuantWeight& q, QuantWeight& k, QuantWeight& v)` that slices the packed/scales bytes appropriately.
+
+**Verification**: Load with a pure dense model (llama-style) to confirm fallback path works; load Qwen3.5-4B to confirm combined path works.
+
+---
+
+### Phase 15.3: TYPE100 Recognition in GGUF Loader — DESIGN ONLY
+
+**Goal**: GGUF loader recognizes ROCmFP4 custom type (TYPE100 = 100 decimal) alongside standard llama.cpp types (Q4_0=8, Q4_1=9, Q8_0=10, FP16=1, etc.).
+
+**Changes:**
+1. In `gguf_mmap.cpp`, extend the type name/size map to include `GGML_TYPE_MXFP4_ROCM = 100`.
+2. When loading tensors of type 100, use our ROCmFP4 block layout (32 values/block, scales at 16-element granularity) instead of falling through to unknown-type error or default handling.
+3. In `inspect_gguf.py`, add `"TYPE100": "ROCmFP4_Codebook10"` mapping for display.
+
+**Files:**
+- `gguf_mmap.cpp`: update `type_names_tensor` and `type_sizes_tensor` dicts/maps.
+- `scripts/inspect_gguf.py`: add TYPE100 to display mapping.
+
+**Verification**: Run `python3 scripts/inspect_gguf.py Qwen3.5-4B-ROCMFP4.gguf` — TYPE100 tensors should display correctly with proper type name.
+
+---
+
+### Phase 15.4: SSM Component Stubs — DESIGN ONLY
+
+**Goal**: Detect hybrid architecture and handle SSM tensors gracefully without crashing. Currently, SSM tensors are simply ignored by the weight loader (not requested by tensor names), which means the model loads but SSM layers produce no output effect. For correctness testing, we skip them in the forward pass.
+
+**Approach**: 
+The forward pass iterates over all layers (`n_layer`). For a hybrid model with `full_attention_interval=4`, every 4th layer is an SSM layer; the rest are attention layers. We detect this via GGUF KV and add a simple skip pattern:
+- If layer index % full_attention_interval == 0 → mark as SSM layer
+- In forward pass for SSM layers: run a no-op or identity residual pass (SSM implementation deferred)
+- All other layers proceed through standard attention + MLP path
+
+**Files:**
+- `qwen_model.cpp`: add `is_ssm_layer(int layer_idx)` helper based on `full_attention_interval`. Skip SSM layers in the decoder loop with a placeholder note.
+- The Qwen3.5 model has its own SSM-specific kernels that don't exist yet; skipping preserves correctness for the attention components while allowing baseline inference to work.
+
+**Verification**: After Phases 15.1–15.3, the engine should load successfully and generate tokens from attention-only layers (ignoring SSM). This proves the core weight loading and inference pipeline works for the hybrid architecture.
+
+---
+
+### Phase 15.5: Mixed Quantization Type Dispatch — FUTURE
+
+**Goal**: Handle models where different tensors use different quantization types (e.g., FFN gate/down may be Q4_0/Q4_1 instead of TYPE100).
+
+**Design:**
+The current `load_quant_weight_from_gguf()` assumes all weights are ROCmFP4 (dequant via `dequant_code()` + UE4M3 scales). For Q4_0/Q4_1 tensors, we need the llama.cpp dequant path. Options:
+1. Check tensor type during loading; if TYPE100, use ROCmFP4 path; otherwise dispatch to standard llama.cpp-style dequant.
+2. Store dequant function pointer per QuantWeight at load time.
+
+This is lower priority because most of the Qwen3.5-4B's key matrices are TYPE100; only a few use Q4_0/Q4_1.
+
+---
+
+### Phase 15.6: Full SSM Implementation — FUTURE
+
+**Goal**: Implement actual SSM/nextn component computation using the loaded SSM weights.
+
+**Scope**: The SSM components (ssm_alpha, ssm_beta, ssm_out, ssm_dt, etc.) implement state-space dynamics that operate alongside attention layers. This requires:
+- New GPU kernels for SSM convolution and selective scan operations
+- Integration into the layer forward pass between attention and MLP stages
+- Proper handling of the hybrid architecture's alternating pattern
+
+This is deferred until baseline inference (attention-only) is working end-to-end.
+
+---
+
+## Phase 15 Summary & Priority Order
+
+| Sub-phase | Scope | Effort | Blocker? |
+|-----------|-------|--------|----------|
+| **15.3** TYPE100 GGUF recognition | gguf_mmap.h/.cpp, inspect_gguf.py | Small (~2h) | Yes — prevents type display in tooling |
+| **15.1** Read metadata from GGUF | inference.cpp:load_model_weights | Medium (~4h) | Yes — hardcoded values cause wrong dimensions |
+| **15.2** Combined QKV loading + split | inference.cpp::load_model_weights | Medium (~4h) | Yes — primary load failure reason ("Missing tensor blk.0.attn_q.weight") |
+| **15.4** SSM skip stubs | qwen_model.cpp::forward() | Small (~1h) | No — graceful degradation only |
+| **15.5** Mixed quant dispatch | inference.cpp + kernel updates | Medium (~6h) | No — works for current model config |
+| **15.6** Full SSM kernels | New .hip files, integration | Large (~2-3 weeks) | No — architectural feature add-on |
+
+**Immediate action items (Phases 15.1–15.4):** These four sub-phases together unblock the Qwen3.5-4B model and should take approximately 8-10 engineering hours. They do not require any new GPU kernels — all work is in weight loading, metadata extraction, and host-side tensor splitting.
+
+---
+
+## Phase 16: SSM Implementation & Performance Tuning (FUTURE)
+
+Once baseline hybrid support is working:
+1. Implement SSM convolution kernel (causal 1D conv with ssm_conv1d weights)
+2. Implement selective scan kernel using ssm_alpha/beta/dt parameters  
+3. Optimize attention+SSM alternation pattern for Strix Halo's memory layout
+4. Profile and tune batched throughput at context lengths up to 128K
 
 
 ---
