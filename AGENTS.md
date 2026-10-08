@@ -7,7 +7,7 @@ This is a proof-of-concept integrating two features into [llama.cpp](https://git
 
 Similar in spirit to [blazux/qwen3.8-Flash-DGX](https://github.com/blazux/qwen3.8-Flash-DGX), which adds mmap() support for n-gram MoE Qwen3.8-Flash models in vLLM, but targeting llama.cpp's GGUF format with ROCm hardware acceleration.
 
-See `PLAN.md` for current status and roadmap.
+See `PLAN.md` for current status and roadmap. **On any request involving progress, next steps, or work planning, read `PLAN.md` first** to understand what is done and what remains. Do not read it for git maintenance or one-off code changes that don't affect the project trajectory.
 
 ## Branches
 
