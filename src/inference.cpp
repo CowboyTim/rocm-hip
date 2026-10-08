@@ -422,12 +422,91 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
                 }
                 break;
             }
-            case 2: case 3: case 7: case 8: {
-                // Q4_0/Q4_1/Q8_0: FP16 deltas embedded in blocks — use placeholder until proper dequant path added
-                fprintf(stderr, "[load_quant_weight] type %d self-contained: FP16 delta extraction not yet wired\n", t);
+            case 2: { // Q4_0: block_size=32, layout [delta_fp16(2B), packed_data(16B)] = 18 bytes/block
+                fprintf(stderr, "[load_quant_weight] extracting Q4_0 FP16 deltas\n");
+                w.scales.assign(out_dim * scales_per_row, 0); // zero-fill; delta read from blocks at runtime
+                
+                const uint8_t* data = w.packed.data();
+                size_t block_bytes_q40 = 18; // 2B delta + 16B packed data
+                size_t blocks_per_row_q40 = (size_t)in_dim / 32;
+                
                 for (int64_t row = 0; row < out_dim; ++row) {
-                    for (size_t s = 0; s < scales_per_row; ++s) {
-                        w.scales[row * scales_per_row + s] = 0x60; // unity UE4M3 placeholder
+                    for (size_t b = 0; b < blocks_per_row_q40; ++b) {
+                        const uint8_t* blk = data + (row * blocks_per_row_q40 + b) * block_bytes_q40;
+                        
+                        // Repack FP16 delta as two UE4M3-style scale entries for GPU kernel compatibility
+                        size_t si0 = row * scales_per_row + b * 2;
+                        size_t si1 = si0 + 1;
+                        if (si0 < out_dim * scales_per_row) {
+                            uint8_t d_lo, d_hi;
+                            memcpy(&d_lo, blk, sizeof(uint8_t));
+                            memcpy(&d_hi, (blk + 1), sizeof(uint8_t));
+                            w.scales[si0] = d_lo;
+                            w.scales[si1] = d_hi;
+                        }
+                    }
+                }
+                break;
+            }
+            case 3: { // Q4_1: block_size=32, layout [scale_fp16(2B), min_fp16(2B), packed_data(16B)] = 20 bytes/block
+                fprintf(stderr, "[load_quant_weight] extracting Q4_1 FP16 scale+min\n");
+                w.scales.assign(out_dim * scales_per_row, 0); // zero-fill; scale+min read from blocks at runtime
+                
+                const uint8_t* data = w.packed.data();
+                size_t block_bytes_q41 = 20; // 2B scale + 2B min + 16B packed data
+                size_t blocks_per_row_q41 = (size_t)in_dim / 32;
+                
+                for (int64_t row = 0; row < out_dim; ++row) {
+                    for (size_t b = 0; b < blocks_per_row_q41; ++b) {
+                        const uint8_t* blk = data + (row * blocks_per_row_q41 + b) * block_bytes_q41;
+                        __half h_scale, h_min;
+                        memcpy(&h_scale, blk, sizeof(__half));
+                        memcpy(&h_min, blk + 2, sizeof(__half));
+                        
+                        size_t si0 = row * scales_per_row + b * 2;
+                        size_t si1 = si0 + 1;
+                        if (si0 < out_dim * scales_per_row) {
+                            uint8_t s_lo, s_hi, m_lo, m_hi;
+                            memcpy(&s_lo, &h_scale, sizeof(uint8_t));
+                            memcpy(&s_hi, ((uint8_t*)&h_scale + 1), sizeof(uint8_t));
+                            memcpy(&m_lo, &h_min, sizeof(uint8_t));
+                            memcpy(&m_hi, ((uint8_t*)&h_min + 1), sizeof(uint8_t));
+                            w.scales[si0] = s_lo;
+                            w.scales[si1] = s_hi;
+                            // Store min in next block's scale slots (for runtime access)
+                            size_t si2 = row * scales_per_row + (b + 1 == blocks_per_row_q41 ? 0 : b * 2 + 2);
+                            if (si2 < out_dim * scales_per_row) {
+                                w.scales[si2] = m_lo;
+                                w.scales[si2 + 1] = m_hi;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            case 7: case 8: { // Q8_0: block_size=32, layout [delta_fp16(2B), values_int8(32B)] = 34 bytes/block
+                fprintf(stderr, "[load_quant_weight] extracting Q8_0 FP16 delta\n");
+                w.scales.assign(out_dim * scales_per_row, 0); // zero-fill; delta read from blocks at runtime
+                
+                const uint8_t* data = w.packed.data();
+                size_t block_bytes_q80 = 34; // 2B delta + 32B int8 values
+                size_t blocks_per_row_q80 = (size_t)in_dim / 32;
+                
+                for (int64_t row = 0; row < out_dim; ++row) {
+                    for (size_t b = 0; b < blocks_per_row_q80; ++b) {
+                        const uint8_t* blk = data + (row * blocks_per_row_q80 + b) * block_bytes_q80;
+                        __half h_delta;
+                        memcpy(&h_delta, blk, sizeof(__half));
+                        
+                        size_t si0 = row * scales_per_row + b * 2;
+                        size_t si1 = si0 + 1;
+                        if (si0 < out_dim * scales_per_row) {
+                            uint8_t d_lo, d_hi;
+                            memcpy(&d_lo, &h_delta, sizeof(uint8_t));
+                            memcpy(&d_hi, ((uint8_t*)&h_delta + 1), sizeof(uint8_t));
+                            w.scales[si0] = d_lo;
+                            w.scales[si1] = d_hi;
+                        }
                     }
                 }
                 break;
@@ -447,17 +526,156 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
     
     // Build true_v for CPU reference (dequant using loaded scales)
     w.true_v.resize((size_t)w.N * w.K);
-    const size_t strips = w.K / 16;
-    for (int n = 0; n < w.N; ++n) {
-        for (size_t s = 0; s < strips; ++s) {
-            float sc = ue4m3_to_float(w.scales[(size_t)n * strips + s]);
-            for (int i = 0; i < 16; ++i) {
-                int k = (int)s * 16 + i;
-                uint8_t wb = w.packed[(size_t)n * (w.K / 2) + (k >> 1)];
-                uint8_t nib = (k & 1) ? (wb >> 4) : (wb & 0x0F);
-                float code = dequant_code(nib);
-                w.true_v[(size_t)n * w.K + k] = code * sc;
+    
+    switch (t) {
+        case 100: { // TYPE100/MXFP4: [scale_lo(1B), scale_hi(1B), packed_data(16B)] = 17 bytes per 32 values
+            fprintf(stderr, "[load_quant_weight] true_v: TYPE100 UE4M3 formula\n");
+            {
+                size_t blocks_per_row = (size_t)in_dim / 32;
+                for (int n = 0; n < out_dim; ++n) {
+                    for (size_t b = 0; b < blocks_per_row; ++b) {
+                        uint8_t sc_byte = w.packed[(size_t)n * blocks_per_row * 17 + b * 17 + 16]; // scale at offset 16
+                        float sc = ue4m3_to_float(sc_byte);
+                        for (int v = 0; v < 32; ++v) {
+                            int k = (int)b * 32 + v;
+                            uint8_t wb = w.packed[(size_t)n * blocks_per_row * 17 + b * 17 + 16 + (k >> 1)];
+                            uint8_t nib = (k & 1) ? (wb >> 4) : (wb & 0x0F);
+                            w.true_v[(size_t)n * w.K + k] = dequant_code(nib) * sc;
+                        }
+                    }
+                }
             }
+            break;
+        }
+        case 13: { // TYPE13: [scale_0..15(16B), packed_data(128B)] = 144 bytes per 256 values
+            fprintf(stderr, "[load_quant_weight] true_v: TYPE13 UE4M3 formula\n");
+            {
+                size_t blocks_per_row = (size_t)in_dim / 256;
+                for (int n = 0; n < out_dim; ++n) {
+                    for (size_t b = 0; b < blocks_per_row; ++b) {
+                        for (int v = 0; v < 256; ++v) {
+                            int k = (int)b * 256 + v;
+                            size_t scale_idx = (size_t)v / 16;
+                            float sc = ue4m3_to_float(w.packed[(size_t)n * blocks_per_row * 144 + b * 144 + scale_idx]);
+                            uint8_t wb = w.packed[(size_t)n * blocks_per_row * 144 + b * 144 + 16 + ((size_t)(b * 256 + v) >> 1)];
+                            uint8_t nib = (k & 1) ? (wb >> 4) : (wb & 0x0F);
+                            w.true_v[(size_t)n * w.K + k] = dequant_code(nib) * sc;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        case 14: { // TYPE14: [scales(16B), packed_data(...)] = 176 bytes per 256 values  
+            fprintf(stderr, "[load_quant_weight] true_v: TYPE14 UE4M3 formula\n");
+            {
+                size_t blocks_per_row = (size_t)in_dim / 256;
+                for (int n = 0; n < out_dim; ++n) {
+                    for (size_t b = 0; b < blocks_per_row; ++b) {
+                        for (int v = 0; v < 256; ++v) {
+                            int k = (int)b * 256 + v;
+                            size_t scale_idx = (size_t)v / 16;
+                            float sc = ue4m3_to_float(w.packed[(size_t)n * blocks_per_row * 176 + b * 176 + scale_idx]);
+                            uint8_t wb = w.packed[(size_t)n * blocks_per_row * 176 + b * 176 + 16 + ((size_t)(b * 256 + v) >> 1)];
+                            uint8_t nib = (k & 1) ? (wb >> 4) : (wb & 0x0F);
+                            w.true_v[(size_t)n * w.K + k] = dequant_code(nib) * sc;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        case 2: { // Q4_0: [delta_fp16(2B), packed_data(16B)] = 18 bytes per 32 values
+            fprintf(stderr, "[load_quant_weight] true_v: Q4_0 formula\n");
+            {
+                size_t blocks_per_row_q40 = (size_t)in_dim / 32;
+                for (int n = 0; n < out_dim; ++n) {
+                    for (size_t b = 0; b < blocks_per_row_q40; ++b) {
+                        const uint8_t* blk = w.packed.data() + (size_t)n * blocks_per_row_q40 * 18 + b * 18;
+                        __half h_delta;
+                        memcpy(&h_delta, blk, sizeof(__half));
+                        float delta_f = __half2float(h_delta);
+                        
+                        for (int v = 0; v < 32; ++v) {
+                            int k = (int)b * 32 + v;
+                            uint8_t wb = blk[2 + ((size_t)(b * 32 + v) >> 1)];
+                            uint8_t nib = (k & 1) ? (wb >> 4) : (wb & 0x0F);
+                            // Q4_0: value = delta * codebook[nibble] where nibble is signed via bit 3
+                            int sign_bit = nib >> 3;
+                            int mag = nib & 0x7;
+                            float val = sign_bit ? -((float)mag + 1.0f) : (float)mag;
+                            w.true_v[(size_t)n * w.K + k] = val * delta_f;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        case 3: { // Q4_1: [scale_fp16(2B), min_fp16(2B), packed_data(16B)] = 20 bytes per 32 values
+            fprintf(stderr, "[load_quant_weight] true_v: Q4_1 formula\n");
+            {
+                size_t blocks_per_row_q41 = (size_t)in_dim / 32;
+                for (int n = 0; n < out_dim; ++n) {
+                    for (size_t b = 0; b < blocks_per_row_q41; ++b) {
+                        const uint8_t* blk = w.packed.data() + (size_t)n * blocks_per_row_q41 * 20 + b * 20;
+                        __half h_scale, h_min;
+                        memcpy(&h_scale, blk, sizeof(__half));
+                        memcpy(&h_min, blk + 2, sizeof(__half));
+                        float scale_f = __half2float(h_scale);
+                        float min_f = __half2float(h_min);
+                        
+                        for (int v = 0; v < 32; ++v) {
+                            int k = (int)b * 32 + v;
+                            uint8_t wb = blk[4 + ((size_t)(b * 32 + v) >> 1)];
+                            uint8_t nib = (k & 1) ? (wb >> 4) : (wb & 0x0F);
+                            // Q4_1: value = scale * codebook[nibble] + min  
+                            w.true_v[(size_t)n * w.K + k] = scale_f * dequant_code(nib) + min_f;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        case 7: case 8: { // Q8_0: [delta_fp16(2B), values_int8(32B)] = 34 bytes per block of 32 values
+            fprintf(stderr, "[load_quant_weight] true_v: Q8_0 formula\n");
+            {
+                const uint8_t* data = w.packed.data();
+                size_t blocks_per_row_q80 = (size_t)in_dim / 32;
+                for (int n = 0; n < out_dim; ++n) {
+                    for (size_t b = 0; b < blocks_per_row_q80; ++b) {
+                        const uint8_t* blk = data + (size_t)n * blocks_per_row_q80 * 34 + b * 34;
+                        __half h_delta;
+                        memcpy(&h_delta, blk, sizeof(__half));
+                        float delta_f = __half2float(h_delta);
+                        
+                        for (int v = 0; v < 32; ++v) {
+                            int k = (int)b * 32 + v;
+                            int8_t val = (int8_t)blk[2 + v]; // int8 value at offset 2 within block
+                            w.true_v[(size_t)n * w.K + k] = val * delta_f;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        default: {
+            // Unknown type — use UE4M3 formula with unity scale as safe fallback
+            fprintf(stderr, "[load_quant_weight] unknown type %d, using UE4M3 formula with unity scale\n", t);
+            const size_t strips = w.K / 16;
+            for (int n = 0; n < out_dim; ++n) {
+                for (size_t s = 0; s < strips; ++s) {
+                    float sc = ue4m3_to_float(w.scales[(size_t)n * strips + s]);
+                    if (sc == 0.5f) sc = 1.0f; // Skip zero scales (unity placeholder reads as 0.5 in UE4M3)
+                    for (int i = 0; i < 16; ++i) {
+                        int k = (int)s * 16 + i;
+                        uint8_t wb = w.packed[(size_t)n * (w.K / 2) + (k >> 1)];
+                        uint8_t nib = (k & 1) ? (wb >> 4) : (wb & 0x0F);
+                        float code = dequant_code(nib);
+                        w.true_v[(size_t)n * w.K + k] = code * sc;
+                    }
+                }
+            }
+            break;
         }
     }
     return true;
@@ -735,6 +953,31 @@ static bool load_model_weights(inference_model* m) {
                                 (si < total_scales_per_row) ? all_scales[si] : 0x60;
                         }
                     }
+                } else if (t == 2) { // Q4_0 in combined QKV — scales extracted per-row at runtime in true_v
+                    fprintf(stderr, "blk.%d: Q4_0 combined QKV — scales stored in blocks, use true_v for CPU ref\n", i);
+                    // Fill scale arrays with unity placeholder; real deltas read from blocks during true_v computation
+                    for (int64_t row = 0; row < E; ++row) {
+                        for (size_t s = 0; s < q_scales_per_row; ++s) L.Wq.scales[row * q_scales_per_row + s] = 0x60;
+                        for (size_t s = 0; s < k_scales_per_row; ++s) L.Wk.scales[row * k_scales_per_row + s] = 0x60;
+                        for (size_t s = 0; s < v_scales_per_row; ++s) L.Wv.scales[row * v_scales_per_row + s] = 0x60;
+                    }
+
+                } else if (t == 3) { // Q4_1 in combined QKV — scales extracted per-row at runtime in true_v
+                    fprintf(stderr, "blk.%d: Q4_1 combined QKV — scales stored in blocks, use true_v for CPU ref\n", i);
+                    for (int64_t row = 0; row < E; ++row) {
+                        for (size_t s = 0; s < q_scales_per_row; ++s) L.Wq.scales[row * q_scales_per_row + s] = 0x60;
+                        for (size_t s = 0; s < k_scales_per_row; ++s) L.Wk.scales[row * k_scales_per_row + s] = 0x60;
+                        for (size_t s = 0; s < v_scales_per_row; ++s) L.Wv.scales[row * v_scales_per_row + s] = 0x60;
+                    }
+
+                } else if (t == 7 || t == 8) { // Q8_0 in combined QKV — scales extracted per-row at runtime in true_v
+                    fprintf(stderr, "blk.%d: Q8_0 combined QKV — scales stored in blocks, use true_v for CPU ref\n", i);
+                    for (int64_t row = 0; row < E; ++row) {
+                        for (size_t s = 0; s < q_scales_per_row; ++s) L.Wq.scales[row * q_scales_per_row + s] = 0x60;
+                        for (size_t s = 0; s < k_scales_per_row; ++s) L.Wk.scales[row * k_scales_per_row + s] = 0x60;
+                        for (size_t s = 0; s < v_scales_per_row; ++s) L.Wv.scales[row * v_scales_per_row + s] = 0x60;
+                    }
+
                 } else {
                     // Unknown self-contained type — fill with unity scale as safe fallback
                     fprintf(stderr, "blk.%d: unknown type %d in combined QKV, filling unity placeholder\n", i, t);
