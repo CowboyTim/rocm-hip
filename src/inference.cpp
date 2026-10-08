@@ -204,6 +204,7 @@ static bool has_tensor(gguf_model_t* gguf, const char* name) {
 }
 
 // ======================== SCALE EXTRACTION HELPERS ========================
+/* --- Unused helpers (kept for reference; inline extraction used instead) ---
 
 // Extract UE4M3 scales from TYPE100 blocks (block_size=32, 2 scales per block at offset 16).
 // Layout: [scale_lo(1B), scale_hi(1B), data(16B)] × Nblocks
@@ -291,6 +292,8 @@ static void extract_scales_q4_1(const uint8_t* data, size_t nbytes, float* scale
     }
 }
 
+*/
+
 // Load quantized weight by name from GGUF (for non-QKV tensors)
 static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_name, const char* scales_name, QuantWeight& w) {
     size_t w_sz, s_sz;
@@ -346,7 +349,7 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
                 fprintf(stderr, "[load_quant_weight] extracting TYPE100 scales\n");
                 
                 const uint8_t* data = w.packed.data();
-                size_t total_blocks = w_sz / 17;
+                // TYPE100: UE4M3 scales embedded in blocks alongside packed data (w_sz / 17 total blocks)
                 size_t blocks_per_row = (size_t)in_dim / 32;
                 size_t tmp_scales_per_row = blocks_per_row * 2;
                 
@@ -386,7 +389,7 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
                 fprintf(stderr, "[load_quant_weight] extracting TYPE13 scales\n");
                 
                 const uint8_t* data = w.packed.data();
-                size_t total_blocks = w_sz / 144;
+                // total_blocks = w_sz / 144 (documented, not needed for calculation)
                 size_t blocks_per_row = (size_t)in_dim / 256;
                 size_t tmp_scales_per_row = blocks_per_row * 16;
                 
@@ -932,13 +935,11 @@ inference_model_t* inference_load_model(const char* gguf_path) {
                             // TYPE100 / MXFP4: UE4M3 scales per block of 32 values
                             {
                                 const uint8_t* data = packed.data();
-                                size_t bytes_per_block = 17; // 2 scale + 16 data
-                                size_t total_blocks = total_elements / 32;
-                                
+                                // Block size constants for documentation/debugging only (not used in calculation)
+
                                 for (int vi = 0; vi < m->vocab_size; ++vi) {
                                     int64_t row_offset = (int64_t)vi * m->n_embd;
-                                    size_t row_blocks = m->n_embd / 32;
-                                    
+
                                     for (int ei = 0; ei < m->n_embd; ++ei) {
                                         int bi = ei / 32;
                                         int val_in_block = ei % 32;
@@ -963,12 +964,10 @@ inference_model_t* inference_load_model(const char* gguf_path) {
                             {
                                 const uint8_t* data = packed.data();
                                 size_t bytes_per_block = 20; // 2 scale + 2 min + 16 packed
-                                size_t total_blocks = total_elements / 32;
-                                
+
                                 for (int vi = 0; vi < m->vocab_size; ++vi) {
                                     int64_t row_offset = (int64_t)vi * m->n_embd;
-                                    size_t row_blocks = m->n_embd / 32;
-                                    
+
                                     for (int ei = 0; ei < m->n_embd; ++ei) {
                                         int bi = ei / 32;
                                         int val_in_block = ei % 32;
@@ -995,12 +994,10 @@ inference_model_t* inference_load_model(const char* gguf_path) {
                             {
                                 const uint8_t* data = packed.data();
                                 size_t bytes_per_block = 18; 
-                                size_t total_blocks = total_elements / 32;
-                                
+
                                 for (int vi = 0; vi < m->vocab_size; ++vi) {
                                     int64_t row_offset = (int64_t)vi * m->n_embd;
-                                    size_t row_blocks = m->n_embd / 32;
-                                    
+
                                     for (int ei = 0; ei < m->n_embd; ++ei) {
                                         int bi = ei / 32;
                                         int val_in_block = ei % 32;
@@ -1286,7 +1283,7 @@ int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
                 qwen_model_set_embed_table(m->qwen, d_emb_dev);
             } else {
                 fprintf(stderr, "[KV_INIT] hipMemcpy failed: %s\n", hipGetErrorString(e));
-                hipFree(d_emb_dev);
+                (void)hipFree(d_emb_dev);
             }
         } else {
             fprintf(stderr, "[KV_INIT] hipMalloc failed: %s\n", hipGetErrorString(e));

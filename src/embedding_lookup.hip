@@ -1,6 +1,9 @@
 // ==================== Embedding Lookup ====================
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+
 extern "C" __global__ void embedding_lookup(const int* token_ids, const __half* embed_table,
-                                            __half* output, int batch_size, int hidden_size, int vocab_size)
+                                             __half* output, int batch_size, int hidden_size, int vocab_size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= batch_size) return;
@@ -15,10 +18,6 @@ extern "C" __global__ void embedding_lookup(const int* token_ids, const __half* 
     // Simple element-by-element copy (avoids potential uint4 alignment issues on AMD)
     for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
         dst[i] = src[i];
-    }
-}
-
-        }
     }
 }
 
