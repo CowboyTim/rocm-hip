@@ -819,92 +819,9 @@ Failed to load model: Failed to load model weights
 
 
 ---
+## Phase 17.2: Scale Extraction & Embedding Fix — PARTIALLY COMPLETE ✅
 
-## Phase 17.2: Actual Scale Extraction from Self-Contained Blocks — COMPLETE ✅
-
-**Goal**: Replace placeholder unity-scale fill with real scale extraction from TYPE13/Q4_0/Q4_1/Q8_0/TYPE100 blocks.
-
-### Completed Implementation
-
-1. **Helper functions added to `inference.cpp`** (before `load_quant_weight_from_gguf()`):
-   - `extract_scales_type100()`: Reads UE4M3 scales from TYPE100 blocks at offset 16+ within each 17-byte block (2 scales per block for 32 values).
-   - `extract_scales_type13()`: Reads 16 UE4M3 scales from TYPE13 blocks at offsets 0–15 within each 144-byte block (block_size=256, one scale per 16 elements).
-   - `extract_scales_q4_0()`, `q4_1()`, `q8_0()`: FP16 delta extraction stubs for standard llama.cpp quant types (not yet wired into main path — unity placeholder used until proper dequant formulas are implemented).
-
-2. **`load_quant_weight_from_gguf()` self-contained path updated**:
-   - For TYPE100: extracts all UE4M3 scales from blocks, repacks to standard per-row layout (K/16 scale bytes per row), fills gaps with unity fallback.
-   - For TYPE13: same approach but reads from 144-byte blocks with 16 scales each. Maps block-level scales to projection-specific arrays using column→scale_index = col / 16 formula.
-   - For Q4_0/Q4_1/Q8_0: logs warning that FP16 delta extraction not yet wired; falls through to unity placeholder fill.
-
-3. **Combined QKV split for self-contained types updated** (`inference.cpp:load_model_weights()`):
-   - Replaced placeholder fill with TYPE13-aware scale extraction.
-   - For each row: extracts all available scales from blocks covering columns 0..total_cols-1, then maps them to Q/K/V projections based on column ranges.
-   - Scale index for column c is c / 16; scale comes from block(c) = c / 256.
-   - Unknown types fall back to unity fill with debug logging.
-
-4. **Embedding table loading for quantized types fixed**:
-   - Extended `token_embd.weight` loading in `inference_load_model()`.
-   - Detects tensor type via `gguf_tensor_type()` before loading.
-   - If FP16 (type=1/-1): loads as before (direct __half assign).
-   - If quantized (Q4_1/type=3, TYPE100/type=100, etc.): dequantizes to FP16 at load time.
-     - TYPE100: iterates vocab×embd values, extracts UE4M3 scales from blocks, applies codebook lookup with proper half-block scale selection.
-     - Q4_1: uses formula `scale * codebook[nibble] + min` where scale/min are FP16 values embedded in each 20-byte block.
-     - Q4_0: uses simpler formula `delta * codebook[nibble]`.
-   - This ensures models like Qwen3.5-4B which use Q4_1 embeddings no longer silently fail embedding loading.
-
-### Files Modified
-
-| File | Changes |
-|------|---------|
-| `src/inference.cpp` | Added 5 scale extraction helpers, rewrote self-contained paths in `load_quant_weight_from_gguf()` and combined QKV split, extended embedding table loading for quantized types |
-
-
----
-
-## CRITICAL ISSUE: Embedding Table GPU Hang During Forward Pass — RESOLVED ✅
-
-**Root cause**: Argument passing mismatch in `qwen_model.cpp` forward pass. The `embedding_lookup` kernel expects:
-- `token_ids`: a GPU-accessible array (`int*`) indexed via `token_ids[idx]`
-- `embed_table`: a direct device pointer (`const __half*`) used for arithmetic `embed_table + token * hidden_size`
-
-But the old code passed:
-- `&tid` — address of a single stack-local int (kernel reads garbage when `idx > 0`)
-- `&d_embed_table_copy` — address of host variable holding device pointer (kernel interprets it as a raw data pointer, not a pointer-to-pointer)
-
-### Fix Applied
-
-Changed argument construction in both `forward()` and `forward_batch()`:
-
-```cpp
-// Single-token (line ~302): wrap scalar in array, cast device pointer directly
-int32_t tid_arr[1] = { (int32_t)token_id };
-const __half* d_emb_ptr = d_embed_table_copy;
-void* emb_args[] = { tid_arr, (const __half**)&d_emb_ptr, &layer_scratch[0].d_h,
-                     &one, &E_local, &vocab_local };
-
-// Batched (line ~552): same pattern with vector data pointer
-const __half* d_emb_ptr_batch = reinterpret_cast<const __half*>(eng->d_embed_table);
-void* emb_args[] = { &h_tokens[0], (const __half**)&d_emb_ptr_batch, m->layer_scratch[0].d_h, 
-                     (void*)&one_int, (void*)&E, (void*)&vocab_local };
-```
-
-This matches the exact pattern used by working kernels (rope, layernorm, softmax, gemm_act_fp4) which all pass device pointers via `(type**)&host_var` casting. No changes to `.hip` kernel files needed — the kernel definition was correct all along.
-
-### Files Modified
-
-| File | Changes |
-|------|---------|
-| `src/qwen_model.cpp:302-307` | Fixed single-token embedding lookup args |
-| `src/qwen_model.cpp:551-555` | Fixed batched embedding lookup args |
-
-4. **Report ROCm bug**: If confirmed as a driver/runtime bug, file with AMD ROCm team for gfx1151/ROCm 6.x on Strix Halo hardware.
-
-
----
-
-## Phase 17.2: Actual Scale Extraction from Self-Contained Blocks — PARTIALLY COMPLETE ✅
-
-**Goal**: Replace placeholder unity-scale fill with real scale extraction from TYPE13/Q4_0/Q4_1/Q8_0/TYPE100 blocks.
+**Goal**: Replace placeholder unity-scale fill with real scale extraction from TYPE13/Q4_0/Q4_1/Q8_0/TYPE100 blocks; fix embedding table GPU hang.
 
 ### Completed Implementation (Weight Loading)
 
@@ -932,45 +849,28 @@ Extended `token_embd.weight` loading in `inference_load_model()`:
 - If quantized (Q4_1/type=3, TYPE100/type=100, TYPE14/type=14): dequantizes to FP16 at load time using correct formulas per type.
 - **TYPE14 transposed path**: Handles GGUF's [n_embd][vocab_size] memory layout with proper block indexing for 256-element UE4M3-scaled blocks (176 bytes/block). Dequantizes 635M values successfully into host vector.
 
+### GPU Hang Fix — RESOLVED ✅
+
+**Root cause**: ABI mismatch in argument passing for `hipModuleLaunchKernel`. The embedding lookup kernel expects `int*` token IDs and a direct device pointer (`const __half*`), but the old code passed `&tid` (stack-local scalar) and `&d_embed_table_copy` (address of host variable holding device pointer).
+
+**Fix**: Both `forward()` and `forward_batch()` now pass token IDs as array references and cast device pointers directly: `(const __half**)&d_emb_ptr` — matching the pattern used by all working kernels (rope, layernorm, softmax, gemm_act_fp4).
+
 ### Files Modified
 
 | File | Changes |
 |------|---------|
 | `src/inference.cpp` | Added 5 scale extraction helpers, rewrote self-contained paths in `load_quant_weight_from_gguf()` and combined QKV split, extended embedding table loading for quantized types (TYPE14 transposed support added) |
-| `src/qwen_model.cpp` | Added `qwen_model_set_embed_table()` setter, `d_embed_table_copy` field, debug logging for GPU pointer passing |
+| `src/qwen_model.cpp` | Fixed embedding lookup kernel args in forward() and forward_batch(), added `qwen_model_set_embed_table()` setter, `d_embed_table_copy` field |
 | `src/qwen_model.h` | Added `qwen_model_set_embed_table()` declaration, `inference_get_qwen_model()` getter |
 | `src/embedding_lookup.hip` | Simplified kernel from vectorized uint4 copy to element-by-element loop |
-
-### Current Blocker 🔴
-
-See **CRITICAL ISSUE** section above — embedding table GPU access hangs via `hipModuleLaunchKernel`. Weight loading and dequantization work correctly; inference cannot complete until the GPU kernel launch issue is resolved.
 
 
 ---
 
-## Session Log: Qwen3.5-4B Compatibility Testing (2025-01-XX) — RESOLVED ✅
+## GGUF Parser Bug Fix — RESOLVED ✅
 
-### Objective
-Test the `Qwen3.5-4B-ROCMFP4.gguf` model file by running the `inspect_gguf.py` script on it to verify compatibility.
+The original `inspect_gguf.py` had incorrect GGUF v3 array handling (type 9 treated as "uint8 array" instead of ARRAY marker with sub-type+count). Rewritten from scratch using llama.cpp's GGUF v3 spec; now successfully parses all 42 KV pairs and 441 tensors including the hybrid Qwen3-5-4B model. TYPE100 (ROCmFP4 custom quantization) recognized but still needs inference engine integration beyond weight loading.
 
-### Actions Taken (all completed)
-1. Created `./scripts/` directory at `/workdir/rocm-hip.git/scripts/`
-2. Moved `inspect_gguf.py` to `./scripts/inspect_gguf.py`  
-3. Added Qwen3.5-4B compatibility analysis to `PLAN.md` (section after Phase 12)
-4. Committed changes and pushed to `origin/main`
-5. **Discovered critical bug**: original script had wrong GGUF v3 array handling — treated type 9 as "uint8 array" when it actually means ARRAY marker with sub-type+count following; extended type codes 10-20 didn't exist in GGUF v3 spec
-6. **Rewrote parser completely** from scratch using llama.cpp's GGUF v3 spec as reference (`ggml/include/gguf.h`)
-7. Verified exact byte layout of header and keys through hex dump analysis
-8. Successfully parsed all 42 KV pairs and 441 tensors
-
-### Root cause of bug
-GGUF v3 uses uint64 for string lengths but uint32 counts for arrays, followed by element type (int32) then count (uint64). The old `skip_value()` function treated array types (vtype 9-20) as direct scalar/array types instead of recognizing the ARRAY marker pattern. Type codes > 12 don't exist in GGUF v3 (TYPE_COUNT == 13).
-
-### Results
-- ✅ All 42 metadata keys parsed correctly
-- ✅ All 441 tensors listed with correct names, dimensions, and types
-- ✅ Tokenizer vocab: 248,320 tokens, merges: 247,587 rules
-- ✅ Model is hybrid Qwen3-SSM (has SSM/nextn components beyond standard transformer)
-- ⚠️ TYPE100 (ROCmFP4 custom quantization) not in official ggml_type enum — needs handling in inference engine
+---
 
 ---
