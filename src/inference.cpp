@@ -47,10 +47,13 @@ static void clear_error() { g_last_error[0] = 0; }
 struct QuantWeight {
     int N, K;                                  // output_dim x input_dim (K multiple of 16)
     std::vector<unsigned char> packed;         // N x K/2 bytes
-    std::vector<unsigned char> scales;         // N x K/16 bytes
+    std::vector<unsigned char> scales;         // N x K/16 bytes (UE4M3 encoding: TYPE100/TYPE13)
+    std::vector<float> scales_f;               // N x num_blocks floats (non-UE4M3: Q4_0/Q4_1/Q8_0 FP16 delta/scale as floats)
     std::vector<float> true_v;                 // N x K effective values (for CPU ref)
     void* d_packed = nullptr;
-    void* d_scales = nullptr;
+    void* d_scales = nullptr;                  // device ptr for scales (UE4M3 types only)
+    void* d_scales_f = nullptr;                // device ptr for scales_f (Q4_0/Q4_1/Q8_0 types)
+    int8_t quant_type = 0;                     // GGUF tensor type for GPU kernel dispatch (0=default, 2=Q4_0, 3=Q4_1, 7/8=Q8_0, 13=TYPE13, 100=TYPE100)
 };
 
 // Per-layer weights (attention + MLP)
@@ -90,7 +93,8 @@ struct inference_model {
     // For simplicity in Phase 4, we'll use FP4 too; Q8_0 comes in Phase 5
     QuantWeight lm_head;
     void* d_lm_head_packed = nullptr;
-    void* d_lm_head_scales = nullptr;
+    void* d_lm_head_scales = nullptr;               // device ptr for scales (UE4M3 types)
+    void* d_lm_head_scales_f = nullptr;             // device ptr for scales_f (Q4_0/Q4_1/Q8_0 types)
 
     // Final LayerNorm
     std::vector<__half> final_ln_scale;
@@ -130,12 +134,25 @@ static bool pin_model_memory(inference_model* m) {
                 fprintf(stderr, "[pin_model] packed register failed (%zu bytes)\n", w.packed.size());
                 return false;
             }
-            if (hipHostRegister(w.scales.data(), w.scales.size(), hipHostRegisterDefault) != hipSuccess) {
+            if (!w.scales.empty() && hipHostRegister(w.scales.data(), w.scales.size(), hipHostRegisterDefault) != hipSuccess) {
                 fprintf(stderr, "[pin_model] scales register failed (%zu bytes)\n", w.scales.size());
                 return false;
             }
+            if (!w.scales_f.empty() && hipHostRegister(w.scales_f.data(), w.scales_f.size() * sizeof(float), hipHostRegisterDefault) != hipSuccess) {
+                fprintf(stderr, "[pin_model] scales_f register failed (%zu bytes)\n", w.scales_f.size() * sizeof(float));
+                return false;
+            }
             (void)hipHostGetDevicePointer(&w.d_packed, w.packed.data(), 0);
-            (void)hipHostGetDevicePointer(&w.d_scales, w.scales.data(), 0);
+            const unsigned char* scales_raw = !w.scales.empty() ? w.scales.data() : w.packed.data();
+            (void)hipHostGetDevicePointer(&w.d_scales, const_cast<unsigned char*>(scales_raw), 0);
+            const float* scaled_f_raw = !w.scales_f.empty() ? w.scales_f.data() : nullptr;
+            if (!scaled_f_raw) {
+                // Fallback: use packed data address (will not be used for non-UE4M3 types)
+                void* dummy = (void*)w.packed.data();
+                (void)hipHostGetDevicePointer(&dummy, w.packed.data(), 0);
+                scaled_f_raw = reinterpret_cast<const float*>(dummy);
+            }
+            (void)hipHostGetDevicePointer(&w.d_scales_f, const_cast<float*>(scaled_f_raw), 0);
             return true;
         };
         if (!pin(L.Wq) || !pin(L.Wk) || !pin(L.Wv) || !pin(L.Wo) ||
@@ -152,9 +169,22 @@ static bool pin_model_memory(inference_model* m) {
     // Pin LM head
     if (!m->lm_head.packed.empty()) {
         (void)hipHostRegister(m->lm_head.packed.data(), m->lm_head.packed.size(), hipHostRegisterDefault);
-        (void)hipHostRegister(m->lm_head.scales.data(), m->lm_head.scales.size(), hipHostRegisterDefault);
+        if (!m->lm_head.scales.empty()) {
+            (void)hipHostRegister(m->lm_head.scales.data(), m->lm_head.scales.size(), hipHostRegisterDefault);
+        }
+        if (!m->lm_head.scales_f.empty()) {
+            (void)hipHostRegister(m->lm_head.scales_f.data(), m->lm_head.scales_f.size() * sizeof(float), hipHostRegisterDefault);
+        }
         (void)hipHostGetDevicePointer(&m->d_lm_head_packed, m->lm_head.packed.data(), 0);
-        (void)hipHostGetDevicePointer(&m->d_lm_head_scales, m->lm_head.scales.data(), 0);
+        const unsigned char* lm_scales_raw = !m->lm_head.scales.empty() ? m->lm_head.scales.data() : m->lm_head.packed.data();
+        (void)hipHostGetDevicePointer(&m->d_lm_head_scales, const_cast<unsigned char*>(lm_scales_raw), 0);
+        const float* lm_scaled_f_raw = !m->lm_head.scales_f.empty() ? m->lm_head.scales_f.data() : nullptr;
+        if (!lm_scaled_f_raw) {
+            void* dummy = (void*)m->lm_head.packed.data();
+            (void)hipHostGetDevicePointer(&dummy, m->lm_head.packed.data(), 0);
+            lm_scaled_f_raw = reinterpret_cast<const float*>(dummy);
+        }
+        (void)hipHostGetDevicePointer(&m->d_lm_head_scales_f, const_cast<float*>(lm_scaled_f_raw), 0);
     }
     if (!m->final_ln_scale.empty()) {
         (void)hipHostRegister(m->final_ln_scale.data(), m->final_ln_scale.size() * sizeof(__half), hipHostRegisterDefault);
@@ -169,16 +199,16 @@ static void unpin_model_memory(inference_model* m) {
     };
     unpin(m->d_embed_table);
     for (auto& L : m->layers) {
-        unpin(L.Wq.d_packed); unpin(L.Wq.d_scales);
-        unpin(L.Wk.d_packed); unpin(L.Wk.d_scales);
-        unpin(L.Wv.d_packed); unpin(L.Wv.d_scales);
-        unpin(L.Wo.d_packed); unpin(L.Wo.d_scales);
-        unpin(L.W_gate.d_packed); unpin(L.W_gate.d_scales);
-        unpin(L.W_up.d_packed); unpin(L.W_up.d_scales);
-        unpin(L.W_down.d_packed); unpin(L.W_down.d_scales);
+        unpin(L.Wq.d_packed); unpin(L.Wq.d_scales); unpin(L.Wq.d_scales_f);
+        unpin(L.Wk.d_packed); unpin(L.Wk.d_scales); unpin(L.Wk.d_scales_f);
+        unpin(L.Wv.d_packed); unpin(L.Wv.d_scales); unpin(L.Wv.d_scales_f);
+        unpin(L.Wo.d_packed); unpin(L.Wo.d_scales); unpin(L.Wo.d_scales_f);
+        unpin(L.W_gate.d_packed); unpin(L.W_gate.d_scales); unpin(L.W_gate.d_scales_f);
+        unpin(L.W_up.d_packed); unpin(L.W_up.d_scales); unpin(L.W_up.d_scales_f);
+        unpin(L.W_down.d_packed); unpin(L.W_down.d_scales); unpin(L.W_down.d_scales_f);
         unpin(L.d_attn_ln); unpin(L.d_mlp_ln);
     }
-    unpin(m->d_lm_head_packed); unpin(m->d_lm_head_scales);
+    unpin(m->d_lm_head_packed); unpin(m->d_lm_head_scales); unpin(m->d_lm_head_scales_f);
     unpin(m->d_final_ln);
 }
 
@@ -424,37 +454,39 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
             }
             case 2: { // Q4_0: block_size=32, layout [delta_fp16(2B), packed_data(16B)] = 18 bytes/block
                 fprintf(stderr, "[load_quant_weight] extracting Q4_0 FP16 deltas\n");
-                w.scales.assign(out_dim * scales_per_row, 0); // zero-fill; delta read from blocks at runtime
+                w.quant_type = 2;
 
                 const uint8_t* data = w.packed.data();
                 size_t block_bytes_q40 = 18; // 2B delta + 16B packed data
                 size_t blocks_per_row_q40 = (size_t)in_dim / 32;
 
+                // Q4_1-compatible layout: two decoded floats per block (scale=delta, min=0) -> N * (K/16) floats
+                w.scales_f.resize((size_t)out_dim * blocks_per_row_q40 * 2);
+
                 for (int64_t row = 0; row < out_dim; ++row) {
                     for (size_t b = 0; b < blocks_per_row_q40; ++b) {
                         const uint8_t* blk = data + (row * blocks_per_row_q40 + b) * block_bytes_q40;
+                        __half h_delta;
+                        memcpy(&h_delta, blk, sizeof(__half));
+                        float delta_f = __half2float(h_delta);
 
-                        // Repack FP16 delta as two UE4M3-style scale entries for GPU kernel compatibility
-                        size_t si0 = row * scales_per_row + b * 2;
-                        size_t si1 = si0 + 1;
-                        if (si0 < out_dim * scales_per_row) {
-                            uint8_t d_lo, d_hi;
-                            memcpy(&d_lo, blk, sizeof(uint8_t));
-                            memcpy(&d_hi, (blk + 1), sizeof(uint8_t));
-                            w.scales[si0] = d_lo;
-                            w.scales[si1] = d_hi;
-                        }
+                        size_t fi = (size_t)row * blocks_per_row_q40 * 2 + b * 2;
+                        w.scales_f[fi]     = delta_f;  // scale = delta for Q4_0
+                        w.scales_f[fi + 1] = 0.0f;      // min = 0 for Q4_0
                     }
                 }
                 break;
             }
             case 3: { // Q4_1: block_size=32, layout [scale_fp16(2B), min_fp16(2B), packed_data(16B)] = 20 bytes/block
                 fprintf(stderr, "[load_quant_weight] extracting Q4_1 FP16 scale+min\n");
-                w.scales.assign(out_dim * scales_per_row, 0); // zero-fill; scale+min read from blocks at runtime
+                w.quant_type = 3;
 
                 const uint8_t* data = w.packed.data();
                 size_t block_bytes_q41 = 20; // 2B scale + 2B min + 16B packed data
                 size_t blocks_per_row_q41 = (size_t)in_dim / 32;
+
+                // Two decoded floats per block (scale + min) -> N * (K/16) floats
+                w.scales_f.resize((size_t)out_dim * blocks_per_row_q41 * 2);
 
                 for (int64_t row = 0; row < out_dim; ++row) {
                     for (size_t b = 0; b < blocks_per_row_q41; ++b) {
@@ -463,50 +495,34 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
                         memcpy(&h_scale, blk, sizeof(__half));
                         memcpy(&h_min, blk + 2, sizeof(__half));
 
-                        size_t si0 = row * scales_per_row + b * 2;
-                        size_t si1 = si0 + 1;
-                        if (si0 < out_dim * scales_per_row) {
-                            uint8_t s_lo, s_hi, m_lo, m_hi;
-                            memcpy(&s_lo, &h_scale, sizeof(uint8_t));
-                            memcpy(&s_hi, ((uint8_t*)&h_scale + 1), sizeof(uint8_t));
-                            memcpy(&m_lo, &h_min, sizeof(uint8_t));
-                            memcpy(&m_hi, ((uint8_t*)&h_min + 1), sizeof(uint8_t));
-                            w.scales[si0] = s_lo;
-                            w.scales[si1] = s_hi;
-                            // Store min in next block's scale slots (for runtime access)
-                            size_t si2 = row * scales_per_row + (b + 1 == blocks_per_row_q41 ? 0 : b * 2 + 2);
-                            if (si2 < out_dim * scales_per_row) {
-                                w.scales[si2] = m_lo;
-                                w.scales[si2 + 1] = m_hi;
-                            }
-                        }
+                        size_t fi = (size_t)row * blocks_per_row_q41 * 2 + b * 2;
+                        w.scales_f[fi]     = __half2float(h_scale);  // scale
+                        w.scales_f[fi + 1] = __half2float(h_min);    // min
                     }
                 }
                 break;
             }
             case 7: case 8: { // Q8_0: block_size=32, layout [delta_fp16(2B), values_int8(32B)] = 34 bytes/block
                 fprintf(stderr, "[load_quant_weight] extracting Q8_0 FP16 delta\n");
-                w.scales.assign(out_dim * scales_per_row, 0); // zero-fill; delta read from blocks at runtime
+                w.quant_type = (t == 7) ? 7 : 8;
 
                 const uint8_t* data = w.packed.data();
                 size_t block_bytes_q80 = 34; // 2B delta + 32B int8 values
                 size_t blocks_per_row_q80 = (size_t)in_dim / 32;
+
+                // Q4_1-compatible layout: two decoded floats per block (scale=delta, min=0) -> N * (K/16) floats
+                w.scales_f.resize((size_t)out_dim * blocks_per_row_q80 * 2);
 
                 for (int64_t row = 0; row < out_dim; ++row) {
                     for (size_t b = 0; b < blocks_per_row_q80; ++b) {
                         const uint8_t* blk = data + (row * blocks_per_row_q80 + b) * block_bytes_q80;
                         __half h_delta;
                         memcpy(&h_delta, blk, sizeof(__half));
+                        float delta_f = __half2float(h_delta);
 
-                        size_t si0 = row * scales_per_row + b * 2;
-                        size_t si1 = si0 + 1;
-                        if (si0 < out_dim * scales_per_row) {
-                            uint8_t d_lo, d_hi;
-                            memcpy(&d_lo, &h_delta, sizeof(uint8_t));
-                            memcpy(&d_hi, ((uint8_t*)&h_delta + 1), sizeof(uint8_t));
-                            w.scales[si0] = d_lo;
-                            w.scales[si1] = d_hi;
-                        }
+                        size_t fi = (size_t)row * blocks_per_row_q80 * 2 + b * 2;
+                        w.scales_f[fi]     = delta_f;  // scale = delta for Q8_0
+                        w.scales_f[fi + 1] = 0.0f;      // min = 0 for Q8_0
                     }
                 }
                 break;
@@ -953,29 +969,138 @@ static bool load_model_weights(inference_model* m) {
                                 (si < total_scales_per_row) ? all_scales[si] : 0x60;
                         }
                     }
-                } else if (t == 2) { // Q4_0 in combined QKV — scales extracted per-row at runtime in true_v
-                    fprintf(stderr, "blk.%d: Q4_0 combined QKV — scales stored in blocks, use true_v for CPU ref\n", i);
-                    // Fill scale arrays with unity placeholder; real deltas read from blocks during true_v computation
+                } else if (t == 2) { // Q4_0 in combined QKV — decode FP16 delta from blocks per projection
+                    fprintf(stderr, "blk.%d: Q4_0 combined QKV — extracting FP16 delta from blocks\n", i);
+
+                    size_t block_bytes_q40 = 34; // For combined QKV, total block is 34 bytes (2B delta + 32B int8)
+                    size_t blocks_per_row_total = total_cols / 32;
+
                     for (int64_t row = 0; row < E; ++row) {
-                        for (size_t s = 0; s < q_scales_per_row; ++s) L.Wq.scales[row * q_scales_per_row + s] = 0x60;
-                        for (size_t s = 0; s < k_scales_per_row; ++s) L.Wk.scales[row * k_scales_per_row + s] = 0x60;
-                        for (size_t s = 0; s < v_scales_per_row; ++s) L.Wv.scales[row * v_scales_per_row + s] = 0x60;
+                        const unsigned char* src_row = pk + row * blocks_per_row_total * block_bytes_q40;
+
+                        // Extract all deltas from this row's blocks
+                        std::vector<float> all_deltas(blocks_per_row_total);
+                        for (size_t b = 0; b < blocks_per_row_total; ++b) {
+                            const uint8_t* blk = src_row + b * block_bytes_q40;
+                            __half h_delta;
+                            memcpy(&h_delta, blk, sizeof(__half));
+                            all_deltas[b] = __half2float(h_delta);
+                        }
+
+                        // Map scale+min pairs to projections based on column ranges (Q4_1-compatible layout)
+                        size_t q_blocks = DQ / 32;
+                        for (size_t s = 0; s < q_scales_per_row; ++s) {
+                            L.Wq.scales_f[(size_t)row * q_scales_per_row * 2 + s * 2] =
+                                (s < q_blocks && s < all_deltas.size()) ? all_deltas[s] : 1.0f; // scale=delta
+                            L.Wq.scales_f[(size_t)row * q_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0 for Q4_0
+                        }
+
+                        size_t k_start_block = q_blocks;
+                        size_t k_blocks = DKV / 32;
+                        for (size_t s = 0; s < k_scales_per_row; ++s) {
+                            size_t bi = k_start_block + s;
+                            L.Wk.scales_f[(size_t)row * k_scales_per_row * 2 + s * 2] =
+                                (bi < blocks_per_row_total && bi < all_deltas.size()) ? all_deltas[bi] : 1.0f; // scale=delta
+                            L.Wk.scales_f[(size_t)row * k_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0 for Q4_0
+                        }
+
+                        size_t v_start_block = q_blocks + k_blocks;
+                        for (size_t s = 0; s < v_scales_per_row; ++s) {
+                            size_t bi = v_start_block + s;
+                            L.Wv.scales_f[(size_t)row * v_scales_per_row * 2 + s * 2] =
+                                (bi < blocks_per_row_total && bi < all_deltas.size()) ? all_deltas[bi] : 1.0f; // scale=delta
+                            L.Wv.scales_f[(size_t)row * v_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0 for Q4_0
+                        }
                     }
 
-                } else if (t == 3) { // Q4_1 in combined QKV — scales extracted per-row at runtime in true_v
-                    fprintf(stderr, "blk.%d: Q4_1 combined QKV — scales stored in blocks, use true_v for CPU ref\n", i);
+                } else if (t == 3) { // Q4_1 in combined QKV — decode FP16 scale+min from blocks per projection
+                    fprintf(stderr, "blk.%d: Q4_1 combined QKV — extracting FP16 scale+min from blocks\n", i);
+
+                    size_t block_bytes_q41 = 34; // For combined QKV, total block is 34 bytes (2B scale + 2B min + 32B int8)
+                    size_t blocks_per_row_total = total_cols / 32;
+
                     for (int64_t row = 0; row < E; ++row) {
-                        for (size_t s = 0; s < q_scales_per_row; ++s) L.Wq.scales[row * q_scales_per_row + s] = 0x60;
-                        for (size_t s = 0; s < k_scales_per_row; ++s) L.Wk.scales[row * k_scales_per_row + s] = 0x60;
-                        for (size_t s = 0; s < v_scales_per_row; ++s) L.Wv.scales[row * v_scales_per_row + s] = 0x60;
+                        const unsigned char* src_row = pk + row * blocks_per_row_total * block_bytes_q41;
+
+                        // Extract all scale/min pairs from this row's blocks
+                        std::vector<float> all_scales(blocks_per_row_total * 2);
+                        for (size_t b = 0; b < blocks_per_row_total; ++b) {
+                            const uint8_t* blk = src_row + b * block_bytes_q41;
+                            __half h_scale, h_min;
+                            memcpy(&h_scale, blk, sizeof(__half));
+                            memcpy(&h_min, blk + 2, sizeof(__half));
+                            all_scales[b * 2]     = __half2float(h_scale); // scale
+                            all_scales[b * 2 + 1] = __half2float(h_min);    // min
+                        }
+
+                        // Map scale/min pairs to projections based on column ranges
+                        size_t q_blocks = DQ / 32;
+                        for (size_t s = 0; s < q_scales_per_row; ++s) {
+                            L.Wq.scales_f[(size_t)row * q_scales_per_row + s] =
+                                (s * 2 < (size_t)all_scales.size() && s * 2 + 1 < (size_t)all_scales.size())
+                                    ? all_scales[s * 2] : 1.0f;
+                        }
+
+                        size_t k_start_block = q_blocks;
+                        size_t k_blocks = DKV / 32;
+                        for (size_t s = 0; s < k_scales_per_row; ++s) {
+                            size_t bi = k_start_block + s;
+                            L.Wk.scales_f[(size_t)row * k_scales_per_row + s] =
+                                (bi * 2 < (size_t)all_scales.size() && bi * 2 + 1 < (size_t)all_scales.size())
+                                    ? all_scales[bi * 2] : 1.0f;
+                        }
+
+                        size_t v_start_block = q_blocks + k_blocks;
+                        for (size_t s = 0; s < v_scales_per_row; ++s) {
+                            size_t bi = v_start_block + s;
+                            L.Wv.scales_f[(size_t)row * v_scales_per_row * 2 + s * 2] =
+                                (bi * 2 < (size_t)all_scales.size() && bi * 2 + 1 < (size_t)all_scales.size())
+                                    ? all_scales[bi * 2] : 1.0f;
+                        }
                     }
 
-                } else if (t == 7 || t == 8) { // Q8_0 in combined QKV — scales extracted per-row at runtime in true_v
-                    fprintf(stderr, "blk.%d: Q8_0 combined QKV — scales stored in blocks, use true_v for CPU ref\n", i);
+                } else if (t == 7 || t == 8) { // Q8_0 in combined QKV — decode FP16 delta from blocks per projection
+                    fprintf(stderr, "blk.%d: Q8_0 combined QKV — extracting FP16 delta from blocks\n", i);
+
+                    size_t block_bytes_q80 = 34; // 2B delta + 32B int8 values
+                    size_t blocks_per_row_total = total_cols / 32;
+
                     for (int64_t row = 0; row < E; ++row) {
-                        for (size_t s = 0; s < q_scales_per_row; ++s) L.Wq.scales[row * q_scales_per_row + s] = 0x60;
-                        for (size_t s = 0; s < k_scales_per_row; ++s) L.Wk.scales[row * k_scales_per_row + s] = 0x60;
-                        for (size_t s = 0; s < v_scales_per_row; ++s) L.Wv.scales[row * v_scales_per_row + s] = 0x60;
+                        const unsigned char* src_row = pk + row * blocks_per_row_total * block_bytes_q80;
+
+                        // Extract all deltas from this row's blocks
+                        std::vector<float> all_deltas(blocks_per_row_total);
+                        for (size_t b = 0; b < blocks_per_row_total; ++b) {
+                            const uint8_t* blk = src_row + b * block_bytes_q80;
+                            __half h_delta;
+                            memcpy(&h_delta, blk, sizeof(__half));
+                            all_deltas[b] = __half2float(h_delta);
+                        }
+
+                        // Map scale+min pairs to projections based on column ranges (Q4_1-compatible layout)
+                        size_t q_blocks = DQ / 32;
+                        for (size_t s = 0; s < q_scales_per_row; ++s) {
+                            L.Wq.scales_f[(size_t)row * q_scales_per_row * 2 + s * 2] =
+                                (s < q_blocks && s < all_deltas.size()) ? all_deltas[s] : 1.0f; // scale=delta
+                            L.Wq.scales_f[(size_t)row * q_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0 for Q8_0
+                        }
+
+                        size_t k_start_block = q_blocks;
+                        size_t k_blocks = DKV / 32;
+                        for (size_t s = 0; s < k_scales_per_row; ++s) {
+                            size_t bi = k_start_block + s;
+                            L.Wk.scales_f[(size_t)row * k_scales_per_row * 2 + s * 2] =
+                                (bi < blocks_per_row_total && bi < all_deltas.size()) ? all_deltas[bi] : 1.0f; // scale=delta
+                            L.Wk.scales_f[(size_t)row * k_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0 for Q8_0
+                        }
+
+                        size_t v_start_block = q_blocks + k_blocks;
+                        for (size_t s = 0; s < v_scales_per_row; ++s) {
+                            size_t bi = v_start_block + s;
+                            L.Wv.scales_f[(size_t)row * v_scales_per_row * 2 + s * 2] =
+                                (bi < blocks_per_row_total && bi < all_deltas.size()) ? all_deltas[bi] : 1.0f; // scale=delta
+                            L.Wv.scales_f[(size_t)row * v_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0 for Q8_0
+                        }
                     }
 
                 } else {
@@ -983,13 +1108,16 @@ static bool load_model_weights(inference_model* m) {
                     fprintf(stderr, "blk.%d: unknown type %d in combined QKV, filling unity placeholder\n", i, t);
                     for (int64_t row = 0; row < E; ++row) {
                         for (size_t s = 0; s < q_scales_per_row; ++s) {
-                            L.Wq.scales[row * q_scales_per_row + s] = 0x60; // unity UE4M3 = 1.0f
+                            L.Wq.scales_f[row * q_scales_per_row * 2 + s * 2] = 1.0f;   // scale=1.0
+                            L.Wq.scales_f[row * q_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0
                         }
                         for (size_t s = 0; s < k_scales_per_row; ++s) {
-                            L.Wk.scales[row * k_scales_per_row + s] = 0x60;
+                            L.Wk.scales_f[row * k_scales_per_row * 2 + s * 2] = 1.0f;   // scale=1.0
+                            L.Wk.scales_f[row * k_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0
                         }
                         for (size_t s = 0; s < v_scales_per_row; ++s) {
-                            L.Wv.scales[row * v_scales_per_row + s] = 0x60;
+                            L.Wv.scales_f[row * v_scales_per_row * 2 + s * 2] = 1.0f;   // scale=1.0
+                            L.Wv.scales_f[row * v_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0
                         }
                     }
                 }

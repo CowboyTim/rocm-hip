@@ -40,6 +40,7 @@ struct inference_model {
         struct QuantWeight {
             void* d_packed = nullptr;
             void* d_scales = nullptr;
+            void* d_scales_f = nullptr;     // device ptr for scaled_f (Q4_0/Q4_1/Q8_0 types)
         } Wq, Wk, Wv, Wo, Wgate, Wup, Wdown;
         void* d_attn_ln = nullptr;
         void* d_mlp_ln = nullptr;
@@ -48,9 +49,11 @@ struct inference_model {
     struct QuantWeight {
         void* d_packed = nullptr;
         void* d_scales = nullptr;
+        void* d_scales_f = nullptr;         // device ptr for scaled_f (Q4_0/Q4_1/Q8_0 types)
     } lm_head;
     void* d_lm_head_packed = nullptr;
-    void* d_lm_head_scales = nullptr;
+    void* d_lm_head_scales = nullptr;               // device ptr for scales (UE4M3 types)
+    void* d_lm_head_scales_f = nullptr;             // device ptr for scaled_f (Q4_0/Q4_1/Q8_0 types)
     void* d_final_ln = nullptr;
     inference_kv_cache_t* kvc = nullptr;
 
@@ -335,14 +338,16 @@ struct QwenModel {
 
             // --- b) Q/K/V Projections (gemm_act_fp4, M=1) ---
             // Q: [1 x DQ] = h[1 x E] @ Wq^T
-            void* g4_args[] = { &s.d_h, &L.Wq.d_packed, &L.Wq.d_scales, &s.d_q,
-                               &one, &DQ_local, &E_local };
+            void* g4_args[] = { &s.d_h, &L.Wq.d_packed, &L.Wq.d_scales, &L.Wq.d_scales_f, &s.d_q,
+                                &one, &DQ_local, &E_local };
             (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DQ+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
             // K: [1 x DKV] = h[1 x E] @ Wk^T
-            g4_args[1] = &L.Wk.d_packed; g4_args[2] = &L.Wk.d_scales; g4_args[3] = &s.d_k; g4_args[5] = &DKV_local;
+            g4_args[1] = &L.Wk.d_packed; g4_args[2] = &L.Wk.d_scales; g4_args[3] = &L.Wk.d_scales_f; g4_args[4] = &s.d_k;
+            g4_args[6] = &DKV_local;
             (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DKV+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
             // V: [1 x DKV] = h[1 x E] @ Wv^T
-            g4_args[1] = &L.Wv.d_packed; g4_args[2] = &L.Wv.d_scales; g4_args[3] = &s.d_v; g4_args[5] = &DKV_local;
+            g4_args[1] = &L.Wv.d_packed; g4_args[2] = &L.Wv.d_scales; g4_args[3] = &L.Wv.d_scales_f; g4_args[4] = &s.d_v;
+            g4_args[6] = &DKV_local;
             (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DKV+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
             (void)hipDeviceSynchronize();
 
@@ -424,7 +429,7 @@ struct QwenModel {
             (void)hipHostGetDevicePointer(&s.d_oin, s.oin, 0);
 
             // --- h) O-Projection ---
-            void* o_args[] = { &s.d_oin, &L.Wo.d_packed, &L.Wo.d_scales, &s.d_down,
+            void* o_args[] = { &s.d_oin, &L.Wo.d_packed, &L.Wo.d_scales, &L.Wo.d_scales_f, &s.d_down,
                               &one, &E_local, &DQ_local };
             (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (E+15)/16, 1, 32, 1, 1, 0, 0, o_args, nullptr);
             (void)hipDeviceSynchronize();
@@ -461,7 +466,7 @@ struct QwenModel {
 
         // ---- 4) LM Head (gemm_act_fp4, M=1, N=vocab_size) ----
         void* lm_args[] = { &layer_scratch[0].d_h, &eng_model->d_lm_head_packed,
-                           &eng_model->d_lm_head_scales, logits_out,
+                           &eng_model->d_lm_head_scales, &eng_model->d_lm_head_scales_f, logits_out,
                            &one, &vocab_local, &E_local };
         (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (vocab_size+15)/16, 1, 32, 1, 1, 0, 0, lm_args, nullptr);
         (void)hipDeviceSynchronize();
@@ -587,7 +592,9 @@ int qwen_model_forward_batch(qwen_model_t* model,
         // Batch dimension Z: process all sequences simultaneously
         {
             std::vector<void*> d_input_arr(batch_size), d_output_arr(batch_size);
-            void* w_packed = L.Wq.d_packed, *w_scales = L.Wq.d_scales;
+            void* w_packed = L.Wq.d_packed; 
+            void* w_scales = L.Wq.d_scales;
+            void* w_scales_f = L.Wq.d_scales_f;
 
             for (int b = 0; b < batch_size; ++b) {
                 d_input_arr[b] = m->layer_scratch[0].d_h;   // offset handled via blockIdx.z
@@ -595,7 +602,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
             }
 
             int DQ_b = DQ_local;
-            void* g4_args[] = { &d_input_arr[0], &w_packed, &w_scales, &d_output_arr[0],
+            void* g4_args[] = { &d_input_arr[0], &w_packed, &w_scales, &w_scales_f, &d_output_arr[0],
                                &one_int, &DQ_b, &E_local };
             dim3 gemm_grid(1, (DQ + 15) / 16, batch_size);
             (void)hipModuleLaunchKernel(fn_gemm_act_fp4, gemm_grid.x, gemm_grid.y, gemm_grid.z,
@@ -605,10 +612,10 @@ int qwen_model_forward_batch(qwen_model_t* model,
             }
 
             // K projection: [1 x DKV] = h @ Wk^T
-            w_packed = L.Wk.d_packed; w_scales = L.Wk.d_scales;
+            w_packed = L.Wk.d_packed; w_scales = L.Wk.d_scales; w_scales_f = L.Wk.d_scales_f;
             int DKV_b = DKV_local;
             for (int b = 0; b < batch_size; ++b) d_output_arr[b] = m->layer_scratch[l].d_k;
-            void* k4_args[] = { &d_input_arr[0], &w_packed, &w_scales, &d_output_arr[0],
+            void* k4_args[] = { &d_input_arr[0], &w_packed, &w_scales, &w_scales_f, &d_output_arr[0],
                                 &one_int, &DKV_b, &E_local };
             dim3 k_grid(1, (DKV + 15) / 16, batch_size);
             (void)hipModuleLaunchKernel(fn_gemm_act_fp4, k_grid.x, k_grid.y, k_grid.z,
@@ -618,9 +625,9 @@ int qwen_model_forward_batch(qwen_model_t* model,
             }
 
             // V projection: [1 x DKV] = h @ Wv^T
-            w_packed = L.Wv.d_packed; w_scales = L.Wv.d_scales;
+            w_packed = L.Wv.d_packed; w_scales = L.Wv.d_scales; w_scales_f = L.Wv.d_scales_f;
             for (int b = 0; b < batch_size; ++b) d_output_arr[b] = m->layer_scratch[l].d_v;
-            void* v4_args[] = { &d_input_arr[0], &w_packed, &w_scales, &d_output_arr[0],
+            void* v4_args[] = { &d_input_arr[0], &w_packed, &w_scales, &w_scales_f, &d_output_arr[0],
                                &one_int, &DKV_b, &E_local };
             (void)hipModuleLaunchKernel(fn_gemm_act_fp4, k_grid.x, k_grid.y, k_grid.z,
                                  32, 16, 1, 0, 0, v4_args, nullptr);
@@ -721,7 +728,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
                 out_arr[b] = m->layer_scratch[l].d_down;   // residual add destination (offset by seq)
             }
 
-            void* o_args[] = { &inp_arr[0], &L.Wo.d_packed, &L.Wo.d_scales, &out_arr[0],
+            void* o_args[] = { &inp_arr[0], &L.Wo.d_packed, &L.Wo.d_scales, &L.Wo.d_scales_f, &out_arr[0],
                               &one_int, &E_local, &DQ_local };
             dim3 o_grid(1, (E + 15) / 16, batch_size);
             (void)hipModuleLaunchKernel(fn_gemm_act_fp4, o_grid.x, o_grid.y, o_grid.z,
@@ -798,7 +805,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
 
         int vocab_b = m->vocab_size;
         void* lm_args[] = { &inp_arr[0], &eng->d_lm_head_packed,
-                           &eng->d_lm_head_scales, &out_arr[0],
+                           &eng->d_lm_head_scales, &eng->d_lm_head_scales_f, &out_arr[0],
                            &one_int, &vocab_b, &E_local };
         dim3 lm_grid(1, (vocab_b + 15) / 16, batch_size);
         (void)hipModuleLaunchKernel(fn_gemm_act_fp4, lm_grid.x, lm_grid.y, lm_grid.z,
