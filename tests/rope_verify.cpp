@@ -167,11 +167,11 @@ int main(int argc, char* argv[]) {
     }
 
     int failed = 0;
-    
+
     for (const auto& s : shapes) {
         std::vector<int> pos(positions.begin(), positions.begin() + s.rows);
         if (!run_shape(s.rows, s.dim, pos)) failed++;
-        
+
     }
 
     if (failed == 0) { printf("\n  ROPE VERIFICATION PASSED (%zu shape%s)\n\n", shapes.size(), shapes.size() > 1 ? "s" : ""); return 0; }

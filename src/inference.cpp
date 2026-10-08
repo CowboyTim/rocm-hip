@@ -126,13 +126,13 @@ static bool pin_model_memory(inference_model* m) {
     for (auto& L : m->layers) {
         auto pin = [](QuantWeight& w) -> bool {
             if (w.packed.empty()) return true;  // Empty is OK for tied/embedded models
-            if (hipHostRegister(w.packed.data(), w.packed.size(), hipHostRegisterDefault) != hipSuccess) { 
-                fprintf(stderr, "[pin_model] packed register failed (%zu bytes)\n", w.packed.size()); 
-                return false; 
+            if (hipHostRegister(w.packed.data(), w.packed.size(), hipHostRegisterDefault) != hipSuccess) {
+                fprintf(stderr, "[pin_model] packed register failed (%zu bytes)\n", w.packed.size());
+                return false;
             }
-            if (hipHostRegister(w.scales.data(), w.scales.size(), hipHostRegisterDefault) != hipSuccess) { 
-                fprintf(stderr, "[pin_model] scales register failed (%zu bytes)\n", w.scales.size()); 
-                return false; 
+            if (hipHostRegister(w.scales.data(), w.scales.size(), hipHostRegisterDefault) != hipSuccess) {
+                fprintf(stderr, "[pin_model] scales register failed (%zu bytes)\n", w.scales.size());
+                return false;
             }
             (void)hipHostGetDevicePointer(&w.d_packed, w.packed.data(), 0);
             (void)hipHostGetDevicePointer(&w.d_scales, w.scales.data(), 0);
@@ -212,7 +212,7 @@ static void extract_scales_type100(const uint8_t* data, size_t nbytes, uint8_t* 
     const size_t block_bytes = 17; // 2 scale bytes + 16 packed data bytes
     const size_t scales_per_block = 2;
     const size_t blocks_per_row = nbytes / block_bytes;
-    
+
     for (int64_t row = 0; row < N; ++row) {
         size_t row_blocks = blocks_per_row;
         for (size_t b = 0; b < row_blocks; ++b) {
@@ -231,7 +231,7 @@ static void extract_scales_type13(const uint8_t* data, size_t nbytes, uint8_t* s
     const size_t block_bytes = 144; // 16 scale bytes + 128 packed data bytes
     const size_t scales_per_block = 16;
     const size_t blocks_per_row = nbytes / block_bytes;
-    
+
     for (int64_t row = 0; row < N; ++row) {
         size_t row_blocks = blocks_per_row;
         for (size_t b = 0; b < row_blocks; ++b) {
@@ -248,7 +248,7 @@ static void extract_scales_type13(const uint8_t* data, size_t nbytes, uint8_t* s
 static void extract_scales_q8_0(const uint8_t* data, size_t nbytes, float* scales_out, int64_t N) {
     const size_t block_bytes = 34; // 2 byte delta + 32 bytes int8 values
     const size_t blocks_per_row = nbytes / block_bytes;
-    
+
     for (int64_t row = 0; row < N; ++row) {
         size_t row_blocks = blocks_per_row;
         for (size_t b = 0; b < row_blocks; ++b) {
@@ -265,7 +265,7 @@ static void extract_scales_q8_0(const uint8_t* data, size_t nbytes, float* scale
 static void extract_scales_q4_0(const uint8_t* data, size_t nbytes, float* scales_out, int64_t N) {
     const size_t block_bytes = 20; // 2 byte scale + 2 byte min + 16 bytes packed
     const size_t blocks_per_row = nbytes / block_bytes;
-    
+
     for (int64_t row = 0; row < N; ++row) {
         size_t row_blocks = blocks_per_row;
         for (size_t b = 0; b < row_blocks; ++b) {
@@ -281,7 +281,7 @@ static void extract_scales_q4_0(const uint8_t* data, size_t nbytes, float* scale
 static void extract_scales_q4_1(const uint8_t* data, size_t nbytes, float* scales_out, int64_t N) {
     const size_t block_bytes = 20; // same layout as Q4_0
     const size_t blocks_per_row = nbytes / block_bytes;
-    
+
     for (int64_t row = 0; row < N; ++row) {
         size_t row_blocks = blocks_per_row;
         for (size_t b = 0; b < row_blocks; ++b) {
@@ -311,16 +311,16 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
     }
     int t = gguf_tensor_type(gguf, idx);
     int self_contained = gguf_type_is_self_contained(t);
-    
+
     // For self-contained types, external .scales tensor is optional — extract from blocks or fill with placeholder
     if (!s_ptr && !self_contained) {
         fprintf(stderr, "Missing scales tensor %s (type %d requires external scales)\n", scales_name, t);
         return false;
     } else if (!s_ptr && self_contained) {
-        fprintf(stderr, "[load_quant_weight] %s: self-contained type %d, no external scales — extracting from blocks\n", 
+        fprintf(stderr, "[load_quant_weight] %s: self-contained type %d, no external scales — extracting from blocks\n",
                 weight_name, t);
     }
-    
+
     // Get dimensions: assume 2D [out_dim, in_dim]
     int64_t* ne = gguf_tensor_ne(gguf, idx);
     if (!ne) return false;
@@ -330,7 +330,7 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
     w.K = (int)in_dim;
     // Copy packed bytes from weight tensor
     w.packed.assign((const unsigned char*)w_ptr, (const unsigned char*)w_ptr + w_sz);
-    
+
     if (s_ptr && s_sz > 0) {
         // External scales tensor found — use it normally
         w.scales.assign((const unsigned char*)s_ptr, (const unsigned char*)s_ptr + s_sz);
@@ -338,7 +338,7 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
         // Self-contained type with no external scales — extract actual scales from within each block
         size_t scales_per_row = ((size_t)in_dim + 15) >> 4;  // UE4M3 scale per 16 elements (standard layout)
         w.scales.resize((size_t)out_dim * scales_per_row);
-        
+
         // Determine extraction strategy based on type
         switch (t) {
             case 100: {
@@ -347,22 +347,22 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
                 // Total blob = w_sz; blocks per row = K / 32; scales per block = 2.
                 // Repack to standard layout: one UE4M3 scale byte per 16 elements.
                 fprintf(stderr, "[load_quant_weight] extracting TYPE100 scales\n");
-                
+
                 const uint8_t* data = w.packed.data();
                 // TYPE100: UE4M3 scales embedded in blocks alongside packed data (w_sz / 17 total blocks)
                 size_t blocks_per_row = (size_t)in_dim / 32;
                 size_t tmp_scales_per_row = blocks_per_row * 2;
-                
+
                 std::vector<uint8_t> tmp_scales((size_t)out_dim * tmp_scales_per_row);
-                
+
                 for (int64_t row = 0; row < out_dim; ++row) {
                     int64_t row_start_elem = row * in_dim;
                     size_t row_start_block = (size_t)row_start_elem / 32;
-                    
+
                     for (size_t b = 0; b < blocks_per_row; ++b) {
                         size_t blk_idx = row_start_block + b;
                         size_t src_off = blk_idx * 17;
-                        
+
                         for (size_t s = 0; s < 2; ++s) {
                             size_t global_si = (size_t)(row * blocks_per_row * 2) + b * 2 + s;
                             if (global_si < tmp_scales.size()) {
@@ -371,12 +371,12 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
                         }
                     }
                 }
-                
+
                 // Repack: map extracted scales to standard per-row layout (K/16 scale bytes per row)
                 for (int64_t row = 0; row < out_dim; ++row) {
                     size_t src_row_off = (size_t)row * tmp_scales_per_row;
                     for (size_t s = 0; s < scales_per_row; ++s) {
-                        w.scales[row * scales_per_row + s] = 
+                        w.scales[row * scales_per_row + s] =
                             (s < tmp_scales_per_row) ? tmp_scales[src_row_off + s] : 0x60;
                     }
                 }
@@ -387,22 +387,22 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
                 // Block layout (144 bytes): [scale_0..scale_15(16B), packed_data(128B)].
                 // Each scale covers 16 elements within the block.
                 fprintf(stderr, "[load_quant_weight] extracting TYPE13 scales\n");
-                
+
                 const uint8_t* data = w.packed.data();
                 // total_blocks = w_sz / 144 (documented, not needed for calculation)
                 size_t blocks_per_row = (size_t)in_dim / 256;
                 size_t tmp_scales_per_row = blocks_per_row * 16;
-                
+
                 std::vector<uint8_t> tmp_scales((size_t)out_dim * tmp_scales_per_row);
-                
+
                 for (int64_t row = 0; row < out_dim; ++row) {
                     int64_t row_start_elem = row * in_dim;
                     size_t row_start_block = (size_t)row_start_elem / 256;
-                    
+
                     for (size_t b = 0; b < blocks_per_row; ++b) {
                         size_t blk_idx = row_start_block + b;
                         const uint8_t* blk = data + blk_idx * 144;
-                        
+
                         for (size_t s = 0; s < 16; ++s) {
                             size_t global_si = (size_t)(row * tmp_scales_per_row) + b * 16 + s;
                             if (global_si < tmp_scales.size()) {
@@ -411,12 +411,12 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
                         }
                     }
                 }
-                
+
                 // Repack: map extracted scales to standard per-row layout
                 for (int64_t row = 0; row < out_dim; ++row) {
                     size_t src_row_off = (size_t)row * tmp_scales_per_row;
                     for (size_t s = 0; s < scales_per_row; ++s) {
-                        w.scales[row * scales_per_row + s] = 
+                        w.scales[row * scales_per_row + s] =
                             (s < tmp_scales_per_row) ? tmp_scales[src_row_off + s] : 0x60;
                     }
                 }
@@ -425,15 +425,15 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
             case 2: { // Q4_0: block_size=32, layout [delta_fp16(2B), packed_data(16B)] = 18 bytes/block
                 fprintf(stderr, "[load_quant_weight] extracting Q4_0 FP16 deltas\n");
                 w.scales.assign(out_dim * scales_per_row, 0); // zero-fill; delta read from blocks at runtime
-                
+
                 const uint8_t* data = w.packed.data();
                 size_t block_bytes_q40 = 18; // 2B delta + 16B packed data
                 size_t blocks_per_row_q40 = (size_t)in_dim / 32;
-                
+
                 for (int64_t row = 0; row < out_dim; ++row) {
                     for (size_t b = 0; b < blocks_per_row_q40; ++b) {
                         const uint8_t* blk = data + (row * blocks_per_row_q40 + b) * block_bytes_q40;
-                        
+
                         // Repack FP16 delta as two UE4M3-style scale entries for GPU kernel compatibility
                         size_t si0 = row * scales_per_row + b * 2;
                         size_t si1 = si0 + 1;
@@ -451,18 +451,18 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
             case 3: { // Q4_1: block_size=32, layout [scale_fp16(2B), min_fp16(2B), packed_data(16B)] = 20 bytes/block
                 fprintf(stderr, "[load_quant_weight] extracting Q4_1 FP16 scale+min\n");
                 w.scales.assign(out_dim * scales_per_row, 0); // zero-fill; scale+min read from blocks at runtime
-                
+
                 const uint8_t* data = w.packed.data();
                 size_t block_bytes_q41 = 20; // 2B scale + 2B min + 16B packed data
                 size_t blocks_per_row_q41 = (size_t)in_dim / 32;
-                
+
                 for (int64_t row = 0; row < out_dim; ++row) {
                     for (size_t b = 0; b < blocks_per_row_q41; ++b) {
                         const uint8_t* blk = data + (row * blocks_per_row_q41 + b) * block_bytes_q41;
                         __half h_scale, h_min;
                         memcpy(&h_scale, blk, sizeof(__half));
                         memcpy(&h_min, blk + 2, sizeof(__half));
-                        
+
                         size_t si0 = row * scales_per_row + b * 2;
                         size_t si1 = si0 + 1;
                         if (si0 < out_dim * scales_per_row) {
@@ -487,17 +487,17 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
             case 7: case 8: { // Q8_0: block_size=32, layout [delta_fp16(2B), values_int8(32B)] = 34 bytes/block
                 fprintf(stderr, "[load_quant_weight] extracting Q8_0 FP16 delta\n");
                 w.scales.assign(out_dim * scales_per_row, 0); // zero-fill; delta read from blocks at runtime
-                
+
                 const uint8_t* data = w.packed.data();
                 size_t block_bytes_q80 = 34; // 2B delta + 32B int8 values
                 size_t blocks_per_row_q80 = (size_t)in_dim / 32;
-                
+
                 for (int64_t row = 0; row < out_dim; ++row) {
                     for (size_t b = 0; b < blocks_per_row_q80; ++b) {
                         const uint8_t* blk = data + (row * blocks_per_row_q80 + b) * block_bytes_q80;
                         __half h_delta;
                         memcpy(&h_delta, blk, sizeof(__half));
-                        
+
                         size_t si0 = row * scales_per_row + b * 2;
                         size_t si1 = si0 + 1;
                         if (si0 < out_dim * scales_per_row) {
@@ -523,10 +523,10 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
             }
         }
     }
-    
+
     // Build true_v for CPU reference (dequant using loaded scales)
     w.true_v.resize((size_t)w.N * w.K);
-    
+
     switch (t) {
         case 100: { // TYPE100/MXFP4: [scale_lo(1B), scale_hi(1B), packed_data(16B)] = 17 bytes per 32 values
             fprintf(stderr, "[load_quant_weight] true_v: TYPE100 UE4M3 formula\n");
@@ -566,7 +566,7 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
             }
             break;
         }
-        case 14: { // TYPE14: [scales(16B), packed_data(...)] = 176 bytes per 256 values  
+        case 14: { // TYPE14: [scales(16B), packed_data(...)] = 176 bytes per 256 values
             fprintf(stderr, "[load_quant_weight] true_v: TYPE14 UE4M3 formula\n");
             {
                 size_t blocks_per_row = (size_t)in_dim / 256;
@@ -595,7 +595,7 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
                         __half h_delta;
                         memcpy(&h_delta, blk, sizeof(__half));
                         float delta_f = __half2float(h_delta);
-                        
+
                         for (int v = 0; v < 32; ++v) {
                             int k = (int)b * 32 + v;
                             uint8_t wb = blk[2 + ((size_t)(b * 32 + v) >> 1)];
@@ -623,12 +623,12 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
                         memcpy(&h_min, blk + 2, sizeof(__half));
                         float scale_f = __half2float(h_scale);
                         float min_f = __half2float(h_min);
-                        
+
                         for (int v = 0; v < 32; ++v) {
                             int k = (int)b * 32 + v;
                             uint8_t wb = blk[4 + ((size_t)(b * 32 + v) >> 1)];
                             uint8_t nib = (k & 1) ? (wb >> 4) : (wb & 0x0F);
-                            // Q4_1: value = scale * codebook[nibble] + min  
+                            // Q4_1: value = scale * codebook[nibble] + min
                             w.true_v[(size_t)n * w.K + k] = scale_f * dequant_code(nib) + min_f;
                         }
                     }
@@ -647,7 +647,7 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
                         __half h_delta;
                         memcpy(&h_delta, blk, sizeof(__half));
                         float delta_f = __half2float(h_delta);
-                        
+
                         for (int v = 0; v < 32; ++v) {
                             int k = (int)b * 32 + v;
                             int8_t val = (int8_t)blk[2 + v]; // int8 value at offset 2 within block
@@ -701,37 +701,37 @@ static bool load_model_weights(inference_model* m) {
                 fprintf(stderr, "[load_model_weights] blk.%d: SSM layer detected, skipping\n", i);
             }
         }
-        
+
         if (is_ssm_layer) continue;  // Skip SSM-only layers entirely
-        
+
         // Check if we have a combined QKV tensor (Qwen3.5-4B pattern) or separate ones (Qwen3-7B)
         snprintf(wname, sizeof(wname), "blk.%d.attn_qkv.weight", i);
         snprintf(sname, sizeof(sname), "blk.%d.attn_qkv.scales", i);
-        
+
         size_t qkv_w_sz = 0;
         const void* qkv_ptr = gguf_get_tensor_ptr(m->gguf, wname, &qkv_w_sz);
-        
+
         if (qkv_ptr && qkv_w_sz > 0) {
             // Combined QKV tensor found — load and split into Wq/Wk/Wv
-            fprintf(stderr, "[load_model_weights] blk.%d: using combined attn_qkv weight [%ld x %ld]\n", 
+            fprintf(stderr, "[load_model_weights] blk.%d: using combined attn_qkv weight [%ld x %ld]\n",
                     i, (long)m->layers[i].Wq.N, (long)(m->n_head * m->head_dim + 2 * m->n_head_kv * m->head_dim));
-            
+
             int qidx = find_tensor_index(m->gguf, wname);
             if (qidx < 0) return false;
             int64_t* ne = gguf_tensor_ne(m->gguf, qidx);
             if (!ne) return false;
-            
+
             int64_t E = ne[0];              // embedding length (rows)
             int64_t DQ = (int64_t)m->n_head * m->head_dim;   // Q columns
             int64_t DKV = (int64_t)m->n_head_kv * m->head_dim; // K/V columns
-            
+
             size_t total_cols = DQ + 2 * DKV;
             size_t packed_bytes_per_row = total_cols >> 1;  // 2 nibbles per byte
-            
+
             L.Wq.N = (int)E; L.Wq.K = (int)DQ;
             L.Wk.N = (int)E; L.Wk.K = (int)DKV;
             L.Wv.N = (int)E; L.Wv.K = (int)DKV;
-            
+
             // Load scales — check if tensor type is self-contained first
             int qkv_type = find_tensor_index(m->gguf, wname);
             int self_contained = 0;
@@ -740,13 +740,13 @@ static bool load_model_weights(inference_model* m) {
                 self_contained = gguf_type_is_self_contained(t);
                 fprintf(stderr, "blk.%d: qkv_type=%d self_contained=%d\n", i, t, self_contained);
             }
-            
+
             size_t s_sz;
             const void* s_ptr = gguf_get_tensor_ptr(m->gguf, sname, &s_sz);
-            
+
             if (!self_contained && !s_ptr) {
                 // Non-self-contained type without external scales — cannot proceed
-                fprintf(stderr, "blk.%d: combined qkv scales tensor not found (type %d requires external scales)\n", 
+                fprintf(stderr, "blk.%d: combined qkv scales tensor not found (type %d requires external scales)\n",
                         i, qkv_type >= 0 ? gguf_tensor_type(m->gguf, qkv_type) : -1);
                 return false;
             } else if (!self_contained && s_ptr) {
@@ -755,22 +755,22 @@ static bool load_model_weights(inference_model* m) {
                 // Self-contained type (TYPE13/Q4_0/Q8_0/etc.) — no external scales expected
                 fprintf(stderr, "blk.%d: self-contained quantization type detected, skipping external scale lookup\n", i);
             }
-            
+
             const unsigned char* pk = (const unsigned char*)qkv_ptr;
-            
+
             // Allocate packed arrays for each projection
             size_t q_packed_bytes = (size_t)E * ((size_t)DQ >> 1);
             size_t k_packed_bytes = (size_t)E * ((size_t)DKV >> 1);
             size_t v_packed_bytes = (size_t)E * ((size_t)DKV >> 1);
-            
+
             L.Wq.packed.resize(q_packed_bytes);
             L.Wk.packed.resize(k_packed_bytes);
             L.Wv.packed.resize(v_packed_bytes);
-            
+
             // Extract packed data row by row
             for (int64_t row = 0; row < E; ++row) {
                 const unsigned char* src_row = pk + row * packed_bytes_per_row;
-                
+
                 // Q: columns [0 .. DQ-1] → packed cols [0 .. DQ/2-1]
                 for (int c = 0; c < (int)DQ - 1; c += 2) {
                     size_t dst_off = (size_t)(c >> 1);
@@ -785,7 +785,7 @@ static bool load_model_weights(inference_model* m) {
                     unsigned char b = src_row[src_off];
                     L.Wq.packed[(size_t)row * q_packed_bytes / E + dst_off] = (unsigned char)(b & 0x0F);
                 }
-                
+
                 // K: columns [DQ .. DQ+DKV-1] → packed cols [0 .. DKV/2-1]
                 for (int c = 0; c < (int)DKV - 1; c += 2) {
                     int global_col = (int)DQ + c;
@@ -801,8 +801,8 @@ static bool load_model_weights(inference_model* m) {
                     unsigned char b = src_row[src_off];
                     L.Wk.packed[(size_t)row * k_packed_bytes / E + dst_off] = (unsigned char)(b & 0x0F);
                 }
-                
-                // V: columns [DQ+DKV .. DQ+2*DKV-1] → packed cols [0 .. DKV/2-1]  
+
+                // V: columns [DQ+DKV .. DQ+2*DKV-1] → packed cols [0 .. DKV/2-1]
                 for (int c = 0; c < (int)DKV - 1; c += 2) {
                     int global_col = (int)DQ + (int)DKV + c;
                     size_t src_off = (size_t)(global_col >> 1);
@@ -818,23 +818,23 @@ static bool load_model_weights(inference_model* m) {
                     L.Wv.packed[(size_t)row * v_packed_bytes / E + dst_off] = (unsigned char)(b & 0x0F);
                 }
             }
-            
-            // Load scales — try per-projection first, then combined fallback  
+
+            // Load scales — try per-projection first, then combined fallback
             char sname_q[128], sname_k[128], sname_v[128];
             snprintf(sname_q, sizeof(sname_q), "blk.%d.attn_q.scales", i);
             snprintf(sname_k, sizeof(sname_k), "blk.%d.attn_k.scales", i);
             snprintf(sname_v, sizeof(sname_v), "blk.%d.attn_v.scales", i);
-            
+
             size_t sq_sz;
             const void* sq_ptr = gguf_get_tensor_ptr(m->gguf, sname_q, &sq_sz);
-            
+
             if (!self_contained) {
                 // Non-self-contained types require external scales — use existing split logic
                 if (sq_ptr && sq_sz > 0) {
                     // Separate scales for each projection (Qwen3-7B style)
                     const void* sk_p = gguf_get_tensor_ptr(m->gguf, sname_k, &sq_sz);
                     const void* sv_p = gguf_get_tensor_ptr(m->gguf, sname_v, &sq_sz);
-                    
+
                     L.Wq.scales.assign((const unsigned char*)sq_ptr, (const unsigned char*)sq_ptr + sq_sz);
                     L.Wk.scales.assign((const unsigned char*)sk_p, (const unsigned char*)sk_p + sq_sz);
                     L.Wv.scales.assign((const unsigned char*)sv_p, (const unsigned char*)sv_p + sq_sz);
@@ -842,39 +842,39 @@ static bool load_model_weights(inference_model* m) {
                     // Combined scales tensor — split by row index and scale column offset
                     int sc_idx = find_tensor_index(m->gguf, sname);
                     if (sc_idx < 0) return false;
-                    
+
                     int64_t* ne_sc = gguf_tensor_ne(m->gguf, sc_idx);
                     if (!ne_sc) return false;
                     size_t total_scale_cols = (size_t)ne_sc[1];
-                    
+
                     // Scales per row for Q/K/V projections: ceil(DQ/16), ceil(DKV/16), ceil(DKV/16)
                     size_t q_scales_per_row = ((size_t)DQ + 15) >> 4;
                     size_t k_scales_per_row = ((size_t)DKV + 15) >> 4;
                     size_t v_scales_per_row = ((size_t)DKV + 15) >> 4;
-                    
+
                     L.Wq.scales.resize((size_t)E * q_scales_per_row);
                     L.Wk.scales.resize((size_t)E * k_scales_per_row);
                     L.Wv.scales.resize((size_t)E * v_scales_per_row);
-                    
+
                     const unsigned char* src_sc = (const unsigned char*)s_ptr;
                     size_t scales_per_row_total = total_scale_cols;
-                    
+
                     for (int64_t row = 0; row < E; ++row) {
                         size_t src_row_off = row * scales_per_row_total;
-                        
+
                         // Q scales: first q_scales_per_row entries in this row
                         for (size_t s = 0; s < q_scales_per_row; ++s) {
                             L.Wq.scales[row * q_scales_per_row + s] = src_sc[src_row_off + s];
                         }
-                        
-                        // K scales: next k_scales_per_row entries 
+
+                        // K scales: next k_scales_per_row entries
                         int k_start = (int)q_scales_per_row;
                         for (size_t s = 0; s < k_scales_per_row; ++s) {
                             if ((size_t)(k_start + s) < scales_per_row_total) {
                                 L.Wk.scales[row * k_scales_per_row + s] = src_sc[src_row_off + (size_t)k_start + s];
                             }
                         }
-                        
+
                         // V scales: next v_scales_per_row entries
                         int v_start = (int)(q_scales_per_row + k_scales_per_row);
                         for (size_t s = 0; s < v_scales_per_row; ++s) {
@@ -888,17 +888,17 @@ static bool load_model_weights(inference_model* m) {
                 // Self-contained quantization — no external scales tensor exists.
                 // Extract actual scales from within blocks based on tensor type.
                 fprintf(stderr, "blk.%d: self-contained type %d, extracting scales from blocks\n", i, qkv_type >= 0 ? gguf_tensor_type(m->gguf, qkv_type) : -1);
-                
+
                 size_t q_scales_per_row = ((size_t)DQ + 15) >> 4;
                 size_t k_scales_per_row = ((size_t)DKV + 15) >> 4;
                 size_t v_scales_per_row = ((size_t)DKV + 15) >> 4;
-                
+
                 L.Wq.scales.resize((size_t)E * q_scales_per_row);
                 L.Wk.scales.resize((size_t)E * k_scales_per_row);
                 L.Wv.scales.resize((size_t)E * v_scales_per_row);
-                
+
                 int t = (qkv_type >= 0) ? gguf_tensor_type(m->gguf, qkv_type) : -1;
-                
+
                 if (t == 13) {
                     // TYPE13: block_size=256 values/block, UE4M3 scales embedded in each block.
                     // Block layout: [scale_0..scale_15 (16 bytes), packed_data (128 bytes)] = 144 bytes per block.
@@ -906,13 +906,13 @@ static bool load_model_weights(inference_model* m) {
                     // For combined QKV with total_cols columns:
                     //   blocks_per_row = ceil(total_cols / 256)
                     //   total_scales_per_row = blocks_per_row * 16
-                    
+
                     size_t blocks_per_row = (total_cols + 255) / 256;
                     size_t total_scales_per_row = blocks_per_row * 16;
-                    
+
                     for (int64_t row = 0; row < E; ++row) {
                         const unsigned char* src_row = pk + row * blocks_per_row * 144;
-                        
+
                         // --- Extract all scales from this row's blocks into a temp buffer ---
                         std::vector<uint8_t> all_scales(total_scales_per_row);
                         for (size_t b = 0; b < blocks_per_row; ++b) {
@@ -921,18 +921,18 @@ static bool load_model_weights(inference_model* m) {
                                 all_scales[b * 16 + s] = blk[s]; // UE4M3 scale at offset s within block
                             }
                         }
-                        
+
                         // Map scales to projection-specific arrays.
                         // Column c maps to scale_index = c / 16, and scale comes from block (c/256).
                         // Q: columns [0 .. DQ-1], K: columns [DQ .. DQ+DKV-1], V: columns [DQ+DKV .. DQ+2*DKV-1]
-                        
+
                         size_t q_scale_count = (DQ + 15) >> 4; // ceil(DQ/16), but may exceed available scales
                         if (q_scale_count > total_scales_per_row) q_scale_count = total_scales_per_row;
                         for (size_t s = 0; s < q_scales_per_row; ++s) {
-                            L.Wq.scales[row * q_scales_per_row + s] = 
+                            L.Wq.scales[row * q_scales_per_row + s] =
                                 (s < q_scale_count) ? all_scales[s] : 0x60;
                         }
-                        
+
                         // K starts after Q's column range in terms of which scales apply.
                         // Scale index for column (DQ + k) is (DQ + k) / 16.
                         // But we need the scale that covers column (DQ + k), which comes from block ((DQ+k)/256).
@@ -940,16 +940,16 @@ static bool load_model_weights(inference_model* m) {
                         for (size_t s = 0; s < k_scales_per_row; ++s) {
                             int col = (int)(k_start_col + s * 16);
                             size_t si = col / 16;
-                            L.Wk.scales[row * k_scales_per_row + s] = 
+                            L.Wk.scales[row * k_scales_per_row + s] =
                                 (si < total_scales_per_row) ? all_scales[si] : 0x60;
                         }
-                        
+
                         // V: columns [DQ+DKV .. DQ+2*DKV-1]
                         size_t v_start_col = DQ + DKV;
                         for (size_t s = 0; s < v_scales_per_row; ++s) {
                             int col = (int)(v_start_col + s * 16);
                             size_t si = col / 16;
-                            L.Wv.scales[row * v_scales_per_row + s] = 
+                            L.Wv.scales[row * v_scales_per_row + s] =
                                 (si < total_scales_per_row) ? all_scales[si] : 0x60;
                         }
                     }
@@ -994,17 +994,17 @@ static bool load_model_weights(inference_model* m) {
                     }
                 }
             }
-            
+
         } else {
             // Separate Q/K/V tensors — original path (backward compatible with Qwen3-7B)
             snprintf(wname, sizeof(wname), "blk.%d.attn_q.weight", i);
             snprintf(sname, sizeof(sname), "blk.%d.attn_q.scales", i);
             if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wq)) return false;
-            
+
             snprintf(wname, sizeof(wname), "blk.%d.attn_k.weight", i);
             snprintf(sname, sizeof(sname), "blk.%d.attn_k.scales", i);
             if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wk)) return false;
-            
+
             snprintf(wname, sizeof(wname), "blk.%d.attn_v.weight", i);
             snprintf(sname, sizeof(sname), "blk.%d.attn_v.scales", i);
             if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wv)) return false;
@@ -1026,7 +1026,7 @@ static bool load_model_weights(inference_model* m) {
                 fprintf(stderr, "[load_model_weights] blk.%d: no attn_o/attn_output tensor found (may be SSM layer)\n", i);
             }
         }
-        
+
         // MLP gate, up, down — make optional for layers without FFN (SSM-only blocks)
         snprintf(wname, sizeof(wname), "blk.%d.ffn_gate.weight", i);
         snprintf(sname, sizeof(sname), "blk.%d.ffn_gate.scales", i);
@@ -1035,7 +1035,7 @@ static bool load_model_weights(inference_model* m) {
         } else {
             fprintf(stderr, "[load_model_weights] blk.%d: no ffn_gate tensor found\n", i);
         }
-        
+
         snprintf(wname, sizeof(wname), "blk.%d.ffn_up.weight", i);
         snprintf(sname, sizeof(sname), "blk.%d.ffn_up.scales", i);
         if (has_tensor(m->gguf, wname)) {
@@ -1043,7 +1043,7 @@ static bool load_model_weights(inference_model* m) {
         } else {
             fprintf(stderr, "[load_model_weights] blk.%d: no ffn_up tensor found\n", i);
         }
-        
+
         snprintf(wname, sizeof(wname), "blk.%d.ffn_down.weight", i);
         snprintf(sname, sizeof(sname), "blk.%d.ffn_down.scales", i);
         if (has_tensor(m->gguf, wname)) {
@@ -1053,7 +1053,7 @@ static bool load_model_weights(inference_model* m) {
         }
         // LayerNorm scales
         size_t ln_sz;
-        const void* ln_ptr = gguf_get_tensor_ptr(m->gguf, 
+        const void* ln_ptr = gguf_get_tensor_ptr(m->gguf,
             (std::string("blk.") + std::to_string(i) + ".attn_norm.weight").c_str(), &ln_sz);
         if (ln_ptr && ln_sz == (size_t)m->n_embd * sizeof(__half)) {
             L.attn_ln_scale.assign((const __half*)ln_ptr, (const __half*)ln_ptr + m->n_embd);
@@ -1072,7 +1072,7 @@ static bool load_model_weights(inference_model* m) {
 inference_model_t* inference_load_model(const char* gguf_path) {
     clear_error();
     if (!gguf_path) { set_error("NULL path"); return nullptr; }
-    
+
     fprintf(stderr, "[LOAD] Starting load_model for %s\n", gguf_path); fflush(stderr);
     inference_model_t* m = new inference_model();
     m->gguf = gguf_mmap_open(gguf_path);
@@ -1081,16 +1081,16 @@ inference_model_t* inference_load_model(const char* gguf_path) {
     // Read model metadata from GGUF (Phase 15.1)
     int64_t n_layer = gguf_block_count(m->gguf);
     if (n_layer <= 0) { set_error("block_count not found in GGUF"); delete m; return nullptr; }
-    
+
     int64_t n_embd = gguf_embedding_length(m->gguf);
     if (n_embd <= 0) { set_error("embedding_length not found in GGUF"); delete m; return nullptr; }
-    
+
     int64_t n_head = gguf_head_count(m->gguf);
     int64_t n_head_kv = gguf_head_count_kv(m->gguf);
-    
+
     // head_dim = embedding_length / head_count (derived, not stored)
     int64_t hd = n_embd / n_head;
-    
+
     // vocab_size: prefer tokenizer.ggml.vocab_size or array length
     int64_t vs = gguf_vocab_size(m->gguf);
     if (vs <= 0) {
@@ -1100,14 +1100,14 @@ inference_model_t* inference_load_model(const char* gguf_path) {
         }
     }
     if (vs <= 0) { set_error("vocab_size not found in GGUF"); delete m; return nullptr; }
-    
+
     int64_t ctx_len = gguf_context_length(m->gguf);
     if (ctx_len <= 0) ctx_len = 4096;  // fallback default
-    
+
     // Read architecture string from GGUF
     const char* arch = gguf_arch(m->gguf);
     m->model_name = arch ? arch : "qwen3-unknown";
-    
+
     m->n_layer = (int)n_layer;
     m->n_embd = (int)n_embd;
     m->n_head = (int)n_head;
@@ -1126,12 +1126,12 @@ inference_model_t* inference_load_model(const char* gguf_path) {
             if (emb_idx >= 0) {
                 emb_type = gguf_tensor_type(m->gguf, emb_idx);
             }
-            
+
             if (emb_type == -1 || emb_type == 1 /* F16 */) {
                 // FP16 embedding table — load directly as before
                 if (sz == (size_t)m->vocab_size * m->n_embd * sizeof(__half)) {
                     m->embed_table.assign((const __half*)emb_ptr, (const __half*)emb_ptr + m->vocab_size * m->n_embd);
-                    fprintf(stderr, "[load_model] token_embd: FP16 (%zu bytes, %dx%d)\n", 
+                    fprintf(stderr, "[load_model] token_embd: FP16 (%zu bytes, %dx%d)\n",
                             sz, m->vocab_size, m->n_embd);
                 } else {
                     fprintf(stderr, "[load_model] WARNING: token_embd exists but size mismatch for FP16 (%zu vs expected %zu)\n",
@@ -1139,39 +1139,39 @@ inference_model_t* inference_load_model(const char* gguf_path) {
                 }
             } else {
                 // Quantized embedding — load via QuantWeight path with dequant at runtime
-                fprintf(stderr, "[load_model] token_embd: quantized type %d (%zu bytes), loading through QuantWeight path\n", 
+                fprintf(stderr, "[load_model] token_embd: quantized type %d (%zu bytes), loading through QuantWeight path\n",
                         emb_type, sz);
-                
+
                 int64_t* ne = gguf_tensor_ne(m->gguf, emb_idx);
                 if (ne && ne[0] == m->vocab_size && ne[1] == m->n_embd) {
                     // Load packed data and scales into temp storage
-                    std::vector<unsigned char> packed((const unsigned char*)emb_ptr, 
+                    std::vector<unsigned char> packed((const unsigned char*)emb_ptr,
                                                        (const unsigned char*)emb_ptr + sz);
-                    
+
                     // Determine scale tensor name based on type
                     char sname[128];
                     snprintf(sname, sizeof(sname), "token_embd.scales");
                     size_t s_sz;
                     const void* s_ptr = gguf_get_tensor_ptr(m->gguf, sname, &s_sz);
-                    
+
                     if (s_ptr && s_sz > 0) {
                         // External scales exist — could store these for later use
                         fprintf(stderr, "[load_model] token_embd: has external scales (%zu bytes)\n", s_sz);
                     } else if (gguf_type_is_self_contained(emb_type)) {
                         // Self-contained — scales embedded in blocks, will extract at runtime
-                        fprintf(stderr, "[load_model] token_embd: self-contained type %d, scales embedded in blocks\n", 
+                        fprintf(stderr, "[load_model] token_embd: self-contained type %d, scales embedded in blocks\n",
                                 emb_type);
                     } else {
-                        fprintf(stderr, "[load_model] WARNING: token_embd is quantized but no scales available (type %d)\n", 
+                        fprintf(stderr, "[load_model] WARNING: token_embd is quantized but no scales available (type %d)\n",
                                 emb_type);
                     }
-                    
+
                     // For now: dequantize to FP16 for embedding lookup compatibility.
                     // At Q4_1 with vocab=248320, n_embd=2560 → ~635M values → ~1.2GB dequantized FP16.
                     // This is acceptable on 128GB UMA systems.
                     size_t total_elements = (size_t)m->vocab_size * m->n_embd;
                     m->embed_table.resize(total_elements);
-                    
+
                     // Dequantize based on type using scale extraction
                     switch (emb_type) {
                         case 100: {
@@ -1187,14 +1187,14 @@ inference_model_t* inference_load_model(const char* gguf_path) {
                                         int bi = ei / 32;
                                         int val_in_block = ei % 32;
                                         size_t blk_idx = (size_t)row_offset / 32 + bi;
-                                        
+
                                         float sc;
                                         if (val_in_block < 16) {
                                             sc = ue4m3_to_float(data[blk_idx * 17 + 16]); // first half-block scale
                                         } else {
-                                            sc = ue4m3_to_float(data[blk_idx * 17 + 17]); // second half-block scale  
+                                            sc = ue4m3_to_float(data[blk_idx * 17 + 17]); // second half-block scale
                                         }
-                                        
+
                                         uint8_t nibble = (data[blk_idx * 17 + 16 + (val_in_block >> 1)] >> ((val_in_block & 1) << 2)) & 0x0F;
                                         m->embed_table[(size_t)vi * m->n_embd + ei] = __half(dequant_code(nibble) * sc);
                                     }
@@ -1215,14 +1215,14 @@ inference_model_t* inference_load_model(const char* gguf_path) {
                                         int bi = ei / 32;
                                         int val_in_block = ei % 32;
                                         size_t blk_idx = (size_t)row_offset / 32 + bi;
-                                        
+
                                         __half h_scale, h_min;
                                         memcpy(&h_scale, &data[blk_idx * bytes_per_block], sizeof(__half));
                                         memcpy(&h_min, &data[blk_idx * bytes_per_block + 2], sizeof(__half));
-                                        
+
                                         float scale_f = __half2float(h_scale);
                                         float min_f = __half2float(h_min);
-                                        
+
                                         uint8_t nibble = (data[blk_idx * bytes_per_block + 4 + (val_in_block >> 1)] >> ((val_in_block & 1) << 2)) & 0x0F;
                                         // Q4_1: value = scale * codebook[nibble] + min
                                         float val = scale_f * dequant_code(nibble) + min_f;
@@ -1236,7 +1236,7 @@ inference_model_t* inference_load_model(const char* gguf_path) {
                             // Q4_0 block layout: [delta_fp16(2B), packed_data(16B)] = 18 bytes per 32 values
                             {
                                 const uint8_t* data = packed.data();
-                                size_t bytes_per_block = 18; 
+                                size_t bytes_per_block = 18;
 
                                 for (int vi = 0; vi < m->vocab_size; ++vi) {
                                     int64_t row_offset = (int64_t)vi * m->n_embd;
@@ -1245,12 +1245,12 @@ inference_model_t* inference_load_model(const char* gguf_path) {
                                         int bi = ei / 32;
                                         int val_in_block = ei % 32;
                                         size_t blk_idx = (size_t)row_offset / 32 + bi;
-                                        
+
                                         __half h_delta;
                                         memcpy(&h_delta, &data[blk_idx * bytes_per_block], sizeof(__half));
-                                        
+
                                         float delta_f = __half2float(h_delta);
-                                        
+
                                         uint8_t nibble = (data[blk_idx * bytes_per_block + 2 + (val_in_block >> 1)] >> ((val_in_block & 1) << 2)) & 0x0F;
                                         // Q4_0: value = delta * codebook[nibble] - min (min encoded in data)
                                         float val = delta_f * dequant_code(nibble);
@@ -1268,27 +1268,27 @@ inference_model_t* inference_load_model(const char* gguf_path) {
                                 size_t bytes_per_block = 176; // calculated from tensor size: 437043200 / (total_elements/256)
                                 size_t blocks_per_row = m->n_embd / block_size_elements;
                                 size_t total_blocks = blocks_per_row * m->vocab_size;
-                                
-                                fprintf(stderr, "[load_model] TYPE14: blocks_per_row=%zu total_blocks=%zu bytes/block=%zu\n", 
+
+                                fprintf(stderr, "[load_model] TYPE14: blocks_per_row=%zu total_blocks=%zu bytes/block=%zu\n",
                                         blocks_per_row, total_blocks, bytes_per_block);
-                                
+
                                 for (int vi = 0; vi < m->vocab_size; ++vi) {
                                     int64_t row_offset = (int64_t)vi * m->n_embd;
-                                    
+
                                     for (int ei = 0; ei < m->n_embd; ++ei) {
                                         int bi = ei / block_size_elements;
                                         int val_in_block = ei % block_size_elements;
                                         size_t blk_idx = (size_t)row_offset / block_size_elements + bi;
-                                        
+
                                         // Scale index within block: each scale covers 16 elements, stored as UE4M3 (1 byte)
                                         size_t scale_idx = val_in_block / 16;
                                         size_t scale_byte_off = blk_idx * bytes_per_block + scale_idx; // UE4M3 stored as 1 byte
-                                        
+
                                         float sc = ue4m3_to_float(data[scale_byte_off]);
-                                        
+
                                         // Data offset after scales (scales occupy first 16 bytes of block header for 16 scales)
                                         size_t data_off = blk_idx * bytes_per_block + 16;
-                                        
+
                                         // Nibble index: pair of values per byte in data section
                                         int nibble_idx = val_in_block / 2;
                                         uint8_t nibble = (data[data_off + nibble_idx] >> ((val_in_block & 1) << 2)) & 0x0F;
@@ -1300,7 +1300,7 @@ inference_model_t* inference_load_model(const char* gguf_path) {
                             break;
                         }
                         default: {
-                            fprintf(stderr, "[load_model] WARNING: quantized embedding type %d not supported for dequant\n", 
+                            fprintf(stderr, "[load_model] WARNING: quantized embedding type %d not supported for dequant\n",
                                     emb_type);
                             // Fall through to keep model loading — embeddings will be zeroed
                             break;
@@ -1308,38 +1308,38 @@ inference_model_t* inference_load_model(const char* gguf_path) {
                     }
                 } else if (ne && ne[0] == m->n_embd && ne[1] == m->vocab_size) {
                     // Transposed layout [n_embd][vocab_size] — common GGUF convention
-                    fprintf(stderr, "[load_model] token_emb: transposed layout detected [%lld x %lld], dequantizing...\n", 
+                    fprintf(stderr, "[load_model] token_emb: transposed layout detected [%lld x %lld], dequantizing...\n",
                             (long long)ne[0], (long long)ne[1]);
-                    
+
                     size_t total_elements = (size_t)m->vocab_size * m->n_embd;
                     m->embed_table.resize(total_elements);
-                    
+
                     // Load packed data for transposed path
-                    std::vector<unsigned char> packed((const unsigned char*)emb_ptr, 
+                    std::vector<unsigned char> packed((const unsigned char*)emb_ptr,
                                                        (const unsigned char*)emb_ptr + sz);
-                    
+
                     // Dequantize based on type using scale extraction (transposed indexing)
                     switch (emb_type) {
                         case 3: { // Q4_1 transposed
                             const uint8_t* data = packed.data();
                             size_t bytes_per_block = 20; // 2 scale + 2 min + 16 packed
-                            
+
                             for (int vi = 0; vi < m->vocab_size; ++vi) {
                                 int64_t row_offset = (int64_t)vi;
                                 size_t row_blocks = m->n_embd / 32;
-                                
+
                                 for (int ei = 0; ei < m->n_embd; ++ei) {
                                     int bi = ei / 32;
                                     int val_in_block = ei % 32;
                                     size_t blk_idx = (size_t)row_offset * row_blocks + bi;
-                                    
+
                                     __half h_scale, h_min;
                                     memcpy(&h_scale, &data[blk_idx * bytes_per_block], sizeof(__half));
                                     memcpy(&h_min, &data[blk_idx * bytes_per_block + 2], sizeof(__half));
-                                    
+
                                     float scale_f = __half2float(h_scale);
                                     float min_f = __half2float(h_min);
-                                    
+
                                     uint8_t nibble = (data[blk_idx * bytes_per_block + 4 + (val_in_block >> 1)] >> ((val_in_block & 1) << 2)) & 0x0F;
                                     float val = scale_f * dequant_code(nibble) + min_f;
                                     m->embed_table[(size_t)vi * m->n_embd + ei] = __half(val);
@@ -1353,13 +1353,13 @@ inference_model_t* inference_load_model(const char* gguf_path) {
                             size_t block_size_elements = 256; // TYPE14 uses 256-element blocks
                             size_t bytes_per_block = 176;     // computed from tensor size
                             size_t blocks_per_vocab_row = m->vocab_size / block_size_elements;
-                            
+
                             // Validate block layout against actual file size
                             size_t total_blocks_calc = (size_t)m->n_embd * blocks_per_vocab_row;
                             size_t expected_size = total_blocks_calc * bytes_per_block;
-                            fprintf(stderr, "[load_model] TYPE14 validate: total_blocks=%zu expected_sz=%zu actual_sz=%zu\n", 
+                            fprintf(stderr, "[load_model] TYPE14 validate: total_blocks=%zu expected_sz=%zu actual_sz=%zu\n",
                                     total_blocks_calc, expected_size, sz);
-                            
+
                             for (int vi = 0; vi < m->vocab_size; ++vi) {
                                 for (int ei = 0; ei < m->n_embd; ++ei) {
                                     // GGUF stores [n_embd][vocab_size] in row-major C order
@@ -1367,23 +1367,23 @@ inference_model_t* inference_load_model(const char* gguf_path) {
                                     int bi = vi / block_size_elements;          // which block within this n_embd row
                                     int val_in_block = vi % block_size_elements; // position within block
                                     size_t blk_idx = (size_t)ei * blocks_per_vocab_row + bi;
-                                    
+
                                     // Bounds check on block index
                                     if (blk_idx >= total_blocks_calc) {
                                         fprintf(stderr, "[load_model] ERROR TYPE14: blk_idx=%zu >= total_blocks=%zu at vi=%d ei=%d\n",
                                                 blk_idx, total_blocks_calc, vi, ei);
                                         goto type14_done;
                                     }
-                                    
+
                                     // Scale index within block: each scale covers 16 elements, stored as UE4M3 (1 byte)
                                     size_t scale_idx = val_in_block / 16;
                                     size_t scale_byte_off = blk_idx * bytes_per_block + scale_idx; // UE4M3 stored as 1 byte
-                                    
+
                                     float sc = ue4m3_to_float(data[scale_byte_off]);
-                                    
+
                                     // Data offset after scales (scales occupy first 16 bytes of block header for 16 scales)
                                     size_t data_off = blk_idx * bytes_per_block + 16;
-                                    
+
                                     // Nibble index: pair of values per byte in data section
                                     int nibble_idx = val_in_block / 2;
                                     uint8_t nibble = (data[data_off + nibble_idx] >> ((val_in_block & 1) << 2)) & 0x0F;
@@ -1395,7 +1395,7 @@ type14_done:;
                             break;
                         }
                         default: {
-                            fprintf(stderr, "[load_model] WARNING: quantized embedding type %d not supported for dequant\n", 
+                            fprintf(stderr, "[load_model] WARNING: quantized embedding type %d not supported for dequant\n",
                                     emb_type);
                             break;
                         }
@@ -1426,14 +1426,14 @@ type14_done:;
     char out_wname[128], out_sname[128];
     snprintf(out_wname, sizeof(out_wname), "output.weight");
     snprintf(out_sname, sizeof(out_sname), "output.scales");
-    
+
     // Try multiple possible names for the output/LM-head tensor
     const char* lm_head_names[] = {"output.weight", "lm_head.weight", "embed_tokens.weight"};
     bool has_lm_head = false;
     for (const char* name : lm_head_names) {
         if (has_tensor(m->gguf, name)) { has_lm_head = true; break; }
     }
-    
+
     if (has_lm_head) {
         if (!load_quant_weight_from_gguf(m->gguf, "output.weight", "output.scales", m->lm_head)) {
             set_error("Failed to load LM head");
@@ -1444,7 +1444,7 @@ type14_done:;
     } else {
         fprintf(stderr, "[inference_load_model] No LM head tensor found — using tied embeddings (token_embd.weight as output projection)\n");
         // For tied embeddings: lm_head is just token_embd shared between input and output
-        m->lm_head.N = m->vocab_size;  // output dim = vocab size  
+        m->lm_head.N = m->vocab_size;  // output dim = vocab size
         m->lm_head.K = m->n_embd;      // input dim = embedding length
         m->lm_head.packed.clear();     // will reuse embed_table packed data at runtime
         m->lm_head.scales.clear();     // scales also shared

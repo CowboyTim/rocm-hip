@@ -128,7 +128,7 @@ int main() {
     HIP_CHECK(hipInit(0), "init");
     hipModule_t mod;
     HIP_CHECK(hipModuleLoadData(&mod, coData), "load module");
-    
+
     hipFunction_t func;
     HIP_CHECK(hipModuleGetFunction(&func, mod, "wmma_matmul_fp4_native"), "get function");
 
@@ -141,7 +141,7 @@ int main() {
     HIP_CHECK(hipModuleLaunchKernel(func, grid.x, grid.y, 1, block.x, block.y, 1,
                                     0, 0, args, nullptr), "launch");
     HIP_CHECK(hipDeviceSynchronize(), "sync after kernel");
-    
+
     munmap(coData, st.st_size);
     close(kfd);
     HIP_CHECK(hipModuleUnload(mod), "unload");
@@ -178,7 +178,7 @@ int main() {
             printf(" %8.1f", C_cpu[i * 16 + j]);
         }
         printf(" ]");
-        
+
         bool row_match = true;
         for (int j = 0; j < 16; ++j) {
             if (fabsf(C_cpu[i * 16 + j] - C_gpu[i * 16 + j]) > 1.0f) {
@@ -189,7 +189,7 @@ int main() {
         printf(" [%s]\n", row_match ? "OK" : "MISMATCH");
         if (!row_match) all_match = false;
     }
-    
+
     if (all_match) {
         printf("\n  All values match!\n");
     }

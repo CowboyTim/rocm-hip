@@ -80,7 +80,7 @@ static const size_t TYPE_SIZES[] = {
     0,                      // index 4 (reserved)
     0,                      // index 5 (reserved)
     22,                     // index 6: FP8_E4M3 block
-    24,                     // index 7: FP8_E5M2 block  
+    24,                     // index 7: FP8_E5M2 block
     34,                     // index 8: FP8 block
     36,                     // index 9: FP8 block
     62,                     // index 10: QK type
@@ -124,17 +124,17 @@ int gguf_type_is_self_contained(int type) {
     switch (type) {
         /* Standard llama.cpp quantization types - all self-contained */
         case 2:  /* Q4_0: {half scale, uint8[16]} per 32 values */
-        case 3:  /* Q4_1: {half scale, half min, uint8[16]} per 32 values */  
+        case 3:  /* Q4_1: {half scale, half min, uint8[16]} per 32 values */
         case 7:  /* Q5_0/Q8_0 variants depending on GGUF version */
         case 8:  /* Q8_0: {half scale, int8[32]} per 32 values */
             return 1;
-        
+
         /* Extended/custom quantization types */
         case 13: /* Qwen3.5 custom (TYPE13): block_size=256, UE4M3 scales per-16 elements */
         case 14: /* Qwen3.5 variant of Q4_K/Q4_1 equivalent — self-contained block layout */
         case 100:/* TYPE100 = ROCmFP4 Codebook10: UE4M3 scale + nibbles per block */
             return 1;
-        
+
         default:
             /* For unknown types, treat as self-contained by default.
              * Quantized types store scales internally; only FP16/F32/etc. need no scales at all.
@@ -699,7 +699,7 @@ const char *gguf_tokenizer_type(const gguf_model_t *m) {
 const char *gguf_pre_type(const gguf_model_t *m) {
     static char pre_buf[128] = {0};
     int64_t idx = find_kv_idx(m, "tokenizer.ggml.pre");
-    if (idx < 0) idx = find_kv_idx(m, "preprocessing"); 
+    if (idx < 0) idx = find_kv_idx(m, "preprocessing");
     if (idx >= 0 && m->kvs[idx].str_val && m->kvs[idx].str_val[0]) {
         strncpy(pre_buf, m->kvs[idx].str_val, sizeof(pre_buf)-1);
         return pre_buf;
@@ -719,7 +719,7 @@ int64_t gguf_vocab_size(const gguf_model_t *m) {
 
 int64_t gguf_head_count(const gguf_model_t *m) {
     const char *keys[] = {
-        "attention.head_count", "qwen35.attention.head_count", 
+        "attention.head_count", "qwen35.attention.head_count",
         "llama.attention.heads"
     };
     int64_t idx = find_kv_or(m, keys, 3);
@@ -750,7 +750,7 @@ int64_t gguf_context_length(const gguf_model_t *m) {
 int64_t gguf_embedding_length(const gguf_model_t *m) {
     const char *keys[] = {
         "embedding_length", "qwen35.embedding_length", "qwen2.embedding_length",
-        "llama.embedding_length", "model_dim" 
+        "llama.embedding_length", "model_dim"
     };
     int64_t idx = find_kv_or(m, keys, 5);
     if (idx < 0) return 0;
@@ -759,7 +759,7 @@ int64_t gguf_embedding_length(const gguf_model_t *m) {
 
 int64_t gguf_block_count(const gguf_model_t *m) {
     const char *keys[] = {
-        "block_count", "qwen35.block_count", "qwen2.block_count", 
+        "block_count", "qwen35.block_count", "qwen2.block_count",
         "llama.n_layer", "n_layer"
     };
     int64_t idx = find_kv_or(m, keys, 5);
@@ -818,15 +818,15 @@ const void* gguf_get_tensor_ptr(const gguf_model_t *m, const char* name, size_t*
     for (size_t i = 0; i < n_tensors; ++i) {
         if (strcmp(model->tensors[i].name, name) == 0) {
             const struct tensor_meta *tm = &model->tensors[i];
-            
+
             /* Calculate total elements */
             int64_t total_elems = tm->ne[0];
             for (uint8_t d = 1; d < tm->n_dims; ++d) total_elems *= tm->ne[d];
-            
+
             /* For quantized types, compute based on blocks */
             int64_t bs = get_block_size(tm->type);
             size_t ts = get_type_size(tm->type);
-            
+
             if (bs > 0 && ts != (size_t)-1) {
                 /* Quantized: ceil(total_elements / block_size) × bytes_per_block */
                 int64_t total_blocks = total_elems / bs;
@@ -836,7 +836,7 @@ const void* gguf_get_tensor_ptr(const gguf_model_t *m, const char* name, size_t*
                 /* Unquantized: total_elements × element_size */
                 *out_bytes = (size_t)total_elems * ts;
             }
-            
+
             return (const char*)model->map_ptr + model->data_off + tm->data_offset;
         }
     }

@@ -81,7 +81,7 @@ const void* gguf_get_tensor_ptr(const gguf_model_t *model, const char* name, siz
 /* --- Quantization type helpers --- */
 
 /* Check if a tensor type stores scales internally (self-contained).
- * Returns 1 for Q4_0, Q4_1, Q8_0, TYPE100 etc. where scales are 
+ * Returns 1 for Q4_0, Q4_1, Q8_0, TYPE100 etc. where scales are
  * embedded within each block structure. Returns 0 for external-scales types. */
 int          gguf_type_is_self_contained(int type);
 

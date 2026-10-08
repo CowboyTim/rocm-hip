@@ -215,7 +215,7 @@ struct QwenModel {
     }
 
     // Phase 15.4 helpers: find KV index by key, extract int64 value, read tensor type by name
-    
+
     static int64_t find_kv_idx_gguf(gguf_model_t* m, const char* key) {
         if (!m || !key) return -1;
         for (int64_t i = 0; i < gguf_n_kv(m); ++i) {
@@ -479,7 +479,7 @@ qwen_model_t* qwen_model_create(inference_model_t* engine_model) {
 
 void qwen_model_set_embed_table(qwen_model_t* model, void* d_embed_table) {
     QwenModel* m = static_cast<QwenModel*>(model);
-    fprintf(stderr, "[SET_EMBED] Setting d_embed_table_copy from %p to %p\n", 
+    fprintf(stderr, "[SET_EMBED] Setting d_embed_table_copy from %p to %p\n",
             (void*)(m ? m->d_embed_table_copy : nullptr), d_embed_table);
     if (m) m->d_embed_table_copy = reinterpret_cast<const __half*>(d_embed_table);
 }
@@ -502,7 +502,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
                              int seq_len,
                              float* logits_out) {
     (void)seq_len;
-    
+
     QwenModel* m = model;
     inference_model* eng = model->eng_model;
     const int E = m->n_embd, HD = m->head_dim, HQ = m->n_head, HKV = m->n_head_kv;
@@ -513,11 +513,11 @@ int qwen_model_forward_batch(qwen_model_t* model,
     size_t scores_bytes = (size_t)batch_size * seq_len * seq_len * sizeof(float);
     size_t qpos_bytes = (size_t)batch_size * seq_len * sizeof(int);
     size_t logits_bytes = (size_t)batch_size * m->vocab_size * sizeof(float);
-    
+
     float* d_scores_batch = nullptr;
     int* d_qpos_batch = nullptr;
     float* d_logits_batch = nullptr;
-    
+
     hipError_t herr = hipMalloc(&d_scores_batch, scores_bytes);
     if (herr != hipSuccess) { qwen_set_error("hipMalloc scores batch failed"); return INFERENCE_ERR_KERNEL_LAUNCH; }
     herr = hipMalloc(&d_qpos_batch, qpos_bytes);
@@ -544,13 +544,13 @@ int qwen_model_forward_batch(qwen_model_t* model,
     // ---- Embedding lookup (per sequence via grid-stride launch) ----
     int vocab_local = eng->vocab_size;
     int one_int = 1;
-    
+
     // Build per-sequence embedding index arrays (each sequence has different token ID)
     std::vector<int32_t> h_tokens(batch_size);
     for (int b = 0; b < batch_size; ++b) h_tokens[b] = tokens[b];
 
     const __half* d_emb_ptr_batch = reinterpret_cast<const __half*>(eng->d_embed_table);
-    void* emb_args[] = { &h_tokens[0], (const __half**)&d_emb_ptr_batch, m->layer_scratch[0].d_h, 
+    void* emb_args[] = { &h_tokens[0], (const __half**)&d_emb_ptr_batch, m->layer_scratch[0].d_h,
                          (void*)&one_int, (void*)&E, (void*)&vocab_local };
     // Embedding lookup is inherently per-token (different indices), so single-launch with grid-stride over batch
     (void)hipModuleLaunchKernel(fn_embedding, 1, 1, batch_size, 256, 1, 1, 0, 0, emb_args, nullptr);
@@ -588,30 +588,30 @@ int qwen_model_forward_batch(qwen_model_t* model,
         {
             std::vector<void*> d_input_arr(batch_size), d_output_arr(batch_size);
             void* w_packed = L.Wq.d_packed, *w_scales = L.Wq.d_scales;
-            
+
             for (int b = 0; b < batch_size; ++b) {
                 d_input_arr[b] = m->layer_scratch[0].d_h;   // offset handled via blockIdx.z
                 d_output_arr[b] = m->layer_scratch[l].d_q;  // per-layer scratch buffer
             }
-            
+
             int DQ_b = DQ_local;
             void* g4_args[] = { &d_input_arr[0], &w_packed, &w_scales, &d_output_arr[0],
                                &one_int, &DQ_b, &E_local };
             dim3 gemm_grid(1, (DQ + 15) / 16, batch_size);
-            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, gemm_grid.x, gemm_grid.y, gemm_grid.z, 
+            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, gemm_grid.x, gemm_grid.y, gemm_grid.z,
                                  32, 16, 1, 0, 0, g4_args, nullptr);
             if (hipGetLastError() != hipSuccess) {
                 qwen_set_error("gemm Q failed"); goto cleanup;
             }
 
-            // K projection: [1 x DKV] = h @ Wk^T  
+            // K projection: [1 x DKV] = h @ Wk^T
             w_packed = L.Wk.d_packed; w_scales = L.Wk.d_scales;
             int DKV_b = DKV_local;
             for (int b = 0; b < batch_size; ++b) d_output_arr[b] = m->layer_scratch[l].d_k;
             void* k4_args[] = { &d_input_arr[0], &w_packed, &w_scales, &d_output_arr[0],
                                 &one_int, &DKV_b, &E_local };
             dim3 k_grid(1, (DKV + 15) / 16, batch_size);
-            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, k_grid.x, k_grid.y, k_grid.z, 
+            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, k_grid.x, k_grid.y, k_grid.z,
                                  32, 16, 1, 0, 0, k4_args, nullptr);
             if (hipGetLastError() != hipSuccess) {
                 qwen_set_error("gemm K failed"); goto cleanup;
@@ -622,7 +622,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
             for (int b = 0; b < batch_size; ++b) d_output_arr[b] = m->layer_scratch[l].d_v;
             void* v4_args[] = { &d_input_arr[0], &w_packed, &w_scales, &d_output_arr[0],
                                &one_int, &DKV_b, &E_local };
-            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, k_grid.x, k_grid.y, k_grid.z, 
+            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, k_grid.x, k_grid.y, k_grid.z,
                                  32, 16, 1, 0, 0, v4_args, nullptr);
             if (hipGetLastError() != hipSuccess) {
                 qwen_set_error("gemm V failed"); goto cleanup;
@@ -632,7 +632,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
         // --- c) Per-head staging (FP32 -> FP16) - CPU-side with batching ---
         // Build FP16 staging arrays for Q/K across all sequences
         // This is the bottleneck - requires reading device results back to host
-        
+
         // --- d) RoPE on Q/K - build tables once for all positions present in batch ---
         // Collect unique positions from all sequences and build combined tables
         std::vector<int> unique_positions;
@@ -646,12 +646,12 @@ int qwen_model_forward_batch(qwen_model_t* model,
         }
 
         int HQ_local = HQ, HD2_local = HD / 2;
-        
+
         // RoPE kernel launch with per-sequence position offsets via LDS LUT arrays
-        void* rope_args[] = { &m->layer_scratch[l].d_qh, &unique_positions[0], &pos_to_seq[0], 
+        void* rope_args[] = { &m->layer_scratch[l].d_qh, &unique_positions[0], &pos_to_seq[0],
                              &batch_size, &HQ_local, &HD2_local };
         dim3 rope_grid(HQ, 1, unique_positions.size());
-        (void)hipModuleLaunchKernel(fn_rope, rope_grid.x, rope_grid.y, rope_grid.z, 
+        (void)hipModuleLaunchKernel(fn_rope, rope_grid.x, rope_grid.y, rope_grid.z,
                              32, 1, 1, 0, 0, rope_args, nullptr);
         if (hipGetLastError() != hipSuccess) {
             qwen_set_error("RoPE failed"); goto cleanup;
@@ -662,7 +662,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
             std::vector<void*> k_src_arr(batch_size), v_src_arr(batch_size);
             std::vector<void*> k_dst_arr(batch_size), v_dst_arr(batch_size);
             std::vector<int> pos_arr(batch_size), ctx_arr(batch_size);
-            
+
             for (int b = 0; b < batch_size; ++b) {
                 k_src_arr[b] = m->layer_scratch[l].d_rks;   // roped K output (offset by seq)
                 v_src_arr[b] = m->layer_scratch[l].d_v;     // V output (offset by seq)
@@ -671,13 +671,13 @@ int qwen_model_forward_batch(qwen_model_t* model,
                 pos_arr[b] = positions[b];
                 ctx_arr[b] = seq_lens ? seq_lens[b] : seq_len;
             }
-            
+
             int DKV_b = DKV_local;
-            void* kvs_args[] = { &k_src_arr[0], &v_src_arr[0], 
+            void* kvs_args[] = { &k_src_arr[0], &v_src_arr[0],
                                  &k_dst_arr[0], &v_dst_arr[0],
                                  &batch_size, &DKV_b, &pos_arr[0], &ctx_arr[0] };
             dim3 kv_grid((HKV + 7) / 8, 1, batch_size);
-            (void)hipModuleLaunchKernel(fn_kv_store, kv_grid.x, kv_grid.y, kv_grid.z, 
+            (void)hipModuleLaunchKernel(fn_kv_store, kv_grid.x, kv_grid.y, kv_grid.z,
                                  32, 1, 1, 0, 0, kvs_args, nullptr);
             if (hipGetLastError() != hipSuccess) {
                 qwen_set_error("kv_store failed"); goto cleanup;
@@ -688,9 +688,9 @@ int qwen_model_forward_batch(qwen_model_t* model,
         {
             int CTX_b = CTX_local;
             float scale_f = 1.0f / sqrtf((float)HD);
-            
-            // Batched softmax for all sequences in parallel  
-            void* sm_args[] = { &d_scores_batch, &batch_size, &CTX_b, &scale_f, 
+
+            // Batched softmax for all sequences in parallel
+            void* sm_args[] = { &d_scores_batch, &batch_size, &CTX_b, &scale_f,
                                &d_qpos_batch[0], &seq_len };
             dim3 softmax_grid(1, 1, batch_size);
             (void)hipModuleLaunchKernel(fn_softmax, (seq_len + 31) / 32, 1, batch_size,
@@ -702,7 +702,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
             // Batched GEMM for attention output: probs @ V -> [batch x HQ x HD]
             int HD_b = HD;
             void* attn_gemm_args[] = { &m->layer_scratch[l].d_pf,    // probs FP16 base (offset per seq)
-                                       m->layer_scratch[l].d_vb2,   // V cache base (per head/layer)  
+                                       m->layer_scratch[l].d_vb2,   // V cache base (per head/layer)
                                        d_logits_batch,              // output logits buffer
                                        &batch_size, &HD_b, &CTX_b };
             dim3 attn_grid((HQ + 15) / 16, (HD + 15) / 16, batch_size);
@@ -720,11 +720,11 @@ int qwen_model_forward_batch(qwen_model_t* model,
                 inp_arr[b] = d_logits_batch + (size_t)b * m->vocab_size * sizeof(float);  // attention output
                 out_arr[b] = m->layer_scratch[l].d_down;   // residual add destination (offset by seq)
             }
-            
+
             void* o_args[] = { &inp_arr[0], &L.Wo.d_packed, &L.Wo.d_scales, &out_arr[0],
                               &one_int, &E_local, &DQ_local };
             dim3 o_grid(1, (E + 15) / 16, batch_size);
-            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, o_grid.x, o_grid.y, o_grid.z, 
+            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, o_grid.x, o_grid.y, o_grid.z,
                                  32, 16, 1, 0, 0, o_args, nullptr);
             if (hipGetLastError() != hipSuccess) {
                 qwen_set_error("O projection failed"); goto cleanup;
@@ -742,7 +742,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
             void* ln_mlp_args[] = { &m->layer_scratch[l].h, &L.d_mlp_ln, &m->layer_scratch[l].d_hmlp,
                                    &E_local, &E_local, (void*)&eps_f };
             dim3 mlp_norm_grid((E + 31) / 32, 1, batch_size);
-            (void)hipModuleLaunchKernel(fn_layernorm, mlp_norm_grid.x, mlp_norm_grid.y, mlp_norm_grid.z, 
+            (void)hipModuleLaunchKernel(fn_layernorm, mlp_norm_grid.x, mlp_norm_grid.y, mlp_norm_grid.z,
                                  32, 1, 1, 0, 0, ln_mlp_args, nullptr);
             if (hipGetLastError() != hipSuccess) {
                 qwen_set_error("RMSNorm MLP failed"); goto cleanup;
@@ -752,17 +752,17 @@ int qwen_model_forward_batch(qwen_model_t* model,
             std::vector<void*> h_arr(batch_size), gate_arr(batch_size), up_arr(batch_size);
             for (int b = 0; b < batch_size; ++b) {
                 h_arr[b] = m->layer_scratch[l].h_mlp;   // MLP input (offset by seq)
-                gate_arr[b] = m->layer_scratch[l].d_gate;   // gate output (offset by seq)  
+                gate_arr[b] = m->layer_scratch[l].d_gate;   // gate output (offset by seq)
                 up_arr[b] = m->layer_scratch[l].d_up;     // up output (offset by seq)
             }
-            
+
             void* swiglu_args[] = { &h_arr[0],
                                    &L.Wgate.d_packed, &L.Wgate.d_scales,
                                    &L.Wup.d_packed, &L.Wup.d_scales,
                                    m->layer_scratch[l].d_down,    // down projection output (residual destination)
                                    &batch_size, &E_local, &E_local };
             dim3 swiglu_grid(1, (E + 15) / 16, batch_size);
-            (void)hipModuleLaunchKernel(fn_swiglu, swiglu_grid.x, swiglu_grid.y, swiglu_grid.z, 
+            (void)hipModuleLaunchKernel(fn_swiglu, swiglu_grid.x, swiglu_grid.y, swiglu_grid.z,
                                  32, 16, 1, 0, 0, swiglu_args, nullptr);
             if (hipGetLastError() != hipSuccess) {
                 qwen_set_error("SwiGLU failed"); goto cleanup;
@@ -772,7 +772,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
             for (int i = 0; i < E; ++i) {
                 __half h_val = ((__half*)m->layer_scratch[l].h)[i];
                 float h_f = __half2float(h_val);
-                float swi_f = ((float*)d_logits_batch)[i];  // SwiGLU output from logits buffer  
+                float swi_f = ((float*)d_logits_batch)[i];  // SwiGLU output from logits buffer
                 ((__half*)m->layer_scratch[l].h)[i] = __float2half(h_f + swi_f);
             }
         }
@@ -783,7 +783,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
         void* lnf_args[] = { &m->layer_scratch[0].h, &eng->d_final_ln, m->layer_scratch[0].d_h,
                             &E_local, &E_local, (void*)&eps_f };
         dim3 final_norm_grid((E + 31) / 32, 1, batch_size);
-        (void)hipModuleLaunchKernel(fn_layernorm, final_norm_grid.x, final_norm_grid.y, final_norm_grid.z, 
+        (void)hipModuleLaunchKernel(fn_layernorm, final_norm_grid.x, final_norm_grid.y, final_norm_grid.z,
                              32, 1, 1, 0, 0, lnf_args, nullptr);
         if (hipGetLastError() != hipSuccess) {
             qwen_set_error("final layer norm failed"); goto cleanup;
@@ -795,13 +795,13 @@ int qwen_model_forward_batch(qwen_model_t* model,
             inp_arr[b] = m->layer_scratch[0].d_h;   // normalized output (offset by seq)
             out_arr[b] = d_logits_batch + (size_t)b * m->vocab_size * sizeof(float);  // per-sequence logits
         }
-        
+
         int vocab_b = m->vocab_size;
         void* lm_args[] = { &inp_arr[0], &eng->d_lm_head_packed,
                            &eng->d_lm_head_scales, &out_arr[0],
                            &one_int, &vocab_b, &E_local };
         dim3 lm_grid(1, (vocab_b + 15) / 16, batch_size);
-        (void)hipModuleLaunchKernel(fn_gemm_act_fp4, lm_grid.x, lm_grid.y, lm_grid.z, 
+        (void)hipModuleLaunchKernel(fn_gemm_act_fp4, lm_grid.x, lm_grid.y, lm_grid.z,
                              32, 16, 1, 0, 0, lm_args, nullptr);
         if (hipGetLastError() != hipSuccess) {
             qwen_set_error("LM head failed"); goto cleanup;
@@ -815,10 +815,10 @@ int qwen_model_forward_batch(qwen_model_t* model,
     }
 
     (void)hipDeviceSynchronize();
-    
+
 cleanup:
     (void)hipFree(d_scores_batch);
-    (void)hipFree(d_qpos_batch); 
+    (void)hipFree(d_qpos_batch);
     (void)hipFree(d_logits_batch);
     return hipGetLastError() == hipSuccess ? 0 : INFERENCE_ERR_KERNEL_LAUNCH;
 }

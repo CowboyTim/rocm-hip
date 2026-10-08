@@ -153,7 +153,7 @@ int main() {
     HIP_CHECK(hipInit(0), "init");
     hipModule_t mod;
     HIP_CHECK(hipModuleLoadData(&mod, coData), "load module");
-    
+
     hipFunction_t func;
     HIP_CHECK(hipModuleGetFunction(&func, mod, "wmma_matmul_fp4"), "get function");
 
@@ -166,7 +166,7 @@ int main() {
     HIP_CHECK(hipModuleLaunchKernel(func, grid.x, grid.y, 1, block.x, block.y, 1,
                                     0, 0, args, nullptr), "launch");
     HIP_CHECK(hipDeviceSynchronize(), "sync after kernel");
-    
+
     munmap(coData, st.st_size);
     close(kfd);
     HIP_CHECK(hipModuleUnload(mod), "unload");
@@ -185,7 +185,7 @@ int main() {
     printf("\nCPU Verification:\n");
     printf("  Dequant A_fp4[i][k] using ROCmFP4 Codebook10\n");
     printf("  Compute C[i][j] = sum_k A_fp4[i][k] x B[k][j]\n\n");
-    
+
     bool all_match = true;
     for (int i = 0; i < MATRIX_SIZE; ++i) {
         for (int j = 0; j < MATRIX_SIZE; ++j) {
@@ -216,7 +216,7 @@ int main() {
             if (diff >= 2.0f) all_match = false;
         }
     }
-    
+
     if (all_match) {
         printf("\n  All values match within tolerance!\n");
     }

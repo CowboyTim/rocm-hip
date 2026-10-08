@@ -103,7 +103,7 @@ int main() {
     HIP_CHECK(hipInit(0), "init");
     hipModule_t mod;
     HIP_CHECK(hipModuleLoadData(&mod, coData), "load module");
-    
+
     hipFunction_t func;
     HIP_CHECK(hipModuleGetFunction(&func, mod, "wmma_matmul"), "get function");
 
@@ -114,10 +114,10 @@ int main() {
 
     printf("\nLaunching wmma_matmul<<<%d, %d>>>...\n", grid.x, block.x);
     void* args[] = { &devA, &devB, &devC };
-    HIP_CHECK(hipModuleLaunchKernel(func, grid.x, grid.y, 1, block.x, block.y, 1, 
+    HIP_CHECK(hipModuleLaunchKernel(func, grid.x, grid.y, 1, block.x, block.y, 1,
                                     0, 0, args, nullptr), "launch");
     HIP_CHECK(hipDeviceSynchronize(), "sync after kernel");
-    
+
     munmap(coData, st.st_size);
     close(kfd);
     HIP_CHECK(hipModuleUnload(mod), "unload");

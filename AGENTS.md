@@ -35,3 +35,17 @@ For temporary code snippets, test scripts, and debugging runs, use files in `/tm
 - Iterative fixes (e.g., wrapping blocks in conditionals, adding braces) are safer with file-based editing
 
 Pattern: write initial snippet to `/tmp/snippet_name.cpp` or `/tmp/debug_script.py`, run it, then use Edit to fix any errors before re-running.
+
+## File Cleanliness
+
+Always keep source files clean — no trailing whitespace on any line. Run this after edits:
+
+```bash
+sed -i 's/[[:space:]]*$//' <file>
+```
+
+Or for all source files at once:
+
+```bash
+find src tests -name '*.cpp' -o -name '*.h' -o -name '*.hpp' -o -name '*.hip' | xargs sed -i 's/[[:space:]]*$//'
+```
