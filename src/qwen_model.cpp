@@ -299,9 +299,10 @@ struct QwenModel {
 
         // ---- 1) Embedding lookup ----
         fprintf(stderr, "[FORWARD] token_id=%d d_embed_table_copy=%p\n", token_id, (void*)d_embed_table_copy);
-        int32_t tid = token_id;
-        void* emb_args[] = { &tid, &d_embed_table_copy, &layer_scratch[0].d_h,
-                            &one, &E_local, &vocab_local };
+        int32_t tid_arr[1] = { (int32_t)token_id };
+        const __half* d_emb_ptr = d_embed_table_copy;
+        void* emb_args[] = { tid_arr, (const __half**)&d_emb_ptr, &layer_scratch[0].d_h,
+                             &one, &E_local, &vocab_local };
         hipError_t e;
         fprintf(stderr, "[FORWARD] Launching embedding_lookup kernel...\n"); fflush(stderr);
         e = hipModuleLaunchKernel(fn_embedding, 1, 1, 1, 256, 1, 1, 0, 0, emb_args, nullptr);
@@ -542,13 +543,14 @@ int qwen_model_forward_batch(qwen_model_t* model,
 
     // ---- Embedding lookup (per sequence via grid-stride launch) ----
     int vocab_local = eng->vocab_size;
+    int one_int = 1;
     
     // Build per-sequence embedding index arrays (each sequence has different token ID)
     std::vector<int32_t> h_tokens(batch_size);
     for (int b = 0; b < batch_size; ++b) h_tokens[b] = tokens[b];
 
-    int one_int = 1;
-    void* emb_args[] = { &h_tokens[0], &eng->d_embed_table, m->layer_scratch[0].d_h, 
+    const __half* d_emb_ptr_batch = reinterpret_cast<const __half*>(eng->d_embed_table);
+    void* emb_args[] = { &h_tokens[0], (const __half**)&d_emb_ptr_batch, m->layer_scratch[0].d_h, 
                          (void*)&one_int, (void*)&E, (void*)&vocab_local };
     // Embedding lookup is inherently per-token (different indices), so single-launch with grid-stride over batch
     (void)hipModuleLaunchKernel(fn_embedding, 1, 1, batch_size, 256, 1, 1, 0, 0, emb_args, nullptr);

@@ -861,56 +861,41 @@ Failed to load model: Failed to load model weights
 
 ---
 
-## CRITICAL ISSUE: Embedding Table GPU Hang During Forward Pass — IN PROGRESS 🔴
+## CRITICAL ISSUE: Embedding Table GPU Hang During Forward Pass — RESOLVED ✅
 
-**Symptom**: Model loads successfully, embeddings dequantize correctly into host memory and are pinned via `hipHostRegister`. However, when `qwen_model_forward()` launches the `embedding_lookup` kernel via `hipModuleLaunchKernel`, the GPU hangs with fault at address `(nil)` or offset `0x3000`.
+**Root cause**: Argument passing mismatch in `qwen_model.cpp` forward pass. The `embedding_lookup` kernel expects:
+- `token_ids`: a GPU-accessible array (`int*`) indexed via `token_ids[idx]`
+- `embed_table`: a direct device pointer (`const __half*`) used for arithmetic `embed_table + token * hidden_size`
 
-### Investigation Summary
+But the old code passed:
+- `&tid` — address of a single stack-local int (kernel reads garbage when `idx > 0`)
+- `&d_embed_table_copy` — address of host variable holding device pointer (kernel interprets it as a raw data pointer, not a pointer-to-pointer)
 
-1. **Scale extraction works**: TYPE13/TYPE100 scales extracted from blocks correctly (verified by log output).
+### Fix Applied
 
-2. **Embedding dequantization works**: TYPE14 transposed embeddings (vocab=248320, n_embd=2560 → 635M values) dequantize successfully from blocks into `std::vector<__half>` buffer of size 1,271,398,400 bytes.
+Changed argument construction in both `forward()` and `forward_batch()`:
 
-3. **GPU device buffer copy succeeds**: Explicit `hipMalloc` + `hipMemcpyHostToDevice` to allocate GPU device memory and copy embedding data completes without error. Device pointer is valid (`0x...e00000`).
+```cpp
+// Single-token (line ~302): wrap scalar in array, cast device pointer directly
+int32_t tid_arr[1] = { (int32_t)token_id };
+const __half* d_emb_ptr = d_embed_table_copy;
+void* emb_args[] = { tid_arr, (const __half**)&d_emb_ptr, &layer_scratch[0].d_h,
+                     &one, &E_local, &vocab_local };
 
-4. **Pointer value is correct**: Debug logging shows `d_embed_table_copy = 0x7ab73e1b5010` (host-pinned) or `0x7a7563e00000` (device-mapped), both non-NULL and correct.
+// Batched (line ~552): same pattern with vector data pointer
+const __half* d_emb_ptr_batch = reinterpret_cast<const __half*>(eng->d_embed_table);
+void* emb_args[] = { &h_tokens[0], (const __half**)&d_emb_ptr_batch, m->layer_scratch[0].d_h, 
+                     (void*)&one_int, (void*)&E, (void*)&vocab_local };
+```
 
-5. **GPU still hangs**: `hipModuleLaunchKernel(fn_embedding, ...)` returns success but `hipDeviceSynchronize()` blocks forever. GPU faults at address `(nil)` — kernel receives NULL or invalid pointer despite our debug showing correct values.
+This matches the exact pattern used by working kernels (rope, layernorm, softmax, gemm_act_fp4) which all pass device pointers via `(type**)&host_var` casting. No changes to `.hip` kernel files needed — the kernel definition was correct all along.
 
-### Root Cause Hypothesis
+### Files Modified
 
-The issue appears to be an **ABI incompatibility** between `hipModuleLaunchKernel` and parameter passing for module-loaded kernels on ROCm gfx1151 (RDNA3.5). While other kernels (rope, softmax, layernorm, gemm_act_fp4) launch successfully through the same module-loading mechanism, the `embedding_lookup` kernel consistently hangs when accessed via `hipModuleLaunchKernel`.
-
-Potential causes:
-- `hipModuleLoadData` + `hipModuleGetFunction` + `hipModuleLaunchKernel` pipeline has issues with certain parameter types (pointer-to-pointer args like `&d_embed_table_copy`)
-- The vectorized uint4 loads in embedding_lookup.hip may have subtle alignment/UB issues on AMD hardware
-- ROCm driver bug for module-launched kernels accessing host-pinned memory on integrated GPUs
-
-### Actions Taken
-
-- Added explicit error checking after all HIP API calls (`hipModuleLaunchKernel`, `hipDeviceSynchronize`)
-- Changed `QwenModel::d_embed_table_copy` from `void*` to `const __half*` for type safety
-- Copied embedding data to GPU device memory via `hipMalloc` + `hipMemcpyHostToDevice` — still hangs
-- Simplified embedding_lookup.hip kernel from vectorized uint4 copy to element-by-element loop
-- Added comprehensive debug logging at every step: load_model → pin_model_memory → kv_cache_init → qwen_model_set_embed_table → forward() → kernel launch → synchronize
-- Verified simple test_kernel launches and executes correctly on same GPU — ROCm runtime is functional
-
-### Files Involved
-
-| File | Role |
-|------|------|
-| `src/inference.cpp` | Model loading, embedding dequantization, GPU buffer allocation/copy |
-| `src/qwen_model.cpp` | Forward pass orchestration, kernel argument construction |  
-| `src/embedding_lookup.hip` | Embedding lookup kernel definition (currently hanging) |
-| `src/qwen_model.hip` | Contains alternative `embedding_lookup_kernel` with simpler loop structure |
-
-### Next Steps
-
-1. **Switch to `hipLaunchKernelGGL`**: Replace `hipModuleLaunchKernel(fn_embedding, ...)` with direct kernel invocation using the GGL macro, which uses compile-time template instantiation instead of runtime module loading. This requires compiling qwen_model.hip alongside qwen_model.cpp with hipcc.
-
-2. **Use inline device function in qwen_model.cpp**: Define the embedding lookup kernel as an `inline __device__` function within a `.hip` file included by qwen_model.cpp, eliminating the module-loading indirection entirely.
-
-3. **Test with minimal kernel**: Write a tiny test kernel that copies a single value and passes it through the same `hipModuleLaunchKernel` pipeline to isolate whether the issue is specific to embedding_lookup or affects all module-loaded kernels.
+| File | Changes |
+|------|---------|
+| `src/qwen_model.cpp:302-307` | Fixed single-token embedding lookup args |
+| `src/qwen_model.cpp:551-555` | Fixed batched embedding lookup args |
 
 4. **Report ROCm bug**: If confirmed as a driver/runtime bug, file with AMD ROCm team for gfx1151/ROCm 6.x on Strix Halo hardware.
 
