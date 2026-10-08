@@ -116,10 +116,11 @@ static bool pin_model_memory(inference_model* m) {
     fprintf(stderr, "[pin_model] embed_table size=%zu\n", m->embed_table.size());
     if (!m->embed_table.empty()) {
         hipError_t e = hipHostRegister(m->embed_table.data(),
-                                        m->embed_table.size() * sizeof(__half),
-                                        hipHostRegisterDefault);
+                                         m->embed_table.size() * sizeof(__half),
+                                         hipHostRegisterDefault);
         if (e != hipSuccess) { fprintf(stderr, "[pin_model] embed register failed: %s\n", hipGetErrorString(e)); return false; }
         (void)hipHostGetDevicePointer(&m->d_embed_table, m->embed_table.data(), 0);
+        fprintf(stderr, "[pin_model] embed registered, d_embed_table=%p\n", (void*)m->d_embed_table);
     }
     // Pin per-layer weights
     for (auto& L : m->layers) {
@@ -253,7 +254,7 @@ static void extract_scales_q8_0(const uint8_t* data, size_t nbytes, float* scale
             const uint8_t* blk = data + row * row_blocks * block_bytes + b * block_bytes;
             float d; memcpy(&d, blk, sizeof(float)); // FP16 stored as half-precision but we read raw
             __half h; memcpy(&h, blk, sizeof(__half));
-            scales_out[row * row_blocks + b] = __half_to_float(h);
+            scales_out[row * row_blocks + b] = __half2float(h);
         }
     }
 }
@@ -269,7 +270,7 @@ static void extract_scales_q4_0(const uint8_t* data, size_t nbytes, float* scale
         for (size_t b = 0; b < row_blocks; ++b) {
             const uint8_t* blk = data + row * row_blocks * block_bytes + b * block_bytes;
             __half h; memcpy(&h, blk, sizeof(__half));
-            scales_out[row * row_blocks + b] = __half_to_float(h);
+            scales_out[row * row_blocks + b] = __half2float(h);
         }
     }
 }
@@ -285,7 +286,7 @@ static void extract_scales_q4_1(const uint8_t* data, size_t nbytes, float* scale
         for (size_t b = 0; b < row_blocks; ++b) {
             const uint8_t* blk = data + row * row_blocks * block_bytes + b * block_bytes;
             __half h; memcpy(&h, blk, sizeof(__half));
-            scales_out[row * row_blocks + b] = __half_to_float(h);
+            scales_out[row * row_blocks + b] = __half2float(h);
         }
     }
 }
@@ -825,7 +826,8 @@ static bool load_model_weights(inference_model* m) {
 inference_model_t* inference_load_model(const char* gguf_path) {
     clear_error();
     if (!gguf_path) { set_error("NULL path"); return nullptr; }
-
+    
+    fprintf(stderr, "[LOAD] Starting load_model for %s\n", gguf_path); fflush(stderr);
     inference_model_t* m = new inference_model();
     m->gguf = gguf_mmap_open(gguf_path);
     if (!m->gguf) { set_error("gguf_mmap_open failed"); delete m; return nullptr; }
@@ -976,8 +978,8 @@ inference_model_t* inference_load_model(const char* gguf_path) {
                                         memcpy(&h_scale, &data[blk_idx * bytes_per_block], sizeof(__half));
                                         memcpy(&h_min, &data[blk_idx * bytes_per_block + 2], sizeof(__half));
                                         
-                                        float scale_f = __half_to_float(h_scale);
-                                        float min_f = __half_to_float(h_min);
+                                        float scale_f = __half2float(h_scale);
+                                        float min_f = __half2float(h_min);
                                         
                                         uint8_t nibble = (data[blk_idx * bytes_per_block + 4 + (val_in_block >> 1)] >> ((val_in_block & 1) << 2)) & 0x0F;
                                         // Q4_1: value = scale * codebook[nibble] + min
@@ -1007,7 +1009,7 @@ inference_model_t* inference_load_model(const char* gguf_path) {
                                         __half h_delta;
                                         memcpy(&h_delta, &data[blk_idx * bytes_per_block], sizeof(__half));
                                         
-                                        float delta_f = __half_to_float(h_delta);
+                                        float delta_f = __half2float(h_delta);
                                         
                                         uint8_t nibble = (data[blk_idx * bytes_per_block + 2 + (val_in_block >> 1)] >> ((val_in_block & 1) << 2)) & 0x0F;
                                         // Q4_0: value = delta * codebook[nibble] - min (min encoded in data)
@@ -1018,6 +1020,45 @@ inference_model_t* inference_load_model(const char* gguf_path) {
                             }
                             break;
                         }
+                        case 14: { // TYPE14: Qwen3.5 custom quantization — self-contained UE4M3 blocks
+                            fprintf(stderr, "[load_model] token_embd: extracting TYPE14 scales from blocks (type=%d)\n", emb_type);
+                            {
+                                const uint8_t* data = packed.data();
+                                size_t block_size_elements = 256; // TYPE14 uses 256-element blocks like TYPE13
+                                size_t bytes_per_block = 176; // calculated from tensor size: 437043200 / (total_elements/256)
+                                size_t blocks_per_row = m->n_embd / block_size_elements;
+                                size_t total_blocks = blocks_per_row * m->vocab_size;
+                                
+                                fprintf(stderr, "[load_model] TYPE14: blocks_per_row=%zu total_blocks=%zu bytes/block=%zu\n", 
+                                        blocks_per_row, total_blocks, bytes_per_block);
+                                
+                                for (int vi = 0; vi < m->vocab_size; ++vi) {
+                                    int64_t row_offset = (int64_t)vi * m->n_embd;
+                                    
+                                    for (int ei = 0; ei < m->n_embd; ++ei) {
+                                        int bi = ei / block_size_elements;
+                                        int val_in_block = ei % block_size_elements;
+                                        size_t blk_idx = (size_t)row_offset / block_size_elements + bi;
+                                        
+                                        // Scale index within block: each scale covers 16 elements, stored as UE4M3 (1 byte)
+                                        size_t scale_idx = val_in_block / 16;
+                                        size_t scale_byte_off = blk_idx * bytes_per_block + scale_idx; // UE4M3 stored as 1 byte
+                                        
+                                        float sc = ue4m3_to_float(data[scale_byte_off]);
+                                        
+                                        // Data offset after scales (scales occupy first 16 bytes of block header for 16 scales)
+                                        size_t data_off = blk_idx * bytes_per_block + 16;
+                                        
+                                        // Nibble index: pair of values per byte in data section
+                                        int nibble_idx = val_in_block / 2;
+                                        uint8_t nibble = (data[data_off + nibble_idx] >> ((val_in_block & 1) << 2)) & 0x0F;
+                                        m->embed_table[(size_t)vi * m->n_embd + ei] = __half(dequant_code(nibble) * sc);
+                                    }
+                                }
+                            }
+                            fprintf(stderr, "[load_model] token_embd TYPE14 dequantized (%d x %d)\n", m->vocab_size, m->n_embd);
+                            break;
+                        }
                         default: {
                             fprintf(stderr, "[load_model] WARNING: quantized embedding type %d not supported for dequant\n", 
                                     emb_type);
@@ -1025,8 +1066,107 @@ inference_model_t* inference_load_model(const char* gguf_path) {
                             break;
                         }
                     }
+                } else if (ne && ne[0] == m->n_embd && ne[1] == m->vocab_size) {
+                    // Transposed layout [n_embd][vocab_size] — common GGUF convention
+                    fprintf(stderr, "[load_model] token_emb: transposed layout detected [%lld x %lld], dequantizing...\n", 
+                            (long long)ne[0], (long long)ne[1]);
+                    
+                    size_t total_elements = (size_t)m->vocab_size * m->n_embd;
+                    m->embed_table.resize(total_elements);
+                    
+                    // Load packed data for transposed path
+                    std::vector<unsigned char> packed((const unsigned char*)emb_ptr, 
+                                                       (const unsigned char*)emb_ptr + sz);
+                    
+                    // Dequantize based on type using scale extraction (transposed indexing)
+                    switch (emb_type) {
+                        case 3: { // Q4_1 transposed
+                            const uint8_t* data = packed.data();
+                            size_t bytes_per_block = 20; // 2 scale + 2 min + 16 packed
+                            
+                            for (int vi = 0; vi < m->vocab_size; ++vi) {
+                                int64_t row_offset = (int64_t)vi;
+                                size_t row_blocks = m->n_embd / 32;
+                                
+                                for (int ei = 0; ei < m->n_embd; ++ei) {
+                                    int bi = ei / 32;
+                                    int val_in_block = ei % 32;
+                                    size_t blk_idx = (size_t)row_offset * row_blocks + bi;
+                                    
+                                    __half h_scale, h_min;
+                                    memcpy(&h_scale, &data[blk_idx * bytes_per_block], sizeof(__half));
+                                    memcpy(&h_min, &data[blk_idx * bytes_per_block + 2], sizeof(__half));
+                                    
+                                    float scale_f = __half2float(h_scale);
+                                    float min_f = __half2float(h_min);
+                                    
+                                    uint8_t nibble = (data[blk_idx * bytes_per_block + 4 + (val_in_block >> 1)] >> ((val_in_block & 1) << 2)) & 0x0F;
+                                    float val = scale_f * dequant_code(nibble) + min_f;
+                                    m->embed_table[(size_t)vi * m->n_embd + ei] = __half(val);
+                                }
+                            }
+                            break;
+                        }
+                        case 14: { // TYPE14 transposed [n_embd][vocab_size]
+                            fprintf(stderr, "[load_model] token_embd TYPE14 transposed, extracting scales from blocks\n");
+                            const uint8_t* data = packed.data();
+                            size_t block_size_elements = 256; // TYPE14 uses 256-element blocks
+                            size_t bytes_per_block = 176;     // computed from tensor size
+                            size_t blocks_per_vocab_row = m->vocab_size / block_size_elements;
+                            
+                            // Validate block layout against actual file size
+                            size_t total_blocks_calc = (size_t)m->n_embd * blocks_per_vocab_row;
+                            size_t expected_size = total_blocks_calc * bytes_per_block;
+                            fprintf(stderr, "[load_model] TYPE14 validate: total_blocks=%zu expected_sz=%zu actual_sz=%zu\n", 
+                                    total_blocks_calc, expected_size, sz);
+                            
+                            for (int vi = 0; vi < m->vocab_size; ++vi) {
+                                for (int ei = 0; ei < m->n_embd; ++ei) {
+                                    // GGUF stores [n_embd][vocab_size] in row-major C order
+                                    // index(ei, vi) = ei * vocab_size + vi
+                                    int bi = vi / block_size_elements;          // which block within this n_embd row
+                                    int val_in_block = vi % block_size_elements; // position within block
+                                    size_t blk_idx = (size_t)ei * blocks_per_vocab_row + bi;
+                                    
+                                    // Bounds check on block index
+                                    if (blk_idx >= total_blocks_calc) {
+                                        fprintf(stderr, "[load_model] ERROR TYPE14: blk_idx=%zu >= total_blocks=%zu at vi=%d ei=%d\n",
+                                                blk_idx, total_blocks_calc, vi, ei);
+                                        goto type14_done;
+                                    }
+                                    
+                                    // Scale index within block: each scale covers 16 elements, stored as UE4M3 (1 byte)
+                                    size_t scale_idx = val_in_block / 16;
+                                    size_t scale_byte_off = blk_idx * bytes_per_block + scale_idx; // UE4M3 stored as 1 byte
+                                    
+                                    float sc = ue4m3_to_float(data[scale_byte_off]);
+                                    
+                                    // Data offset after scales (scales occupy first 16 bytes of block header for 16 scales)
+                                    size_t data_off = blk_idx * bytes_per_block + 16;
+                                    
+                                    // Nibble index: pair of values per byte in data section
+                                    int nibble_idx = val_in_block / 2;
+                                    uint8_t nibble = (data[data_off + nibble_idx] >> ((val_in_block & 1) << 2)) & 0x0F;
+                                    m->embed_table[(size_t)vi * m->n_embd + ei] = __half(dequant_code(nibble) * sc);
+                                }
+                            }
+type14_done:;
+                            fprintf(stderr, "[load_model] token_embd TYPE14 dequantized transposed (%d x %d)\n", m->vocab_size, m->n_embd);
+                            break;
+                        }
+                        default: {
+                            fprintf(stderr, "[load_model] WARNING: quantized embedding type %d not supported for dequant\n", 
+                                    emb_type);
+                            break;
+                        }
+                    }
                 } else {
-                    fprintf(stderr, "[load_model] WARNING: token_embd dimensions don't match vocab_size×n_embd\n");
+                    if (ne) {
+                        fprintf(stderr, "[load_model] WARNING: token_embd dimensions don't match vocab_size×n_embd [%lld x %lld vs %d x %d]\n",
+                                (long long)ne[0], (long long)ne[1], m->vocab_size, m->n_embd);
+                    } else {
+                        fprintf(stderr, "[load_model] WARNING: could not read tensor dimensions for token_embd.weight\n");
+                    }
                 }
             }
         } else {
@@ -1128,13 +1268,43 @@ int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
     if (!m->kvc) { set_error("kv_cache_create failed"); return -1; }
     m->n_ctx = n_ctx;
     // Create Qwen model for forward passes
+    fprintf(stderr, "[KV_INIT] About to create qwen model\n");
     m->qwen = qwen_model_create(m);
     if (!m->qwen) { set_error("qwen_model_create failed"); return -1; }
+    fprintf(stderr, "[KV_INIT] Qwen model created at %p\n", (void*)m->qwen);
+    // Copy embedding table to GPU device memory and set on qwen model
+    if (!m->embed_table.empty()) {
+        size_t emb_bytes = m->embed_table.size() * sizeof(__half);
+        void* d_emb_dev = nullptr;
+        hipError_t e;
+        fprintf(stderr, "[KV_INIT] Copying %zu bytes embed table to GPU device memory...\n", emb_bytes); fflush(stderr);
+        e = hipMalloc(&d_emb_dev, emb_bytes);
+        if (e == hipSuccess) {
+            e = hipMemcpy(d_emb_dev, m->embed_table.data(), emb_bytes, hipMemcpyHostToDevice);
+            if (e == hipSuccess) {
+                fprintf(stderr, "[KV_INIT] Embed copied to GPU device %p\n", d_emb_dev); fflush(stderr);
+                qwen_model_set_embed_table(m->qwen, d_emb_dev);
+            } else {
+                fprintf(stderr, "[KV_INIT] hipMemcpy failed: %s\n", hipGetErrorString(e));
+                hipFree(d_emb_dev);
+            }
+        } else {
+            fprintf(stderr, "[KV_INIT] hipMalloc failed: %s\n", hipGetErrorString(e));
+        }
+    } else {
+        fprintf(stderr, "[KV_INIT] No embedding table to copy\n"); fflush(stderr);
+    }
+    fprintf(stderr, "[KV_INIT] embed table set on qwen model\n");
     return 0;
 }
 
 void inference_kv_cache_free(inference_model_t* m) {
     if (m && m->kvc) { kv_cache_free(m->kvc); m->kvc = nullptr; }
+}
+
+qwen_model_t* inference_get_qwen_model(inference_model_t* m) {
+    if (!m) return nullptr;
+    return m->qwen;
 }
 
 void inference_set_seed(inference_model_t* m, unsigned int seed) {

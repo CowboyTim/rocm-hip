@@ -1,11 +1,5 @@
-// embedding_lookup.hip -- Phase 4: embedding table lookup for Qwen 3 token IDs.
-// Input: token_ids [batch_size] int32, embedding_table [vocab_size x hidden_size] FP16
-// Output: embeddings [batch_size x hidden_size] FP16
-
-#include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
-
-extern "C" __global__ void embedding_lookup(const int* token_ids, const __half* embedding_table,
+// ==================== Embedding Lookup ====================
+extern "C" __global__ void embedding_lookup(const int* token_ids, const __half* embed_table,
                                             __half* output, int batch_size, int hidden_size, int vocab_size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -15,21 +9,15 @@ extern "C" __global__ void embedding_lookup(const int* token_ids, const __half* 
     if (token < 0) token = 0;
     if (token >= vocab_size) token = vocab_size - 1;
 
-    const __half* src = embedding_table + (size_t)token * hidden_size;
+    const __half* src = embed_table + (size_t)token * hidden_size;
     __half* dst = output + (size_t)idx * hidden_size;
 
-    // Vectorized copy: 8 elements per thread (128-bit)
-    for (int i = 0; i < hidden_size; i += blockDim.x * 8) {
-        int pos = i + threadIdx.x * 8;
-        if (pos + 7 < hidden_size) {
-            // Load 8 FP16 elements (128-bit)
-            uint4 chunk = *reinterpret_cast<const uint4*>(src + pos);
-            *reinterpret_cast<uint4*>(dst + pos) = chunk;
-        } else {
-            // Tail handling
-            for (int j = 0; j < 8 && pos + j < hidden_size; ++j) {
-                dst[pos + j] = src[pos + j];
-            }
+    // Simple element-by-element copy (avoids potential uint4 alignment issues on AMD)
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
         }
     }
 }

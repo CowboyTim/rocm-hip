@@ -28,10 +28,12 @@ int main(int argc, char** argv) {
         inference_free_model(engine);
         return 1;
     }
+    fprintf(stderr, "[DEMO] KV cache init succeeded\n");
 
-    qwen_model_t* model = qwen_model_create(engine);
+    // Get the Qwen model created during kv_cache_init (already configured with embedding table)
+    qwen_model_t* model = inference_get_qwen_model(engine);
     if (!model) {
-        fprintf(stderr, "Failed to create Qwen model\n");
+        fprintf(stderr, "Failed to get Qwen model\n");
         inference_kv_cache_free(engine);
         inference_free_model(engine);
         return 1;

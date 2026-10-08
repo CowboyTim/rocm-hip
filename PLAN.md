@@ -861,6 +861,108 @@ Failed to load model: Failed to load model weights
 
 ---
 
+## CRITICAL ISSUE: Embedding Table GPU Hang During Forward Pass — IN PROGRESS 🔴
+
+**Symptom**: Model loads successfully, embeddings dequantize correctly into host memory and are pinned via `hipHostRegister`. However, when `qwen_model_forward()` launches the `embedding_lookup` kernel via `hipModuleLaunchKernel`, the GPU hangs with fault at address `(nil)` or offset `0x3000`.
+
+### Investigation Summary
+
+1. **Scale extraction works**: TYPE13/TYPE100 scales extracted from blocks correctly (verified by log output).
+
+2. **Embedding dequantization works**: TYPE14 transposed embeddings (vocab=248320, n_embd=2560 → 635M values) dequantize successfully from blocks into `std::vector<__half>` buffer of size 1,271,398,400 bytes.
+
+3. **GPU device buffer copy succeeds**: Explicit `hipMalloc` + `hipMemcpyHostToDevice` to allocate GPU device memory and copy embedding data completes without error. Device pointer is valid (`0x...e00000`).
+
+4. **Pointer value is correct**: Debug logging shows `d_embed_table_copy = 0x7ab73e1b5010` (host-pinned) or `0x7a7563e00000` (device-mapped), both non-NULL and correct.
+
+5. **GPU still hangs**: `hipModuleLaunchKernel(fn_embedding, ...)` returns success but `hipDeviceSynchronize()` blocks forever. GPU faults at address `(nil)` — kernel receives NULL or invalid pointer despite our debug showing correct values.
+
+### Root Cause Hypothesis
+
+The issue appears to be an **ABI incompatibility** between `hipModuleLaunchKernel` and parameter passing for module-loaded kernels on ROCm gfx1151 (RDNA3.5). While other kernels (rope, softmax, layernorm, gemm_act_fp4) launch successfully through the same module-loading mechanism, the `embedding_lookup` kernel consistently hangs when accessed via `hipModuleLaunchKernel`.
+
+Potential causes:
+- `hipModuleLoadData` + `hipModuleGetFunction` + `hipModuleLaunchKernel` pipeline has issues with certain parameter types (pointer-to-pointer args like `&d_embed_table_copy`)
+- The vectorized uint4 loads in embedding_lookup.hip may have subtle alignment/UB issues on AMD hardware
+- ROCm driver bug for module-launched kernels accessing host-pinned memory on integrated GPUs
+
+### Actions Taken
+
+- Added explicit error checking after all HIP API calls (`hipModuleLaunchKernel`, `hipDeviceSynchronize`)
+- Changed `QwenModel::d_embed_table_copy` from `void*` to `const __half*` for type safety
+- Copied embedding data to GPU device memory via `hipMalloc` + `hipMemcpyHostToDevice` — still hangs
+- Simplified embedding_lookup.hip kernel from vectorized uint4 copy to element-by-element loop
+- Added comprehensive debug logging at every step: load_model → pin_model_memory → kv_cache_init → qwen_model_set_embed_table → forward() → kernel launch → synchronize
+- Verified simple test_kernel launches and executes correctly on same GPU — ROCm runtime is functional
+
+### Files Involved
+
+| File | Role |
+|------|------|
+| `src/inference.cpp` | Model loading, embedding dequantization, GPU buffer allocation/copy |
+| `src/qwen_model.cpp` | Forward pass orchestration, kernel argument construction |  
+| `src/embedding_lookup.hip` | Embedding lookup kernel definition (currently hanging) |
+| `src/qwen_model.hip` | Contains alternative `embedding_lookup_kernel` with simpler loop structure |
+
+### Next Steps
+
+1. **Switch to `hipLaunchKernelGGL`**: Replace `hipModuleLaunchKernel(fn_embedding, ...)` with direct kernel invocation using the GGL macro, which uses compile-time template instantiation instead of runtime module loading. This requires compiling qwen_model.hip alongside qwen_model.cpp with hipcc.
+
+2. **Use inline device function in qwen_model.cpp**: Define the embedding lookup kernel as an `inline __device__` function within a `.hip` file included by qwen_model.cpp, eliminating the module-loading indirection entirely.
+
+3. **Test with minimal kernel**: Write a tiny test kernel that copies a single value and passes it through the same `hipModuleLaunchKernel` pipeline to isolate whether the issue is specific to embedding_lookup or affects all module-loaded kernels.
+
+4. **Report ROCm bug**: If confirmed as a driver/runtime bug, file with AMD ROCm team for gfx1151/ROCm 6.x on Strix Halo hardware.
+
+
+---
+
+## Phase 17.2: Actual Scale Extraction from Self-Contained Blocks — PARTIALLY COMPLETE ✅
+
+**Goal**: Replace placeholder unity-scale fill with real scale extraction from TYPE13/Q4_0/Q4_1/Q8_0/TYPE100 blocks.
+
+### Completed Implementation (Weight Loading)
+
+1. **Helper functions added to `inference.cpp`** (before `load_quant_weight_from_gguf()`):
+   - `extract_scales_type100()`: Reads UE4M3 scales from TYPE100 blocks at offset 16+ within each 17-byte block (2 scales per block for 32 values).
+   - `extract_scales_type13()`: Reads 16 UE4M3 scales from TYPE13 blocks at offsets 0–15 within each 144-byte block (block_size=256, one scale per 16 elements).
+   - `extract_scales_q4_0()`, `q4_1()`, `q8_0()`: FP16 delta extraction stubs for standard llama.cpp quant types (not yet wired into main path — unity placeholder used until proper dequant formulas are implemented).
+
+2. **`load_quant_weight_from_gguf()` self-contained path updated**:
+   - For TYPE100: extracts all UE4M3 scales from blocks, repacks to standard per-row layout (K/16 scale bytes per row), fills gaps with unity fallback.
+   - For TYPE13: same approach but reads from 144-byte blocks with 16 scales each. Maps block-level scales to projection-specific arrays using column→scale_index = col / 16 formula.
+   - For Q4_0/Q4_1/Q8_0: logs warning that FP16 delta extraction not yet wired; falls through to unity placeholder fill.
+
+3. **Combined QKV split for self-contained types updated** (`inference.cpp:load_model_weights()`):
+   - Replaced placeholder fill with TYPE13-aware scale extraction.
+   - For each row: extracts all available scales from blocks covering columns 0..total_cols-1, then maps them to Q/K/V projections based on column ranges.
+   - Scale index for column c is c / 16; scale comes from block(c) = c / 256.
+   - Unknown types fall back to unity fill with debug logging.
+
+### Embedding Table Loading for Quantized Types — Works ✅
+
+Extended `token_embd.weight` loading in `inference_load_model()`:
+- Detects tensor type via `gguf_tensor_type()` before loading.
+- If FP16 (type=1/-1): loads as before (direct __half assign).
+- If quantized (Q4_1/type=3, TYPE100/type=100, TYPE14/type=14): dequantizes to FP16 at load time using correct formulas per type.
+- **TYPE14 transposed path**: Handles GGUF's [n_embd][vocab_size] memory layout with proper block indexing for 256-element UE4M3-scaled blocks (176 bytes/block). Dequantizes 635M values successfully into host vector.
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `src/inference.cpp` | Added 5 scale extraction helpers, rewrote self-contained paths in `load_quant_weight_from_gguf()` and combined QKV split, extended embedding table loading for quantized types (TYPE14 transposed support added) |
+| `src/qwen_model.cpp` | Added `qwen_model_set_embed_table()` setter, `d_embed_table_copy` field, debug logging for GPU pointer passing |
+| `src/qwen_model.h` | Added `qwen_model_set_embed_table()` declaration, `inference_get_qwen_model()` getter |
+| `src/embedding_lookup.hip` | Simplified kernel from vectorized uint4 copy to element-by-element loop |
+
+### Current Blocker 🔴
+
+See **CRITICAL ISSUE** section above — embedding table GPU access hangs via `hipModuleLaunchKernel`. Weight loading and dequantization work correctly; inference cannot complete until the GPU kernel launch issue is resolved.
+
+
+---
+
 ## Session Log: Qwen3.5-4B Compatibility Testing (2025-01-XX) — RESOLVED ✅
 
 ### Objective

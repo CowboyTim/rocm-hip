@@ -207,6 +207,7 @@ struct QwenModel {
     std::vector<LayerScratch> layer_scratch;
     int n_layer = 28, n_embd = 4096, n_head = 32, n_head_kv = 8, head_dim = 128;
     int vocab_size = 151936, n_ctx = 4096;
+    const __half* d_embed_table_copy = nullptr;  // Use proper type instead of void*
 
     ~QwenModel() {
         for (auto& s : layer_scratch) s.free();
@@ -297,11 +298,17 @@ struct QwenModel {
         float eps_f = (float)eng_model->eps;
 
         // ---- 1) Embedding lookup ----
+        fprintf(stderr, "[FORWARD] token_id=%d d_embed_table_copy=%p\n", token_id, (void*)d_embed_table_copy);
         int32_t tid = token_id;
-        void* emb_args[] = { &tid, &eng_model->d_embed_table, &layer_scratch[0].d_h,
+        void* emb_args[] = { &tid, &d_embed_table_copy, &layer_scratch[0].d_h,
                             &one, &E_local, &vocab_local };
-        (void)hipModuleLaunchKernel(fn_embedding, 1, 1, 1, 256, 1, 1, 0, 0, emb_args, nullptr);
-        (void)hipDeviceSynchronize();
+        hipError_t e;
+        fprintf(stderr, "[FORWARD] Launching embedding_lookup kernel...\n"); fflush(stderr);
+        e = hipModuleLaunchKernel(fn_embedding, 1, 1, 1, 256, 1, 1, 0, 0, emb_args, nullptr);
+        if (e != hipSuccess) { fprintf(stderr, "[FORWARD] Kernel launch failed: %s\n", hipGetErrorString(e)); return -1; }
+        fprintf(stderr, "[FORWARD] Synchronizing after embedding lookup...\n"); fflush(stderr);
+        e = hipDeviceSynchronize();
+        if (e != hipSuccess) { fprintf(stderr, "[FORWARD] Sync failed: %s\n", hipGetErrorString(e)); return -1; }
 
         // Residual starts as embedding output
         __half* residual = layer_scratch[0].h;
@@ -467,6 +474,13 @@ qwen_model_t* qwen_model_create(inference_model_t* engine_model) {
     QwenModel* m = new QwenModel();
     if (!m->init(engine_model)) { delete m; return nullptr; }
     return m;
+}
+
+void qwen_model_set_embed_table(qwen_model_t* model, void* d_embed_table) {
+    QwenModel* m = static_cast<QwenModel*>(model);
+    fprintf(stderr, "[SET_EMBED] Setting d_embed_table_copy from %p to %p\n", 
+            (void*)(m ? m->d_embed_table_copy : nullptr), d_embed_table);
+    if (m) m->d_embed_table_copy = reinterpret_cast<const __half*>(d_embed_table);
 }
 
 void qwen_model_free(qwen_model_t* model) {

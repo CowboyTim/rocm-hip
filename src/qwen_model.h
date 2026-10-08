@@ -16,6 +16,12 @@ typedef struct QwenModel qwen_model_t;
 // Create model from an initialized inference_model_t (engine model with loaded weights)
 qwen_model_t* qwen_model_create(inference_model_t* engine_model);
 
+// Set embedding table device pointer on the qwen model (must be called before forward passes)
+void qwen_model_set_embed_table(qwen_model_t* model, void* d_embed_table);
+
+// Get the qwen model from an inference model (created during kv_cache_init)
+qwen_model_t* inference_get_qwen_model(inference_model_t* model);
+
 // Free model resources
 void qwen_model_free(qwen_model_t* model);
 

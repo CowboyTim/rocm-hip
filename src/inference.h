@@ -92,6 +92,14 @@ int inference_generate(inference_model_t* model,
                        int32_t* out_ids,
                        int* out_len);
 
+// Forward declaration of Qwen model handle (defined in qwen_model.h)
+struct QwenModel;
+typedef struct QwenModel qwen_model_t;
+
+// Get the internal Qwen model handle (created during kv_cache_init)
+// Use this instead of creating a new qwen model — ensures proper initialization
+qwen_model_t* inference_get_qwen_model(inference_model_t* model);
+
 // Logits access for sampling (temperature, top-k, top-p)
 // vocab_ids: pre-allocated int32[vocab_size] array
 // logits: pre-allocated float[vocab_size] array
