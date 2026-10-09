@@ -2,6 +2,7 @@
 // Thin FFI wrappers around the C++ HIP implementation. All state in inference_model_t.
 
 #include "inference.h"
+#include "inference_internal.h"
 #include "gguf_mmap.h"
 #include "fp4_common.h"
 #include "kv_cache.h"
@@ -43,77 +44,8 @@ static void set_error(const char* fmt, ...) {
 
 static void clear_error() { g_last_error[0] = 0; }
 
-// Quantized weight matrix for a single projection (ROCmFP4 Codebook10)
-struct QuantWeight {
-    int N, K;                                  // output_dim x input_dim (K multiple of 16)
-    std::vector<unsigned char> packed;         // N x K/2 bytes
-    std::vector<unsigned char> scales;         // N x K/16 bytes (UE4M3 encoding: TYPE100/TYPE13)
-    std::vector<float> scales_f;               // N x num_blocks floats (non-UE4M3: Q4_0/Q4_1/Q8_0 FP16 delta/scale as floats)
-    std::vector<float> true_v;                 // N x K effective values (for CPU ref)
-    void* d_packed = nullptr;
-    void* d_scales = nullptr;                  // device ptr for scales (UE4M3 types only)
-    void* d_scales_f = nullptr;                // device ptr for scales_f (Q4_0/Q4_1/Q8_0 types)
-    int8_t quant_type = 0;                     // GGUF tensor type for GPU kernel dispatch (0=default, 2=Q4_0, 3=Q4_1, 7/8=Q8_0, 13=TYPE13, 100=TYPE100)
-};
-
-// Per-layer weights (attention + MLP)
-struct LayerWeights {
-    // Attention: Q, K, V, O projections
-    QuantWeight Wq, Wk, Wv, Wo;
-    // MLP: gate, up, down (SwiGLU)
-    QuantWeight W_gate, W_up, W_down;
-    // LayerNorm scales
-    std::vector<__half> attn_ln_scale;
-    std::vector<__half> mlp_ln_scale;
-    // Device pointers for norms
-    void* d_attn_ln = nullptr;
-    void* d_mlp_ln = nullptr;
-};
-
-struct inference_model {
-    gguf_model_t* gguf = nullptr;              // GGUF file mapping
-    std::string model_name;
-    int n_layer = 0;
-    int n_embd = 0;
-    int n_head = 0;
-    int n_head_kv = 0;
-    int head_dim = 0;
-    int vocab_size = 0;
-    int n_ctx = 0;
-
-    // Reference counting for shared ownership
-    std::atomic<int> ref_count{1};
-    std::mutex mtx;
-
-    // Embedding table
-    std::vector<__half> embed_table;           // [vocab_size x n_embd] FP16
-    void* d_embed_table = nullptr;
-
-    // Output projection (LM head) - Q8_0 quantized for dynamic range
-    // For simplicity in Phase 4, we'll use FP4 too; Q8_0 comes in Phase 5
-    QuantWeight lm_head;
-    void* d_lm_head_packed = nullptr;
-    void* d_lm_head_scales = nullptr;               // device ptr for scales (UE4M3 types)
-    void* d_lm_head_scales_f = nullptr;             // device ptr for scales_f (Q4_0/Q4_1/Q8_0 types)
-
-    // Final LayerNorm
-    std::vector<__half> final_ln_scale;
-    void* d_final_ln = nullptr;
-
-    // Per-layer weights
-    std::vector<LayerWeights> layers;
-
-    // KV cache manager
-    inference_kv_cache_t* kvc = nullptr;
-
-    // Scratch buffers (allocated per forward pass size)
-    void* scratch_base = nullptr;
-    size_t scratch_bytes = 0;
-
-    // Tokenizer
-    tokenizer_t* tokenizer = nullptr;
-    qwen_model_t* qwen = nullptr;
-};
+// All internal types (QuantWeight, LayerWeights, inference_model) are 
+// defined in inference_internal.h which is included above.
 
 static bool pin_model_memory(inference_model* m) {
     // Pin embedding table

@@ -6,6 +6,7 @@
 #include "gguf_mmap.h"
 #include "kv_cache.h"
 #include "fp4_common.h"
+#include "inference_internal.h"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <vector>
@@ -22,44 +23,6 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
-// Internal inference_model definition (mirrors inference.cpp)
-struct inference_model {
-    gguf_model_t* gguf = nullptr;
-    std::string model_name;
-    int n_layer = 0;
-    int n_embd = 0;
-    int n_head = 0;
-    int n_head_kv = 0;
-    int head_dim = 0;
-    int vocab_size = 0;
-    int n_ctx = 0;
-    double eps = 1e-5;
-    std::vector<__half> embed_table;
-    void* d_embed_table = nullptr;
-    struct LayerWeights {
-        struct QuantWeight {
-            void* d_packed = nullptr;
-            void* d_scales = nullptr;
-            void* d_scales_f = nullptr;     // device ptr for scaled_f (Q4_0/Q4_1/Q8_0 types)
-        } Wq, Wk, Wv, Wo, Wgate, Wup, Wdown;
-        void* d_attn_ln = nullptr;
-        void* d_mlp_ln = nullptr;
-    };
-    std::vector<LayerWeights> layers;
-    struct QuantWeight {
-        void* d_packed = nullptr;
-        void* d_scales = nullptr;
-        void* d_scales_f = nullptr;         // device ptr for scaled_f (Q4_0/Q4_1/Q8_0 types)
-    } lm_head;
-    void* d_lm_head_packed = nullptr;
-    void* d_lm_head_scales = nullptr;               // device ptr for scales (UE4M3 types)
-    void* d_lm_head_scales_f = nullptr;             // device ptr for scaled_f (Q4_0/Q4_1/Q8_0 types)
-    void* d_final_ln = nullptr;
-    inference_kv_cache_t* kvc = nullptr;
-
-    // Phase 15.4: hybrid architecture support (read from GGUF KV)
-    int full_attention_interval = 0;  // SSM-only layers every N layers (0=disabled)
-};
 
 using namespace rocmfp4;
 
@@ -303,9 +266,15 @@ struct QwenModel {
         // ---- 1) Embedding lookup ----
         fprintf(stderr, "[FORWARD] token_id=%d d_embed_table_copy=%p\n", token_id, (void*)d_embed_table_copy);
         int32_t tid_arr[1] = { (int32_t)token_id };
-        const __half* d_emb_ptr = d_embed_table_copy;
-        void* emb_args[] = { tid_arr, (const __half**)&d_emb_ptr, &layer_scratch[0].d_h,
-                             &one, &E_local, &vocab_local };
+        
+        void* emb_args[] = { 
+            reinterpret_cast<void*>(tid_arr), 
+            reinterpret_cast<void*>(&d_embed_table_copy), 
+            reinterpret_cast<void*>(&layer_scratch[0].d_h),
+            reinterpret_cast<void*>(&one), 
+            reinterpret_cast<void*>(&E_local), 
+            reinterpret_cast<void*>(&vocab_local) 
+        };
         hipError_t e;
         fprintf(stderr, "[FORWARD] Launching embedding_lookup kernel...\n"); fflush(stderr);
         e = hipModuleLaunchKernel(fn_embedding, 1, 1, 1, 256, 1, 1, 0, 0, emb_args, nullptr);
@@ -326,7 +295,7 @@ struct QwenModel {
             }
 
             LayerScratch& s = layer_scratch[l];
-            inference_model::LayerWeights& L = eng_model->layers[l];
+            LayerWeights& L = eng_model->layers[l];
 
             // --- a) RMSNorm (attention) ---
             void* ln_args[] = {
@@ -446,8 +415,8 @@ struct QwenModel {
 
             // --- k) SwiGLU (gate/up/down) ---
             void* swiglu_args[] = { &s.d_hmlp,
-                                   &L.Wgate.d_packed, &L.Wgate.d_scales,
-                                   &L.Wup.d_packed, &L.Wup.d_scales,
+                                   &L.W_gate.d_packed, &L.W_gate.d_scales,
+                                   &L.W_up.d_packed, &L.W_up.d_scales,
                                    &s.d_down,
                                    &one, &E_local, &E_local };
             (void)hipModuleLaunchKernel(fn_swiglu, 1, (E+15)/16, 1, 32, 1, 1, 0, 0, swiglu_args, nullptr);
@@ -571,7 +540,7 @@ int qwen_model_forward_batch(qwen_model_t* model,
     int CTX_local = seq_len;
 
     for (int l = 0; l < m->n_layer; ++l) {
-        inference_model::LayerWeights& L = eng->layers[l];
+        LayerWeights& L = eng->layers[l];
 
         // --- a) RMSNorm (attention) - batched with grid-stride ---
         // Each sequence processes independently -> batch dimension on Z axis
@@ -764,8 +733,8 @@ int qwen_model_forward_batch(qwen_model_t* model,
             }
 
             void* swiglu_args[] = { &h_arr[0],
-                                   &L.Wgate.d_packed, &L.Wgate.d_scales,
-                                   &L.Wup.d_packed, &L.Wup.d_scales,
+                                   &L.W_gate.d_packed, &L.W_gate.d_scales,
+                                   &L.W_up.d_packed, &L.W_up.d_scales,
                                    m->layer_scratch[l].d_down,    // down projection output (residual destination)
                                    &batch_size, &E_local, &E_local };
             dim3 swiglu_grid(1, (E + 15) / 16, batch_size);
