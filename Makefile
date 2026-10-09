@@ -227,7 +227,7 @@ $(QWEN_DEMO): $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_model.h $(SRCDIR)/inferenc
 both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)
 
 clean:
-	rm -rf $(BUILDDIR)
+	rm -rf $(BUILDDIR) *.co
 
 # Copy .co files to root for test execution (tests expect .co files in cwd)
 copy_co_files:
