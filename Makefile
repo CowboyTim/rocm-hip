@@ -100,6 +100,8 @@ $(WMMA_FP4_NATIVE_TARGET): $(WMMA_FP4_NATIVE_OBJ) $(WMMA_FP4_NATIVE_CO)
 
 # Pre-compiled kernel objects (.hip -> .co)
 $(CODIR)/%.co: $(SRCDIR)/%.hip
+# Verify minimal test kernel
+verify_minimal.co: $(SRCDIR)/verify_minimal.hip
 	$(HIPCC) $(HIPFLAGS) -c $< -o $@
 	cp $@ $(BINDIR)/
 
