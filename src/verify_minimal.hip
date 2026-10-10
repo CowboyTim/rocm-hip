@@ -1,5 +1,6 @@
 // Minimal HIP kernel for verifying ROCm 7.10 launch capability
 // Uses UE4M3 path from gemm_act_fp4.hip without conditionals
+#include <stdio.h>
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include "fp4_common.h"
