@@ -225,6 +225,16 @@ $(QWEN_MODEL_LIB): $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_model.h $(SRCDIR)/inf
 $(QWEN_DEMO): $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_model.h $(SRCDIR)/inference.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/demo_qwen.cpp $(INFERENCE_LIB)
 	$(CLANG) $(CXXFLAGS) -I. $(SRCDIR)/qwen_model.cpp $(SRCDIR)/inference.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/demo_qwen.cpp $(INFERENCE_LIB) $(LDFLAGS) -o $@
 
+# End-to-end inference test (real model testing)
+E2E_TEST = $(BINDIR)/inference_e2e_test
+E2E_OBJ = $(OBJDIR)/inference_e2e_test.o
+
+$(E2E_TEST): $(E2E_OBJ) $(CODIR)/embedding_lookup.co copy_co_files
+	$(CLANG) $(CXXFLAGS) -I. $(SRCDIR)/qwen_model.cpp $(SRCDIR)/inference.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/tokenizer.cpp $(E2E_OBJ) $(LDFLAGS) -o $@
+
+$(OBJDIR)/inference_e2e_test.o: $(SRCDIR)/inference_e2e_test.cpp
+	$(CLANG) $(CXXFLAGS) -I. -c $< -o $@
+
 # Build all demos and benchmark
 both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)
 

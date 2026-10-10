@@ -7,6 +7,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "tokenizer.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -116,6 +117,11 @@ int inference_vocab_size(const inference_model_t* model);
 // Returns pointer to tensor data in mapped memory (valid while model is alive)
 // out_bytes: receives tensor size in bytes
 const void* inference_get_tensor_ptr(const inference_model_t* model, const char* tensor_name, size_t* out_bytes);
+
+// Tokenizer access for decoding tokens back to text
+// Returns opaque tokenizer handle (valid while model is alive)
+// Can be passed to tokenizer_decode() for text output
+tokenizer_t* inference_get_tokenizer(const inference_model_t* model);
 
 // Error handling: returns last error message (thread-local static buffer), or NULL if none.
 const char* inference_get_last_error(void);

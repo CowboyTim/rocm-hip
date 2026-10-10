@@ -44,7 +44,7 @@ static void set_error(const char* fmt, ...) {
 
 static void clear_error() { g_last_error[0] = 0; }
 
-// All internal types (QuantWeight, LayerWeights, inference_model) are 
+// All internal types (QuantWeight, LayerWeights, inference_model) are
 // defined in inference_internal.h which is included above.
 
 static bool pin_model_memory(inference_model* m) {
@@ -1829,3 +1829,8 @@ int inference_generate(inference_model_t* model,
     return INFERENCE_OK;
 }
 
+
+tokenizer_t* inference_get_tokenizer(const inference_model_t* m) {
+    if (!m) return nullptr;
+    return m->tokenizer;
+}
