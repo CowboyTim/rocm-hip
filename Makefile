@@ -87,7 +87,7 @@ QWEN_MODEL_LIB   = $(BUILDDIR)/libqwen.a
 QWEN_DEMO        = $(BINDIR)/qwen_demo
 
 # --- Build Rules ---
-all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO)
+all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) test_launch
 
 $(WMMA_TARGET): $(WMMA_OBJ) $(WMMA_CO)
 	$(CLANG) $(WMMA_OBJ) $(LDFLAGS) -o $@
@@ -236,3 +236,19 @@ copy_co_files:
 .PHONY: all clean both tokenizer_verify copy_co_files
 
 tokenizer_verify: $(TOKENIZER_VERIFY) copy_co_files
+
+# Verify minimal test target
+TEST_TARGET = $(BINDIR)/verify_minimal_test
+TEST_OBJ = $(OBJDIR)/verify_minimal_test.o
+
+$(TEST_TARGET): $(TEST_OBJ) verify_minimal.co
+	$(CLANG) $(CXXFLAGS) -I. $(SRCDIR)/verify_minimal_test.cpp -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -o $@
+
+$(OBJDIR)/verify_minimal_test.o: $(SRCDIR)/verify_minimal_test.cpp
+	$(CLANG) $(CXXFLAGS) -I. -c $< -o $@
+
+.PHONY: verify_minimal
+verify_minimal: $(TEST_TARGET)
+	@echo "=== Running verify_minimal_test ===" && \
+	export HSA_OVERRIDE_GFX_VERSION=11.5.1 HSA_ENABLE_SDMA=0 && \
+	./$(TEST_TARGET) 2>&1 || echo "Test exited with code $?"
