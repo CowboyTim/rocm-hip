@@ -65,14 +65,14 @@ int main() {
 
     HIP_CHECK(hipHostRegister(base,total,hipHostRegisterDefault));
 
-    __half*d_A=nullptr;unsigned char*d_W=nullptr;unsigned char*d_Sc=nullptr;float*d_C=nullptr;
+    __half*d_A=nullptr;unsigned char*d_W=nullptr;unsigned char*d_Sc=nullptr;float*d_C=nullptr;float*d_Wsf=nullptr;
     HIP_CHECK(hipHostGetDevicePointer((void**)&d_A,A,0));
     HIP_CHECK(hipHostGetDevicePointer((void**)&d_W,W,0));
     HIP_CHECK(hipHostGetDevicePointer((void**)&d_Sc,Wscl,0));
     HIP_CHECK(hipHostGetDevicePointer((void**)&d_C,C,0));
 
     dim3 grid((M+15)/16,(N+15)/16);
-    void*args[]={&d_A,(void*)&d_W,(void*)&d_Sc,(void*)NULL,(void*)&M,(void*)&N,(void*)&K};
+    void*args[]={&d_A,(void*)&d_W,(void*)&d_Sc,&d_Wsf,(void*)&d_C,(void*)&M,(void*)&N,(void*)&K};
 
     fprintf(stderr, "[5] Launch verify_minimal<<<%d,%d>, 32>>>\n",grid.x,grid.y); fflush(stderr);
 
