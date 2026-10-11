@@ -55,8 +55,11 @@ static bool load_module(const char* co, const char* sym, hipModule_t& m, hipFunc
 }
 
 static bool load_all_kernels() {
+    fprintf(stderr, "[KERNELS] Loading %d kernel modules...\n", 8); fflush(stderr);
     (void)hipInit(0);
-    return load_module("gemm_act_fp4.co", "gemm_act_fp4", mod_gemm_act_fp4, fn_gemm_act_fp4) &&
+    bool ok = load_module("gemm_act_fp4.co", "gemm_act_fp4", mod_gemm_act_fp4, fn_gemm_act_fp4);
+    fprintf(stderr, "[KERNELS] gemm_act_fp4: %s\n", ok ? "OK" : "FAILED"); fflush(stderr);
+    return ok &&
            load_module("swiglu.co", "swiglu_fp4", mod_swiglu, fn_swiglu) &&
            load_module("fp16_gemm.co", "fp16_gemm", mod_fp16_gemm, fn_fp16_gemm) &&
            load_module("rope_embedding.co", "rope_rotate_half", mod_rope, fn_rope) &&
@@ -233,10 +236,17 @@ struct QwenModel {
         vocab_size = model->vocab_size;
         n_ctx = model->n_ctx;
 
+        fprintf(stderr, "[SCRATCH] Starting scratch allocation for %d layers\n", n_layer); fflush(stderr);
         layer_scratch.resize(n_layer);
         for (int i = 0; i < n_layer; ++i) {
-            if (!layer_scratch[i].alloc(E, HD, HQ, HKV, CTX, DQ, DKV)) return false;
+            fprintf(stderr, "[SCRATCH] Allocating layer %d/%d...\n", i+1, n_layer); fflush(stderr);
+            if (!layer_scratch[i].alloc(E, HD, HQ, HKV, CTX, DQ, DKV)) { 
+                fprintf(stderr, "[SCRATCH] Layer %d allocation failed\n", i); fflush(stderr);
+                return false; 
+            }
+            fprintf(stderr, "[SCRATCH] Layer %d OK\n", i+1); fflush(stderr);
         }
+        fprintf(stderr, "[SCRATCH] All layers allocated successfully\n"); fflush(stderr);
         return true;
     }
 
@@ -306,25 +316,81 @@ struct QwenModel {
             void* ln_args[] = { residual, L.d_attn_ln, s.d_h, &E_local, &E_local, &eps_f };
             hipError_t herr;
             fprintf(stderr, "[FORWARD] rmsnorm: res=%p w=%p out=%p\n", (void*)residual, (void*)L.d_attn_ln, (void*)s.d_h); fflush(stderr);
-            herr = hipModuleLaunchKernel(fn_layernorm, E, 1, 1, 32, 1, 1, 0, 0, ln_args, nullptr);
-            if (herr != hipSuccess) { fprintf(stderr, "[FORWARD] rmsnorm launch failed: %s\n", hipGetErrorString(herr)); return -1; }
-            (void)hipDeviceSynchronize();
+            
+            // Qwen3.5-4B has no learnable layer norm weights — skip kernel launch with null gamma
+            if (L.d_attn_ln == nullptr) {
+                fprintf(stderr, "[FORWARD] attn_ln scale is NULL — doing inline RMSNorm\n"); fflush(stderr);
+                // Inline RMSNorm on CPU: rsqrt(mean(x^2) + eps), write to scratch buffer
+                float ssq = 0.0f;
+                for (int i = 0; i < E_local; ++i) ssq += (float)residual[i] * (float)residual[i];
+                const float inv_rms = 1.0f / sqrtf(ssq / (float)E_local + eng_model->eps);
+                for (int i = 0; i < E_local; ++i) s.h[i] = (__half)((float)residual[i] * inv_rms);
+                residual = s.h;  // Continue with normalized data in scratch
+            } else {
+                herr = hipModuleLaunchKernel(fn_layernorm, E, 1, 1, 32, 1, 1, 0, 0, ln_args, nullptr);
+                if (herr != hipSuccess) { fprintf(stderr, "[FORWARD] rmsnorm launch failed: %s\n", hipGetErrorString(herr)); return -1; }
+                (void)hipDeviceSynchronize();
+            }
 
             // --- b) Q/K/V Projections (gemm_act_fp4, M=1) ---
-            void* g4_args[] = { s.d_h, L.Wq.d_packed, L.Wq.d_scales, L.Wq.d_scales_f, s.d_q, &one, &DQ_local, &E_local };
-            fprintf(stderr, "[FORWARD] gemm_Q: h=%p Wq=%p q=%p\n", (void*)s.d_h, (void*)L.Wq.d_packed, (void*)s.d_q); fflush(stderr);
-            herr = hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DQ+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
-            if (herr != hipSuccess) { fprintf(stderr, "[FORWARD] gemm_Q failed: %s\n", hipGetErrorString(herr)); return -1; }
-            
-            void* g4k_args[] = { s.d_h, L.Wk.d_packed, L.Wk.d_scales, L.Wk.d_scales_f, s.d_k, &one, &DKV_local, &E_local };
-            fprintf(stderr, "[FORWARD] gemm_K: h=%p Wk=%p k=%p\n", (void*)s.d_h, (void*)L.Wk.d_packed, (void*)s.d_k); fflush(stderr);
-            herr = hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DKV+15)/16, 1, 32, 1, 1, 0, 0, g4k_args, nullptr);
-            if (herr != hipSuccess) { fprintf(stderr, "[FORWARD] gemm_K failed: %s\n", hipGetErrorString(herr)); return -1; }
-            
-            void* g4v_args[] = { s.d_h, L.Wv.d_packed, L.Wv.d_scales, L.Wv.d_scales_f, s.d_v, &one, &DKV_local, &E_local };
-            fprintf(stderr, "[FORWARD] gemm_V: h=%p Wv=%p v=%p\n", (void*)s.d_h, (void*)L.Wv.d_packed, (void*)s.d_v); fflush(stderr);
-            herr = hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DKV+15)/16, 1, 32, 1, 1, 0, 0, g4v_args, nullptr);
-            if (herr != hipSuccess) { fprintf(stderr, "[FORWARD] gemm_V failed: %s\n", hipGetErrorString(herr)); return -1; }
+            {
+                void* h_ptr = s.d_h;
+                void* w_pack = L.Wq.d_packed;
+                void* w_sc = L.Wq.d_scales;
+                void* w_sf = L.Wq.d_scales_f;
+                void* out_q = s.d_q;
+                
+                fprintf(stderr, "[FORWARD] gemm_Q: h=%p W_pack=%p W_sc=%p W_sf=%p out=%p\n", 
+                        h_ptr, w_pack, w_sc, w_sf, out_q); fflush(stderr);
+                
+                // Verify no NULL pointer values before launch
+                if (!h_ptr || !w_pack || !w_sc || !w_sf || !out_q) {
+                    fprintf(stderr, "[FORWARD] FATAL: NULL kernel arg detected!\n"); fflush(stderr);
+                    return -1;
+                }
+                
+                void* g4_args[] = { &h_ptr, &w_pack, &w_sc, &w_sf, &out_q, &one, &DQ_local, &E_local };
+                fprintf(stderr, "[FORWARD] Launching gemm_Q with grid=(%d,%d,1) block=(32,1,1)\n", 1, (DQ+15)/16); fflush(stderr);
+                herr = hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DQ+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
+                if (herr != hipSuccess) { fprintf(stderr, "[FORWARD] gemm_Q launch FAILED: %s\n", hipGetErrorString(herr)); return -1; }
+            }
+
+            // K projection
+            {
+                void* h_ptr = s.d_h;
+                void* w_pack = L.Wk.d_packed;
+                void* w_sc = L.Wk.d_scales;
+                void* w_sf = L.Wk.d_scales_f;
+                void* out_k = s.d_k;
+                
+                fprintf(stderr, "[FORWARD] gemm_K: h=%p W_pack=%p k=%p\n", 
+                        h_ptr, w_pack, out_k); fflush(stderr);
+                
+                if (!h_ptr || !w_pack || !w_sc || !w_sf || !out_k) {
+                    fprintf(stderr, "[FORWARD] FATAL: NULL kernel arg in gemm_K!\n"); fflush(stderr);
+                    return -1;
+                }
+                
+                void* g4k_args[] = { &h_ptr, &w_pack, &w_sc, &w_sf, &out_k, &one, &DKV_local, &E_local };
+                herr = hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DKV+15)/16, 1, 32, 1, 1, 0, 0, g4k_args, nullptr);
+                if (herr != hipSuccess) { fprintf(stderr, "[FORWARD] gemm_K launch failed: %s\n", hipGetErrorString(herr)); return -1; }
+            }
+
+            // V projection  
+            {
+                void* h_ptr = s.d_h;
+                void* w_pack = L.Wv.d_packed;
+                void* w_sc = L.Wv.d_scales;
+                void* w_sf = L.Wv.d_scales_f;
+                void* out_v = s.d_v;
+                
+                fprintf(stderr, "[FORWARD] gemm_V: h=%p W_pack=%p v=%p\n", 
+                        h_ptr, w_pack, out_v); fflush(stderr);
+                
+                void* g4v_args[] = { &h_ptr, &w_pack, &w_sc, &w_sf, &out_v, &one, &DKV_local, &E_local };
+                herr = hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DKV+15)/16, 1, 32, 1, 1, 0, 0, g4v_args, nullptr);
+            }
+            if (herr != hipSuccess) { fprintf(stderr, "[FORWARD] gemm_V launch failed: %s\n", hipGetErrorString(herr)); return -1; }
             (void)hipDeviceSynchronize();
 
             // --- c) Per-head staging (FP32 -> FP16) ---
@@ -417,8 +483,20 @@ struct QwenModel {
             // --- j) RMSNorm (MLP) ---
             void* ln2_args[] = { &residual, &L.d_mlp_ln, &s.d_hmlp,
                                 &E_local, &E_local, (void*)&eng_model->eps };
-            (void)hipModuleLaunchKernel(fn_layernorm, E, 1, 1, 32, 1, 1, 0, 0, ln2_args, nullptr);
-            (void)hipDeviceSynchronize();
+            fprintf(stderr, "[FORWARD] rmsnorm_mlp: w=%p attn_ln_size=%zu mlp_ln_size=%zu\n", 
+                    (void*)L.d_mlp_ln, L.attn_ln_scale.size(), L.mlp_ln_scale.size()); fflush(stderr);
+            
+            // Skip MLP layer norm if no learnable weights (Qwen3.5-4B has none) — inline RMSNorm
+            if (L.d_mlp_ln == nullptr) {
+                fprintf(stderr, "[FORWARD] mlp_ln scale is NULL — doing inline RMSNorm\n"); fflush(stderr);
+                float ssq = 0.0f;
+                for (int i = 0; i < E_local; ++i) ssq += (float)residual[i] * (float)residual[i];
+                const float inv_rms = 1.0f / sqrtf(ssq / (float)E_local + eng_model->eps);
+                for (int i = 0; i < E_local; ++i) s.h_mlp[i] = (__half)((float)residual[i] * inv_rms);
+            } else {
+                (void)hipModuleLaunchKernel(fn_layernorm, E, 1, 1, 32, 1, 1, 0, 0, ln2_args, nullptr);
+                (void)hipDeviceSynchronize();
+            }
 
             // --- k) SwiGLU (gate/up/down) ---
             void* swiglu_args[] = { &s.d_hmlp,
