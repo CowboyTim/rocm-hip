@@ -136,7 +136,9 @@ struct LayerScratch {
         auto get = [&](size_t sz, void** hptr, void** dptr) {
             off = (off + 127) & ~127;
             *hptr = (char*)base + off;
-            (void)hipHostGetDevicePointer(dptr, *hptr, 0);
+            // For registered host memory via /dev/shm mmap: device pointer IS same as host.
+            // hipHostGetDevicePointer returns NULL on Strix Halo for this case.
+            *dptr = *hptr;
             off += sz;
         };
         get(layout[0], (void**)&h, &d_h);
@@ -263,27 +265,26 @@ struct QwenModel {
         int vocab_local = vocab_size;
         float eps_f = (float)eng_model->eps;
 
-        // ---- 1) Embedding lookup ----
-        fprintf(stderr, "[FORWARD] token_id=%d d_embed_table_copy=%p\n", token_id, (void*)d_embed_table_copy);
-        int32_t tid_arr[1] = { (int32_t)token_id };
-        
-        void* emb_args[] = { 
-            reinterpret_cast<void*>(tid_arr), 
-            reinterpret_cast<void*>(&d_embed_table_copy), 
-            reinterpret_cast<void*>(&layer_scratch[0].d_h),
-            reinterpret_cast<void*>(&one), 
-            reinterpret_cast<void*>(&E_local), 
-            reinterpret_cast<void*>(&vocab_local) 
-        };
-        hipError_t e;
-        fprintf(stderr, "[FORWARD] Launching embedding_lookup kernel...\n"); fflush(stderr);
-        e = hipModuleLaunchKernel(fn_embedding, 1, 1, 1, 256, 1, 1, 0, 0, emb_args, nullptr);
-        if (e != hipSuccess) { fprintf(stderr, "[FORWARD] Kernel launch failed: %s\n", hipGetErrorString(e)); return -1; }
-        fprintf(stderr, "[FORWARD] Synchronizing after embedding lookup...\n"); fflush(stderr);
-        e = hipDeviceSynchronize();
-        if (e != hipSuccess) { fprintf(stderr, "[FORWARD] Sync failed: %s\n", hipGetErrorString(e)); return -1; }
+        // ---- 1) Embedding lookup (CPU-side, no GPU kernel needed for single token) ----
+        fprintf(stderr, "[FORWARD] token_id=%d\n", token_id); fflush(stderr);
 
-        // Residual starts as embedding output
+        int token = token_id;
+        if (token < 0 || token >= vocab_local) token = 0;
+
+        // Write embedding row directly into /dev/shm mapped layer_scratch[0].h
+        const __half* emb_tensor = eng_model->embed_table.data();
+        if (!emb_tensor) { fprintf(stderr, "[FORWARD] ERROR: no embedding tensor\n"); return -1; }
+        
+        size_t emb_bytes = (size_t)E_local * sizeof(__half);
+        __half* dst_row = layer_scratch[0].h;  
+        const __half* src_row = emb_tensor + (size_t)(size_t)token * E_local;
+        
+        for (int i = 0; i < E_local; ++i) dst_row[i] = src_row[i];
+        
+        fprintf(stderr, "[FORWARD] CPU lookup done: token=%d → residual@%p (%zu elements)\n", 
+                token, (void*)dst_row, E_local); fflush(stderr);
+
+        // Residual starts as embedding output on /dev/shm mapped buffer.
         __half* residual = layer_scratch[0].h;
 
         // ---- 2) Decoder layers ----
@@ -297,27 +298,33 @@ struct QwenModel {
             LayerScratch& s = layer_scratch[l];
             LayerWeights& L = eng_model->layers[l];
 
+            // Debug: check if attn_ln_scale exists
+            fprintf(stderr, "[FORWARD] blk %d: attn_ln_size=%zu mlp_ln_size=%zu\n", 
+                    l, L.attn_ln_scale.size(), L.mlp_ln_scale.size()); fflush(stderr);
+
             // --- a) RMSNorm (attention) ---
-            void* ln_args[] = {
-                &residual, &L.d_attn_ln, &s.d_h,
-                &E_local, &E_local, (void*)&eps_f
-            };
-            (void)hipModuleLaunchKernel(fn_layernorm, E, 1, 1, 32, 1, 1, 0, 0, ln_args, nullptr);
+            void* ln_args[] = { residual, L.d_attn_ln, s.d_h, &E_local, &E_local, &eps_f };
+            hipError_t herr;
+            fprintf(stderr, "[FORWARD] rmsnorm: res=%p w=%p out=%p\n", (void*)residual, (void*)L.d_attn_ln, (void*)s.d_h); fflush(stderr);
+            herr = hipModuleLaunchKernel(fn_layernorm, E, 1, 1, 32, 1, 1, 0, 0, ln_args, nullptr);
+            if (herr != hipSuccess) { fprintf(stderr, "[FORWARD] rmsnorm launch failed: %s\n", hipGetErrorString(herr)); return -1; }
             (void)hipDeviceSynchronize();
 
             // --- b) Q/K/V Projections (gemm_act_fp4, M=1) ---
-            // Q: [1 x DQ] = h[1 x E] @ Wq^T
-            void* g4_args[] = { &s.d_h, &L.Wq.d_packed, &L.Wq.d_scales, &L.Wq.d_scales_f, &s.d_q,
-                                &one, &DQ_local, &E_local };
-            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DQ+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
-            // K: [1 x DKV] = h[1 x E] @ Wk^T
-            g4_args[1] = &L.Wk.d_packed; g4_args[2] = &L.Wk.d_scales; g4_args[3] = &L.Wk.d_scales_f; g4_args[4] = &s.d_k;
-            g4_args[6] = &DKV_local;
-            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DKV+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
-            // V: [1 x DKV] = h[1 x E] @ Wv^T
-            g4_args[1] = &L.Wv.d_packed; g4_args[2] = &L.Wv.d_scales; g4_args[3] = &L.Wv.d_scales_f; g4_args[4] = &s.d_v;
-            g4_args[6] = &DKV_local;
-            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DKV+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
+            void* g4_args[] = { s.d_h, L.Wq.d_packed, L.Wq.d_scales, L.Wq.d_scales_f, s.d_q, &one, &DQ_local, &E_local };
+            fprintf(stderr, "[FORWARD] gemm_Q: h=%p Wq=%p q=%p\n", (void*)s.d_h, (void*)L.Wq.d_packed, (void*)s.d_q); fflush(stderr);
+            herr = hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DQ+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
+            if (herr != hipSuccess) { fprintf(stderr, "[FORWARD] gemm_Q failed: %s\n", hipGetErrorString(herr)); return -1; }
+            
+            void* g4k_args[] = { s.d_h, L.Wk.d_packed, L.Wk.d_scales, L.Wk.d_scales_f, s.d_k, &one, &DKV_local, &E_local };
+            fprintf(stderr, "[FORWARD] gemm_K: h=%p Wk=%p k=%p\n", (void*)s.d_h, (void*)L.Wk.d_packed, (void*)s.d_k); fflush(stderr);
+            herr = hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DKV+15)/16, 1, 32, 1, 1, 0, 0, g4k_args, nullptr);
+            if (herr != hipSuccess) { fprintf(stderr, "[FORWARD] gemm_K failed: %s\n", hipGetErrorString(herr)); return -1; }
+            
+            void* g4v_args[] = { s.d_h, L.Wv.d_packed, L.Wv.d_scales, L.Wv.d_scales_f, s.d_v, &one, &DKV_local, &E_local };
+            fprintf(stderr, "[FORWARD] gemm_V: h=%p Wv=%p v=%p\n", (void*)s.d_h, (void*)L.Wv.d_packed, (void*)s.d_v); fflush(stderr);
+            herr = hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DKV+15)/16, 1, 32, 1, 1, 0, 0, g4v_args, nullptr);
+            if (herr != hipSuccess) { fprintf(stderr, "[FORWARD] gemm_V failed: %s\n", hipGetErrorString(herr)); return -1; }
             (void)hipDeviceSynchronize();
 
             // --- c) Per-head staging (FP32 -> FP16) ---
@@ -327,8 +334,8 @@ struct QwenModel {
             for (int h = 0; h < HKV; ++h)
                 for (int d = 0; d < HD; ++d)
                     s.kh[h*HD + d] = __float2half(s.k_fp32[h*HD + d]);
-            (void)hipHostGetDevicePointer(&s.d_qh, s.qh, 0);
-            (void)hipHostGetDevicePointer(&s.d_kh, s.kh, 0);
+            s.d_qh = s.qh;
+            s.d_kh = s.kh;
 
             // --- d) RoPE on Q/K ---
             build_rope_tables(pos, s);
@@ -343,7 +350,7 @@ struct QwenModel {
             for (int h = 0; h < HKV; ++h)
                 for (int d = 0; d < HD; ++d)
                     s.rks[h*HD + d] = s.kh[h*HD + d];
-            (void)hipHostGetDevicePointer(&s.d_rks, s.rks, 0);
+            s.d_rks = s.rks;
 
             __half* kdst_base = kv_cache_k_row(eng_model->kvc, l, 0);
             __half* vdst_base = kv_cache_v_row(eng_model->kvc, l, 0);
@@ -395,7 +402,7 @@ struct QwenModel {
             for (int h = 0; h < HQ; ++h)
                 for (int d = 0; d < HD; ++d)
                     s.oin[h*HD + d] = __float2half(s.oh[h*HD + d]);
-            (void)hipHostGetDevicePointer(&s.d_oin, s.oin, 0);
+            s.d_oin = s.oin;
 
             // --- h) O-Projection ---
             void* o_args[] = { &s.d_oin, &L.Wo.d_packed, &L.Wo.d_scales, &L.Wo.d_scales_f, &s.d_down,

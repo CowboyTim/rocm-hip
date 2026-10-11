@@ -55,7 +55,7 @@ static bool pin_model_memory(inference_model* m) {
                                          m->embed_table.size() * sizeof(__half),
                                          hipHostRegisterDefault);
         if (e != hipSuccess) { fprintf(stderr, "[pin_model] embed register failed: %s\n", hipGetErrorString(e)); return false; }
-        (void)hipHostGetDevicePointer(&m->d_embed_table, m->embed_table.data(), 0);
+        m->d_embed_table = m->embed_table.data();
         fprintf(stderr, "[pin_model] embed registered, d_embed_table=%p\n", (void*)m->d_embed_table);
     }
     // Pin per-layer weights
@@ -74,28 +74,28 @@ static bool pin_model_memory(inference_model* m) {
                 fprintf(stderr, "[pin_model] scales_f register failed (%zu bytes)\n", w.scales_f.size() * sizeof(float));
                 return false;
             }
-            (void)hipHostGetDevicePointer(&w.d_packed, w.packed.data(), 0);
+            w.d_packed = w.packed.data();
             const unsigned char* scales_raw = !w.scales.empty() ? w.scales.data() : w.packed.data();
-            (void)hipHostGetDevicePointer(&w.d_scales, const_cast<unsigned char*>(scales_raw), 0);
+            w.d_scales = const_cast<unsigned char*>(scales_raw);
             const float* scaled_f_raw = !w.scales_f.empty() ? w.scales_f.data() : nullptr;
             if (!scaled_f_raw) {
                 // Fallback: use packed data address (will not be used for non-UE4M3 types)
                 void* dummy = (void*)w.packed.data();
-                (void)hipHostGetDevicePointer(&dummy, w.packed.data(), 0);
+                dummy = (void*)w.packed.data();
                 scaled_f_raw = reinterpret_cast<const float*>(dummy);
             }
-            (void)hipHostGetDevicePointer(&w.d_scales_f, const_cast<float*>(scaled_f_raw), 0);
+            w.d_scales_f = const_cast<float*>(scaled_f_raw);
             return true;
         };
         if (!pin(L.Wq) || !pin(L.Wk) || !pin(L.Wv) || !pin(L.Wo) ||
             !pin(L.W_gate) || !pin(L.W_up) || !pin(L.W_down)) return false;
         if (!L.attn_ln_scale.empty()) {
             (void)hipHostRegister(L.attn_ln_scale.data(), L.attn_ln_scale.size() * sizeof(__half), hipHostRegisterDefault);
-            (void)hipHostGetDevicePointer(&L.d_attn_ln, L.attn_ln_scale.data(), 0);
+            L.d_attn_ln = L.attn_ln_scale.data();
         }
         if (!L.mlp_ln_scale.empty()) {
             (void)hipHostRegister(L.mlp_ln_scale.data(), L.mlp_ln_scale.size() * sizeof(__half), hipHostRegisterDefault);
-            (void)hipHostGetDevicePointer(&L.d_mlp_ln, L.mlp_ln_scale.data(), 0);
+            L.d_mlp_ln = L.mlp_ln_scale.data();
         }
     }
     // Pin LM head
@@ -107,20 +107,20 @@ static bool pin_model_memory(inference_model* m) {
         if (!m->lm_head.scales_f.empty()) {
             (void)hipHostRegister(m->lm_head.scales_f.data(), m->lm_head.scales_f.size() * sizeof(float), hipHostRegisterDefault);
         }
-        (void)hipHostGetDevicePointer(&m->d_lm_head_packed, m->lm_head.packed.data(), 0);
+        m->d_lm_head_packed = m->lm_head.packed.data();
         const unsigned char* lm_scales_raw = !m->lm_head.scales.empty() ? m->lm_head.scales.data() : m->lm_head.packed.data();
-        (void)hipHostGetDevicePointer(&m->d_lm_head_scales, const_cast<unsigned char*>(lm_scales_raw), 0);
+        m->d_lm_head_scales = const_cast<unsigned char*>(lm_scales_raw);
         const float* lm_scaled_f_raw = !m->lm_head.scales_f.empty() ? m->lm_head.scales_f.data() : nullptr;
         if (!lm_scaled_f_raw) {
             void* dummy = (void*)m->lm_head.packed.data();
-            (void)hipHostGetDevicePointer(&dummy, m->lm_head.packed.data(), 0);
+            dummy = (void*)m->lm_head.packed.data();
             lm_scaled_f_raw = reinterpret_cast<const float*>(dummy);
         }
-        (void)hipHostGetDevicePointer(&m->d_lm_head_scales_f, const_cast<float*>(lm_scaled_f_raw), 0);
+        m->d_lm_head_scales_f = const_cast<float*>(lm_scaled_f_raw);
     }
     if (!m->final_ln_scale.empty()) {
         (void)hipHostRegister(m->final_ln_scale.data(), m->final_ln_scale.size() * sizeof(__half), hipHostRegisterDefault);
-        (void)hipHostGetDevicePointer(&m->d_final_ln, m->final_ln_scale.data(), 0);
+        m->d_final_ln = m->final_ln_scale.data();
     }
     return true;
 }
@@ -1568,21 +1568,24 @@ int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
     if (!m->kvc) { set_error("kv_cache_create failed"); return -1; }
     m->n_ctx = n_ctx;
     // Create Qwen model for forward passes
-    fprintf(stderr, "[KV_INIT] About to create qwen model\n");
+    fprintf(stderr, "[KV_INIT] About to create qwen model\n"); fflush(stderr);
     m->qwen = qwen_model_create(m);
     if (!m->qwen) { set_error("qwen_model_create failed"); return -1; }
     fprintf(stderr, "[KV_INIT] Qwen model created at %p\n", (void*)m->qwen);
-    // Copy embedding table to GPU device memory and set on qwen model
+    // Allocate dedicated GPU device memory for embeddings and copy data there.
+    // This avoids MEMORY_APERTURE_VIOLATION caused by rocWMMA kernarg handling
+    // of indirect pointer references to registered host memory.
     if (!m->embed_table.empty()) {
         size_t emb_bytes = m->embed_table.size() * sizeof(__half);
         void* d_emb_dev = nullptr;
         hipError_t e;
-        fprintf(stderr, "[KV_INIT] Copying %zu bytes embed table to GPU device memory...\n", emb_bytes); fflush(stderr);
+        fprintf(stderr, "[KV_INIT] Allocating %zu bytes GPU memory for embed table...\n", emb_bytes); fflush(stderr);
         e = hipMalloc(&d_emb_dev, emb_bytes);
         if (e == hipSuccess) {
             e = hipMemcpy(d_emb_dev, m->embed_table.data(), emb_bytes, hipMemcpyHostToDevice);
             if (e == hipSuccess) {
-                fprintf(stderr, "[KV_INIT] Embed copied to GPU device %p\n", d_emb_dev); fflush(stderr);
+                fprintf(stderr, "[KV_INIT] Embed copied to GPU device %p (%zu elements)\n", 
+                        d_emb_dev, m->embed_table.size()); fflush(stderr);
                 qwen_model_set_embed_table(m->qwen, d_emb_dev);
             } else {
                 fprintf(stderr, "[KV_INIT] hipMemcpy failed: %s\n", hipGetErrorString(e));
@@ -1592,7 +1595,7 @@ int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
             fprintf(stderr, "[KV_INIT] hipMalloc failed: %s\n", hipGetErrorString(e));
         }
     } else {
-        fprintf(stderr, "[KV_INIT] No embedding table to copy\n"); fflush(stderr);
+        fprintf(stderr, "[KV_INIT] No embedding table available\n"); fflush(stderr);
     }
     fprintf(stderr, "[KV_INIT] embed table set on qwen model\n");
     return 0;

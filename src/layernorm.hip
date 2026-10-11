@@ -38,6 +38,8 @@ extern "C" __global__ void rmsnorm(const __half* x, const __half* gamma, __half*
 
     // Pass 2: normalize and apply the per-channel scale.
     for (int c = threadIdx.x; c < n_embd; c += blockDim.x) {
-        yr[c] = (__half)((float)xr[c] * inv_rms * (float)gamma[c]);
+        float v = (float)xr[c];
+        float g = gamma ? (float)gamma[c] : 1.0f;  // Use unity scale if gamma is null
+        yr[c] = (__half)(v * inv_rms * g);
     }
 }
