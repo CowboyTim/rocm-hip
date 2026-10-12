@@ -36,8 +36,20 @@ constexpr size_t REGION_ALIGN = 256;   // keep every layer region comfortably al
 size_t align_up(size_t x, size_t a = REGION_ALIGN) { return (x + a - 1) & ~(a - 1); }
 
 __half* row_raw(inference_kv_cache_t* c, bool is_v, int layer, int pos) {
-    if (!c || !c->base) return nullptr;
-    if (layer < 0 || layer >= c->cfg.n_layers || pos < 0 || pos >= c->cfg.n_ctx) return nullptr;
+    // DEBUG: check why we might return NULL
+    static int call_count = 0;
+    call_count++;
+    
+    if (!c || !c->base) {
+        fprintf(stderr, "[KV_CACHE] row_raw #%d FAIL: c=%p base=%p (is_v=%d)\n", 
+                call_count, (void*)c, (void*)c ? c->base : nullptr, is_v); fflush(stderr);
+        return nullptr;
+    }
+    if (layer < 0 || layer >= c->cfg.n_layers || pos < 0 || pos >= c->cfg.n_ctx) {
+        fprintf(stderr, "[KV_CACHE] row_raw #%d FAIL: layer=%d n_layers=%d pos=%d n_ctx=%d (is_v=%d)\n",
+                call_count, layer, c->cfg.n_layers, pos, c->cfg.n_ctx, is_v); fflush(stderr);
+        return nullptr;
+    }
 
     const int d = c->cfg.n_heads_kv * c->cfg.head_dim;
     const size_t row_bytes = (size_t)d * sizeof(__half);

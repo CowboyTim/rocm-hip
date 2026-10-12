@@ -101,7 +101,7 @@ struct LayerScratch {
     float* down_fp32 = nullptr; void* d_down = nullptr;
     float* vexpB = nullptr; void* d_vb2 = nullptr;
 
-    void* base = nullptr; size_t total = 0; int fd = -1;
+    void* base = nullptr; size_t total = 0; int fd = -1; bool freed = false;
 
     bool alloc(int E, int HD, int HQ, int HKV, int CTX, int DQ, int DKV) {
         const int hd2 = HD / 2;
@@ -167,8 +167,13 @@ struct LayerScratch {
         return true;
     }
     void free() {
-        if (base) { (void)hipHostUnregister(base); munmap(base, total); }
-        if (fd >= 0) close(fd);
+        if (freed || !base) return;
+        freed = true;
+        fprintf(stderr, "[FREE] LayerScratch: unmap base=%p total=%zu fd=%d\n", 
+                (void*)base, total, fd); fflush(stderr);
+        (void)hipHostUnregister(base); 
+        munmap(base, total); 
+        if (fd >= 0) { close(fd); fd = -1; }
     }
 };
 
@@ -418,49 +423,130 @@ struct QwenModel {
                     s.rks[h*HD + d] = s.kh[h*HD + d];
             s.d_rks = s.rks;
 
+            // Ensure V projection fully completes before KV store reads its output
+            (void)hipDeviceSynchronize();
+            
             __half* kdst_base = kv_cache_k_row(eng_model->kvc, l, 0);
             __half* vdst_base = kv_cache_v_row(eng_model->kvc, l, 0);
+            fprintf(stderr, "[FORWARD] kv_store PRE: rks=%p v=%p kdst=%p vdst=%p DKV=%d pos=%d CTX=%d\n", 
+                    (void*)s.d_rks, (void*)s.d_v, (void*)kdst_base, (void*)vdst_base, 
+                    DKV_local, pos, CTX); fflush(stderr);
+            
+            // Check for NULL pointers before launch
+            if (!s.d_rks || !s.d_v || !kdst_base || !vdst_base) {
+                fprintf(stderr, "[FORWARD] FATAL: NULL pointer in kv_store! rks=%p v=%p kdst=%p vdst=%p\n",
+                        (void*)s.d_rks, (void*)s.d_v, (void*)kdst_base, (void*)vdst_base); fflush(stderr);
+                return -1;
+            }
             int pos_local = pos, CTX_local2 = CTX;
             void* kvs_args[] = { &s.d_rks, &s.d_v, &kdst_base, &vdst_base,
                                 &one, &DKV_local, &pos_local, &CTX_local2 };
-            (void)hipModuleLaunchKernel(fn_kv_store, 8, 1, 1, 32, 1, 1, 0, 0, kvs_args, nullptr);
+            hipError_t herr_kv = hipModuleLaunchKernel(fn_kv_store, 8, 1, 1, 32, 1, 1, 0, 0, kvs_args, nullptr);
+            if (herr_kv != hipSuccess) { fprintf(stderr, "[FORWARD] kv_store launch failed: %s\n", hipGetErrorString(herr_kv)); return -1; }
             (void)hipDeviceSynchronize();
 
-// --- f) Attention per head ---
-            const __half* kc = kv_cache_k_row_const(eng_model->kvc, l, 0);
-            const __half* vc = kv_cache_v_row_const(eng_model->kvc, l, 0);
-            int CTX_local3 = CTX, HD_local = HD, qpos_local = pos, pos1_local = pos + 1;
-            for (int h = 0; h < HQ; ++h) {
-                int kh_ = h / GRP;
+            // --- f) Attention per head ---
+            {
+                const __half* kc = kv_cache_k_row_const(eng_model->kvc, l, 0);
+                const __half* vc = kv_cache_v_row_const(eng_model->kvc, l, 0);
+                int CTX_local3 = CTX, HD_local = HD, qpos_local = pos, pos1_local = pos + 1;
+                
+                for (int h = 0; h < HQ; ++h) {
+                    int kh_ = h / GRP;
 
-                // Build kexpB [HD x CTX] and vexpB [CTX x HD]
-                for (int d = 0; d < HD; ++d)
-                    for (int p = 0; p <= pos; ++p)
-                        s.kh[d*CTX + p] = kc[p*DKV + kh_*HD + d];
-                for (int p = 0; p <= pos; ++p)
+                    // Build kexpB [HD x CTX] and vexpB [CTX x HD]
                     for (int d = 0; d < HD; ++d)
-                        s.vexpB[p*HD + d] = vc[p*DKV + kh_*HD + d];
+                        for (int p = 0; p <= pos; ++p)
+                            s.kh[d*CTX + p] = kc[p*DKV + kh_*HD + d];
+                    for (int p = 0; p <= pos; ++p)
+                        for (int d = 0; d < HD; ++d)
+                            s.vexpB[p*HD + d] = vc[p*DKV + kh_*HD + d];
 
-                // Scores: [1 x CTX] = qh[h] @ kexpB^T
-                void* gemm_args[] = {
-                    (void*)((char*)s.d_qh + h*HD*sizeof(__half)), &s.d_vb2, &s.d_sc,
-                    &one, &CTX_local3, &HD_local };
-                (void)hipModuleLaunchKernel(fn_fp16_gemm, 1, (CTX+15)/16, 1, 32, 1, 1, 0, 0, gemm_args, nullptr);
+                    // --- Scores: [1 x CTX] = qh[h] @ kexpB^T (CPU-side to avoid fp16_gemm gfx1151 bug) ---
+                    const __half* q_h = (__half*)((char*)s.d_qh + h*HD*sizeof(__half));
+                    const __half* k_expB = (const __half*)(s.d_vb2);
+                    float* scores_out = (float*)(s.d_sc);
+                    
+                    fprintf(stderr, "[FORWARD] attn h=%d: CPU gemm_scores [%d x %d] -> [%d]\n", 
+                            h, 1, HD, CTX); fflush(stderr);
+                    
+                    {
+                        // scores[p] = sum_d(q[d] * kexpB[d][p]), d in [0..HD), p in [0..pos]
+                        // Note: scale is applied by softmax_masked kernel, not here
+                        for (int p = 0; p <= pos; ++p) {
+                            float acc = 0.0f;
+                            for (int d = 0; d < HD; ++d) {
+                                acc += (float)q_h[d] * (float)k_expB[(size_t)d * CTX + p];
+                            }
+                            scores_out[p] = acc;
+                        }
+                        // Zero out remaining positions beyond pos (causal mask)
+                        for (int p = pos + 1; p < CTX; ++p) {
+                            scores_out[p] = -INFINITY;
+                        }
+                    }
 
-                // Softmax (causal)
-                void* sm_args[] = { &s.d_sc, &one, &CTX_local3, (void*)&scale,
-                                   &qpos_local, &pos1_local };
-                (void)hipModuleLaunchKernel(fn_softmax, 1, 1, 1, 32, 1, 1, 0, 0, sm_args, nullptr);
-                (void)hipDeviceSynchronize();
+                    // --- Softmax (causal) — CPU-side, properly handles masking ---
+                    {
+                        const int n_rows = 1;
+                        const int n_cols = CTX;
+                        const int qmax = pos;  // causal ceiling (no qpos array needed)
 
-                // Probs to FP16
-                for (int p = 0; p <= pos; ++p)
-                    s.probs_fp16[p] = __float2half(s.scores[p]);
+                        // Find max over VALID columns only (0..qmax), skip masked positions
+                        float m = -INFINITY;
+                        for (int c = 0; c <= qmax && c < n_cols; ++c) {
+                            if (scores_out[c] > m) m = scores_out[c];
+                        }
 
-                // Out: [1 x HD] = probs @ vexpB
-                void* gemm2_args[] = { s.d_pf, s.d_vb2, (void*)((char*)s.d_oh + h*HD*sizeof(float)),
-                                       &one, &HD_local, &CTX_local3 };
-                (void)hipModuleLaunchKernel(fn_fp16_gemm, 1, (HD+15)/16, 1, 32, 1, 1, 0, 0, gemm2_args, nullptr);
+                        fprintf(stderr, "[FORWARD] attn h=%d: softmax max=%.6f\n", h, m == -INFINITY ? 0.0f : m); fflush(stderr);
+
+                        // Handle degenerate case where all values are -INF
+                        if (m == -INFINITY) {
+                            for (int c = 0; c < n_cols; ++c) scores_out[c] = 0.0f;
+                        } else {
+                            // Subtract max and exponentiate ONLY for valid columns
+                            float e_sum = 0.0f;
+                            for (int c = 0; c <= qmax && c < n_cols; ++c) {
+                                scores_out[c] = expf(scores_out[c] - m);
+                                e_sum += scores_out[c];
+                            }
+                            // Masked positions beyond qmax stay at 0.0f (initialized from kernel output)
+
+                            // Normalize by sum ONLY over valid columns
+                            const float inv_sum = 1.0f / e_sum;
+                            for (int c = 0; c <= qmax && c < n_cols; ++c) {
+                                scores_out[c] *= inv_sum;
+                            }
+
+                            fprintf(stderr, "[FORWARD] attn h=%d: softmax done [0..%d], sum=%.6f\n", 
+                                    h, qmax, e_sum); fflush(stderr);
+                        }
+                    }
+
+                    // Probs to FP16
+                    for (int p = 0; p <= pos; ++p)
+                        s.probs_fp16[p] = __float2half(s.scores[p]);
+
+                    // --- Out: [HD] = probs @ vexpB (CPU-side to avoid fp16_gemm gfx1151 bug) ---
+                    const __half* prob_h = (const __half*)(s.d_pf);
+                    const __half* v_expB = (const __half*)(s.d_vb2);
+                    float* out_h = (float*)((char*)s.d_oh + h*HD*sizeof(float));
+                    
+                    fprintf(stderr, "[FORWARD] attn h=%d: CPU gemm_out [%d x %d] -> [%d]\n", 
+                            h, CTX, HD, HD); fflush(stderr);
+                    
+                    {
+                        // out[d] = sum_p(prob[p] * vexpB[p][d]), d in [0..HD), p in [0..pos]
+                        for (int d = 0; d < HD; ++d) {
+                            float acc = 0.0f;
+                            for (int p = 0; p <= pos; ++p) {
+                                acc += (float)prob_h[p] * (float)v_expB[(size_t)p * HD + d];
+                            }
+                            out_h[d] = acc;
+                        }
+                    }
+
+                }
             }
             (void)hipDeviceSynchronize();
 
@@ -470,11 +556,16 @@ struct QwenModel {
                     s.oin[h*HD + d] = __float2half(s.oh[h*HD + d]);
             s.d_oin = s.oin;
 
-            // --- h) O-Projection ---
-            void* o_args[] = { &s.d_oin, &L.Wo.d_packed, &L.Wo.d_scales, &L.Wo.d_scales_f, &s.d_down,
-                              &one, &E_local, &DQ_local };
-            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (E+15)/16, 1, 32, 1, 1, 0, 0, o_args, nullptr);
-            (void)hipDeviceSynchronize();
+            // --- h) O-Projection (skip if SSM-only layer with no attention output weights) ---
+            if (L.Wo.d_packed != nullptr) {
+                void* o_args[] = { &s.d_oin, &L.Wo.d_packed, &L.Wo.d_scales, &L.Wo.d_scales_f, &s.d_down,
+                                  &one, &E_local, &DQ_local };
+                fprintf(stderr, "[FORWARD] blk %d: O-proj via gemm_act_fp4 [%d x %d]\n", l, E, DQ_local); fflush(stderr);
+                (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (E+15)/16, 1, 32, 1, 1, 0, 0, o_args, nullptr);
+                (void)hipDeviceSynchronize();
+            } else {
+                fprintf(stderr, "[FORWARD] blk %d: no attn_o weights — skipping O-projection\n", l); fflush(stderr);
+            }
 
             // --- i) Residual add (attention output) ---
             for (int i = 0; i < E; ++i)
@@ -499,12 +590,15 @@ struct QwenModel {
             }
 
             // --- k) SwiGLU (gate/up/down) ---
+            fprintf(stderr, "[FORWARD] blk %d: SwiGLU gate_pack=%p up_pack=%p down=%p\n", 
+                    l, (void*)L.W_gate.d_packed, (void*)L.W_up.d_packed, (void*)s.d_down); fflush(stderr);
             void* swiglu_args[] = { &s.d_hmlp,
-                                   &L.W_gate.d_packed, &L.W_gate.d_scales,
-                                   &L.W_up.d_packed, &L.W_up.d_scales,
-                                   &s.d_down,
-                                   &one, &E_local, &E_local };
+                                    &L.W_gate.d_packed, &L.W_gate.d_scales,
+                                    &L.W_up.d_packed, &L.W_up.d_scales,
+                                    &s.d_down,
+                                    &one, &E_local, &E_local };
             (void)hipModuleLaunchKernel(fn_swiglu, 1, (E+15)/16, 1, 32, 1, 1, 0, 0, swiglu_args, nullptr);
+
             (void)hipDeviceSynchronize();
 
             // --- l) Residual add (MLP output) ---
@@ -512,18 +606,48 @@ struct QwenModel {
                 residual[i] = __float2half(__half2float(residual[i]) + s.down_fp32[i]);
         }
 
-        // ---- 3) Final LayerNorm ----
-        void* lnf_args[] = { &residual, &eng_model->d_final_ln, &layer_scratch[0].d_h,
-                            &E_local, &E_local, (void*)&eng_model->eps };
-        (void)hipModuleLaunchKernel(fn_layernorm, E, 1, 1, 32, 1, 1, 0, 0, lnf_args, nullptr);
-        (void)hipDeviceSynchronize();
+        // ---- 3) Final LayerNorm — inline CPU when no learnable weights (Qwen3.5 uses fixed eps) ---
+        if (eng_model->d_final_ln != nullptr) {
+            void* lnf_args[] = { &residual, eng_model->d_final_ln, &layer_scratch[0].d_h,
+                                &E_local, &E_local, (void*)&eng_model->eps };
+            fprintf(stderr, "[FORWARD] Final LN via GPU kernel\n"); fflush(stderr);
+            (void)hipModuleLaunchKernel(fn_layernorm, E, 1, 1, 32, 1, 1, 0, 0, lnf_args, nullptr);
+            (void)hipDeviceSynchronize();
+        } else {
+            fprintf(stderr, "[FORWARD] Final LN: no learnable weights — doing inline RMSNorm with eps=%.10f\n", 
+                    eng_model->eps); fflush(stderr);
+            float ssq = 0.0f;
+            for (int i = 0; i < E_local; ++i) ssq += (float)residual[i] * (float)residual[i];
+            const float inv_rms = 1.0f / sqrtf(ssq / (float)E_local + eng_model->eps);
+            for (int i = 0; i < E_local; ++i) layer_scratch[0].h[i] = (__half)((float)residual[i] * inv_rms);
+        }
 
-        // ---- 4) LM Head (gemm_act_fp4, M=1, N=vocab_size) ----
-        void* lm_args[] = { &layer_scratch[0].d_h, &eng_model->d_lm_head_packed,
-                           &eng_model->d_lm_head_scales, &eng_model->d_lm_head_scales_f, logits_out,
-                           &one, &vocab_local, &E_local };
-        (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (vocab_size+15)/16, 1, 32, 1, 1, 0, 0, lm_args, nullptr);
-        (void)hipDeviceSynchronize();
+        // ---- 4) LM Head (gemm_act_fp4, M=1, N=vocab_size) ---
+        // For tied embeddings (Qwen3.5-4B), d_lm_head_packed is NULL — compute logits via CPU dot products with embed table
+        if (!eng_model->d_lm_head_packed) {
+            fprintf(stderr, "[FORWARD] LM head: tied embeddings — CPU dot with embed table\n"); fflush(stderr);
+            
+            const __half* h = layer_scratch[0].h;  // final hidden state [n_embd]
+            const __half* emb_table = eng_model->embed_table.data();  // [vocab x n_embd], dequantized FP16
+            
+            for (int v = 0; v < vocab_local; ++v) {
+                float logit = 0.0f;
+                const __half* emb_row = emb_table + (size_t)v * E_local;
+                for (int i = 0; i < E_local; ++i) {
+                    logit += (float)h[i] * (float)emb_row[i];
+                }
+                logits_out[v] = logit;
+            }
+            
+            fprintf(stderr, "[FORWARD] LM head done: vocab=%d\n", vocab_local); fflush(stderr);
+        } else {
+            void* lm_args[] = { &layer_scratch[0].d_h, &eng_model->d_lm_head_packed,
+                               &eng_model->d_lm_head_scales, &eng_model->d_lm_head_scales_f, logits_out,
+                               &one, &vocab_local, &E_local };
+            fprintf(stderr, "[FORWARD] LM head via GPU gemm_act_fp4 [%d x %d]\n", E_local, vocab_local); fflush(stderr);
+            (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (vocab_size+15)/16, 1, 32, 1, 1, 0, 0, lm_args, nullptr);
+            (void)hipDeviceSynchronize();
+        }
 
         return 0;
     }

@@ -90,7 +90,6 @@ int main(int argc, char** argv) {
         delete[] logits;
     }
 
-    qwen_model_free(model);
     inference_kv_cache_free(engine);
     inference_free_model(engine);
     printf("Done.\n");

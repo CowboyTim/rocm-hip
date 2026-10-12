@@ -1532,12 +1532,18 @@ type14_done:;
 
 void inference_free_model(inference_model_t* m) {
     if (!m) return;
-    if (m->tokenizer) tokenizer_free(m->tokenizer);
-    if (m->qwen) qwen_model_free(m->qwen);
+    fprintf(stderr, "[CLEANUP] Starting model free...\n"); fflush(stderr);
+    if (m->tokenizer) { fprintf(stderr, "[CLEANUP] Freeing tokenizer\n"); fflush(stderr); tokenizer_free(m->tokenizer); }
+    // IMPORTANT: unpin must happen BEFORE qwen_model_free since unpin walks layer weights
+    // whose device pointers point into the layer scratch buffers we're about to free.
+    fprintf(stderr, "[CLEANUP] Unpinning model memory\n"); fflush(stderr);
     unpin_model_memory(m);
-    if (m->kvc) kv_cache_free(m->kvc);
-    if (m->gguf) gguf_mmap_close(m->gguf);
+    if (m->kvc) { fprintf(stderr, "[CLEANUP] Freeing KV cache\n"); fflush(stderr); kv_cache_free(m->kvc); }
+    if (m->qwen) { fprintf(stderr, "[CLEANUP] Freeing qwen model\n"); fflush(stderr); qwen_model_free(m->qwen); }
+    if (m->gguf) { fprintf(stderr, "[CLEANUP] Closing GGUF\n"); fflush(stderr); gguf_mmap_close(m->gguf); }
+    fprintf(stderr, "[CLEANUP] Deleting model struct\n"); fflush(stderr);
     delete m;
+    fprintf(stderr, "[CLEANUP] Model free complete\n"); fflush(stderr);
 }
 
 int32_t* inference_tokenize(inference_model_t* m, const char* text, int* out_len) {
@@ -1563,7 +1569,7 @@ void inference_free_tokens(int32_t* tokens, int len) {
 int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
     clear_error();
     if (!m) { set_error("NULL model"); return -1; }
-    kv_cache_config_t cfg{1, n_ctx, m->n_embd, m->head_dim, m->n_head, m->n_head_kv};
+    kv_cache_config_t cfg{(int)m->n_layer, n_ctx, m->n_embd, m->head_dim, m->n_head, m->n_head_kv};
     m->kvc = kv_cache_create("/dev/shm/inference_kvc.bin", &cfg);
     if (!m->kvc) { set_error("kv_cache_create failed"); return -1; }
     m->n_ctx = n_ctx;
