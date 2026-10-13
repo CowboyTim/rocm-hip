@@ -349,8 +349,9 @@ Verification:
 | 17.2 | - | Scale extraction + embedding table dequant for quantized types (Q4_1 embeddings), GPU hang fix via CPU-side embedding lookup on gfx1151 | ✅ Complete |
 | 18 | - | Q4_0/Q4_1/Q8_0 scales wired into gemm_act_fp4.hip GPU kernel dual-path dispatch (UE4M3 byte path + float-formatted path) | ✅ Complete |
 | 19 | - | Forward-pass runtime fixes on Strix Halo: CPU-side embedding lookup, direct pointer assignment replacing broken hipHostGetDevicePointer(), null-gamma RMSNorm fallback, corrected kernel arg passing, end-to-end forward pass through all 33 layers | ✅ Complete |
+| **20** | **TBD** | **Fix NaN corruption between layers: SwiGLU kernel scale access bug + KV cache layout mismatch** | 🔧 In Progress |
 
-Total: ~19 weeks planned; actual development extended due to architectural discoveries (hybrid SSM model, gfx1151 runtime quirks).
+Total: ~20 phases planned; actual development extended due to architectural discoveries (hybrid SSM model, gfx1151 runtime quirks).
 
 ## Build System Structure
 
@@ -1067,7 +1068,7 @@ Loading model: Qwen3.5-4B-ROCMFP4.gguf
 [FORWARD] Final LN: inline RMSNorm with eps=0.0000100000
 [FORWARD] LM head: tied embeddings — CPU dot with embed table
 [FORWARD] LM head done: vocab=248320
-Prompt tokens (1): 9419 
+Prompt tokens (1): 9419
 Generated token 0: 0   # EOS (model needs weight calibration, but pipeline works end-to-end)
 Done.
 
@@ -1085,3 +1086,144 @@ All 33 layers process without GPU hangs, kernel crashes, or memory faults. The g
 - Platform-specific gfx1151 runtime quirks documented for future work
 
 ---
+
+## Phase 20 – Fix NaN corruption between layers — IN PROGRESS 🔧
+
+**Goal**: The forward pass crashes are fixed (exit 0 through all 33 layers), but generation produces only EOS tokens (ID 0). Debug traces reveal **NaN values corrupt the residual buffer between layers**, causing a chain reaction that destroys every subsequent tensor. Root causes traced to two bugs:
+
+### Problem Summary — Observed From Full Run Output
+
+```
+[FORWARD] token_id=9419: emb[0..15]= 144.0000, -80.0000, 0.0000, 22.0000 ...   ✅ VALID
+[FORWARD] blk 0: q_fp32[0..15]: -1031.9172 -6662.0430 -4668.9590 ...             ✅ VALID (large)
+[FORWARD] blk 0: k_fp32[0..15]: -4348.2012 201.7613 -12469.7051 ...              ✅ VALID (large)
+[FORWARD] attn h=0 blk 0: k_expB_col0[0..7]=-512.0000, 0.0000, nan, nan...      ❌ NaN from index 2
+[FORWARD] partial dot(q,k)[0..15] = nan                                            ❌ All scores NaN
+[FORWARD] softmax max=0.000000                                                     ❌ Zeroed attention
+By block 4+: ALL values become NaN → chain reaction corrupts all downstream layers   ❌
+```
+
+### Root Cause Chain
+
+```
+Embedding lookup (CPU, valid values)
+    → LayerNorm (inline CPU, no weights — uses fixed eps)
+    → Q/K/V projections via gemm_act_fp4 GPU kernel (TYPE13/TYPE100 weights)
+        → q_fp32/k_fp32 are VALID but very large numbers (-4k to +14k range)
+    → RoPE on Q/K (GPU kernel, produces FP16 rounding of those large values)
+    → kv_store kernel writes to KV cache (GPU)
+    ↓
+    ⚠️ BUG #1: KV cache layout mismatch between write and read paths
+        The kv_store kernel writes `s.rks[h*HD+d]` in per-head layout [HD × n_ctx],
+        but the attention scoring code reads with head-major indexing:
+        `kc[p * DKV + kh_ * HD + d]` — these index calculations don't match.
+        Result: k_expB_col contains garbage/NaN because we're reading from wrong memory offsets.
+    ↓
+    ⚠️ BUG #2: SwiGLU scale extraction bug for TYPE100/TYPE13 quantized FFN weights
+        Even if attention were correct, the SwiGLU kernel reads UE4M3 scales from
+        W_gate.d_scales / W_up.d_scales via a formula that doesn't match the CPU-side
+        extraction used during weight loading. Scale bytes at wrong offsets decode to
+        NaN when passed through ue4m3_to_float() or produce wrong magnitude.
+        Output of SwiGLU → NaN flows into residual buffer during MLP add.
+    ↓
+    Residual corruption propagates: once residual[i] = NaN, every LayerNorm produces NaN,
+    every GEMM multiplies NaN by valid weights → still NaN, downstream layers all corrupt.
+```
+
+### Detailed Plan
+
+#### Step 1: Verify K/V Projection GPU Output (BLOCKING) [~30min]
+
+**Action**: Add debug prints right after V projection sync (`qwen_model.cpp:line ~417`) to read back `s.k_fp32` and `s.v_fp32` on CPU side:
+
+```cpp
+fprintf(stderr, "[FORWARD] blk %d: k_fp32[0..7] AFTER GEMM: ", l); fflush(stderr);
+for (int i = 0; i < std::min(HKV * HD, 8); ++i) {
+    float v = s.k_fp32[i];
+    if (i > 0) fprintf(stderr, ", ");
+    if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.6f", v);
+}
+fprintf(stderr, "\n"); fflush(stderr);
+```
+
+Same for `s.v_fp32`. This confirms whether the bug is in the **GPU kernel output** (NaN written by gemm_act_fp4) or in the **CPU read-back / KV cache path** (valid data, wrong indexing).
+
+#### Step 2: Fix KV Cache Write/Read Layout Mismatch (HIGH PRIORITY) [~1h]
+
+**Bug location**: `qwen_model.cpp`, attention section, lines ~517-522.
+
+Current code builds `kexpB` with this loop:
+```cpp
+for (int d = 0; d < HD; ++d)
+    for (int p = 0; p <= pos; ++p)
+        s.kh[d*CTX + p] = kc[p*DKV + kh_*HD + d];
+```
+
+The kv_store kernel writes K values into the cache at positions `(pos_start + t) * DKV + idx` where `idx` iterates over all DKV values contiguously. But the per-head staging on line 481 does `s.rks[h*HD + d] = s.kh[h*HD + d]` — a per-head layout. The kv_store kernel's grid-stride copy reads from these per-head-staged values but uses a flat index calculation that doesn't account for head separation.
+
+**Fix**:
+- Align the write pattern of kv_store with the read pattern in attention scoring
+- Verify `kc = kv_cache_k_row_const(eng_model->kvc, l, 0)` returns pointer to layer l's full K region starting at position 0
+- Trace exact byte offsets being written by kv_store and read back by the attention code
+- Fix indexing formula to match: if KV cache stores `[token_0_K | token_1_K | ... | token_n_K]` each of size DKV, then reading token p of head kh should be `kc[(p * DKV + kh * HD)]` (not the current mixed indexing)
+
+#### Step 3: Fix SwiGLU Scale Access [~2h]
+
+**Bug location**: `swiglu.hip`, lines 66-67.
+
+```cpp
+float wScale_gate = wOK ? ue4m3_to_float(W_gate_scales[(size_t)wLine * numStrips + s]) : 0.0f;
+```
+
+This assumes scales are stored as `[N × K/16]` UE4M3 bytes — matching CPU extraction. But the GPU kernel may be reading from a different memory layout than what the CPU-side weight loader produces.
+
+**Action**:
+- Add CPU-scale validation step before launch: iterate through first few scale bytes in `L.W_gate.scales.data()` on CPU, decode them with `ue4m3_to_float()`, print values
+- Cross-check: take a known-good scale byte and verify both CPU decoding and GPU-decoded value agree
+- Verify that the scale index formula `(wLine * numStrips + s)` correctly maps to the position used during weight loading
+- If scales are wrong, fix either the CPU extraction code or the GPU kernel's scale access pattern to match
+
+#### Step 4: Verify O-Projection Output [~30min]
+
+**Bug location**: `qwen_model.cpp`, line ~654. The O-projection also uses `gemm_act_fp4` with TYPE13/TYPE100 weights. If this kernel has the same bug pattern as SwiGLU (wrong scale access), attention output will be NaN and corrupt everything downstream.
+
+**Action**: Add debug prints after O-projection sync (`qwen_model.cpp`, inside "if (L.Wo.d_packed != nullptr)" block):
+
+```cpp
+fprintf(stderr, "[FORWARD] blk %d: O-proj out[0..7]: ", l); fflush(stderr);
+for (int i = 0; i < std::min(E, 8); ++i) {
+    float v = s.down_fp32[i];
+    if (i > 0) fprintf(stderr, ", ");
+    if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.6f", v);
+}
+fprintf(stderr, "\n"); fflush(stderr);
+```
+
+#### Step 5: Validate Scale Extraction for TYPE13/TYPE100
+
+**Context**: We fixed the CPU-side weight loading in commit d2cc9cc to use correct bounds-checking against type_name_map size and fix weight data byte offsets. But the GPU kernels read scales from device memory — they never see the CPU extraction code directly. The `d_scales` pointer points to a pinned host buffer that the GPU reads directly.
+
+**Potential issues**:
+- Scale bytes extracted during load may not match what the GPU kernel expects
+- The `ue4m3_to_float()` function on CPU and GPU should be identical (it's defined in `fp4_common.h` which is included by both). Verify this.
+- For TYPE100: scales stored at offset 16+ within each 17-byte block; for TYPE13: 16 UE4M3 scale bytes at offsets 0-15 of each 144-byte block
+
+**Action**:
+- Print first 8 decoded scale values from CPU side before launching any GPU kernel that uses them
+- Verify `ue4m3_to_float()` produces reasonable numbers (not NaN/Inf) for all scale bytes
+- Cross-reference with known-good reference model output if available
+
+### Execution Order
+
+1. **Step 1 first** → add K/V projection debug prints, re-run, observe if K/v are valid or already corrupted at GPU output stage
+2. Based on Step 1 result: either fix gemm_act_fp4 kernel OR fix CPU read-back / KV cache indexing
+3. **Steps 2–3 in parallel** — fix KV cache layout AND verify SwiGLU scales independently
+4. **Step 4** — verify attention O-projection output (needed for residual flow to be valid through the full layer)
+5. **Step 5** — validate scale extraction correctness against CPU reference
+
+### Success Criteria
+
+- Embedding values remain valid through all 33 layers
+- No NaN values appear in q_h, k_h, k_expB_col, scores, probs, logits
+- Generated tokens are meaningful (not just EOS token ID 0)
+- Loss/perplexity numbers are reasonable for a working model
