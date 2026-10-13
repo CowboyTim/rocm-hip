@@ -1225,5 +1225,39 @@ fprintf(stderr, "\n"); fflush(stderr);
 
 - Embedding values remain valid through all 33 layers
 - No NaN values appear in q_h, k_h, k_expB_col, scores, probs, logits
-- Generated tokens are meaningful (not just EOS token ID 0)
+- Generated tokens are meaningful (not just EOS token ID 0)  
 - Loss/perplexity numbers are reasonable for a working model
+
+---
+
+### Steps 2–3: Fix SwiGLU scale extraction + KV cache layout (IN PROGRESS 🔧)
+
+**SWI GLU SCALE BUG IDENTIFIED:** POST-SWiGLU down_fp32 contains extreme garbage (`13803172`, `60779104`, millions in magnitude). When added to residual during MLP residual add, these overflow to inf → corrupts layer_scratch[0] → cascades to all downstream blocks.
+
+#### Step 2a: Fix SwiGLU kernel TYPE13/TYPE100 scale extraction
+
+The SwiGLU kernel receives FP4 quantized gate/up projection weights with self-contained scales (TYPE13) or external scales (TYPE100). The kernel currently reads scales from wrong offsets because it uses the same scale access pattern as Q/K/V projections, but FFN tensors have different layouts.
+
+**Files to fix:**
+- `src/swiglu_kernel.hip` — main SwiGLU FP4 computation kernel
+- `src/qwen_model.cpp` lines ~825-845 — SwiGLU argument setup and weight loading
+
+**Fix approach:**
+1. Print extracted scale values right before kernel launch for verification
+2. Compare GPU-extracted scales against CPU reference in `inference.cpp::load_quant_weight_from_gguf()`  
+3. For TYPE13 (self-contained): verify block index calculation `(b * 256 + v) >> 1` matches inference.cpp's formula
+4. For TYPE100 (unknown type): locate and use correct scale tensor from GGUF KV store
+5. Use explicit typed local variables passed by address (`&var`) following verified pattern from qwen_model_forward_batch
+
+#### Step 2b: Fix KV cache write/read layout alignment
+
+Current kv_store writes per-head data using potentially incorrect stride. Attention scoring reads with matching formula — both could be consistently wrong or one is right and one is wrong.
+
+**Files to fix:**
+- `src/kv_cache_store.co` / kv_store kernel source (if available separately)
+- `src/qwen_model.cpp` lines ~517-522 — kexpB/vexpB construction from KV cache
+
+**Fix approach:**
+1. Verify kv_store uses correct indexing: `pos * HKV * HD + h * HD + d` 
+2. Match attention scoring read path to write path exactly
+3. Verify grouped query attention mapping: `kh_ = h / GRP` where GRP = HQ/HKV = 4
