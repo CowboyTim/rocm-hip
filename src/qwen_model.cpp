@@ -839,14 +839,45 @@ struct QwenModel {
             }
 
             // --- k) SwiGLU (gate/up/down) ---
-            fprintf(stderr, "[FORWARD] blk %d: SwiGLU gate_pack=%p up_pack=%p down=%p\n",
+            fprintf(stderr, "[FORWARD] blk %d: SwiGLU gate_pack=%p up_pack=%p down=%p\n", 
                     l, (void*)L.W_gate.d_packed, (void*)L.W_up.d_packed, (void*)s.d_down); fflush(stderr);
 
-            // Debug: verify all weights for SwiGLU
-            if (l == 0) {
-                fprintf(stderr, "[FORWARD] blk 0: W_gate.scale=(%p) W_up.scale=(%p) s.hmlp=(%p)\n",
-                        (void*)L.W_gate.d_scales, (void*)L.W_up.d_scales, (void*)s.d_hmlp); fflush(stderr);
+            // Debug Step O (Phase 20): Read scales directly from CPU before kernel launch
+            if (l == 0) { // Only for block 0
+                int numStrips = E_local / 16; // K/16 strips
+                fprintf(stderr, "[FORWARD] SWIGLU SCALE CHECK blk 0: N=%d K=%d numStrips=%d W_gate.scales_size=%zu W_up.scales_size=%zu\n",
+                        L.W_gate.N, E_local, numStrips, L.W_gate.scales.size(), L.W_up.scales.size()); fflush(stderr);
+                
+                fprintf(stderr, "[FORWARD] SWIGLU blk 0: gate_scales[0..7]= "); fflush(stderr);
+                for (int s = 0; s < std::min(numStrips, 8); ++s) {
+                    uint8_t sc = L.W_gate.scales[s];
+                    float f = ue4m3_to_float(sc);
+                    if (s > 0) fprintf(stderr, " ");
+                    fprintf(stderr, "0x%02x->%.4f", sc, f);
+                }
+                fprintf(stderr, "\n"); fflush(stderr);
+
+                fprintf(stderr, "[FORWARD] SWIGLU blk 0: up_scales[0..7]= "); fflush(stderr);
+                for (int s = 0; s < std::min(numStrips, 8); ++s) {
+                    uint8_t sc = L.W_up.scales[s];
+                    float f = ue4m3_to_float(sc);
+                    if (s > 0) fprintf(stderr, " ");
+                    fprintf(stderr, "0x%02x->%.4f", sc, f);
+                }
+                fprintf(stderr, "\n"); fflush(stderr);
+
+                // Also check scales at kernel-accessed indices (wLine * numStrips + s)  
+                fprintf(stderr, "[FORWARD] SWIGLU blk 0: gate_scales[wLine=0,strp=0..3]= "); fflush(stderr);
+                for (int s = 0; s < std::min(numStrips, 4); ++s) {
+                    int idx = 0 * numStrips + s;
+                    uint8_t sc = L.W_gate.scales[(size_t)idx];
+                    float f = ue4m3_to_float(sc);
+                    if (s > 0) fprintf(stderr, " ");
+                    fprintf(stderr, "[%d]=0x%02x->%.4f", idx, sc, f);
+                }
+                fprintf(stderr, "\n"); fflush(stderr);
             }
+
 
             void* swiglu_args[] = { &s.d_hmlp,
                                     &L.W_gate.d_packed, &L.W_gate.d_scales,
