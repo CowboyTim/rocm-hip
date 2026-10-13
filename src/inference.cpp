@@ -78,12 +78,6 @@ static bool pin_model_memory(inference_model* m) {
             const unsigned char* scales_raw = !w.scales.empty() ? w.scales.data() : w.packed.data();
             w.d_scales = const_cast<unsigned char*>(scales_raw);
             const float* scaled_f_raw = !w.scales_f.empty() ? w.scales_f.data() : nullptr;
-            if (!scaled_f_raw) {
-                // Fallback: use packed data address (will not be used for non-UE4M3 types)
-                void* dummy = (void*)w.packed.data();
-                dummy = (void*)w.packed.data();
-                scaled_f_raw = reinterpret_cast<const float*>(dummy);
-            }
             w.d_scales_f = const_cast<float*>(scaled_f_raw);
             return true;
         };
@@ -111,11 +105,6 @@ static bool pin_model_memory(inference_model* m) {
         const unsigned char* lm_scales_raw = !m->lm_head.scales.empty() ? m->lm_head.scales.data() : m->lm_head.packed.data();
         m->d_lm_head_scales = const_cast<unsigned char*>(lm_scales_raw);
         const float* lm_scaled_f_raw = !m->lm_head.scales_f.empty() ? m->lm_head.scales_f.data() : nullptr;
-        if (!lm_scaled_f_raw) {
-            void* dummy = (void*)m->lm_head.packed.data();
-            dummy = (void*)m->lm_head.packed.data();
-            lm_scaled_f_raw = reinterpret_cast<const float*>(dummy);
-        }
         m->d_lm_head_scales_f = const_cast<float*>(lm_scaled_f_raw);
     }
     if (!m->final_ln_scale.empty()) {
@@ -334,7 +323,7 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
                     }
                 }
 
-                // Repack: map extracted scales to standard per-row layout (K/16 scale bytes per row)
+                // Repack: map extracted scales to standard per-row layout
                 for (int64_t row = 0; row < out_dim; ++row) {
                     size_t src_row_off = (size_t)row * tmp_scales_per_row;
                     for (size_t s = 0; s < scales_per_row; ++s) {
@@ -342,7 +331,16 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
                             (s < tmp_scales_per_row) ? tmp_scales[src_row_off + s] : 0x60;
                     }
                 }
+                // Sample first row scales for debugging
+                if (out_dim > 0 && scales_per_row > 0) {
+                    fprintf(stderr, "[load_quant_weight] TYPE13 sample row0 scales[0..7]: ");
+                    for (int s = 0; s < 8 && s < (int)scales_per_row; ++s) {
+                        fprintf(stderr, "0x%02x ", (unsigned int)w.scales[s]);
+                    }
+                    fprintf(stderr, "\n"); fflush(stderr);
+                }
                 break;
+
             }
             case 13: {
                 // TYPE13: UE4M3 scales embedded in each 256-value block.
@@ -364,6 +362,46 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
                     for (size_t b = 0; b < blocks_per_row; ++b) {
                         size_t blk_idx = row_start_block + b;
                         const uint8_t* blk = data + blk_idx * 144;
+
+                        for (size_t s = 0; s < 16; ++s) {
+                            size_t global_si = (size_t)(row * tmp_scales_per_row) + b * 16 + s;
+                            if (global_si < tmp_scales.size()) {
+                                tmp_scales[global_si] = blk[s]; // UE4M3 scale at offset s within block
+                            }
+                        }
+                    }
+                }
+
+                // Repack: map extracted scales to standard per-row layout
+                for (int64_t row = 0; row < out_dim; ++row) {
+                    size_t src_row_off = (size_t)row * tmp_scales_per_row;
+                    for (size_t s = 0; s < scales_per_row; ++s) {
+                        w.scales[row * scales_per_row + s] =
+                            (s < tmp_scales_per_row) ? tmp_scales[src_row_off + s] : 0x60;
+                    }
+                }
+                break;
+            }
+            case 14: {
+                // TYPE14: UE4M3 scales embedded in each 256-value block.
+                // Block layout (176 bytes): [scale_0..scale_15(16B), packed_data(160B)].
+                // Each scale covers 16 elements within the block.
+                fprintf(stderr, "[load_quant_weight] extracting TYPE14 scales\n");
+                w.quant_type = 14;
+
+                const uint8_t* data = w.packed.data();
+                size_t blocks_per_row = (size_t)in_dim / 256;
+                size_t tmp_scales_per_row = blocks_per_row * 16;
+
+                std::vector<uint8_t> tmp_scales((size_t)out_dim * tmp_scales_per_row);
+
+                for (int64_t row = 0; row < out_dim; ++row) {
+                    int64_t row_start_elem = row * in_dim;
+                    size_t row_start_block = (size_t)row_start_elem / 256;
+
+                    for (size_t b = 0; b < blocks_per_row; ++b) {
+                        size_t blk_idx = row_start_block + b;
+                        const uint8_t* blk = data + blk_idx * 176;
 
                         for (size_t s = 0; s < 16; ++s) {
                             size_t global_si = (size_t)(row * tmp_scales_per_row) + b * 16 + s;
@@ -646,7 +684,6 @@ static bool load_model_weights(inference_model* m) {
             if (has_tensor(m->gguf, ssm_check)) {
                 // This is an SSM layer — skip entirely (Phase 15.4)
                 is_ssm_layer = true;
-                fprintf(stderr, "[load_model_weights] blk.%d: SSM layer detected, skipping\n", i);
             }
         }
 
@@ -661,16 +698,13 @@ static bool load_model_weights(inference_model* m) {
 
         if (qkv_ptr && qkv_w_sz > 0) {
             // Combined QKV tensor found — load and split into Wq/Wk/Wv
-            fprintf(stderr, "[load_model_weights] blk.%d: using combined attn_qkv weight [%ld x %ld]\n",
-                    i, (long)m->layers[i].Wq.N, (long)(m->n_head * m->head_dim + 2 * m->n_head_kv * m->head_dim));
-
             int qidx = find_tensor_index(m->gguf, wname);
             if (qidx < 0) return false;
-            int64_t* ne = gguf_tensor_ne(m->gguf, qidx);
-            if (!ne) return false;
+            int64_t* ne_raw = gguf_tensor_ne(m->gguf, qidx);
+            if (!ne_raw) return false;
 
-            int64_t E = ne[0];              // embedding length (rows)
-            int64_t DQ = (int64_t)m->n_head * m->head_dim;   // Q columns
+            int64_t E = ne_raw[0];              // embedding length (rows)
+            int64_t DQ = (int64_t)m->n_head * m->head_dim;   // Q columns  
             int64_t DKV = (int64_t)m->n_head_kv * m->head_dim; // K/V columns
 
             size_t total_cols = DQ + 2 * DKV;
@@ -681,7 +715,7 @@ static bool load_model_weights(inference_model* m) {
             L.Wv.N = (int)E; L.Wv.K = (int)DKV;
 
             // Load scales — check if tensor type is self-contained first
-            int qkv_type = find_tensor_index(m->gguf, wname);
+            int qkv_type = qidx;
             int self_contained = 0;
             if (qkv_type >= 0) {
                 int t = gguf_tensor_type(m->gguf, qkv_type);
@@ -901,6 +935,49 @@ static bool load_model_weights(inference_model* m) {
                                 (si < total_scales_per_row) ? all_scales[si] : 0x60;
                         }
                     }
+                } else if (t == 14) {
+                    // TYPE14: Same structure as TYPE13 — UE4M3 scales embedded in each 256-value block.
+                    // Block layout: [scale_0..scale_15 (16 bytes), packed_data (160 bytes)] = 176 bytes per block.
+                    fprintf(stderr, "blk.%d: TYPE14 combined QKV — extracting UE4M3 from blocks\n", i);
+
+                    size_t blocks_per_row = (total_cols + 255) / 256;
+                    size_t total_scales_per_row = blocks_per_row * 16;
+
+                    for (int64_t row = 0; row < E; ++row) {
+                        const unsigned char* src_row = pk + row * blocks_per_row * 176;
+
+                        std::vector<uint8_t> all_scales(total_scales_per_row);
+                        for (size_t b = 0; b < blocks_per_row; ++b) {
+                            const uint8_t* blk = src_row + b * 176;
+                            for (size_t s = 0; s < 16; ++s) {
+                                all_scales[b * 16 + s] = blk[s]; // UE4M3 scale at offset s within block
+                            }
+                        }
+
+                        // Map scales to projection-specific arrays (same logic as type 13)
+                        size_t q_scale_count = (DQ + 15) >> 4;
+                        if (q_scale_count > total_scales_per_row) q_scale_count = total_scales_per_row;
+                        for (size_t s = 0; s < q_scales_per_row; ++s) {
+                            L.Wq.scales[row * q_scales_per_row + s] =
+                                (s < q_scale_count) ? all_scales[s] : 0x60;
+                        }
+
+                        size_t k_start_col = DQ;
+                        for (size_t s = 0; s < k_scales_per_row; ++s) {
+                            int col = (int)(k_start_col + s * 16);
+                            size_t si = col / 16;
+                            L.Wk.scales[row * k_scales_per_row + s] =
+                                (si < total_scales_per_row) ? all_scales[si] : 0x60;
+                        }
+
+                        size_t v_start_col = DQ + DKV;
+                        for (size_t s = 0; s < v_scales_per_row; ++s) {
+                            int col = (int)(v_start_col + s * 16);
+                            size_t si = col / 16;
+                            L.Wv.scales[row * v_scales_per_row + s] =
+                                (si < total_scales_per_row) ? all_scales[si] : 0x60;
+                        }
+                    }
                 } else if (t == 2) { // Q4_0 in combined QKV — decode FP16 delta from blocks per projection
                     fprintf(stderr, "blk.%d: Q4_0 combined QKV — extracting FP16 delta from blocks\n", i);
 
@@ -1083,7 +1160,6 @@ static bool load_model_weights(inference_model* m) {
             if (has_tensor(m->gguf, wname)) {
                 if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wo)) return false;
             } else {
-                fprintf(stderr, "[load_model_weights] blk.%d: no attn_o/attn_output tensor found (may be SSM layer)\n", i);
             }
         }
 
@@ -1093,7 +1169,6 @@ static bool load_model_weights(inference_model* m) {
         if (has_tensor(m->gguf, wname)) {
             if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.W_gate)) return false;
         } else {
-            fprintf(stderr, "[load_model_weights] blk.%d: no ffn_gate tensor found\n", i);
         }
 
         snprintf(wname, sizeof(wname), "blk.%d.ffn_up.weight", i);
@@ -1101,7 +1176,6 @@ static bool load_model_weights(inference_model* m) {
         if (has_tensor(m->gguf, wname)) {
             if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.W_up)) return false;
         } else {
-            fprintf(stderr, "[load_model_weights] blk.%d: no ffn_up tensor found\n", i);
         }
 
         snprintf(wname, sizeof(wname), "blk.%d.ffn_down.weight", i);
@@ -1109,7 +1183,6 @@ static bool load_model_weights(inference_model* m) {
         if (has_tensor(m->gguf, wname)) {
             if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.W_down)) return false;
         } else {
-            fprintf(stderr, "[load_model_weights] blk.%d: no ffn_down tensor found\n", i);
         }
         // LayerNorm scales
         size_t ln_sz;
@@ -1168,12 +1241,13 @@ inference_model_t* inference_load_model(const char* gguf_path) {
     const char* arch = gguf_arch(m->gguf);
     m->model_name = arch ? arch : "qwen3-unknown";
 
-    m->n_layer = (int)n_layer;
-    m->n_embd = (int)n_embd;
-    m->n_head = (int)n_head;
-    m->n_head_kv = (int)n_head_kv;
-    m->head_dim = (int)hd;
-    m->vocab_size = (int)vs;
+     m->n_layer = (int)n_layer;
+     m->n_embd = (int)n_embd;
+     m->n_head = (int)n_head;
+     m->n_head_kv = (int)n_head_kv;
+     m->head_dim = (int)hd;
+     m->vocab_size = (int)vs;
+
     m->n_ctx = (int)ctx_len;
 
     // Load embedding table — detect quantized types and route accordingly

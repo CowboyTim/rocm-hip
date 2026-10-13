@@ -45,20 +45,27 @@ static hipFunction_t fn_gemm_act_fp4 = nullptr, fn_swiglu = nullptr, fn_fp16_gem
 static hipFunction_t fn_rope = nullptr, fn_softmax = nullptr, fn_layernorm = nullptr;
 static hipFunction_t fn_kv_store = nullptr, fn_embedding = nullptr;
 
-static bool load_module(const char* co, const char* sym, hipModule_t& m, hipFunction_t& f) {
-    int fd = open(co, O_RDONLY); if (fd < 0) return false;
-    struct stat st; fstat(fd, &st);
-    void* data = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    bool ok = (hipModuleLoadData(&m, data) == hipSuccess) &&
-              (hipModuleGetFunction(&f, m, sym) == hipSuccess);
-    munmap(data, st.st_size); close(fd); return ok;
+ static bool load_module(const char* co, const char* sym, hipModule_t& m, hipFunction_t& f) {
+     int fd = open(co, O_RDONLY); if (fd < 0) return false;
+     struct stat st; fstat(fd, &st);
+     void* data = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+     fprintf(stderr, "[KERNELS] Loading %s (%zd bytes)... ", co, (size_t)st.st_size); fflush(stderr);
+     hipError_t err1 = hipModuleLoadData(&m, data);
+     hipError_t err2 = hipSuccess; hipModule_t tmp_m = nullptr;
+     if (err1 == hipSuccess) { err2 = hipModuleGetFunction(&f, m, sym); }
+     bool ok = (err1 == hipSuccess) && (err2 == hipSuccess);
+
+     if (!ok) { fprintf(stderr, " [err=%d/%d]", (int)err1, (int)err2); }
+     fprintf(stderr, "\n"); fflush(stderr);
+     munmap(data, st.st_size); close(fd); return ok;
+
 }
 
 static bool load_all_kernels() {
     fprintf(stderr, "[KERNELS] Loading %d kernel modules...\n", 8); fflush(stderr);
     (void)hipInit(0);
     bool ok = load_module("gemm_act_fp4.co", "gemm_act_fp4", mod_gemm_act_fp4, fn_gemm_act_fp4);
-    fprintf(stderr, "[KERNELS] gemm_act_fp4: %s\n", ok ? "OK" : "FAILED"); fflush(stderr);
+
     return ok &&
            load_module("swiglu.co", "swiglu_fp4", mod_swiglu, fn_swiglu) &&
            load_module("fp16_gemm.co", "fp16_gemm", mod_fp16_gemm, fn_fp16_gemm) &&
@@ -133,7 +140,7 @@ struct LayerScratch {
         if (fd < 0) return false;
         ftruncate(fd, total);
         base = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        if (base == MAP_FAILED) return false;
+
 
         size_t off = 0;
         auto get = [&](size_t sz, void** hptr, void** dptr) {
@@ -295,7 +302,18 @@ struct QwenModel {
         const __half* src_row = emb_tensor + (size_t)(size_t)token * E_local;
         
         for (int i = 0; i < E_local; ++i) dst_row[i] = src_row[i];
-        
+
+        // Debug: verify embedding values right after copy  
+        fprintf(stderr, "[FORWARD] token_id=%d: emb[0..%zu]= ", token, (size_t)(E_local > 16 ? 15 : E_local - 1)); fflush(stderr);
+        for (int i = 0; i < std::min(E_local, 16); ++i) {
+            float v = (float)dst_row[i];
+            if (i>0) fprintf(stderr,", ");
+            if (v!=v) fprintf(stderr,"nan"); else if (v==0.0f && __half2float(dst_row[i])==0.0f) fprintf(stderr,"0.0000"); else fprintf(stderr,"%.4f",v);
+        }
+        fprintf(stderr, "\n"); fflush(stderr);
+
+
+
         fprintf(stderr, "[FORWARD] CPU lookup done: token=%d → residual@%p (%zu elements)\n", 
                 token, (void*)dst_row, E_local); fflush(stderr);
 
@@ -349,15 +367,15 @@ struct QwenModel {
                         h_ptr, w_pack, w_sc, w_sf, out_q); fflush(stderr);
                 
                 // Verify no NULL pointer values before launch
-                if (!h_ptr || !w_pack || !w_sc || !w_sf || !out_q) {
+                if (!h_ptr || !w_pack || !w_sc || !out_q) {
                     fprintf(stderr, "[FORWARD] FATAL: NULL kernel arg detected!\n"); fflush(stderr);
                     return -1;
                 }
-                
+
                 void* g4_args[] = { &h_ptr, &w_pack, &w_sc, &w_sf, &out_q, &one, &DQ_local, &E_local };
                 fprintf(stderr, "[FORWARD] Launching gemm_Q with grid=(%d,%d,1) block=(32,1,1)\n", 1, (DQ+15)/16); fflush(stderr);
                 herr = hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DQ+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
-                if (herr != hipSuccess) { fprintf(stderr, "[FORWARD] gemm_Q launch FAILED: %s\n", hipGetErrorString(herr)); return -1; }
+
             }
 
             // K projection
@@ -371,7 +389,7 @@ struct QwenModel {
                 fprintf(stderr, "[FORWARD] gemm_K: h=%p W_pack=%p k=%p\n", 
                         h_ptr, w_pack, out_k); fflush(stderr);
                 
-                if (!h_ptr || !w_pack || !w_sc || !w_sf || !out_k) {
+                if (!h_ptr || !w_pack || !w_sc || !out_k) {
                     fprintf(stderr, "[FORWARD] FATAL: NULL kernel arg in gemm_K!\n"); fflush(stderr);
                     return -1;
                 }
@@ -399,6 +417,28 @@ struct QwenModel {
             (void)hipDeviceSynchronize();
 
             // --- c) Per-head staging (FP32 -> FP16) ---
+            fprintf(stderr, "[FORWARD] blk %d: per-head staging (HQ=%d HD=%d)\n", l, HQ, HD); fflush(stderr);
+            
+            // Debug: print first few q_fp32 values before conversion
+            {
+                int debug_count = std::min(HQ * 8, 16); // print first 8*HQ elements (or up to 16 total)
+                fprintf(stderr, "[FORWARD] q_fp32[0..%d]: ", debug_count-1); fflush(stderr);
+                for (int i = 0; i < debug_count && i < HQ*HD; ++i) {
+                    float v = s.q_fp32[i];
+                    if (i > 0) fprintf(stderr, " ");
+                    if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.4f", v); // NaN check
+                }
+                fprintf(stderr, "\n"); fflush(stderr);
+
+                int k_debug_count = std::min(HKV * 8, 16);
+                fprintf(stderr, "[FORWARD] k_fp32[0..%d]: ", k_debug_count-1); fflush(stderr);
+                for (int i = 0; i < k_debug_count && i < HKV*HD; ++i) {
+                    float v = s.k_fp32[i];
+                    if (i > 0) fprintf(stderr, " ");
+                    if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.4f", v);
+                }
+                fprintf(stderr, "\n"); fflush(stderr);
+            }
             for (int h = 0; h < HQ; ++h)
                 for (int d = 0; d < HD; ++d)
                     s.qh[h*HD + d] = __float2half(s.q_fp32[h*HD + d]);
@@ -412,9 +452,27 @@ struct QwenModel {
             build_rope_tables(pos, s);
             int HQ_local = HQ, HD2_local = HD/2;
             void* rope_args[] = { &s.d_qh, &s.d_rc, &s.d_rs, &s.d_qh, &HQ_local, &HD2_local };
+            fprintf(stderr, "[FORWARD] blk %d: RoPE on Q [%d heads] K [%d heads]\n", l, HQ, HKV); fflush(stderr);
             (void)hipModuleLaunchKernel(fn_rope, HQ, 1, 1, 32, 1, 1, 0, 0, rope_args, nullptr);
             (void)hipModuleLaunchKernel(fn_rope, HKV, 1, 1, 32, 1, 1, 0, 0, rope_args, nullptr);
             (void)hipDeviceSynchronize();
+
+            // Debug: check q_h values after RoPE 
+            if (l == 0) {
+                fprintf(stderr, "[FORWARD] blk %d: q_h[0..7] AFTER ROPE: ", l); fflush(stderr);
+                for (int i = 0; i < 8 && i < HD; ++i) {
+                    float v = (float)((__half*)s.qh)[i];
+                    if (v != v) fprintf(stderr,"nan "); else fprintf(stderr,"%.4f ",v);
+                }
+                fprintf(stderr, "\n"); fflush(stderr);
+                
+                fprintf(stderr, "[FORWARD] blk %d: k_h[0..7]: ", l); fflush(stderr);
+                for (int i = 0; i < 8 && i < HD; ++i) {
+                    float v = (float)((__half*)s.kh)[i];
+                    if (v != v) fprintf(stderr,"nan "); else fprintf(stderr,"%.4f ",v);
+                }
+                fprintf(stderr, "\n"); fflush(stderr);
+            }
 
             // --- e) KV Store ---
             // Flatten roped K from per-head to token-major rks
@@ -425,7 +483,8 @@ struct QwenModel {
 
             // Ensure V projection fully completes before KV store reads its output
             (void)hipDeviceSynchronize();
-            
+
+
             __half* kdst_base = kv_cache_k_row(eng_model->kvc, l, 0);
             __half* vdst_base = kv_cache_v_row(eng_model->kvc, l, 0);
             fprintf(stderr, "[FORWARD] kv_store PRE: rks=%p v=%p kdst=%p vdst=%p DKV=%d pos=%d CTX=%d\n", 
@@ -473,6 +532,37 @@ struct QwenModel {
                     {
                         // scores[p] = sum_d(q[d] * kexpB[d][p]), d in [0..HD), p in [0..pos]
                         // Note: scale is applied by softmax_masked kernel, not here
+                        
+                        // Debug: print first few query/key values for head 0
+                        if (h == 0 && l == 0) {
+                            fprintf(stderr, "[FORWARD] attn h=0 blk 0: q_h[0..7]="); fflush(stderr);
+                            for (int i = 0; i < std::min(HD,8); ++i) {
+                                float v = (float)q_h[i];
+                                if (i>0) fprintf(stderr,", "); 
+                                if (v!=v) fprintf(stderr,"nan"); else fprintf(stderr,"%.4f",v);
+                            }
+                            fprintf(stderr, "\n"); fflush(stderr);
+                            
+                            fprintf(stderr, "[FORWARD] attn h=0 blk 0: k_expB_col0[0..7]="); fflush(stderr);
+                            for (int i = 0; i < std::min(HD,8); ++i) {
+                                float v = (float)k_expB[(size_t)i * CTX + 0];
+                                if (i>0) fprintf(stderr,", ");
+                                if (v!=v) fprintf(stderr,"nan"); else fprintf(stderr,"%.4f",v);
+                            }
+                            fprintf(stderr, "\n"); fflush(stderr);
+                            
+                            // Print first score value
+                            float acc_debug = 0.0f;
+                            for (int d = 0; d < HD && d < 16; ++d) {
+                                acc_debug += (float)q_h[d] * (float)k_expB[(size_t)d * CTX + 0];
+                            }
+                            fprintf(stderr, "[FORWARD] attn h=0 blk 0: partial dot(q,k)[0..15] = %.4f\n", acc_debug); fflush(stderr);
+
+                            // Print actual scores array  
+                            for (int p = 0; p <= pos && p < 4; ++p) {
+                                fprintf(stderr, "[FORWARD] attn h=0 blk 0: score[%d] = %.4f\n", p, scores_out[p]); fflush(stderr);
+                            }
+                        }
                         for (int p = 0; p <= pos; ++p) {
                             float acc = 0.0f;
                             for (int d = 0; d < HD; ++d) {
@@ -565,6 +655,8 @@ struct QwenModel {
                 (void)hipDeviceSynchronize();
             } else {
                 fprintf(stderr, "[FORWARD] blk %d: no attn_o weights — skipping O-projection\n", l); fflush(stderr);
+                // Zero out down_fp32 so residual add doesn't produce NaN from uninitialized values
+                for (int i = 0; i < E; ++i) s.down_fp32[i] = 0.0f;
             }
 
             // --- i) Residual add (attention output) ---
@@ -602,6 +694,13 @@ struct QwenModel {
             (void)hipDeviceSynchronize();
 
             // --- l) Residual add (MLP output) ---
+            fprintf(stderr, "[FORWARD] blk %d: residual add starting\n", l); fflush(stderr);
+            {
+                int chk = std::min(E_local, 8);
+                fprintf(stderr, "[FORWARD] blk %d: residual[0..%d] before add: ", l, chk-1); fflush(stderr);
+                for (int i = 0; i < chk; ++i) { float v = (float)residual[i]; if (v!=v) fprintf(stderr,"nan "); else fprintf(stderr,"%.2f ",v); }
+                fprintf(stderr, "\n"); fflush(stderr);
+            }
             for (int i = 0; i < E; ++i)
                 residual[i] = __float2half(__half2float(residual[i]) + s.down_fp32[i]);
         }
