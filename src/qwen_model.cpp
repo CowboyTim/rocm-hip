@@ -838,55 +838,89 @@ struct QwenModel {
                 (void)hipDeviceSynchronize();
             }
 
-            // --- k) SwiGLU (gate/up/down) ---
+            // --- k) SwiGLU (gate/up/down) -- FIXED: allocate scales on GPU via hipMalloc
             fprintf(stderr, "[FORWARD] blk %d: SwiGLU gate_pack=%p up_pack=%p down=%p\n", 
                     l, (void*)L.W_gate.d_packed, (void*)L.W_up.d_packed, (void*)s.d_down); fflush(stderr);
 
-            // Debug Step O (Phase 20): Read scales directly from CPU before kernel launch
-            if (l == 0) { // Only for block 0
-                int numStrips = E_local / 16; // K/16 strips
-                fprintf(stderr, "[FORWARD] SWIGLU SCALE CHECK blk 0: N=%d K=%d numStrips=%d W_gate.scales_size=%zu W_up.scales_size=%zu\n",
-                        L.W_gate.N, E_local, numStrips, L.W_gate.scales.size(), L.W_up.scales.size()); fflush(stderr);
-                
-                fprintf(stderr, "[FORWARD] SWIGLU blk 0: gate_scales[0..7]= "); fflush(stderr);
-                for (int s = 0; s < std::min(numStrips, 8); ++s) {
-                    uint8_t sc = L.W_gate.scales[s];
-                    float f = ue4m3_to_float(sc);
-                    if (s > 0) fprintf(stderr, " ");
-                    fprintf(stderr, "0x%02x->%.4f", sc, f);
-                }
-                fprintf(stderr, "\n"); fflush(stderr);
+            // Allocate scale arrays directly in GPU device memory via hipMalloc.
+            // This ensures the GPU can access them without any kernarg dereferencing issues.
+            {
+                const size_t numStrips = E_local / 16;
+                static float* d_gate_scales_f = nullptr;
+                static float* d_up_scales_f = nullptr;
+                static size_t d_scale_size = 0;
 
-                fprintf(stderr, "[FORWARD] SWIGLU blk 0: up_scales[0..7]= "); fflush(stderr);
-                for (int s = 0; s < std::min(numStrips, 8); ++s) {
-                    uint8_t sc = L.W_up.scales[s];
-                    float f = ue4m3_to_float(sc);
-                    if (s > 0) fprintf(stderr, " ");
-                    fprintf(stderr, "0x%02x->%.4f", sc, f);
-                }
-                fprintf(stderr, "\n"); fflush(stderr);
+                if (!L.W_gate.scales.empty() && !L.W_up.scales.empty()) {
+                    // Allocate device memory once for scales (reused across all forward passes)
+                    if (!d_gate_scales_f || d_scale_size < numStrips * E_local) {
+                        hipMalloc(&d_gate_scales_f, numStrips * E_local * sizeof(float));
+                        hipMalloc(&d_up_scales_f, numStrips * E_local * sizeof(float));
+                        d_scale_size = numStrips * E_local;
+                        fprintf(stderr, "[FORWARD] SwiGLU: allocated device scale arrays [%zu floats each]\n", 
+                                numStrips * E_local); fflush(stderr);
+                    }
 
-                // Also check scales at kernel-accessed indices (wLine * numStrips + s)  
-                fprintf(stderr, "[FORWARD] SWIGLU blk 0: gate_scales[wLine=0,strp=0..3]= "); fflush(stderr);
-                for (int s = 0; s < std::min(numStrips, 4); ++s) {
-                    int idx = 0 * numStrips + s;
-                    uint8_t sc = L.W_gate.scales[(size_t)idx];
-                    float f = ue4m3_to_float(sc);
-                    if (s > 0) fprintf(stderr, " ");
-                    fprintf(stderr, "[%d]=0x%02x->%.4f", idx, sc, f);
+                    // Copy decoded UE4M3 scales to GPU device memory
+                    const uint8_t* sc_g = L.W_gate.scales.data();
+                    const uint8_t* sc_u = L.W_up.scales.data();
+
+                    // Decode UE4M3 bytes to float scales on CPU side
+                    std::vector<float> host_gates(numStrips * E_local);
+                    std::vector<float> host_ups(numStrips * E_local);
+                    for (int c = 0; c < E_local; ++c) {
+                        for (size_t s = 0; s < numStrips; ++s) {
+                            size_t idx = (size_t)c * numStrips + s;
+                            host_gates[idx] = rocmfp4::ue4m3_to_float(sc_g[idx]);
+                            host_ups[idx] = rocmfp4::ue4m3_to_float(sc_u[idx]);
+                        }
+                    }
+
+                    // Debug: print first few decoded scale values
+                    if (l == 0) {
+                        fprintf(stderr, "[FORWARD] SwiGLU blk 0: decoded gate_scales[0..7]= "); fflush(stderr);
+                        for (int i = 0; i < std::min((int)numStrips, 8); ++i) {
+                            float v = host_gates[i];
+                            if (i > 0) fprintf(stderr, " ");
+                            if (v != v) fprintf(stderr, "nan"); else if (v == 0.0f) fprintf(stderr, "0.0000"); else fprintf(stderr, "%.4f", v);
+                        }
+                        fprintf(stderr, "\n"); fflush(stderr);
+
+                        fprintf(stderr, "[FORWARD] SwiGLU blk 0: decoded up_scales[0..7]= "); fflush(stderr);
+                        for (int i = 0; i < std::min((int)numStrips, 8); ++i) {
+                            float v = host_ups[i];
+                            if (i > 0) fprintf(stderr, " ");
+                            if (v != v) fprintf(stderr, "nan"); else if (v == 0.0f) fprintf(stderr, "0.0000"); else fprintf(stderr, "%.4f", v);
+                        }
+                        fprintf(stderr, "\n"); fflush(stderr);
+                    }
+
+                    // Copy decoded scales from CPU to GPU device memory
+                    hipMemcpy(d_gate_scales_f, host_gates.data(), numStrips * E_local * sizeof(float), hipMemcpyHostToDevice);
+                    hipMemcpy(d_up_scales_f, host_ups.data(), numStrips * E_local * sizeof(float), hipMemcpyHostToDevice);
+                    (void)hipDeviceSynchronize();
+
+                    fprintf(stderr, "[FORWARD] SwiGLU blk %d: scale arrays copied to GPU\n", l); fflush(stderr);
+
+                     // Pass GPU device pointers directly — no kernarg dereferencing needed
+                    void* swiglu_args[] = { &s.d_hmlp,
+                                            L.W_gate.d_packed, d_gate_scales_f,
+                                            L.W_up.d_packed, d_up_scales_f,
+                                            s.d_down,
+                                            &one, &E_local, &E_local };
+
+                    fprintf(stderr, "[FORWARD] Launching SwiGLU with GPU-scale arrays [grid=(%d,%d)]\n", 
+                            (E+15)/16, (E+15)/16); fflush(stderr);
+                    (void)hipModuleLaunchKernel(fn_swiglu, 1, (E+15)/16, 1, 32, 1, 1, 0, 0, swiglu_args, nullptr);
+                } else {
+                    fprintf(stderr, "[FORWARD] WARNING: No scale data for SwiGLU blk %d!\n", l); fflush(stderr);
+                    void* swiglu_args[] = { &s.d_hmlp,
+                                            L.W_gate.d_packed, (void*)nullptr,
+                                            L.W_up.d_packed, (void*)nullptr,
+                                            s.d_down,
+                                            &one, &E_local, &E_local };
+                    (void)hipModuleLaunchKernel(fn_swiglu, 1, (E+15)/16, 1, 32, 1, 1, 0, 0, swiglu_args, nullptr);
                 }
-                fprintf(stderr, "\n"); fflush(stderr);
             }
-
-
-            void* swiglu_args[] = { &s.d_hmlp,
-                                    &L.W_gate.d_packed, &L.W_gate.d_scales,
-                                    &L.W_up.d_packed, &L.W_up.d_scales,
-                                    &s.d_down,
-                                    &one, &E_local, &E_local };
-            (void)hipModuleLaunchKernel(fn_swiglu, 1, (E+15)/16, 1, 32, 1, 1, 0, 0, swiglu_args, nullptr);
-
-            (void)hipDeviceSynchronize();
 
             // --- Debug Step N (Phase 20): Check SwiGLU output for block 0 ---
             if (l == 0) {
