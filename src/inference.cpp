@@ -261,32 +261,55 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
         return false;
     }
     int t = gguf_tensor_type(gguf, idx);
+    fprintf(stderr, "[load_quant_weight] %s: tensor_idx=%d found\n", weight_name, idx);
+    fprintf(stderr, "[load_quant_weight] %s: type=%d\n", weight_name, t);
     int self_contained = gguf_type_is_self_contained(t);
+
+
+    // Debug: log tensor type and scale source for all quantized weights
+    static const char* type_name_map[] = {"","Q4_0","Q4_1","","","","","",
+        "Q8_0","Q8_0PPL","","","","TYPE13","TYPE14","","","","","","",
+        "","","","","","","","","","","","MXFP4","","","","","","",
+        "","","","TYPE100"};
+    int type_name_count = sizeof(type_name_map) / sizeof(type_name_map[0]);
+    fprintf(stderr, "[load_quant_weight] %s: type=%d(%s) scales_ext=%p self_cont=%d\n",
+            weight_name, t, (t > 0 && t < type_name_count) ? type_name_map[t] : "UNKNOWN_TYPE", s_ptr, self_contained);
 
     // For self-contained types, external .scales tensor is optional — extract from blocks or fill with placeholder
     if (!s_ptr && !self_contained) {
         fprintf(stderr, "Missing scales tensor %s (type %d requires external scales)\n", scales_name, t);
         return false;
-    } else if (!s_ptr && self_contained) {
+        } else if (!s_ptr && self_contained) {
+        fprintf(stderr, "[load_quant_weight] %s: ENTERING else-if branch for self-contained\n", weight_name);
         fprintf(stderr, "[load_quant_weight] %s: self-contained type %d, no external scales — extracting from blocks\n",
+
+
                 weight_name, t);
     }
 
-    // Get dimensions: assume 2D [out_dim, in_dim]
+        // Get dimensions: assume 2D [out_dim, in_dim]
     int64_t* ne = gguf_tensor_ne(gguf, idx);
     if (!ne) return false;
     int64_t out_dim = ne[0];
     int64_t in_dim = ne[1];
+        fprintf(stderr, "[load_quant_weight] %s dims: N=%lld K=%lld packed_sz=%zu scales_ext=%p\n",
+            weight_name, (long long)out_dim, (long long)in_dim, w_sz, s_ptr);
+
     w.N = (int)out_dim;
     w.K = (int)in_dim;
+
+
     // Copy packed bytes from weight tensor
     w.packed.assign((const unsigned char*)w_ptr, (const unsigned char*)w_ptr + w_sz);
 
     if (s_ptr && s_sz > 0) {
         // External scales tensor found — use it normally
         w.scales.assign((const unsigned char*)s_ptr, (const unsigned char*)s_ptr + s_sz);
-    } else {
+        } else {
+        fprintf(stderr, "[load_quant_weight] %s: entering self-contained scale extraction\n", weight_name);
         // Self-contained type with no external scales — extract actual scales from within each block
+
+
         size_t scales_per_row = ((size_t)in_dim + 15) >> 4;  // UE4M3 scale per 16 elements (standard layout)
         w.scales.resize((size_t)out_dim * scales_per_row);
 
@@ -537,19 +560,34 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
             fprintf(stderr, "[load_quant_weight] true_v: TYPE13 UE4M3 formula\n");
             {
                 size_t blocks_per_row = (size_t)in_dim / 256;
+                size_t total_blocks = (size_t)out_dim * blocks_per_row;
+                size_t packed_sz = w.packed.size();
+                fprintf(stderr, "[load_quant_weight] TYPE13: out_dim=%d in_dim=%d blocks_per_row=%zu total_blocks=%zu packed_size=%zu scales_size=%zu\n",
+                        out_dim, in_dim, blocks_per_row, total_blocks, packed_sz, w.scales.size());
+
                 for (int n = 0; n < out_dim; ++n) {
+                    if (n % 256 == 0 && n > 0) fprintf(stderr, "[TYPE13] row %d/%d...\n", n, out_dim);
                     for (size_t b = 0; b < blocks_per_row; ++b) {
+                        size_t row_base = (size_t)n * blocks_per_row * 144 + b * 144;
                         for (int v = 0; v < 256; ++v) {
                             int k = (int)b * 256 + v;
                             size_t scale_idx = (size_t)v / 16;
-                            float sc = ue4m3_to_float(w.packed[(size_t)n * blocks_per_row * 144 + b * 144 + scale_idx]);
-                            uint8_t wb = w.packed[(size_t)n * blocks_per_row * 144 + b * 144 + 16 + ((size_t)(b * 256 + v) >> 1)];
+                            size_t sc_off = row_base + scale_idx;
+                            size_t wt_off = row_base + 16 + (v >> 1);
+                            if (sc_off >= packed_sz || wt_off >= packed_sz) {
+                                fprintf(stderr, "[TYPE13] OOB: n=%d b=%d v=%d sc_off=%zu wt_off=%zu packed_sz=%zu\n",
+                                        n, b, v, sc_off, wt_off, packed_sz);
+                                goto type13_done;
+                            }
+                            float sc = ue4m3_to_float(w.packed[sc_off]);
+                            uint8_t wb = w.packed[wt_off];
                             uint8_t nib = (k & 1) ? (wb >> 4) : (wb & 0x0F);
                             w.true_v[(size_t)n * w.K + k] = dequant_code(nib) * sc;
                         }
                     }
                 }
             }
+            type13_done:;
             break;
         }
         case 14: { // TYPE14: [scales(16B), packed_data(...)] = 176 bytes per 256 values
@@ -562,7 +600,8 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
                             int k = (int)b * 256 + v;
                             size_t scale_idx = (size_t)v / 16;
                             float sc = ue4m3_to_float(w.packed[(size_t)n * blocks_per_row * 176 + b * 176 + scale_idx]);
-                            uint8_t wb = w.packed[(size_t)n * blocks_per_row * 176 + b * 176 + 16 + ((size_t)(b * 256 + v) >> 1)];
+                            uint8_t wb = w.packed[(size_t)n * blocks_per_row * 176 + b * 176 + 16 + (v >> 1)];
+
                             uint8_t nib = (k & 1) ? (wb >> 4) : (wb & 0x0F);
                             w.true_v[(size_t)n * w.K + k] = dequant_code(nib) * sc;
                         }
@@ -664,6 +703,7 @@ static bool load_quant_weight_from_gguf(gguf_model_t* gguf, const char* weight_n
             break;
         }
     }
+    fprintf(stderr, "[load_quant_weight] %s: true_v construction complete\n", weight_name);
     return true;
 }
 
@@ -704,7 +744,7 @@ static bool load_model_weights(inference_model* m) {
             if (!ne_raw) return false;
 
             int64_t E = ne_raw[0];              // embedding length (rows)
-            int64_t DQ = (int64_t)m->n_head * m->head_dim;   // Q columns  
+            int64_t DQ = (int64_t)m->n_head * m->head_dim;   // Q columns
             int64_t DKV = (int64_t)m->n_head_kv * m->head_dim; // K/V columns
 
             size_t total_cols = DQ + 2 * DKV;
@@ -1164,6 +1204,7 @@ static bool load_model_weights(inference_model* m) {
         }
 
         // MLP gate, up, down — make optional for layers without FFN (SSM-only blocks)
+        fprintf(stderr, "loading blk.%d.ffn_gate...\n", i);
         snprintf(wname, sizeof(wname), "blk.%d.ffn_gate.weight", i);
         snprintf(sname, sizeof(sname), "blk.%d.ffn_gate.scales", i);
         if (has_tensor(m->gguf, wname)) {
@@ -1172,6 +1213,7 @@ static bool load_model_weights(inference_model* m) {
         }
 
         snprintf(wname, sizeof(wname), "blk.%d.ffn_up.weight", i);
+        fprintf(stderr, "loading blk.%d.ffn_up...\n", i);
         snprintf(sname, sizeof(sname), "blk.%d.ffn_up.scales", i);
         if (has_tensor(m->gguf, wname)) {
             if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.W_up)) return false;
@@ -1664,7 +1706,7 @@ int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
         if (e == hipSuccess) {
             e = hipMemcpy(d_emb_dev, m->embed_table.data(), emb_bytes, hipMemcpyHostToDevice);
             if (e == hipSuccess) {
-                fprintf(stderr, "[KV_INIT] Embed copied to GPU device %p (%zu elements)\n", 
+                fprintf(stderr, "[KV_INIT] Embed copied to GPU device %p (%zu elements)\n",
                         d_emb_dev, m->embed_table.size()); fflush(stderr);
                 qwen_model_set_embed_table(m->qwen, d_emb_dev);
             } else {
