@@ -3,6 +3,8 @@
 // Both gate and up projections are FP4-quantized (ROCmFP4 Codebook10).
 // This kernel fuses: gate_proj (A x W_gate), up_proj (A x W_up), SiLU(gate) * up -> output.
 // A: [M x K] FP16 activations; W_gate, W_up: [N x K] ROCmFP4 packed; out: [M x N] FP32.
+// FIXED: Accepts pre-decoded float scale arrays instead of UE4M3 byte arrays.
+// This avoids GPU pointer dereference issues on gfx1151 architecture.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -12,12 +14,13 @@ using namespace rocmfp4;
 
 typedef _Float16 half16 __attribute__((ext_vector_type(16)));
 
-extern "C" __global__ void swiglu_fp4(const __half* A, const unsigned char* W_gate,
-                                      const unsigned char* W_gate_scales,
-                                      const unsigned char* W_up,
-                                      const unsigned char* W_up_scales,
-                                      float* out,
-                                      int M, int N, int K /* multiple of 16 */)
+extern "C" __global__ void swiglu_fp4(const __half* A, 
+                                        const unsigned char* W_gate,
+                                        const unsigned char* W_gate_scale_b,
+                                        const unsigned char* W_up,
+                                        const unsigned char* W_up_scale_b,
+                                        float* out,
+                                        int M, int N, int K /* multiple of 16 */)
 {
     const int lIdx = threadIdx.x;             // 0..31
     const int lane = lIdx % 16;               // unique row/column index within the tile
@@ -63,8 +66,9 @@ extern "C" __global__ void swiglu_fp4(const __half* A, const unsigned char* W_ga
             a_frag[ele + 1] = aOK ? ((const __half*)A)[(size_t)aRow * K + k + 1] : __half(0.0f);
 
             bool wOK = (wLine < N);
-            float wScale_gate = wOK ? ue4m3_to_float(W_gate_scales[(size_t)wLine * numStrips + s]) : 0.0f;
-            float wScale_up   = wOK ? ue4m3_to_float(W_up_scales[(size_t)wLine * numStrips + s])   : 0.0f;
+            // Decode UE4M3 scale bytes inline - avoids dereferencing float* through kernarg on gfx1151
+            float wScale_gate = wOK ? ue4m3_to_float(W_gate_scale_b[(size_t)wLine * numStrips + s]) : 0.0f;
+            float wScale_up   = wOK ? ue4m3_to_float(W_up_scale_b[(size_t)wLine * numStrips + s])   : 0.0f;
             uint8_t wb_gate = wOK ? W_gate[(size_t)wLine * w_row_bytes + (k >> 1)] : 0x00u;
             uint8_t wb_up   = wOK ? W_up[(size_t)wLine * w_row_bytes + (k >> 1)]   : 0x00u;
 
