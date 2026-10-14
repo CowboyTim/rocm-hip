@@ -1185,8 +1185,41 @@ for the symptoms above.
 DeltaNet + gated attention but a dense FFN, and only Q4_0/Q4_1/Q8_0/TYPE100 weights, so no MoE and no
 TYPE101/TYPE30. The 35B-A3B comes after 4B produces correct tokens.
 
-**Step 0: stop the crash.** Fix the 35b70f4 regression: the SwiGLU scale buffers must be pinned or registered,
-not raw host-heap pointers.
+**Step 0: stop the crash — DONE ✅ (2026-10-14).** The real cause was not un-pinned memory. The weight
+buffers *are* registered (`pin_model_memory`). The `swiglu_args[]` array passed five arguments as raw pointers
+(`L.W_gate.d_packed`, …, `s.d_down`) instead of addresses of pointers, so `hipModuleLaunchKernel` read 8 bytes
+of weight data as each pointer. The pre-35b70f4 hipMalloc version had the same bug, which is where the
+"device memory access faults" came from. Fix in `qwen_model.cpp`:
+- Replaced the fused `swiglu_fp4` call with three `gemm_act_fp4` launches (gate, up, down) plus CPU
+  `SiLU(gate)*up`. This adds the **missing down projection** (SwiGLU output used to go straight into the
+  residual at width E), and each projection now dispatches its own quant type (`ffn_gate`/`ffn_up`/`ffn_down`
+  mix Q4_0/TYPE100/Q4_1 within one layer). The fused kernel only handled UE4M3.
+- Scratch `gate_fp32`/`up_fp32` were sized `DQ`/`DKV` (4096/1024) for a 9216-wide FFN. They are now sized by FF,
+  and a new FP16 `act` buffer feeds `ffn_down`.
+- Shape guard: the FFN runs only when gate/up/down dims are consistent, otherwise it is skipped with a log line.
+
+Result: `qwen_demo` on the 4B completes with exit 0 (it was crashing with an aperture violation). Output is still
+NaN/EOS, as expected until Steps 2–7. The guard currently skips **every** FFN because of finding 3a below.
+
+Found during Step 0 (fold into the steps below):
+- **3a. N/K are transposed for every weight.** `load_quant_weight_from_gguf()` (`inference.cpp:293`) takes
+  `ne[0]` as the output dim, but in GGUF `ne[0]` is the contiguous **input** dim (`ffn_gate` 2560×9216 → N=9216,
+  K=2560). Some call sites compensate (`inference.cpp:753` hard-codes `Wq.N=E, Wq.K=DQ`), and launches use
+  config dims, not `W.N/K`.
+- **3b. `w.packed` is raw GGUF block bytes**, with scales/deltas interleaved (Q4_0: 2B delta + 16B qs per 32
+  values; TYPE100: 17-byte blocks). `gemm_act_fp4` expects pure `N × K/2` nibble rows, so it reads scale bytes as
+  weights. Repack to nibble rows at load time (and record the per-format nibble order: Q4_0/Q4_1 store elements
+  0–15 in low nibbles and 16–31 in high nibbles), or teach the kernel the block formats.
+- **3c. The Q4_0/Q4_1 value mapping is not Codebook10.** Q4_0 is `(nib − 8) × d`, Q4_1 is `nib × d + m`, but the
+  kernel's float path uses `codebook[nib]`.
+- **Tokenizer**: "The capital of France is" encodes as `760 288 62865 288 1020 288 …`, i.e. a standalone space
+  token (288) between words. GPT-2-style BPE should merge `Ġ` into the following word. Check against the
+  reference tokenizer in Step 1.
+- **Scratch aliasing**: every layer's `LayerScratch::alloc()` maps the same `/dev/shm/qwen_layer_scratch.bin`, so
+  all 33 "per-layer" scratch areas are the same memory, registered 33 times. Harmless while layers run
+  sequentially, but a single shared scratch is cleaner.
+- The batched path (`qwen_model_forward_batch`, ~`qwen_model.cpp:1295`) still calls `swiglu_fp4` with the same
+  FFN-width and missing-down-projection issues. Fix it after the single-token path is validated.
 
 **Step 1: reference oracle** [blocking]. Build the archived `q4_0_rocmfp4_q8_1` llama.cpp fork (it understands
 ftype 107/108). Dump per-layer activations for one prompt token (`llama-eval-callback` or `GGML_SCHED` debug),
@@ -1198,8 +1231,8 @@ against this, not against "no NaN".
 switches on `kind`; delete the `l % interval` arithmetic. Fix `gguf_block_count()` and other key lookups to use
 `general.architecture`.
 
-**Step 3: weight decoding.** Verify Q4_0/Q4_1/Q8_0/TYPE100 decode against the reference dequant from step 1
-(and later add TYPE101/TYPE30 for the 35B). Dequantize Q8_0 norm vectors to float. Extend `actfp4_verify` with (a) a production shape
+**Step 3: weight decoding.** Fix 3a–3c from Step 0 first. Then verify Q4_0/Q4_1/Q8_0/TYPE100 decode against the
+reference dequant from step 1 (and later add TYPE101/TYPE30 for the 35B). Dequantize Q8_0 norm vectors to float. Extend `actfp4_verify` with (a) a production shape
 (M=1, N=8192, K=2048), (b) the float-scale path, and (c) one real tensor from the GGUF compared with the reference.
 Fix the Q4_0 34-vs-18 block size.
 

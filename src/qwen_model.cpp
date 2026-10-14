@@ -107,11 +107,14 @@ struct LayerScratch {
     float* up_fp32 = nullptr; void* d_up = nullptr;
     float* down_fp32 = nullptr; void* d_down = nullptr;
     float* vexpB = nullptr; void* d_vb2 = nullptr;
+    __half* act = nullptr; void* d_act = nullptr;     // SiLU(gate)*up, FP16 input to ffn_down
+    int ff = 0;                                        // FFN width (ffn_gate/ffn_up output dim)
 
     void* base = nullptr; size_t total = 0; int fd = -1; bool freed = false;
 
-    bool alloc(int E, int HD, int HQ, int HKV, int CTX, int DQ, int DKV) {
+    bool alloc(int E, int HD, int HQ, int HKV, int CTX, int DQ, int DKV, int FF) {
         const int hd2 = HD / 2;
+        ff = FF;
         size_t layout[] = {
             (size_t)E * sizeof(__half),                    // h
             (size_t)DQ * sizeof(float),                    // q_fp32
@@ -127,10 +130,11 @@ struct LayerScratch {
             (size_t)HQ * HD * sizeof(float),               // oh
             (size_t)DQ * sizeof(__half),                   // oin
             (size_t)E * sizeof(__half),                    // h_mlp
-            (size_t)DQ * sizeof(float),                    // gate_fp32
-            (size_t)DKV * sizeof(float),                   // up_fp32
+            (size_t)FF * sizeof(float),                    // gate_fp32
+            (size_t)FF * sizeof(float),                    // up_fp32
             (size_t)E * sizeof(float),                     // down_fp32
             (size_t)CTX * HD * sizeof(__half),             // vexpB
+            (size_t)FF * sizeof(__half),                   // act
         };
         size_t total = 0;
         for (size_t sz : layout) { total = (total + 127) & ~127; total += sz; }
@@ -169,6 +173,7 @@ struct LayerScratch {
         get(layout[15], (void**)&up_fp32, &d_up);
         get(layout[16], (void**)&down_fp32, &d_down);
         get(layout[17], (void**)&vexpB, &d_vb2);
+        get(layout[18], (void**)&act, &d_act);
 
         (void)hipHostRegister(base, total, hipHostRegisterDefault);
         return true;
@@ -249,11 +254,17 @@ struct QwenModel {
         vocab_size = model->vocab_size;
         n_ctx = model->n_ctx;
 
+        // FFN width from the loaded ffn_gate/ffn_up tensors (output dim N); falls back to E.
+        int FF = E;
+        for (const auto& L : model->layers)
+            FF = std::max(FF, std::max(L.W_gate.N, L.W_up.N));
+        fprintf(stderr, "[INIT] ffn width FF=%d\n", FF); fflush(stderr);
+
         fprintf(stderr, "[SCRATCH] Starting scratch allocation for %d layers\n", n_layer); fflush(stderr);
         layer_scratch.resize(n_layer);
         for (int i = 0; i < n_layer; ++i) {
             fprintf(stderr, "[SCRATCH] Allocating layer %d/%d...\n", i+1, n_layer); fflush(stderr);
-            if (!layer_scratch[i].alloc(E, HD, HQ, HKV, CTX, DQ, DKV)) {
+            if (!layer_scratch[i].alloc(E, HD, HQ, HKV, CTX, DQ, DKV, FF)) {
                 fprintf(stderr, "[SCRATCH] Layer %d allocation failed\n", i); fflush(stderr);
                 return false;
             }
@@ -850,38 +861,42 @@ struct QwenModel {
                 (void)hipDeviceSynchronize();
             }
 
-            // --- k) SwiGLU (gate/up/down) -- FIXED: allocate scales on GPU via hipMalloc
-            fprintf(stderr, "[FORWARD] blk %d: SwiGLU gate_pack=%p up_pack=%p down=%p\n", 
-                    l, (void*)L.W_gate.d_packed, (void*)L.W_up.d_packed, (void*)s.d_down); fflush(stderr);
+            // --- k) FFN: down( SiLU(gate(h)) * up(h) ) ---
+            // Three gemm_act_fp4 launches (verified by actfp4_verify) rather than the fused swiglu_fp4:
+            // gate/up/down can each be a different quant type (e.g. blk.0: Q4_0 / TYPE100 / Q4_1), and
+            // gemm_act_fp4 dispatches per tensor on d_scales_f (float path) vs d_scales (UE4M3 path).
+            // Every args[] entry is the ADDRESS of the argument value, as hipModuleLaunchKernel requires.
+            const bool ffn_ok = L.W_gate.d_packed && L.W_up.d_packed && L.W_down.d_packed &&
+                                L.W_gate.K == E_local && L.W_up.K == E_local &&
+                                L.W_gate.N == L.W_up.N && L.W_gate.N <= s.ff &&
+                                L.W_down.K == L.W_gate.N && L.W_down.N == E_local;
+            if (ffn_ok) {
+                int FF_l = L.W_gate.N;
+                void* g_args[] = { &s.d_hmlp, &L.W_gate.d_packed, &L.W_gate.d_scales, &L.W_gate.d_scales_f,
+                                   &s.d_gate, &one, &FF_l, &E_local };
+                (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (FF_l+15)/16, 1, 32, 1, 1, 0, 0, g_args, nullptr);
+                void* u_args[] = { &s.d_hmlp, &L.W_up.d_packed, &L.W_up.d_scales, &L.W_up.d_scales_f,
+                                   &s.d_up, &one, &FF_l, &E_local };
+                (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (FF_l+15)/16, 1, 32, 1, 1, 0, 0, u_args, nullptr);
+                hipError_t gu_err = hipDeviceSynchronize();
 
-            // --- k) SwiGLU (gate/up/down) -- FIXED: Pass UE4M3 scale bytes directly from model weights.
-            fprintf(stderr, "[FORWARD] blk %d: SwiGLU gate_pack=%p up_pack=%p down=%p\n", 
-                    l, (void*)L.W_gate.d_packed, (void*)L.W_up.d_packed, (void*)s.d_down); fflush(stderr);
+                for (int i = 0; i < FF_l; ++i) {
+                    const float g = s.gate_fp32[i];
+                    s.act[i] = __float2half(g / (1.0f + expf(-g)) * s.up_fp32[i]);
+                }
 
-            if (!L.W_gate.scales.empty() && !L.W_up.scales.empty()) {
-                fprintf(stderr, "[FORWARD] SwiGLU blk %d: W_gate_d_scales=%p W_up_d_scales=%p\n", 
-                        l, (void*)L.W_gate.d_scales, (void*)L.W_up.d_scales); fflush(stderr);
-                fprintf(stderr, "[FORWARD] SwiGLU blk %d: d_hmlp=%p d_down=%p W_gate_d_packed=%p\n", 
-                        l, (void*)s.d_hmlp, (void*)s.d_down, (void*)L.W_gate.d_packed); fflush(stderr);
-                // Pass UE4M3 scale bytes directly from model weights - decode inline in kernel on GPU.
-                // This avoids hipMalloc device memory access issues on gfx1151.
-                void* swiglu_args[] = { &s.d_hmlp,
-                                        L.W_gate.d_packed, L.W_gate.d_scales,
-                                        L.W_up.d_packed, L.W_up.d_scales,
-                                        s.d_down,
-                                        &one, &E_local, &E_local };
-
-                fprintf(stderr, "[FORWARD] Launching SwiGLU with UE4M3-scale arrays [grid=(%d,%d)]\n", 
-                        (E+15)/16, (E+15)/16); fflush(stderr);
-                (void)hipModuleLaunchKernel(fn_swiglu, 1, (E+15)/16, 1, 32, 1, 1, 0, 0, swiglu_args, nullptr);
+                void* d_args[] = { &s.d_act, &L.W_down.d_packed, &L.W_down.d_scales, &L.W_down.d_scales_f,
+                                   &s.d_down, &one, &E_local, &FF_l };
+                (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (E+15)/16, 1, 32, 1, 1, 0, 0, d_args, nullptr);
+                hipError_t dn_err = hipDeviceSynchronize();
+                fprintf(stderr, "[FORWARD] blk %d: FFN [%d -> %d -> %d] types gate=%d up=%d down=%d err=%d/%d\n",
+                        l, E_local, FF_l, E_local, L.W_gate.quant_type, L.W_up.quant_type, L.W_down.quant_type,
+                        (int)gu_err, (int)dn_err); fflush(stderr);
             } else {
-                fprintf(stderr, "[FORWARD] WARNING: No scale data for SwiGLU blk %d!\n", l); fflush(stderr);
-                    void* swiglu_args[] = { &s.d_hmlp,
-                                            L.W_gate.d_packed, (void*)nullptr,
-                                            L.W_up.d_packed, (void*)nullptr,
-                                            s.d_down,
-                                            &one, &E_local, &E_local };
-                    (void)hipModuleLaunchKernel(fn_swiglu, 1, (E+15)/16, 1, 32, 1, 1, 0, 0, swiglu_args, nullptr);
+                fprintf(stderr, "[FORWARD] blk %d: FFN weights missing or shape mismatch "
+                        "(gate %dx%d up %dx%d down %dx%d, ff=%d) — FFN skipped\n", l,
+                        L.W_gate.N, L.W_gate.K, L.W_up.N, L.W_up.K, L.W_down.N, L.W_down.K, s.ff); fflush(stderr);
+                for (int i = 0; i < E; ++i) s.down_fp32[i] = 0.0f;
             }
 
             // --- Debug Step N (Phase 20): Check SwiGLU output for block 0 ---
