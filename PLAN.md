@@ -77,7 +77,7 @@ This section outlines the forward-looking plan: building a minimalist inference 
 
 - **Zero-copy everywhere**: GGUF tensors live in file-backed mapped memory (either `/dev/shm` or directly from the .gguf file), GPU reads/writes them through `hipHostRegister`. No `hipMemcpy` ever.
 - **No host-to-device conversion**: weights stay in their quantized format on the GPU. Dequant happens inline via hardware-accelerated DP4A (`__builtin_amdgcn_perm` + `__builtin_amdgcn_sudot4`). FP4->WMMA path uses LDS LUT for nibble-to-FP16 conversion before tensor core compute.
-- **Qwen 3 model family**: dense transformer architecture, not MoE. Assumes Qwen3 lineage tokenizer + RoPE. Quantization targets Qwen3's known sensitivity to weight precision.
+- **Qwen 3.5 model family**: originally scoped as dense Qwen3. The actual targets are **hybrid**: Gated DeltaNet linear-attention layers, with gated full attention every 4th layer, partial-rotary M-RoPE, and an MTP block (`qwen35`, e.g. Qwen3.5-4B). `qwen35moe` (Qwen3.6-35B-A3B) adds a 256-expert MoE. See Phase 20.
 - **128GB UMA advantage**: no need to partition between "VRAM" and system RAM. Everything is shared physical memory accessible by both CPU and GPU at identical addresses. The constraint becomes memory bandwidth, not capacity -- hence why FP4 matters more than FP16.
 - **C API surface**: all public interfaces exported as `extern "C"` functions. C++ HIP implementation hidden behind opaque handles. Designed for eventual Perl XS CPAN module consumption.
 
@@ -348,8 +348,8 @@ Verification:
 | 17* | - | Self-contained quantization types (TYPE13/Q4_0/Q4_1/Q8_0/TYPE100) with embedded scale extraction and FP16 delta decoding into GPU kernels | ✅ Complete (*reworked after Phase 15 discoveries) |
 | 17.2 | - | Scale extraction + embedding table dequant for quantized types (Q4_1 embeddings), GPU hang fix via CPU-side embedding lookup on gfx1151 | ✅ Complete |
 | 18 | - | Q4_0/Q4_1/Q8_0 scales wired into gemm_act_fp4.hip GPU kernel dual-path dispatch (UE4M3 byte path + float-formatted path) | ✅ Complete |
-| 19 | - | Forward-pass runtime fixes on Strix Halo: CPU-side embedding lookup, direct pointer assignment replacing broken hipHostGetDevicePointer(), null-gamma RMSNorm fallback, corrected kernel arg passing, end-to-end forward pass through all 33 layers | ✅ Complete |
-| **20** | **TBD** | **Fix NaN corruption between layers: SwiGLU kernel scale access bug + KV cache layout mismatch** | 🔧 In Progress |
+| 19 | - | Forward-pass runtime fixes on Strix Halo: CPU-side embedding lookup, direct pointer assignment replacing broken hipHostGetDevicePointer(), null-gamma RMSNorm fallback, corrected kernel arg passing, pipeline runs through all 33 blocks without crashing (*not* numerically correct; see Phase 20) | ✅ Complete (runs, not correct) |
+| **20** | **TBD** | **Reassessment: fix hybrid-architecture mapping (layer-type inversion, DeltaNet layers, norm weights, RoPE, gated attention) against a llama.cpp reference** | 🔧 In Progress |
 
 Total: ~20 phases planned; actual development extended due to architectural discoveries (hybrid SSM model, gfx1151 runtime quirks).
 
@@ -1078,6 +1078,11 @@ $ echo $?
 
 All 33 layers process without GPU hangs, kernel crashes, or memory faults. The generation produces EOS tokens because the model weights need calibration (they were quantized as ROCmFP4/TYPE100 with placeholder scales), but the **full inference pipeline executes correctly**.
 
+> **Correction (2026-10-14, Phase 20 reassessment):** "executes" here means *runs without crashing*. The weights
+> do not need calibration. The forward pass runs attention on the SSM layers, skips the real attention layers
+> and the DeltaNet layers, ignores norm weights, and uses the wrong RoPE parameters. Block 32 is an MTP block,
+> not a decoder layer. See Phase 20.1.
+
 ### What This Enables
 
 - Full end-to-end forward pass on Strix Halo hardware for Qwen3.5-4B and similar architectures
@@ -1087,177 +1092,147 @@ All 33 layers process without GPU hangs, kernel crashes, or memory faults. The g
 
 ---
 
-## Phase 20 – Fix NaN corruption between layers — IN PROGRESS 🔧
+## Phase 20 – Reassessment + correct hybrid-architecture mapping — IN PROGRESS 🔧
 
-**Goal**: The forward pass crashes are fixed (exit 0 through all 33 layers), but generation produces only EOS tokens (ID 0). Debug traces reveal **NaN values corrupt the residual buffer between layers**, causing a chain reaction that destroys every subsequent tensor. Root causes traced to two bugs:
+> **Re-scoped 2026-10-14.** The original Phase 20 framed the problem as "NaN corruption between layers" caused by
+> a KV-cache layout mismatch and a SwiGLU scale-indexing bug. A fresh build + test run + code audit shows those
+> are **downstream symptoms**. The forward pass does not yet implement the model it is loading: it runs
+> attention on the wrong layers, skips the layers that hold real attention weights, ignores norm weights,
+> uses the wrong RoPE parameters, and decodes the dominant weight type with placeholder scales. No amount of
+> NaN-chasing will produce meaningful tokens until the architecture mapping is correct.
 
-### Problem Summary — Observed From Full Run Output
+### 20.0 Assessment snapshot (2026-10-14, gfx1151, ROCm at /opt/rocm)
 
-```
-[FORWARD] token_id=9419: emb[0..15]= 144.0000, -80.0000, 0.0000, 22.0000 ...   ✅ VALID
-[FORWARD] blk 0: q_fp32[0..15]: -1031.9172 -6662.0430 -4668.9590 ...             ✅ VALID (large)
-[FORWARD] blk 0: k_fp32[0..15]: -4348.2012 201.7613 -12469.7051 ...              ✅ VALID (large)
-[FORWARD] attn h=0 blk 0: k_expB_col0[0..7]=-512.0000, 0.0000, nan, nan...      ❌ NaN from index 2
-[FORWARD] partial dot(q,k)[0..15] = nan                                            ❌ All scores NaN
-[FORWARD] softmax max=0.000000                                                     ❌ Zeroed attention
-By block 4+: ALL values become NaN → chain reaction corrupts all downstream layers   ❌
-```
+**Build**: `make clean && make all` succeeds in ~7s. 14 warnings (unused variables, `%d`/`size_t` format
+mismatches in `qwen_model.cpp` / `inference.cpp`); no errors.
 
-### Root Cause Chain
+**Kernel verification harnesses** (`build/*_verify`):
 
-```
-Embedding lookup (CPU, valid values)
-    → LayerNorm (inline CPU, no weights — uses fixed eps)
-    → Q/K/V projections via gemm_act_fp4 GPU kernel (TYPE13/TYPE100 weights)
-        → q_fp32/k_fp32 are VALID but very large numbers (-4k to +14k range)
-    → RoPE on Q/K (GPU kernel, produces FP16 rounding of those large values)
-    → kv_store kernel writes to KV cache (GPU)
-    ↓
-    ⚠️ BUG #1: KV cache layout mismatch between write and read paths
-        The kv_store kernel writes `s.rks[h*HD+d]` in per-head layout [HD × n_ctx],
-        but the attention scoring code reads with head-major indexing:
-        `kc[p * DKV + kh_ * HD + d]` — these index calculations don't match.
-        Result: k_expB_col contains garbage/NaN because we're reading from wrong memory offsets.
-    ↓
-    ⚠️ BUG #2: SwiGLU scale extraction bug for TYPE100/TYPE13 quantized FFN weights
-        Even if attention were correct, the SwiGLU kernel reads UE4M3 scales from
-        W_gate.d_scales / W_up.d_scales via a formula that doesn't match the CPU-side
-        extraction used during weight loading. Scale bytes at wrong offsets decode to
-        NaN when passed through ue4m3_to_float() or produce wrong magnitude.
-        Output of SwiGLU → NaN flows into residual buffer during MLP add.
-    ↓
-    Residual corruption propagates: once residual[i] = NaN, every LayerNorm produces NaN,
-    every GEMM multiplies NaN by valid weights → still NaN, downstream layers all corrupt.
-```
+| Harness | Result | Notes |
+|---|---|---|
+| `kv_verify` | ✅ PASS | |
+| `gemm_verify` | ✅ PASS | single 33×17×40 shape |
+| `layernorm_verify` | ✅ PASS | single 32×64 shape |
+| `rope_verify` | ✅ PASS | theta=1e4, full rotary only |
+| `softmax_verify` | ✅ PASS | |
+| `tokenizer_verify` | ✅ PASS | 10-token toy vocab |
+| `actfp4_verify` | ❌→✅ | **Was segfaulting since Phase 18 (3765fe4)**: kernel gained a `W_scales_f` param but the test still passed 7 args. Fixed 2026-10-14 (pass `nullptr` → UE4M3 path). Now passes. |
+| `attn_verify` | ❌→✅ | Same arg drift (5 call sites). Fixed; full GQA chain passes **including KV store write/read vs CPU reference**. |
 
-### Detailed Plan
+So the individual kernels (UE4M3 FP4 GEMM, RMSNorm, RoPE, softmax, KV store, full attention chain) are
+**correct in isolation**. The "KV cache layout mismatch" hypothesis from the old Step 2 is not supported by
+the harness; the kernels agree with the CPU reference.
 
-#### Step 1: Verify K/V Projection GPU Output (BLOCKING) [~30min]
+Test coverage caveats: every harness exercises one small shape. None runs at production shapes
+(K=2048, N=8192, head_dim=256), on the float-scale path (Q4_0/Q4_1/Q8_0), or on real GGUF tensors.
 
-**Action**: Add debug prints right after V projection sync (`qwen_model.cpp:line ~417`) to read back `s.k_fp32` and `s.v_fp32` on CPU side:
+**End-to-end run, `Qwen3.5-4B-ROCMFP4.gguf`** (HEAD 35b70f4): **regressed, now crashes in block 0.**
+`swiglu_fp4` hits `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION`. Commit 35b70f4 passes `W_up_d_scales` as a
+plain host-heap pointer (`0x5626…`, an un-registered `std::vector`) that the GPU cannot reach. Before the
+crash, SwiGLU writes all zeros, and block 0 (an SSM layer) produces "attention" K values of ±23k from
+gamma-free norms.
 
-```cpp
-fprintf(stderr, "[FORWARD] blk %d: k_fp32[0..7] AFTER GEMM: ", l); fflush(stderr);
-for (int i = 0; i < std::min(HKV * HD, 8); ++i) {
-    float v = s.k_fp32[i];
-    if (i > 0) fprintf(stderr, ", ");
-    if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.6f", v);
-}
-fprintf(stderr, "\n"); fflush(stderr);
-```
+**End-to-end run, `Qwen3.6-35B-A3B-ROCMFP4.gguf`** (arch `qwen35moe`): fails at load with
+`block_count not found in GGUF`. `gguf_block_count()` (`gguf_mmap.cpp:760`) hard-codes `qwen35.`/`qwen2.`
+prefixes rather than using `general.architecture`.
 
-Same for `s.v_fp32`. This confirms whether the bug is in the **GPU kernel output** (NaN written by gemm_act_fp4) or in the **CPU read-back / KV cache path** (valid data, wrong indexing).
+**Model architecture actually in the GGUF** (`scripts/inspect_gguf.py`; 4B values, 35B differences in brackets):
 
-#### Step 2: Fix KV Cache Write/Read Layout Mismatch (HIGH PRIORITY) [~1h]
+- 33 blocks = **32 decoder layers + 1 MTP block** (`blk.32.nextn.*`, `nextn_predict_layers=1`) [35B: 40 + 1]. The MTP block must not run in the normal stack.
+- `full_attention_interval=4`: blocks **3, 7, 11, …, 31** carry full attention (`attn_q/k/v/output`, `attn_q_norm`, `attn_k_norm`). All others (0, 1, 2, 4, …) are **Gated DeltaNet linear attention** (`attn_qkv`, `attn_gate`, `ssm_a`, `ssm_alpha`, `ssm_beta`, `ssm_conv1d`, `ssm_dt.bias`, `ssm_norm`, `ssm_out`). Verified on both files.
+- `attn_q` is 2560→8192 = 16 heads × 256 × 2, i.e. **Q and an output gate packed together** (gated attention). GQA 16 Q heads / 4 KV heads [35B: 2].
+- head_dim 256, but `rope.dimension_count=64` (**partial rotary**), `rope.freq_base=1e7`, M-RoPE `dimension_sections`
+- FFN: dense SwiGLU, 9216 wide [35B: 256-expert MoE, 8 active, plus a shared expert]
+- Tensor types: Q8_0 ×184 (incl. **all norm weights**), TYPE100 ×164, Q4_0 ×70, Q4_1 ×23 [35B: TYPE101 ×389, Q8_0 ×308, TYPE100 ×52, TYPE30 ×3, Q4_1 ×1]. Weight types are **mixed within a layer** (e.g. blk.0 `ffn_gate` Q4_0, `ffn_up` TYPE100, `ffn_down` Q4_1), so per-tensor dispatch must be right everywhere.
 
-**Bug location**: `qwen_model.cpp`, attention section, lines ~517-522.
+### 20.1 Root-cause findings (code audit)
 
-Current code builds `kexpB` with this loop:
-```cpp
-for (int d = 0; d < HD; ++d)
-    for (int p = 0; p <= pos; ++p)
-        s.kh[d*CTX + p] = kc[p*DKV + kh_*HD + d];
-```
+Ordered by impact. Each one alone is enough to produce garbage or EOS output.
 
-The kv_store kernel writes K values into the cache at positions `(pos_start + t) * DKV + idx` where `idx` iterates over all DKV values contiguously. But the per-head staging on line 481 does `s.rks[h*HD + d] = s.kh[h*HD + d]` — a per-head layout. The kv_store kernel's grid-stride copy reads from these per-head-staged values but uses a flat index calculation that doesn't account for head separation.
+1. **Layer-type mapping is inverted between the loader and the forward pass.**
+   - Loader (`inference.cpp:720-730`): skips any block with `ssm_alpha`, so weights load only for the real attention blocks (3, 7, 11, …).
+   - Forward (`qwen_model.cpp:339,356`): runs attention when `l % interval == 0` (blocks 0, 4, 8, …) and skips the rest.
+   - Result: **attention runs exactly on the SSM blocks, and the real attention blocks are skipped.** Both GGUFs follow llama.cpp's `(l + 1) % interval == 0` convention. This likely also explains the null/invalid pointers and memory faults that Phase 19 and late Phase 20 worked around (commits 3a42e55, 35b70f4).
+2. **75% of layers are no-ops.** The Gated DeltaNet layers are skipped outright ("not yet implemented"), so the residual stream passes through them unchanged.
+3. **Norm weights are ignored.** `qwen_model.cpp:403` states "Qwen3.5-4B has no learnable layer norm weights" and does gamma-free RMSNorm. The GGUF does have `attn_norm`, `post_attention_norm`, `attn_q_norm`, `attn_k_norm`, `ssm_norm` and `output_norm`. They are stored as Q8_0 and the loader never dequantizes them. Missing q/k-norm in particular is consistent with the huge (±14k) Q/K values in the old traces.
+4. **RoPE is wrong.** `build_rope_tables()` (`qwen_model.cpp:266`) hard-codes theta=1e4 and rotates the full head_dim. The model needs theta=`rope.freq_base` (1e7), rotary over only the first `rope.dimension_count` dims, and M-RoPE sections.
+5. **Gated attention is missing.** `attn_q`'s second half (output gate, sigmoid) is not split out or applied.
+6. **Un-pinned host memory handed to the GPU** (35b70f4): the SwiGLU scale arrays are passed as raw `std::vector` data. Every buffer a kernel reads must go through `hipHostRegister` (the project's core pattern). Revert or fix this before anything else, since it is the current crash.
+7. **[35B only] The dominant weight type is undecoded.** TYPE101 (389/753 tensors: FFN, `attn_q`, `attn_output`, `ssm_out`) has no `case` in `load_quant_weight_from_gguf()`. It falls to `default:`, which fills unity-scale placeholders (`0x60`, which actually decodes to 0.5 and is then special-cased back to 1.0 at `inference.cpp:692`). TYPE30 (`output.weight`) is also unhandled. Before writing decoders, confirm the TYPE100/TYPE101/TYPE13 block layouts against the archived `q4_0_rocmfp4_q8_1` llama.cpp fork.
+8. **Smaller correctness bugs found in passing:**
+   - `inference.cpp:1024`: the Q4_0 combined-QKV path uses a 34-byte block (Q8_0 size). Q4_0 is 18 bytes.
+   - `inference.cpp:215`: the comment describes a Q4_0 layout with a `min` field, which is Q4_1.
+   - The Q8_0 float-scale path feeds int8 data to a nibble-packed GEMM. Verify `gemm_act_fp4`'s float path actually reads 1 byte/value for Q8_0; no harness covers it.
+9. **[35B only] MoE is unimplemented**: router, top-8 selection, expert dispatch, shared expert.
 
-**Fix**:
-- Align the write pattern of kv_store with the read pattern in attention scoring
-- Verify `kc = kv_cache_k_row_const(eng_model->kvc, l, 0)` returns pointer to layer l's full K region starting at position 0
-- Trace exact byte offsets being written by kv_store and read back by the attention code
-- Fix indexing formula to match: if KV cache stores `[token_0_K | token_1_K | ... | token_n_K]` each of size DKV, then reading token p of head kh should be `kc[(p * DKV + kh * HD)]` (not the current mixed indexing)
+Phase 19's "end-to-end forward pass ✅" means *the pipeline runs without crashing*, not that it computes the
+model. Several of its fixes (CPU attention/LM-head/embedding fallbacks, null-gamma RMSNorm) were workarounds
+for the symptoms above.
 
-#### Step 3: Fix SwiGLU Scale Access [~2h]
+### 20.2 Code-quality notes
 
-**Bug location**: `swiglu.hip`, lines 66-67.
+- **Debug noise**: 166 `fprintf` in `qwen_model.cpp`, 85 in `inference.cpp`, many per-layer/per-element. Gate them behind `QWEN_DEBUG` (env var) before the next round of tracing, or the useful signal is unreadable.
+- **CPU fallbacks in the hot path**: embedding lookup, attention scoring, LM head (248k × 2560 dot products per token) run on CPU. Fine for correctness work; track them for removal later.
+- **Interface drift**: kernel signatures changed (Phase 18) without updating the tests, and nothing caught it. Add `make test` that runs every `*_verify` and fails on a non-zero exit, and run it before each commit.
+- **Duplicated structs**: `QuantWeight` is mirrored in `inference.cpp` and `qwen_model.cpp` (Phase 18 notes). Keep a single definition in `inference_internal.h`.
+- **Stale files**: `src/swiglu.hip.backup`; `verify_minimal*` scratch tests in `src/`.
+- **Arch keys**: GGUF key lookups hard-code `qwen35.`. Read `general.architecture` and build `<arch>.<key>`.
+- 14 compiler warnings (were zero after 9b8ba6b).
 
-```cpp
-float wScale_gate = wOK ? ue4m3_to_float(W_gate_scales[(size_t)wLine * numStrips + s]) : 0.0f;
-```
+### 20.3 Plan
 
-This assumes scales are stored as `[N × K/16]` UE4M3 bytes — matching CPU extraction. But the GPU kernel may be reading from a different memory layout than what the CPU-side weight loader produces.
+**Target model: `Qwen3.5-4B-ROCMFP4.gguf`** (restored to `/dev/shm/models/` on 2026-10-14). It has hybrid
+DeltaNet + gated attention but a dense FFN, and only Q4_0/Q4_1/Q8_0/TYPE100 weights, so no MoE and no
+TYPE101/TYPE30. The 35B-A3B comes after 4B produces correct tokens.
 
-**Action**:
-- Add CPU-scale validation step before launch: iterate through first few scale bytes in `L.W_gate.scales.data()` on CPU, decode them with `ue4m3_to_float()`, print values
-- Cross-check: take a known-good scale byte and verify both CPU decoding and GPU-decoded value agree
-- Verify that the scale index formula `(wLine * numStrips + s)` correctly maps to the position used during weight loading
-- If scales are wrong, fix either the CPU extraction code or the GPU kernel's scale access pattern to match
+**Step 0: stop the crash.** Fix the 35b70f4 regression: the SwiGLU scale buffers must be pinned or registered,
+not raw host-heap pointers.
 
-#### Step 4: Verify O-Projection Output [~30min]
+**Step 1: reference oracle** [blocking]. Build the archived `q4_0_rocmfp4_q8_1` llama.cpp fork (it understands
+ftype 107/108). Dump per-layer activations for one prompt token (`llama-eval-callback` or `GGML_SCHED` debug),
+plus the dequantized values of one tensor of each type (TYPE100/101/30, Q8_0, Q4_1). Every later step is checked
+against this, not against "no NaN".
 
-**Bug location**: `qwen_model.cpp`, line ~654. The O-projection also uses `gemm_act_fp4` with TYPE13/TYPE100 weights. If this kernel has the same bug pattern as SwiGLU (wrong scale access), attention output will be NaN and corrupt everything downstream.
+**Step 2: single source of truth for layer types.** In the loader, classify each block by tensor presence
+(`ssm_alpha` ⇒ linear, `attn_q` ⇒ full, `nextn` ⇒ MTP/excluded) into `LayerWeights::kind`. The forward pass
+switches on `kind`; delete the `l % interval` arithmetic. Fix `gguf_block_count()` and other key lookups to use
+`general.architecture`.
 
-**Action**: Add debug prints after O-projection sync (`qwen_model.cpp`, inside "if (L.Wo.d_packed != nullptr)" block):
+**Step 3: weight decoding.** Verify Q4_0/Q4_1/Q8_0/TYPE100 decode against the reference dequant from step 1
+(and later add TYPE101/TYPE30 for the 35B). Dequantize Q8_0 norm vectors to float. Extend `actfp4_verify` with (a) a production shape
+(M=1, N=8192, K=2048), (b) the float-scale path, and (c) one real tensor from the GGUF compared with the reference.
+Fix the Q4_0 34-vs-18 block size.
 
-```cpp
-fprintf(stderr, "[FORWARD] blk %d: O-proj out[0..7]: ", l); fflush(stderr);
-for (int i = 0; i < std::min(E, 8); ++i) {
-    float v = s.down_fp32[i];
-    if (i > 0) fprintf(stderr, ", ");
-    if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.6f", v);
-}
-fprintf(stderr, "\n"); fflush(stderr);
-```
+**Step 4: full-attention layers correct.** Pre-norm with gamma; Q/K/V projections; split Q and gate; per-head
+q_norm/k_norm; partial-rotary M-RoPE with theta from GGUF; GQA (16 Q heads / 4 KV heads); sigmoid output gate;
+O projection; post-attention norm. Compare layer 3 output with the reference, temporarily treating linear
+layers as identity in both implementations.
 
-#### Step 5: Validate Scale Extraction for TYPE13/TYPE100
+**Step 5: Gated DeltaNet layers.** CPU reference implementation first: conv1d (kernel 4) with state, alpha/beta
+gating, the delta-rule recurrent state update (128-dim state per head), ssm_norm, output gate, ssm_out. Then
+port to GPU. Recurrent and conv state must persist across tokens, like the KV cache.
 
-**Context**: We fixed the CPU-side weight loading in commit d2cc9cc to use correct bounds-checking against type_name_map size and fix weight data byte offsets. But the GPU kernels read scales from device memory — they never see the CPU extraction code directly. The `d_scales` pointer points to a pinned host buffer that the GPU reads directly.
+**Step 6: FFN.** 4B: dense SwiGLU. Revisit the old SwiGLU scale question here, now with correct inputs and a
+reference to diff against. 35B: router + top-8 experts + shared expert.
 
-**Potential issues**:
-- Scale bytes extracted during load may not match what the GPU kernel expects
-- The `ue4m3_to_float()` function on CPU and GPU should be identical (it's defined in `fp4_common.h` which is included by both). Verify this.
-- For TYPE100: scales stored at offset 16+ within each 17-byte block; for TYPE13: 16 UE4M3 scale bytes at offsets 0-15 of each 144-byte block
+**Step 7: final norm + LM head + sampling.** Use `output_norm` gamma, and use `output.weight` (TYPE30) where
+present instead of tied embeddings.
 
-**Action**:
-- Print first 8 decoded scale values from CPU side before launching any GPU kernel that uses them
-- Verify `ue4m3_to_float()` produces reasonable numbers (not NaN/Inf) for all scale bytes
-- Cross-reference with known-good reference model output if available
+**Step 8: hygiene** (can run in parallel): `QWEN_DEBUG`-gated logging, a `make test` target, zero warnings, a
+single `QuantWeight` definition, removal of stale files.
 
-### Execution Order
+### Success criteria
 
-1. **Step 1 first** → add K/V projection debug prints, re-run, observe if K/v are valid or already corrupted at GPU output stage
-2. Based on Step 1 result: either fix gemm_act_fp4 kernel OR fix CPU read-back / KV cache indexing
-3. **Steps 2–3 in parallel** — fix KV cache layout AND verify SwiGLU scales independently
-4. **Step 4** — verify attention O-projection output (needed for residual flow to be valid through the full layer)
-5. **Step 5** — validate scale extraction correctness against CPU reference
+- Per-layer hidden states match the llama.cpp reference within FP4/FP16 tolerance (cosine sim > 0.99 per layer)
+- Top-1 next token matches the reference for a handful of prompts; perplexity on a short text is within a few % of the reference
+- `make test` green; zero compiler warnings
 
-### Success Criteria
+### Superseded hypotheses (old Phase 20 Steps 1–5)
 
-- Embedding values remain valid through all 33 layers
-- No NaN values appear in q_h, k_h, k_expB_col, scores, probs, logits
-- Generated tokens are meaningful (not just EOS token ID 0)  
-- Loss/perplexity numbers are reasonable for a working model
-
----
-
-### Steps 2–3: Fix SwiGLU scale extraction + KV cache layout (IN PROGRESS 🔧)
-
-**SWI GLU SCALE BUG IDENTIFIED:** POST-SWiGLU down_fp32 contains extreme garbage (`13803172`, `60779104`, millions in magnitude). When added to residual during MLP residual add, these overflow to inf → corrupts layer_scratch[0] → cascades to all downstream blocks.
-
-#### Step 2a: Fix SwiGLU kernel TYPE13/TYPE100 scale extraction
-
-The SwiGLU kernel receives FP4 quantized gate/up projection weights with self-contained scales (TYPE13) or external scales (TYPE100). The kernel currently reads scales from wrong offsets because it uses the same scale access pattern as Q/K/V projections, but FFN tensors have different layouts.
-
-**Files to fix:**
-- `src/swiglu_kernel.hip` — main SwiGLU FP4 computation kernel
-- `src/qwen_model.cpp` lines ~825-845 — SwiGLU argument setup and weight loading
-
-**Fix approach:**
-1. Print extracted scale values right before kernel launch for verification
-2. Compare GPU-extracted scales against CPU reference in `inference.cpp::load_quant_weight_from_gguf()`  
-3. For TYPE13 (self-contained): verify block index calculation `(b * 256 + v) >> 1` matches inference.cpp's formula
-4. For TYPE100 (unknown type): locate and use correct scale tensor from GGUF KV store
-5. Use explicit typed local variables passed by address (`&var`) following verified pattern from qwen_model_forward_batch
-
-#### Step 2b: Fix KV cache write/read layout alignment
-
-Current kv_store writes per-head data using potentially incorrect stride. Attention scoring reads with matching formula — both could be consistently wrong or one is right and one is wrong.
-
-**Files to fix:**
-- `src/kv_cache_store.co` / kv_store kernel source (if available separately)
-- `src/qwen_model.cpp` lines ~517-522 — kexpB/vexpB construction from KV cache
-
-**Fix approach:**
-1. Verify kv_store uses correct indexing: `pos * HKV * HD + h * HD + d` 
-2. Match attention scoring read path to write path exactly
-3. Verify grouped query attention mapping: `kh_ = h / GRP` where GRP = HQ/HKV = 4
+| Old hypothesis | Status |
+|---|---|
+| KV cache write/read layout mismatch | Not reproduced: `attn_verify` KV store matches the CPU reference. Re-check only after Step 4. |
+| SwiGLU UE4M3 scale offsets wrong | Possibly real, but its inputs are currently garbage (wrong layer, no norms). Re-evaluate in Step 6. |
+| O-projection scale bug | Same; covered by Step 4. |
+| TYPE13/TYPE100 scale extraction | Folded into Step 3, verified against the reference dequant. |
+| "Weights need calibration" (Phase 19) | Incorrect; the weights are fine, the decode and architecture mapping are not. |

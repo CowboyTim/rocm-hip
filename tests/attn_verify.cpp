@@ -37,6 +37,9 @@
 
 using namespace rocmfp4;
 
+// gemm_act_fp4's W_scales_f argument: nullptr selects the UE4M3 byte-scale path tested here.
+static const float* g_no_scales_f = nullptr;
+
 #define HIP_CHECK(cmd, str) \
     do { \
         hipError_t s_ = (cmd); \
@@ -390,11 +393,11 @@ int main(int argc, char** argv) {
         if (g_maxstep >= 2) {   // 2) Q/K/V projections from Codebook10 weights
             int M=T, K=E;
             void* dhv=(void*)h_s;
-            { int N=DQ;  void* cq=(void*)q_s; void* ar[] = { &dhv,&dw_q,&dw_qs,&cq,(void*)&M,(void*)&N,(void*)&K };
+            { int N=DQ;  void* cq=(void*)q_s; void* ar[] = { &dhv,&dw_q,&dw_qs,(void*)&g_no_scales_f,&cq,(void*)&M,(void*)&N,(void*)&K };
               HIP_CHECK(hipModuleLaunchKernel(f_g4, (T+15)/16, (DQ+15)/16, 1, 32, 1, 1, 0, 0, ar, nullptr), "proj-q"); }   // grid.x=M rows, grid.y=N cols
-            { int N=DKV; void* ck=(void*)k_s; void* ar[] = { &dhv,&dkp,&dks,&ck,(void*)&M,(void*)&N,(void*)&K };
+            { int N=DKV; void* ck=(void*)k_s; void* ar[] = { &dhv,&dkp,&dks,(void*)&g_no_scales_f,&ck,(void*)&M,(void*)&N,(void*)&K };
               HIP_CHECK(hipModuleLaunchKernel(f_g4, (T+15)/16, (DKV+15)/16, 1, 32, 1, 1, 0, 0, ar, nullptr), "proj-k"); }   // grid.x=M rows, grid.y=N cols
-            { int N=DKV; void* cv=(void*)v_s; void* ar[] = { &dhv,&dvp,&dvs,&cv,(void*)&M,(void*)&N,(void*)&K };
+            { int N=DKV; void* cv=(void*)v_s; void* ar[] = { &dhv,&dvp,&dvs,(void*)&g_no_scales_f,&cv,(void*)&M,(void*)&N,(void*)&K };
               HIP_CHECK(hipModuleLaunchKernel(f_g4, (T+15)/16, (DKV+15)/16, 1, 32, 1, 1, 0, 0, ar, nullptr), "proj-v"); }   // grid.x=M rows, grid.y=N cols
             HIP_CHECK(hipDeviceSynchronize(), "post-proj sync");   // staging copies below read GPU outputs
         } else printf("    [maxstep] skip step 2\n");
@@ -548,7 +551,7 @@ int main(int argc, char** argv) {
             void* ca=(void*)(oin + (size_t)S*DQ);
             int N=E;
             void* cc=(void*)(outC + (size_t)S*E);
-            void* ar[] = { &ca, &dop, &dops, &cc, (void*)&M, (void*)&N, (void*)&K };
+            void* ar[] = { &ca, &dop, &dops, (void*)&g_no_scales_f,&cc, (void*)&M, (void*)&N, (void*)&K };
             HIP_CHECK(hipModuleLaunchKernel(f_g4, 1, (N+15)/16, 1, 32, 1, 1, 0, 0, ar, nullptr), "proj-o");
         } else printf("    [maxstep] skip step 7\n");
         HIP_CHECK(hipDeviceSynchronize(), "scenario sync");
@@ -661,7 +664,7 @@ if (bad_result_final(g,r)) {
             int M=T, N=DQ, K=E;
             void* ca=(void*)((char*)dh + (size_t)S*E*sizeof(__half));
             void* cc=(void*)(outC + (size_t)S*E);   // scratch reuse: final-row comparison already done above
-            void* ar[] = { &ca, &dw_q, &dw_qs, &cc, (void*)&M, (void*)&N, (void*)&K };
+            void* ar[] = { &ca, &dw_q, &dw_qs, (void*)&g_no_scales_f,&cc, (void*)&M, (void*)&N, (void*)&K };
             HIP_CHECK(hipModuleLaunchKernel(f_g4, (T+15)/16, (N+15)/16, 1, 32, 1, 1, 0, 0, ar, nullptr), "probeB");
             HIP_CHECK(hipDeviceSynchronize(), "probeB sync");
             long bb=0; float mx=0;

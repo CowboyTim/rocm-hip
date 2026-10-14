@@ -32,6 +32,9 @@ using namespace rocmfp4;
         } \
     } while(0)
 
+// gemm_act_fp4's W_scales_f argument: nullptr selects the UE4M3 byte-scale path tested here.
+static const float* g_no_scales_f = nullptr;
+
 static uint32_t g_rng_state = 55;
 static float rndf(float lo, float hi) {   // LCG -> [lo, hi)
     g_rng_state = g_rng_state * 1664525u + 1013904223u;
@@ -122,7 +125,7 @@ static bool run_shape(int M, int N, int K) {
     HIP_CHECK(hipModuleGetFunction(&func, mod, "gemm_act_fp4"), "get function");
 
     dim3 grid((M + 15) / 16, (N + 15) / 16);
-    void* args[] = { &d_A, (void*)&d_W, (void*)&d_Sc, &d_C, (void*)&M, (void*)&N, (void*)&K };
+    void* args[] = { &d_A, (void*)&d_W, (void*)&d_Sc, (void*)&g_no_scales_f, &d_C, (void*)&M, (void*)&N, (void*)&K };
     HIP_CHECK(hipModuleLaunchKernel(func, grid.x, grid.y, 1, 32, 1, 1, 0, 0, args, nullptr), "launch");
     HIP_CHECK(hipDeviceSynchronize(), "sync");
     HIP_CHECK(hipModuleUnload(mod), "unload");
