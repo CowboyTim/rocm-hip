@@ -356,7 +356,8 @@ struct QwenModel {
             // those layers pass the residual through unchanged and only run the FFN below.
             if (L.kind == LAYER_FULL_ATTN) {
                 // --- a) RMSNorm (attention) ---
-                void* ln_args[] = { residual, L.d_attn_ln, s.d_h, &E_local, &E_local, &eps_f };
+                // hipModuleLaunchKernel takes the ADDRESS of each argument (raw pointers here were read as arg values)
+                void* ln_args[] = { &residual, &L.d_attn_ln, &s.d_h, &E_local, &E_local, &eps_f };
                 hipError_t herr;
                 fprintf(stderr, "[FORWARD] rmsnorm: res=%p w=%p out=%p\n", (void*)residual, (void*)L.d_attn_ln, (void*)s.d_h); fflush(stderr);
 
