@@ -52,7 +52,7 @@
       "Edit(scripts/**)",
       "Edit(PLAN.md)",
       "Edit(Makefile)",
-      "Edit(/tmp/**)"
+      "Edit(//tmp/**)"
     ],
     "deny": [
       "Bash(git push --force*)",
