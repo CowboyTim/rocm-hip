@@ -43,7 +43,7 @@ def read_value(f):
     elif vtype == 9:  # is_array, sub-type follows in the data stream
         _etype = struct.unpack('<I', f.read(4))[0]  # element type
         cnt = struct.unpack('<Q', f.read(8))[0]      # count
-        
+
         elem_sizes = {0:1, 1:1, 2:2, 3:2, 4:4, 5:4, 6:4, 7:1}
         if _etype in elem_sizes:
             f.seek(cnt * elem_sizes[_etype], 1)
@@ -53,7 +53,7 @@ def read_value(f):
                 f.seek(s, 1)
         else:
             raise ValueError(f"Unknown array element type {_etype}")
-        
+
         return (f"arr[{_etype}]x{cnt}", None)
 
     else:
@@ -76,30 +76,30 @@ def parse_gguf(path):
         for key_idx in range(n_keys):
             key_name = read_string(f)
             type_name, val = read_value(f)
-            
+
             if val is not None and isinstance(val, str):
                 display_val = val[:50] + ('...' if len(val) > 50 else '')
             else:
                 display_val = str(val) if val is not None else ''
-            
+
             print(f"[Key {key_idx}] '{key_name}' -> {type_name} ({display_val})", file=sys.stderr)
 
         # Tensors
         # Tensor data type (ggml_type enum from ggml.h)
-        # Our ROCm fork adds custom types; fall back to raw value for unknowns
+        # Values copied from the ROCmFPX fork's ggml/include/ggml.h (100+ are fork-only);
+        # fall back to raw value for unknowns
         type_names_tensor = {
-            0:"Q8_0", 1:"Q8_1", 2:"F32", 3:"F16", 4:"I32",
-            5:"I64", 6:"F64", 7:"I8", 8:"I4", 9:"U4",
-            10:"I2", 11:"U2", 12:"BF16", 13:"Q4_0", 14:"Q4_1",
-            15:"Q4_1_Q8_0", 16:"Q4_2_Q8_0", 17:"Q4_K", 18:"Q5_0",
-            19:"Q5_1", 20:"Q5_K", 21:"Q6_K", 22:"Q8_0_K",
-            23:"IQ4_NL", 24:"IQ4_XS", 25:"IQ3_XS",
-            27: "FP4(MX)", 
-            99:"ROCmFP4(Codebook10)", # ftype 99 = ROCmFP4 Codebook10, the custom type used in our fork
+            0:"F32", 1:"F16", 2:"Q4_0", 3:"Q4_1", 6:"Q5_0", 7:"Q5_1", 8:"Q8_0", 9:"Q8_1",
+            10:"Q2_K", 11:"Q3_K", 12:"Q4_K", 13:"Q5_K", 14:"Q6_K", 15:"Q8_K",
+            16:"IQ2_XXS", 17:"IQ2_XS", 18:"IQ3_XXS", 19:"IQ1_S", 20:"IQ4_NL", 21:"IQ3_S",
+            22:"IQ2_S", 23:"IQ4_XS", 24:"I8", 25:"I16", 26:"I32", 27:"I64", 28:"F64",
+            29:"IQ1_M", 30:"BF16", 34:"TQ1_0", 35:"TQ2_0", 39:"MXFP4", 40:"NVFP4", 41:"Q1_0",
+            100:"Q4_0_ROCMFP4", 101:"Q4_0_ROCMFP4_FAST", 102:"Q6_0_ROCMFPX", 103:"Q8_0_ROCMFPX",
+            104:"Q3_0_ROCMFPX", 107:"Q2_0_ROCMFPX", 108:"Q4_0_ROCMI4",
         }
 
         print("=" * 120)
-        print(f"{'No':<5} {'Type':<10} {'Name':<65} {'Dims'}")
+        print(f"{'No':<5} {'Type':<18} {'Name':<65} {'Dims'}")
         print("=" * 120)
 
         for i in range(n_tensors):
@@ -116,7 +116,7 @@ def parse_gguf(path):
             # Read and skip tensor data offset (uint64)
             offset = struct.unpack('<Q', f.read(8))[0]
 
-            print(f"{i:<5} {type_name:<10} {name:<65} {dims_str}")
+            print(f"{i:<5} {type_name:<18} {name:<65} {dims_str}")
 
 
 if __name__ == '__main__':

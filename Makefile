@@ -240,6 +240,21 @@ $(OBJDIR)/inference_e2e_test.o: $(SRCDIR)/inference_e2e_test.cpp
 # Build all demos and benchmark
 both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)
 
+# Phase 20 reference oracle (test tooling only, never linked into libinference / the XS module).
+# Needs the ROCmFPX llama.cpp CPU build: cmake -S llama.cpp -B llama.cpp/build-cpu && cmake --build llama.cpp/build-cpu
+REF_LLAMA    ?= llama.cpp
+REF_LLAMA_B  ?= $(REF_LLAMA)/build-cpu
+REF_DUMP     = $(BINDIR)/ref_dump
+
+ref_dump: $(REF_DUMP)
+
+$(REF_DUMP): tools/ref_oracle/ref_dump.cpp
+	@mkdir -p $(BINDIR)
+	c++ -O2 -std=c++17 -I$(REF_LLAMA)/include -I$(REF_LLAMA)/ggml/include $< \
+		$(REF_LLAMA_B)/src/libllama.a $(REF_LLAMA_B)/ggml/src/libggml.a \
+		$(REF_LLAMA_B)/ggml/src/libggml-cpu.a $(REF_LLAMA_B)/ggml/src/libggml-base.a \
+		-fopenmp -lpthread -ldl -o $@
+
 clean:
 	rm -rf $(BUILDDIR) *.co
 
@@ -247,7 +262,7 @@ clean:
 copy_co_files:
 	cp -f $(CODIR)/*.co . 2>/dev/null || true
 
-.PHONY: all clean both tokenizer_verify copy_co_files
+.PHONY: all clean both ref_dump tokenizer_verify copy_co_files
 
 tokenizer_verify: $(TOKENIZER_VERIFY) copy_co_files
 

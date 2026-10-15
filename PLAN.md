@@ -1143,7 +1143,7 @@ prefixes rather than using `general.architecture`.
 - `attn_q` is 2560→8192 = 16 heads × 256 × 2, i.e. **Q and an output gate packed together** (gated attention). GQA 16 Q heads / 4 KV heads [35B: 2].
 - head_dim 256, but `rope.dimension_count=64` (**partial rotary**), `rope.freq_base=1e7`, M-RoPE `dimension_sections`
 - FFN: dense SwiGLU, 9216 wide [35B: 256-expert MoE, 8 active, plus a shared expert]
-- Tensor types: Q8_0 ×184 (incl. **all norm weights**), TYPE100 ×164, Q4_0 ×70, Q4_1 ×23 [35B: TYPE101 ×389, Q8_0 ×308, TYPE100 ×52, TYPE30 ×3, Q4_1 ×1]. Weight types are **mixed within a layer** (e.g. blk.0 `ffn_gate` Q4_0, `ffn_up` TYPE100, `ffn_down` Q4_1), so per-tensor dispatch must be right everywhere.
+- Tensor types (**corrected 2026-10-15**; the original list came from a wrong type-ID table in `scripts/inspect_gguf.py`): F32 ×184 (**all norm weights, plain float**), Q4_0_ROCMFP4 (100) ×164, Q5_K (13) ×70, Q6_K (14) ×23 [35B: Q4_0_ROCMFP4_FAST (101) ×389, F32 ×308, Q4_0_ROCMFP4 ×52, BF16 (30) ×3 incl. `output.weight`, Q6_K ×1 = `token_embd`]. **There are no Q4_0, Q4_1 or Q8_0 tensors.** Weight types are **mixed within a layer** (blk.0 `ffn_gate` Q5_K, `ffn_up` ROCMFP4, `ffn_down` Q6_K), so per-tensor dispatch must be right everywhere.
 
 ### 20.1 Root-cause findings (code audit)
 
@@ -1154,7 +1154,7 @@ Ordered by impact. Each one alone is enough to produce garbage or EOS output.
    - Forward (`qwen_model.cpp:339,356`): runs attention when `l % interval == 0` (blocks 0, 4, 8, …) and skips the rest.
    - Result: **attention runs exactly on the SSM blocks, and the real attention blocks are skipped.** Both GGUFs follow llama.cpp's `(l + 1) % interval == 0` convention. This likely also explains the null/invalid pointers and memory faults that Phase 19 and late Phase 20 worked around (commits 3a42e55, 35b70f4).
 2. **75% of layers are no-ops.** The Gated DeltaNet layers are skipped outright ("not yet implemented"), so the residual stream passes through them unchanged.
-3. **Norm weights are ignored.** `qwen_model.cpp:403` states "Qwen3.5-4B has no learnable layer norm weights" and does gamma-free RMSNorm. The GGUF does have `attn_norm`, `post_attention_norm`, `attn_q_norm`, `attn_k_norm`, `ssm_norm` and `output_norm`. They are stored as Q8_0 and the loader never dequantizes them. Missing q/k-norm in particular is consistent with the huge (±14k) Q/K values in the old traces.
+3. **Norm weights are ignored.** `qwen_model.cpp:403` states "Qwen3.5-4B has no learnable layer norm weights" and does gamma-free RMSNorm. The GGUF does have `attn_norm`, `post_attention_norm`, `attn_q_norm`, `attn_k_norm`, `ssm_norm` and `output_norm`. They are plain F32 (type 0, not Q8_0 as first reported), and the loader never reads them. Missing q/k-norm in particular is consistent with the huge (±14k) Q/K values in the old traces.
 4. **RoPE is wrong.** `build_rope_tables()` (`qwen_model.cpp:266`) hard-codes theta=1e4 and rotates the full head_dim. The model needs theta=`rope.freq_base` (1e7), rotary over only the first `rope.dimension_count` dims, and M-RoPE sections.
 5. **Gated attention is missing.** `attn_q`'s second half (output gate, sigmoid) is not split out or applied.
 6. **Un-pinned host memory handed to the GPU** (35b70f4): the SwiGLU scale arrays are passed as raw `std::vector` data. Every buffer a kernel reads must go through `hipHostRegister` (the project's core pattern). Revert or fix this before anything else, since it is the current crash.
@@ -1207,8 +1207,8 @@ for the symptoms above.
 ### 20.3 Plan
 
 **Target model: `Qwen3.5-4B-ROCMFP4.gguf`** (restored to `/dev/shm/models/` on 2026-10-14). It has hybrid
-DeltaNet + gated attention but a dense FFN, and only Q4_0/Q4_1/Q8_0/TYPE100 weights, so no MoE and no
-TYPE101/TYPE30. The 35B-A3B comes after 4B produces correct tokens.
+DeltaNet + gated attention but a dense FFN, and only F32/ROCMFP4/Q5_K/Q6_K tensors, so no MoE and no
+ROCMFP4_FAST/BF16. The 35B-A3B comes after 4B produces correct tokens.
 
 **Step 0: stop the crash — DONE ✅ (2026-10-14).** The real cause was not un-pinned memory. The weight
 buffers *are* registered (`pin_model_memory`). The `swiglu_args[]` array passed five arguments as raw pointers
@@ -1235,7 +1235,7 @@ Found during Step 0 (fold into the steps below):
   values; TYPE100: 18-byte blocks, 16B qs then 2 UE4M3 scales; the loader wrongly uses 17, see 20.2a). `gemm_act_fp4` expects pure `N × K/2` nibble rows, so it reads scale bytes as
   weights. Repack to nibble rows at load time (and record the per-format nibble order: Q4_0/Q4_1 store elements
   0–15 in low nibbles and 16–31 in high nibbles), or teach the kernel the block formats.
-- **3c. The Q4_0/Q4_1 value mapping is not Codebook10.** Q4_0 is `(nib − 8) × d`, Q4_1 is `nib × d + m`, but the
+- **3c. [Moot 2026-10-15: these models have no Q4_0/Q4_1 tensors; the real issue is Q5_K/Q6_K, see Step 3.]** The Q4_0/Q4_1 value mapping is not Codebook10. Q4_0 is `(nib − 8) × d`, Q4_1 is `nib × d + m`, but the
   kernel's float path uses `codebook[nib]`.
 - **Tokenizer**: "The capital of France is" encodes as `760 288 62865 288 1020 288 …`, i.e. a standalone space
   token (288) between words. GPT-2-style BPE should merge `Ġ` into the following word. Check against the
@@ -1246,7 +1246,20 @@ Found during Step 0 (fold into the steps below):
 - The batched path (`qwen_model_forward_batch`, ~`qwen_model.cpp:1295`) still calls `swiglu_fp4` with the same
   FFN-width and missing-down-projection issues. Fix it after the single-token path is validated.
 
-**Step 1: reference oracle** [blocking] — oracle available, tooling remaining. `llama.cpp/build-cpu` (ROCmFPX
+**Step 1: reference oracle — DONE ✅ (2026-10-15).** `make ref_dump` builds `build/ref_dump`
+(`tools/ref_oracle/ref_dump.cpp`), linked against `llama.cpp/build-cpu`. It is test tooling only: ROCmFPX is a
+reference, and nothing from it goes into `libinference` or the CPAN XS module. Subcommands:
+- `types <gguf>`: per-tensor type ID and name.
+- `tokens <gguf> <prompt>`: reference token IDs.
+- `acts <gguf> <prompt> <dir>`: every F32 graph tensor of one decode, full precision, as `<seq>_<name>.f32` plus `index.tsv`, `tokens.txt` and `next_token.txt`.
+- `dequant <gguf> <dir> <tensor>…`: raw GGUF bytes plus `to_float` output.
+
+Reference data (in /dev/shm, regenerate after a container restart):
+- `/dev/shm/ref_qwen35_4b/`: "The capital of France is" → tokens `760 6511 314 9338 369`, 1301 tensors (295 MB),
+  **top-1 next token 11751 " Paris"**; `dequant/` has one tensor per type (Q5_K, ROCMFP4, Q6_K, F32).
+- `/dev/shm/ref_qwen36_35b/dequant/`: BF16 `output.weight`, ROCMFP4_FAST `attn_q` and `ffn_down_exps`, Q6_K `token_embd`.
+
+Original Step 1 text, kept for history: oracle available, tooling remaining. `llama.cpp/build-cpu` (ROCmFPX
 main) already runs the 4B and dumps every intermediate tensor (see 20.2a). Remaining work: (a) a script that saves
 the full `llama-eval-callback` tensors to `.npy`/binary (the default print is truncated to 3+3 values per row; use
 `GGML_SCHED`/a small custom callback or the `--tensor-filter`-style dump if available) for one token; (b) a tiny
@@ -1259,7 +1272,12 @@ checked against this, not against "no NaN".
 switches on `kind`; delete the `l % interval` arithmetic. Fix `gguf_block_count()` and other key lookups to use
 `general.architecture`.
 
-**Step 3: weight decoding.** Fix 3a–3c from Step 0 first. Then verify Q4_0/Q4_1/Q8_0/TYPE100 decode against the
+**Step 3: weight decoding.** *(Re-scoped 2026-10-15 after the type correction.)* The loader's `case 13`/`case 14`
+treat Q5_K/Q6_K as invented "UE4M3 custom" formats (144/176-byte blocks); the real ggml blocks are
+`block_q5_K` = 176 B and `block_q6_K` = 210 B per 256 values. The `case 2/3/8` (Q4_0/Q4_1/Q8_0) paths are never hit
+by these models. Norms are F32: read them directly, with no dequant. Needed decoders, each checked bit-exact against
+`ref_dump dequant`: Q4_0_ROCMFP4 (18 B), Q5_K, Q6_K (4B); Q4_0_ROCMFP4_FAST (17 B) and BF16 (35B). Port the
+reference dequant into our own code; don't link ROCmFPX. Original text: Fix 3a–3c from Step 0 first. Then verify Q4_0/Q4_1/Q8_0/TYPE100 decode against the
 reference dequant from step 1 (and later add TYPE101/TYPE30 for the 35B). Dequantize Q8_0 norm vectors to float. Extend `actfp4_verify` with (a) a production shape
 (M=1, N=8192, K=2048), (b) the float-scale path, and (c) one real tensor from the GGUF compared with the reference.
 Fix the Q4_0 34-vs-18 block size.
