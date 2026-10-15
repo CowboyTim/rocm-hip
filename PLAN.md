@@ -1206,6 +1206,27 @@ for the symptoms above.
 
 ### 20.3 Plan
 
+> **▶ NEXT STEP (as of 2026-10-15, HEAD aee78c5): Step 3c — switch the loader and forward pass to the verified weight path.**
+>
+> Steps 1, 2, 3a and 3b are done. The decoders (`quant_types`) and GPU kernels (`matvec_q.hip` / `qmatvec`) are
+> verified on their own, but the engine still uses the old repacking code, so `qwen_demo` still outputs token 0.
+>
+> 1. **Loader:** a weight becomes {type, N = ne[1], K = ne[0], pointer into the GGUF map, row_bytes}. Pin the whole
+>    map once (`gguf_map_base` + `hipHostRegisterReadOnly`). Delete the per-format repacking in
+>    `load_quant_weight_from_gguf` (`packed`/`scales`/`scales_f`/`true_v`, `.scales` lookups, ~500 lines). This
+>    fixes the N/K transpose, scale bytes read as weights, and wrong value maps (Step 0 findings 3a–3c).
+> 2. **Norms:** read the F32 norm vectors (`attn_norm`, `post_attention_norm`, `attn_q_norm`/`attn_k_norm`,
+>    `output_norm`) directly from the map.
+> 3. **Forward:** Q/K/V/O, FFN gate/up/down and the LM head all call `qmatvec_launch` instead of `gemm_act_fp4`.
+>
+> **Check:** no end-to-end token match yet (attention and DeltaNet arrive in Steps 4–5). Compare isolated pieces
+> against `/dev/shm/ref_qwen35_4b`, e.g. feed the reference `attn_post_norm-0` (or the FFN input) through layer 0's FFN
+> and diff it with `ffn_out-0`. FFNs must stop being skipped by the shape guard.
+>
+> **Then:** Step 4 (8 full-attention layers: gated Q, q/k norm, partial-rotary M-RoPE with theta 1e7, diffed per
+> layer against the reference) → Step 5 (Gated DeltaNet) → Step 7 (final norm + LM head; target: next token " Paris",
+> id 11751). **In parallel, any time:** fix the tokenizer (8 tokens vs the reference's 5 `760 6511 314 9338 369`).
+
 **Target model: `Qwen3.5-4B-ROCMFP4.gguf`** (restored to `/dev/shm/models/` on 2026-10-14). It has hybrid
 DeltaNet + gated attention but a dense FFN, and only F32/ROCMFP4/Q5_K/Q6_K tensors, so no MoE and no
 ROCMFP4_FAST/BF16. The 35B-A3B comes after 4B produces correct tokens.
