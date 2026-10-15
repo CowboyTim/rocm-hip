@@ -714,162 +714,207 @@ static bool load_model_weights(inference_model* m) {
         LayerWeights& L = m->layers[i];
         char wname[128], sname[128];
 
-        // --- Attention Q,K,V,O projections ---
-        // Phase 15.4: Detect SSM-only layers in hybrid architecture and skip them.
-        // Check if ANY attention tensors exist for this layer. If not, it's an SSM layer.
-        bool is_ssm_layer = false;
+        // --- Classify the block by the tensors it carries (Phase 20 Step 2) ---
+        // ssm_alpha.weight => Gated DeltaNet linear attention; attn_q.weight => full attention. MTP (nextn) blocks
+        // sit past n_layer and are never loaded here.
         {
-            char ssm_check[128];
-            snprintf(ssm_check, sizeof(ssm_check), "blk.%d.ssm_alpha", i);
-            if (has_tensor(m->gguf, ssm_check)) {
-                // This is an SSM layer — skip entirely (Phase 15.4)
-                is_ssm_layer = true;
+            char probe[128];
+            snprintf(probe, sizeof(probe), "blk.%d.ssm_alpha.weight", i);
+            const bool linear = has_tensor(m->gguf, probe);
+            snprintf(probe, sizeof(probe), "blk.%d.attn_q.weight", i);
+            const bool full = has_tensor(m->gguf, probe);
+            if (linear == full) {
+                fprintf(stderr, "blk.%d: cannot classify (ssm_alpha=%d attn_q=%d)\n", i, linear, full);
+                return false;
             }
+            L.kind = linear ? LAYER_LINEAR_ATTN : LAYER_FULL_ATTN;
         }
 
-        if (is_ssm_layer) continue;  // Skip SSM-only layers entirely
+        // TODO(Phase 20 Step 5): load Gated DeltaNet weights for LAYER_LINEAR_ATTN.
+        // FFN weights below are loaded for every layer kind.
+        if (L.kind == LAYER_FULL_ATTN) {
+            // Check if we have a combined QKV tensor (Qwen3.5-4B pattern) or separate ones (Qwen3-7B)
+            snprintf(wname, sizeof(wname), "blk.%d.attn_qkv.weight", i);
+            snprintf(sname, sizeof(sname), "blk.%d.attn_qkv.scales", i);
 
-        // Check if we have a combined QKV tensor (Qwen3.5-4B pattern) or separate ones (Qwen3-7B)
-        snprintf(wname, sizeof(wname), "blk.%d.attn_qkv.weight", i);
-        snprintf(sname, sizeof(sname), "blk.%d.attn_qkv.scales", i);
+            size_t qkv_w_sz = 0;
+            const void* qkv_ptr = gguf_get_tensor_ptr(m->gguf, wname, &qkv_w_sz);
 
-        size_t qkv_w_sz = 0;
-        const void* qkv_ptr = gguf_get_tensor_ptr(m->gguf, wname, &qkv_w_sz);
+            if (qkv_ptr && qkv_w_sz > 0) {
+                // Combined QKV tensor found — load and split into Wq/Wk/Wv
+                int qidx = find_tensor_index(m->gguf, wname);
+                if (qidx < 0) return false;
+                int64_t* ne_raw = gguf_tensor_ne(m->gguf, qidx);
+                if (!ne_raw) return false;
 
-        if (qkv_ptr && qkv_w_sz > 0) {
-            // Combined QKV tensor found — load and split into Wq/Wk/Wv
-            int qidx = find_tensor_index(m->gguf, wname);
-            if (qidx < 0) return false;
-            int64_t* ne_raw = gguf_tensor_ne(m->gguf, qidx);
-            if (!ne_raw) return false;
+                int64_t E = ne_raw[0];              // embedding length (rows)
+                int64_t DQ = (int64_t)m->n_head * m->head_dim;   // Q columns
+                int64_t DKV = (int64_t)m->n_head_kv * m->head_dim; // K/V columns
 
-            int64_t E = ne_raw[0];              // embedding length (rows)
-            int64_t DQ = (int64_t)m->n_head * m->head_dim;   // Q columns
-            int64_t DKV = (int64_t)m->n_head_kv * m->head_dim; // K/V columns
+                size_t total_cols = DQ + 2 * DKV;
+                size_t packed_bytes_per_row = total_cols >> 1;  // 2 nibbles per byte
 
-            size_t total_cols = DQ + 2 * DKV;
-            size_t packed_bytes_per_row = total_cols >> 1;  // 2 nibbles per byte
+                L.Wq.N = (int)E; L.Wq.K = (int)DQ;
+                L.Wk.N = (int)E; L.Wk.K = (int)DKV;
+                L.Wv.N = (int)E; L.Wv.K = (int)DKV;
 
-            L.Wq.N = (int)E; L.Wq.K = (int)DQ;
-            L.Wk.N = (int)E; L.Wk.K = (int)DKV;
-            L.Wv.N = (int)E; L.Wv.K = (int)DKV;
-
-            // Load scales — check if tensor type is self-contained first
-            int qkv_type = qidx;
-            int self_contained = 0;
-            if (qkv_type >= 0) {
-                int t = gguf_tensor_type(m->gguf, qkv_type);
-                self_contained = gguf_type_is_self_contained(t);
-                fprintf(stderr, "blk.%d: qkv_type=%d self_contained=%d\n", i, t, self_contained);
-            }
-
-            size_t s_sz;
-            const void* s_ptr = gguf_get_tensor_ptr(m->gguf, sname, &s_sz);
-
-            if (!self_contained && !s_ptr) {
-                // Non-self-contained type without external scales — cannot proceed
-                fprintf(stderr, "blk.%d: combined qkv scales tensor not found (type %d requires external scales)\n",
-                        i, qkv_type >= 0 ? gguf_tensor_type(m->gguf, qkv_type) : -1);
-                return false;
-            } else if (!self_contained && s_ptr) {
-                // External scales exist for non-self-contained type — use existing split logic below
-            } else {
-                // Self-contained type (TYPE13/Q4_0/Q8_0/etc.) — no external scales expected
-                fprintf(stderr, "blk.%d: self-contained quantization type detected, skipping external scale lookup\n", i);
-            }
-
-            const unsigned char* pk = (const unsigned char*)qkv_ptr;
-
-            // Allocate packed arrays for each projection
-            size_t q_packed_bytes = (size_t)E * ((size_t)DQ >> 1);
-            size_t k_packed_bytes = (size_t)E * ((size_t)DKV >> 1);
-            size_t v_packed_bytes = (size_t)E * ((size_t)DKV >> 1);
-
-            L.Wq.packed.resize(q_packed_bytes);
-            L.Wk.packed.resize(k_packed_bytes);
-            L.Wv.packed.resize(v_packed_bytes);
-
-            // Extract packed data row by row
-            for (int64_t row = 0; row < E; ++row) {
-                const unsigned char* src_row = pk + row * packed_bytes_per_row;
-
-                // Q: columns [0 .. DQ-1] → packed cols [0 .. DQ/2-1]
-                for (int c = 0; c < (int)DQ - 1; c += 2) {
-                    size_t dst_off = (size_t)(c >> 1);
-                    size_t src_off = (size_t)(c >> 1);
-                    L.Wq.packed[(size_t)row * q_packed_bytes / E + dst_off] = src_row[src_off];
-                }
-                // Handle odd column at end of Q if DQ is odd
-                if (DQ & 1) {
-                    int last_c = (int)(DQ - 1);
-                    size_t src_off = (size_t)(last_c >> 1);
-                    size_t dst_off = (size_t)(last_c >> 1);
-                    unsigned char b = src_row[src_off];
-                    L.Wq.packed[(size_t)row * q_packed_bytes / E + dst_off] = (unsigned char)(b & 0x0F);
+                // Load scales — check if tensor type is self-contained first
+                int qkv_type = qidx;
+                int self_contained = 0;
+                if (qkv_type >= 0) {
+                    int t = gguf_tensor_type(m->gguf, qkv_type);
+                    self_contained = gguf_type_is_self_contained(t);
+                    fprintf(stderr, "blk.%d: qkv_type=%d self_contained=%d\n", i, t, self_contained);
                 }
 
-                // K: columns [DQ .. DQ+DKV-1] → packed cols [0 .. DKV/2-1]
-                for (int c = 0; c < (int)DKV - 1; c += 2) {
-                    int global_col = (int)DQ + c;
-                    size_t src_off = (size_t)(global_col >> 1);
-                    size_t dst_off = (size_t)(c >> 1);
-                    L.Wk.packed[(size_t)row * k_packed_bytes / E + dst_off] = src_row[src_off];
-                }
-                if (DKV & 1) {
-                    int last_c = (int)(DKV - 1);
-                    int global_col = (int)DQ + last_c;
-                    size_t src_off = (size_t)(global_col >> 1);
-                    size_t dst_off = (size_t)(last_c >> 1);
-                    unsigned char b = src_row[src_off];
-                    L.Wk.packed[(size_t)row * k_packed_bytes / E + dst_off] = (unsigned char)(b & 0x0F);
-                }
+                size_t s_sz;
+                const void* s_ptr = gguf_get_tensor_ptr(m->gguf, sname, &s_sz);
 
-                // V: columns [DQ+DKV .. DQ+2*DKV-1] → packed cols [0 .. DKV/2-1]
-                for (int c = 0; c < (int)DKV - 1; c += 2) {
-                    int global_col = (int)DQ + (int)DKV + c;
-                    size_t src_off = (size_t)(global_col >> 1);
-                    size_t dst_off = (size_t)(c >> 1);
-                    L.Wv.packed[(size_t)row * v_packed_bytes / E + dst_off] = src_row[src_off];
-                }
-                if (DKV & 1) {
-                    int last_c = (int)(DKV - 1);
-                    int global_col = (int)DQ + (int)DKV + last_c;
-                    size_t src_off = (size_t)(global_col >> 1);
-                    size_t dst_off = (size_t)(last_c >> 1);
-                    unsigned char b = src_row[src_off];
-                    L.Wv.packed[(size_t)row * v_packed_bytes / E + dst_off] = (unsigned char)(b & 0x0F);
-                }
-            }
-
-            // Load scales — try per-projection first, then combined fallback
-            char sname_q[128], sname_k[128], sname_v[128];
-            snprintf(sname_q, sizeof(sname_q), "blk.%d.attn_q.scales", i);
-            snprintf(sname_k, sizeof(sname_k), "blk.%d.attn_k.scales", i);
-            snprintf(sname_v, sizeof(sname_v), "blk.%d.attn_v.scales", i);
-
-            size_t sq_sz;
-            const void* sq_ptr = gguf_get_tensor_ptr(m->gguf, sname_q, &sq_sz);
-
-            if (!self_contained) {
-                // Non-self-contained types require external scales — use existing split logic
-                if (sq_ptr && sq_sz > 0) {
-                    // Separate scales for each projection (Qwen3-7B style)
-                    const void* sk_p = gguf_get_tensor_ptr(m->gguf, sname_k, &sq_sz);
-                    const void* sv_p = gguf_get_tensor_ptr(m->gguf, sname_v, &sq_sz);
-
-                    L.Wq.scales.assign((const unsigned char*)sq_ptr, (const unsigned char*)sq_ptr + sq_sz);
-                    L.Wk.scales.assign((const unsigned char*)sk_p, (const unsigned char*)sk_p + sq_sz);
-                    L.Wv.scales.assign((const unsigned char*)sv_p, (const unsigned char*)sv_p + sq_sz);
+                if (!self_contained && !s_ptr) {
+                    // Non-self-contained type without external scales — cannot proceed
+                    fprintf(stderr, "blk.%d: combined qkv scales tensor not found (type %d requires external scales)\n",
+                            i, qkv_type >= 0 ? gguf_tensor_type(m->gguf, qkv_type) : -1);
+                    return false;
+                } else if (!self_contained && s_ptr) {
+                    // External scales exist for non-self-contained type — use existing split logic below
                 } else {
-                    // Combined scales tensor — split by row index and scale column offset
-                    int sc_idx = find_tensor_index(m->gguf, sname);
-                    if (sc_idx < 0) return false;
+                    // Self-contained type (TYPE13/Q4_0/Q8_0/etc.) — no external scales expected
+                    fprintf(stderr, "blk.%d: self-contained quantization type detected, skipping external scale lookup\n", i);
+                }
 
-                    int64_t* ne_sc = gguf_tensor_ne(m->gguf, sc_idx);
-                    if (!ne_sc) return false;
-                    size_t total_scale_cols = (size_t)ne_sc[1];
+                const unsigned char* pk = (const unsigned char*)qkv_ptr;
 
-                    // Scales per row for Q/K/V projections: ceil(DQ/16), ceil(DKV/16), ceil(DKV/16)
+                // Allocate packed arrays for each projection
+                size_t q_packed_bytes = (size_t)E * ((size_t)DQ >> 1);
+                size_t k_packed_bytes = (size_t)E * ((size_t)DKV >> 1);
+                size_t v_packed_bytes = (size_t)E * ((size_t)DKV >> 1);
+
+                L.Wq.packed.resize(q_packed_bytes);
+                L.Wk.packed.resize(k_packed_bytes);
+                L.Wv.packed.resize(v_packed_bytes);
+
+                // Extract packed data row by row
+                for (int64_t row = 0; row < E; ++row) {
+                    const unsigned char* src_row = pk + row * packed_bytes_per_row;
+
+                    // Q: columns [0 .. DQ-1] → packed cols [0 .. DQ/2-1]
+                    for (int c = 0; c < (int)DQ - 1; c += 2) {
+                        size_t dst_off = (size_t)(c >> 1);
+                        size_t src_off = (size_t)(c >> 1);
+                        L.Wq.packed[(size_t)row * q_packed_bytes / E + dst_off] = src_row[src_off];
+                    }
+                    // Handle odd column at end of Q if DQ is odd
+                    if (DQ & 1) {
+                        int last_c = (int)(DQ - 1);
+                        size_t src_off = (size_t)(last_c >> 1);
+                        size_t dst_off = (size_t)(last_c >> 1);
+                        unsigned char b = src_row[src_off];
+                        L.Wq.packed[(size_t)row * q_packed_bytes / E + dst_off] = (unsigned char)(b & 0x0F);
+                    }
+
+                    // K: columns [DQ .. DQ+DKV-1] → packed cols [0 .. DKV/2-1]
+                    for (int c = 0; c < (int)DKV - 1; c += 2) {
+                        int global_col = (int)DQ + c;
+                        size_t src_off = (size_t)(global_col >> 1);
+                        size_t dst_off = (size_t)(c >> 1);
+                        L.Wk.packed[(size_t)row * k_packed_bytes / E + dst_off] = src_row[src_off];
+                    }
+                    if (DKV & 1) {
+                        int last_c = (int)(DKV - 1);
+                        int global_col = (int)DQ + last_c;
+                        size_t src_off = (size_t)(global_col >> 1);
+                        size_t dst_off = (size_t)(last_c >> 1);
+                        unsigned char b = src_row[src_off];
+                        L.Wk.packed[(size_t)row * k_packed_bytes / E + dst_off] = (unsigned char)(b & 0x0F);
+                    }
+
+                    // V: columns [DQ+DKV .. DQ+2*DKV-1] → packed cols [0 .. DKV/2-1]
+                    for (int c = 0; c < (int)DKV - 1; c += 2) {
+                        int global_col = (int)DQ + (int)DKV + c;
+                        size_t src_off = (size_t)(global_col >> 1);
+                        size_t dst_off = (size_t)(c >> 1);
+                        L.Wv.packed[(size_t)row * v_packed_bytes / E + dst_off] = src_row[src_off];
+                    }
+                    if (DKV & 1) {
+                        int last_c = (int)(DKV - 1);
+                        int global_col = (int)DQ + (int)DKV + last_c;
+                        size_t src_off = (size_t)(global_col >> 1);
+                        size_t dst_off = (size_t)(last_c >> 1);
+                        unsigned char b = src_row[src_off];
+                        L.Wv.packed[(size_t)row * v_packed_bytes / E + dst_off] = (unsigned char)(b & 0x0F);
+                    }
+                }
+
+                // Load scales — try per-projection first, then combined fallback
+                char sname_q[128], sname_k[128], sname_v[128];
+                snprintf(sname_q, sizeof(sname_q), "blk.%d.attn_q.scales", i);
+                snprintf(sname_k, sizeof(sname_k), "blk.%d.attn_k.scales", i);
+                snprintf(sname_v, sizeof(sname_v), "blk.%d.attn_v.scales", i);
+
+                size_t sq_sz;
+                const void* sq_ptr = gguf_get_tensor_ptr(m->gguf, sname_q, &sq_sz);
+
+                if (!self_contained) {
+                    // Non-self-contained types require external scales — use existing split logic
+                    if (sq_ptr && sq_sz > 0) {
+                        // Separate scales for each projection (Qwen3-7B style)
+                        const void* sk_p = gguf_get_tensor_ptr(m->gguf, sname_k, &sq_sz);
+                        const void* sv_p = gguf_get_tensor_ptr(m->gguf, sname_v, &sq_sz);
+
+                        L.Wq.scales.assign((const unsigned char*)sq_ptr, (const unsigned char*)sq_ptr + sq_sz);
+                        L.Wk.scales.assign((const unsigned char*)sk_p, (const unsigned char*)sk_p + sq_sz);
+                        L.Wv.scales.assign((const unsigned char*)sv_p, (const unsigned char*)sv_p + sq_sz);
+                    } else {
+                        // Combined scales tensor — split by row index and scale column offset
+                        int sc_idx = find_tensor_index(m->gguf, sname);
+                        if (sc_idx < 0) return false;
+
+                        int64_t* ne_sc = gguf_tensor_ne(m->gguf, sc_idx);
+                        if (!ne_sc) return false;
+                        size_t total_scale_cols = (size_t)ne_sc[1];
+
+                        // Scales per row for Q/K/V projections: ceil(DQ/16), ceil(DKV/16), ceil(DKV/16)
+                        size_t q_scales_per_row = ((size_t)DQ + 15) >> 4;
+                        size_t k_scales_per_row = ((size_t)DKV + 15) >> 4;
+                        size_t v_scales_per_row = ((size_t)DKV + 15) >> 4;
+
+                        L.Wq.scales.resize((size_t)E * q_scales_per_row);
+                        L.Wk.scales.resize((size_t)E * k_scales_per_row);
+                        L.Wv.scales.resize((size_t)E * v_scales_per_row);
+
+                        const unsigned char* src_sc = (const unsigned char*)s_ptr;
+                        size_t scales_per_row_total = total_scale_cols;
+
+                        for (int64_t row = 0; row < E; ++row) {
+                            size_t src_row_off = row * scales_per_row_total;
+
+                            // Q scales: first q_scales_per_row entries in this row
+                            for (size_t s = 0; s < q_scales_per_row; ++s) {
+                                L.Wq.scales[row * q_scales_per_row + s] = src_sc[src_row_off + s];
+                            }
+
+                            // K scales: next k_scales_per_row entries
+                            int k_start = (int)q_scales_per_row;
+                            for (size_t s = 0; s < k_scales_per_row; ++s) {
+                                if ((size_t)(k_start + s) < scales_per_row_total) {
+                                    L.Wk.scales[row * k_scales_per_row + s] = src_sc[src_row_off + (size_t)k_start + s];
+                                }
+                            }
+
+                            // V scales: next v_scales_per_row entries
+                            int v_start = (int)(q_scales_per_row + k_scales_per_row);
+                            for (size_t s = 0; s < v_scales_per_row; ++s) {
+                                if ((size_t)(v_start + s) < scales_per_row_total) {
+                                    L.Wv.scales[row * v_scales_per_row + s] = src_sc[src_row_off + (size_t)v_start + s];
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Self-contained quantization — no external scales tensor exists.
+                    // Extract actual scales from within blocks based on tensor type.
+                    fprintf(stderr, "blk.%d: self-contained type %d, extracting scales from blocks\n", i, qkv_type >= 0 ? gguf_tensor_type(m->gguf, qkv_type) : -1);
+
                     size_t q_scales_per_row = ((size_t)DQ + 15) >> 4;
                     size_t k_scales_per_row = ((size_t)DKV + 15) >> 4;
                     size_t v_scales_per_row = ((size_t)DKV + 15) >> 4;
@@ -878,328 +923,288 @@ static bool load_model_weights(inference_model* m) {
                     L.Wk.scales.resize((size_t)E * k_scales_per_row);
                     L.Wv.scales.resize((size_t)E * v_scales_per_row);
 
-                    const unsigned char* src_sc = (const unsigned char*)s_ptr;
-                    size_t scales_per_row_total = total_scale_cols;
+                    int t = (qkv_type >= 0) ? gguf_tensor_type(m->gguf, qkv_type) : -1;
 
-                    for (int64_t row = 0; row < E; ++row) {
-                        size_t src_row_off = row * scales_per_row_total;
+                    if (t == 13) {
+                        // TYPE13: block_size=256 values/block, UE4M3 scales embedded in each block.
+                        // Block layout: [scale_0..scale_15 (16 bytes), packed_data (128 bytes)] = 144 bytes per block.
+                        // Each scale covers 16 elements within the block.
+                        // For combined QKV with total_cols columns:
+                        //   blocks_per_row = ceil(total_cols / 256)
+                        //   total_scales_per_row = blocks_per_row * 16
 
-                        // Q scales: first q_scales_per_row entries in this row
-                        for (size_t s = 0; s < q_scales_per_row; ++s) {
-                            L.Wq.scales[row * q_scales_per_row + s] = src_sc[src_row_off + s];
+                        size_t blocks_per_row = (total_cols + 255) / 256;
+                        size_t total_scales_per_row = blocks_per_row * 16;
+
+                        for (int64_t row = 0; row < E; ++row) {
+                            const unsigned char* src_row = pk + row * blocks_per_row * 144;
+
+                            // --- Extract all scales from this row's blocks into a temp buffer ---
+                            std::vector<uint8_t> all_scales(total_scales_per_row);
+                            for (size_t b = 0; b < blocks_per_row; ++b) {
+                                const uint8_t* blk = src_row + b * 144;
+                                for (size_t s = 0; s < 16; ++s) {
+                                    all_scales[b * 16 + s] = blk[s]; // UE4M3 scale at offset s within block
+                                }
+                            }
+
+                            // Map scales to projection-specific arrays.
+                            // Column c maps to scale_index = c / 16, and scale comes from block (c/256).
+                            // Q: columns [0 .. DQ-1], K: columns [DQ .. DQ+DKV-1], V: columns [DQ+DKV .. DQ+2*DKV-1]
+
+                            size_t q_scale_count = (DQ + 15) >> 4; // ceil(DQ/16), but may exceed available scales
+                            if (q_scale_count > total_scales_per_row) q_scale_count = total_scales_per_row;
+                            for (size_t s = 0; s < q_scales_per_row; ++s) {
+                                L.Wq.scales[row * q_scales_per_row + s] =
+                                    (s < q_scale_count) ? all_scales[s] : 0x60;
+                            }
+
+                            // K starts after Q's column range in terms of which scales apply.
+                            // Scale index for column (DQ + k) is (DQ + k) / 16.
+                            // But we need the scale that covers column (DQ + k), which comes from block ((DQ+k)/256).
+                            size_t k_start_col = DQ;
+                            for (size_t s = 0; s < k_scales_per_row; ++s) {
+                                int col = (int)(k_start_col + s * 16);
+                                size_t si = col / 16;
+                                L.Wk.scales[row * k_scales_per_row + s] =
+                                    (si < total_scales_per_row) ? all_scales[si] : 0x60;
+                            }
+
+                            // V: columns [DQ+DKV .. DQ+2*DKV-1]
+                            size_t v_start_col = DQ + DKV;
+                            for (size_t s = 0; s < v_scales_per_row; ++s) {
+                                int col = (int)(v_start_col + s * 16);
+                                size_t si = col / 16;
+                                L.Wv.scales[row * v_scales_per_row + s] =
+                                    (si < total_scales_per_row) ? all_scales[si] : 0x60;
+                            }
                         }
+                    } else if (t == 14) {
+                        // TYPE14: Same structure as TYPE13 — UE4M3 scales embedded in each 256-value block.
+                        // Block layout: [scale_0..scale_15 (16 bytes), packed_data (160 bytes)] = 176 bytes per block.
+                        fprintf(stderr, "blk.%d: TYPE14 combined QKV — extracting UE4M3 from blocks\n", i);
 
-                        // K scales: next k_scales_per_row entries
-                        int k_start = (int)q_scales_per_row;
-                        for (size_t s = 0; s < k_scales_per_row; ++s) {
-                            if ((size_t)(k_start + s) < scales_per_row_total) {
-                                L.Wk.scales[row * k_scales_per_row + s] = src_sc[src_row_off + (size_t)k_start + s];
+                        size_t blocks_per_row = (total_cols + 255) / 256;
+                        size_t total_scales_per_row = blocks_per_row * 16;
+
+                        for (int64_t row = 0; row < E; ++row) {
+                            const unsigned char* src_row = pk + row * blocks_per_row * 176;
+
+                            std::vector<uint8_t> all_scales(total_scales_per_row);
+                            for (size_t b = 0; b < blocks_per_row; ++b) {
+                                const uint8_t* blk = src_row + b * 176;
+                                for (size_t s = 0; s < 16; ++s) {
+                                    all_scales[b * 16 + s] = blk[s]; // UE4M3 scale at offset s within block
+                                }
+                            }
+
+                            // Map scales to projection-specific arrays (same logic as type 13)
+                            size_t q_scale_count = (DQ + 15) >> 4;
+                            if (q_scale_count > total_scales_per_row) q_scale_count = total_scales_per_row;
+                            for (size_t s = 0; s < q_scales_per_row; ++s) {
+                                L.Wq.scales[row * q_scales_per_row + s] =
+                                    (s < q_scale_count) ? all_scales[s] : 0x60;
+                            }
+
+                            size_t k_start_col = DQ;
+                            for (size_t s = 0; s < k_scales_per_row; ++s) {
+                                int col = (int)(k_start_col + s * 16);
+                                size_t si = col / 16;
+                                L.Wk.scales[row * k_scales_per_row + s] =
+                                    (si < total_scales_per_row) ? all_scales[si] : 0x60;
+                            }
+
+                            size_t v_start_col = DQ + DKV;
+                            for (size_t s = 0; s < v_scales_per_row; ++s) {
+                                int col = (int)(v_start_col + s * 16);
+                                size_t si = col / 16;
+                                L.Wv.scales[row * v_scales_per_row + s] =
+                                    (si < total_scales_per_row) ? all_scales[si] : 0x60;
+                            }
+                        }
+                    } else if (t == 2) { // Q4_0 in combined QKV — decode FP16 delta from blocks per projection
+                        fprintf(stderr, "blk.%d: Q4_0 combined QKV — extracting FP16 delta from blocks\n", i);
+
+                        size_t block_bytes_q40 = 34; // For combined QKV, total block is 34 bytes (2B delta + 32B int8)
+                        size_t blocks_per_row_total = total_cols / 32;
+
+                        for (int64_t row = 0; row < E; ++row) {
+                            const unsigned char* src_row = pk + row * blocks_per_row_total * block_bytes_q40;
+
+                            // Extract all deltas from this row's blocks
+                            std::vector<float> all_deltas(blocks_per_row_total);
+                            for (size_t b = 0; b < blocks_per_row_total; ++b) {
+                                const uint8_t* blk = src_row + b * block_bytes_q40;
+                                __half h_delta;
+                                memcpy(&h_delta, blk, sizeof(__half));
+                                all_deltas[b] = __half2float(h_delta);
+                            }
+
+                            // Map scale+min pairs to projections based on column ranges (Q4_1-compatible layout)
+                            size_t q_blocks = DQ / 32;
+                            for (size_t s = 0; s < q_scales_per_row; ++s) {
+                                L.Wq.scales_f[(size_t)row * q_scales_per_row * 2 + s * 2] =
+                                    (s < q_blocks && s < all_deltas.size()) ? all_deltas[s] : 1.0f; // scale=delta
+                                L.Wq.scales_f[(size_t)row * q_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0 for Q4_0
+                            }
+
+                            size_t k_start_block = q_blocks;
+                            size_t k_blocks = DKV / 32;
+                            for (size_t s = 0; s < k_scales_per_row; ++s) {
+                                size_t bi = k_start_block + s;
+                                L.Wk.scales_f[(size_t)row * k_scales_per_row * 2 + s * 2] =
+                                    (bi < blocks_per_row_total && bi < all_deltas.size()) ? all_deltas[bi] : 1.0f; // scale=delta
+                                L.Wk.scales_f[(size_t)row * k_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0 for Q4_0
+                            }
+
+                            size_t v_start_block = q_blocks + k_blocks;
+                            for (size_t s = 0; s < v_scales_per_row; ++s) {
+                                size_t bi = v_start_block + s;
+                                L.Wv.scales_f[(size_t)row * v_scales_per_row * 2 + s * 2] =
+                                    (bi < blocks_per_row_total && bi < all_deltas.size()) ? all_deltas[bi] : 1.0f; // scale=delta
+                                L.Wv.scales_f[(size_t)row * v_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0 for Q4_0
                             }
                         }
 
-                        // V scales: next v_scales_per_row entries
-                        int v_start = (int)(q_scales_per_row + k_scales_per_row);
-                        for (size_t s = 0; s < v_scales_per_row; ++s) {
-                            if ((size_t)(v_start + s) < scales_per_row_total) {
-                                L.Wv.scales[row * v_scales_per_row + s] = src_sc[src_row_off + (size_t)v_start + s];
+                    } else if (t == 3) { // Q4_1 in combined QKV — decode FP16 scale+min from blocks per projection
+                        fprintf(stderr, "blk.%d: Q4_1 combined QKV — extracting FP16 scale+min from blocks\n", i);
+
+                        size_t block_bytes_q41 = 34; // For combined QKV, total block is 34 bytes (2B scale + 2B min + 32B int8)
+                        size_t blocks_per_row_total = total_cols / 32;
+
+                        for (int64_t row = 0; row < E; ++row) {
+                            const unsigned char* src_row = pk + row * blocks_per_row_total * block_bytes_q41;
+
+                            // Extract all scale/min pairs from this row's blocks
+                            std::vector<float> all_scales(blocks_per_row_total * 2);
+                            for (size_t b = 0; b < blocks_per_row_total; ++b) {
+                                const uint8_t* blk = src_row + b * block_bytes_q41;
+                                __half h_scale, h_min;
+                                memcpy(&h_scale, blk, sizeof(__half));
+                                memcpy(&h_min, blk + 2, sizeof(__half));
+                                all_scales[b * 2]     = __half2float(h_scale); // scale
+                                all_scales[b * 2 + 1] = __half2float(h_min);    // min
+                            }
+
+                            // Map scale/min pairs to projections based on column ranges
+                            size_t q_blocks = DQ / 32;
+                            for (size_t s = 0; s < q_scales_per_row; ++s) {
+                                L.Wq.scales_f[(size_t)row * q_scales_per_row + s] =
+                                    (s * 2 < (size_t)all_scales.size() && s * 2 + 1 < (size_t)all_scales.size())
+                                        ? all_scales[s * 2] : 1.0f;
+                            }
+
+                            size_t k_start_block = q_blocks;
+                            size_t k_blocks = DKV / 32;
+                            for (size_t s = 0; s < k_scales_per_row; ++s) {
+                                size_t bi = k_start_block + s;
+                                L.Wk.scales_f[(size_t)row * k_scales_per_row + s] =
+                                    (bi * 2 < (size_t)all_scales.size() && bi * 2 + 1 < (size_t)all_scales.size())
+                                        ? all_scales[bi * 2] : 1.0f;
+                            }
+
+                            size_t v_start_block = q_blocks + k_blocks;
+                            for (size_t s = 0; s < v_scales_per_row; ++s) {
+                                size_t bi = v_start_block + s;
+                                L.Wv.scales_f[(size_t)row * v_scales_per_row * 2 + s * 2] =
+                                    (bi * 2 < (size_t)all_scales.size() && bi * 2 + 1 < (size_t)all_scales.size())
+                                        ? all_scales[bi * 2] : 1.0f;
+                            }
+                        }
+
+                    } else if (t == 7 || t == 8) { // Q8_0 in combined QKV — decode FP16 delta from blocks per projection
+                        fprintf(stderr, "blk.%d: Q8_0 combined QKV — extracting FP16 delta from blocks\n", i);
+
+                        size_t block_bytes_q80 = 34; // 2B delta + 32B int8 values
+                        size_t blocks_per_row_total = total_cols / 32;
+
+                        for (int64_t row = 0; row < E; ++row) {
+                            const unsigned char* src_row = pk + row * blocks_per_row_total * block_bytes_q80;
+
+                            // Extract all deltas from this row's blocks
+                            std::vector<float> all_deltas(blocks_per_row_total);
+                            for (size_t b = 0; b < blocks_per_row_total; ++b) {
+                                const uint8_t* blk = src_row + b * block_bytes_q80;
+                                __half h_delta;
+                                memcpy(&h_delta, blk, sizeof(__half));
+                                all_deltas[b] = __half2float(h_delta);
+                            }
+
+                            // Map scale+min pairs to projections based on column ranges (Q4_1-compatible layout)
+                            size_t q_blocks = DQ / 32;
+                            for (size_t s = 0; s < q_scales_per_row; ++s) {
+                                L.Wq.scales_f[(size_t)row * q_scales_per_row * 2 + s * 2] =
+                                    (s < q_blocks && s < all_deltas.size()) ? all_deltas[s] : 1.0f; // scale=delta
+                                L.Wq.scales_f[(size_t)row * q_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0 for Q8_0
+                            }
+
+                            size_t k_start_block = q_blocks;
+                            size_t k_blocks = DKV / 32;
+                            for (size_t s = 0; s < k_scales_per_row; ++s) {
+                                size_t bi = k_start_block + s;
+                                L.Wk.scales_f[(size_t)row * k_scales_per_row * 2 + s * 2] =
+                                    (bi < blocks_per_row_total && bi < all_deltas.size()) ? all_deltas[bi] : 1.0f; // scale=delta
+                                L.Wk.scales_f[(size_t)row * k_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0 for Q8_0
+                            }
+
+                            size_t v_start_block = q_blocks + k_blocks;
+                            for (size_t s = 0; s < v_scales_per_row; ++s) {
+                                size_t bi = v_start_block + s;
+                                L.Wv.scales_f[(size_t)row * v_scales_per_row * 2 + s * 2] =
+                                    (bi < blocks_per_row_total && bi < all_deltas.size()) ? all_deltas[bi] : 1.0f; // scale=delta
+                                L.Wv.scales_f[(size_t)row * v_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0 for Q8_0
+                            }
+                        }
+
+                    } else {
+                        // Unknown self-contained type — fill with unity scale as safe fallback
+                        fprintf(stderr, "blk.%d: unknown type %d in combined QKV, filling unity placeholder\n", i, t);
+                        for (int64_t row = 0; row < E; ++row) {
+                            for (size_t s = 0; s < q_scales_per_row; ++s) {
+                                L.Wq.scales_f[row * q_scales_per_row * 2 + s * 2] = 1.0f;   // scale=1.0
+                                L.Wq.scales_f[row * q_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0
+                            }
+                            for (size_t s = 0; s < k_scales_per_row; ++s) {
+                                L.Wk.scales_f[row * k_scales_per_row * 2 + s * 2] = 1.0f;   // scale=1.0
+                                L.Wk.scales_f[row * k_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0
+                            }
+                            for (size_t s = 0; s < v_scales_per_row; ++s) {
+                                L.Wv.scales_f[row * v_scales_per_row * 2 + s * 2] = 1.0f;   // scale=1.0
+                                L.Wv.scales_f[row * v_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0
                             }
                         }
                     }
                 }
+
             } else {
-                // Self-contained quantization — no external scales tensor exists.
-                // Extract actual scales from within blocks based on tensor type.
-                fprintf(stderr, "blk.%d: self-contained type %d, extracting scales from blocks\n", i, qkv_type >= 0 ? gguf_tensor_type(m->gguf, qkv_type) : -1);
+                // Separate Q/K/V tensors — original path (backward compatible with Qwen3-7B)
+                snprintf(wname, sizeof(wname), "blk.%d.attn_q.weight", i);
+                snprintf(sname, sizeof(sname), "blk.%d.attn_q.scales", i);
+                if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wq)) return false;
 
-                size_t q_scales_per_row = ((size_t)DQ + 15) >> 4;
-                size_t k_scales_per_row = ((size_t)DKV + 15) >> 4;
-                size_t v_scales_per_row = ((size_t)DKV + 15) >> 4;
+                snprintf(wname, sizeof(wname), "blk.%d.attn_k.weight", i);
+                snprintf(sname, sizeof(sname), "blk.%d.attn_k.scales", i);
+                if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wk)) return false;
 
-                L.Wq.scales.resize((size_t)E * q_scales_per_row);
-                L.Wk.scales.resize((size_t)E * k_scales_per_row);
-                L.Wv.scales.resize((size_t)E * v_scales_per_row);
-
-                int t = (qkv_type >= 0) ? gguf_tensor_type(m->gguf, qkv_type) : -1;
-
-                if (t == 13) {
-                    // TYPE13: block_size=256 values/block, UE4M3 scales embedded in each block.
-                    // Block layout: [scale_0..scale_15 (16 bytes), packed_data (128 bytes)] = 144 bytes per block.
-                    // Each scale covers 16 elements within the block.
-                    // For combined QKV with total_cols columns:
-                    //   blocks_per_row = ceil(total_cols / 256)
-                    //   total_scales_per_row = blocks_per_row * 16
-
-                    size_t blocks_per_row = (total_cols + 255) / 256;
-                    size_t total_scales_per_row = blocks_per_row * 16;
-
-                    for (int64_t row = 0; row < E; ++row) {
-                        const unsigned char* src_row = pk + row * blocks_per_row * 144;
-
-                        // --- Extract all scales from this row's blocks into a temp buffer ---
-                        std::vector<uint8_t> all_scales(total_scales_per_row);
-                        for (size_t b = 0; b < blocks_per_row; ++b) {
-                            const uint8_t* blk = src_row + b * 144;
-                            for (size_t s = 0; s < 16; ++s) {
-                                all_scales[b * 16 + s] = blk[s]; // UE4M3 scale at offset s within block
-                            }
-                        }
-
-                        // Map scales to projection-specific arrays.
-                        // Column c maps to scale_index = c / 16, and scale comes from block (c/256).
-                        // Q: columns [0 .. DQ-1], K: columns [DQ .. DQ+DKV-1], V: columns [DQ+DKV .. DQ+2*DKV-1]
-
-                        size_t q_scale_count = (DQ + 15) >> 4; // ceil(DQ/16), but may exceed available scales
-                        if (q_scale_count > total_scales_per_row) q_scale_count = total_scales_per_row;
-                        for (size_t s = 0; s < q_scales_per_row; ++s) {
-                            L.Wq.scales[row * q_scales_per_row + s] =
-                                (s < q_scale_count) ? all_scales[s] : 0x60;
-                        }
-
-                        // K starts after Q's column range in terms of which scales apply.
-                        // Scale index for column (DQ + k) is (DQ + k) / 16.
-                        // But we need the scale that covers column (DQ + k), which comes from block ((DQ+k)/256).
-                        size_t k_start_col = DQ;
-                        for (size_t s = 0; s < k_scales_per_row; ++s) {
-                            int col = (int)(k_start_col + s * 16);
-                            size_t si = col / 16;
-                            L.Wk.scales[row * k_scales_per_row + s] =
-                                (si < total_scales_per_row) ? all_scales[si] : 0x60;
-                        }
-
-                        // V: columns [DQ+DKV .. DQ+2*DKV-1]
-                        size_t v_start_col = DQ + DKV;
-                        for (size_t s = 0; s < v_scales_per_row; ++s) {
-                            int col = (int)(v_start_col + s * 16);
-                            size_t si = col / 16;
-                            L.Wv.scales[row * v_scales_per_row + s] =
-                                (si < total_scales_per_row) ? all_scales[si] : 0x60;
-                        }
-                    }
-                } else if (t == 14) {
-                    // TYPE14: Same structure as TYPE13 — UE4M3 scales embedded in each 256-value block.
-                    // Block layout: [scale_0..scale_15 (16 bytes), packed_data (160 bytes)] = 176 bytes per block.
-                    fprintf(stderr, "blk.%d: TYPE14 combined QKV — extracting UE4M3 from blocks\n", i);
-
-                    size_t blocks_per_row = (total_cols + 255) / 256;
-                    size_t total_scales_per_row = blocks_per_row * 16;
-
-                    for (int64_t row = 0; row < E; ++row) {
-                        const unsigned char* src_row = pk + row * blocks_per_row * 176;
-
-                        std::vector<uint8_t> all_scales(total_scales_per_row);
-                        for (size_t b = 0; b < blocks_per_row; ++b) {
-                            const uint8_t* blk = src_row + b * 176;
-                            for (size_t s = 0; s < 16; ++s) {
-                                all_scales[b * 16 + s] = blk[s]; // UE4M3 scale at offset s within block
-                            }
-                        }
-
-                        // Map scales to projection-specific arrays (same logic as type 13)
-                        size_t q_scale_count = (DQ + 15) >> 4;
-                        if (q_scale_count > total_scales_per_row) q_scale_count = total_scales_per_row;
-                        for (size_t s = 0; s < q_scales_per_row; ++s) {
-                            L.Wq.scales[row * q_scales_per_row + s] =
-                                (s < q_scale_count) ? all_scales[s] : 0x60;
-                        }
-
-                        size_t k_start_col = DQ;
-                        for (size_t s = 0; s < k_scales_per_row; ++s) {
-                            int col = (int)(k_start_col + s * 16);
-                            size_t si = col / 16;
-                            L.Wk.scales[row * k_scales_per_row + s] =
-                                (si < total_scales_per_row) ? all_scales[si] : 0x60;
-                        }
-
-                        size_t v_start_col = DQ + DKV;
-                        for (size_t s = 0; s < v_scales_per_row; ++s) {
-                            int col = (int)(v_start_col + s * 16);
-                            size_t si = col / 16;
-                            L.Wv.scales[row * v_scales_per_row + s] =
-                                (si < total_scales_per_row) ? all_scales[si] : 0x60;
-                        }
-                    }
-                } else if (t == 2) { // Q4_0 in combined QKV — decode FP16 delta from blocks per projection
-                    fprintf(stderr, "blk.%d: Q4_0 combined QKV — extracting FP16 delta from blocks\n", i);
-
-                    size_t block_bytes_q40 = 34; // For combined QKV, total block is 34 bytes (2B delta + 32B int8)
-                    size_t blocks_per_row_total = total_cols / 32;
-
-                    for (int64_t row = 0; row < E; ++row) {
-                        const unsigned char* src_row = pk + row * blocks_per_row_total * block_bytes_q40;
-
-                        // Extract all deltas from this row's blocks
-                        std::vector<float> all_deltas(blocks_per_row_total);
-                        for (size_t b = 0; b < blocks_per_row_total; ++b) {
-                            const uint8_t* blk = src_row + b * block_bytes_q40;
-                            __half h_delta;
-                            memcpy(&h_delta, blk, sizeof(__half));
-                            all_deltas[b] = __half2float(h_delta);
-                        }
-
-                        // Map scale+min pairs to projections based on column ranges (Q4_1-compatible layout)
-                        size_t q_blocks = DQ / 32;
-                        for (size_t s = 0; s < q_scales_per_row; ++s) {
-                            L.Wq.scales_f[(size_t)row * q_scales_per_row * 2 + s * 2] =
-                                (s < q_blocks && s < all_deltas.size()) ? all_deltas[s] : 1.0f; // scale=delta
-                            L.Wq.scales_f[(size_t)row * q_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0 for Q4_0
-                        }
-
-                        size_t k_start_block = q_blocks;
-                        size_t k_blocks = DKV / 32;
-                        for (size_t s = 0; s < k_scales_per_row; ++s) {
-                            size_t bi = k_start_block + s;
-                            L.Wk.scales_f[(size_t)row * k_scales_per_row * 2 + s * 2] =
-                                (bi < blocks_per_row_total && bi < all_deltas.size()) ? all_deltas[bi] : 1.0f; // scale=delta
-                            L.Wk.scales_f[(size_t)row * k_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0 for Q4_0
-                        }
-
-                        size_t v_start_block = q_blocks + k_blocks;
-                        for (size_t s = 0; s < v_scales_per_row; ++s) {
-                            size_t bi = v_start_block + s;
-                            L.Wv.scales_f[(size_t)row * v_scales_per_row * 2 + s * 2] =
-                                (bi < blocks_per_row_total && bi < all_deltas.size()) ? all_deltas[bi] : 1.0f; // scale=delta
-                            L.Wv.scales_f[(size_t)row * v_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0 for Q4_0
-                        }
-                    }
-
-                } else if (t == 3) { // Q4_1 in combined QKV — decode FP16 scale+min from blocks per projection
-                    fprintf(stderr, "blk.%d: Q4_1 combined QKV — extracting FP16 scale+min from blocks\n", i);
-
-                    size_t block_bytes_q41 = 34; // For combined QKV, total block is 34 bytes (2B scale + 2B min + 32B int8)
-                    size_t blocks_per_row_total = total_cols / 32;
-
-                    for (int64_t row = 0; row < E; ++row) {
-                        const unsigned char* src_row = pk + row * blocks_per_row_total * block_bytes_q41;
-
-                        // Extract all scale/min pairs from this row's blocks
-                        std::vector<float> all_scales(blocks_per_row_total * 2);
-                        for (size_t b = 0; b < blocks_per_row_total; ++b) {
-                            const uint8_t* blk = src_row + b * block_bytes_q41;
-                            __half h_scale, h_min;
-                            memcpy(&h_scale, blk, sizeof(__half));
-                            memcpy(&h_min, blk + 2, sizeof(__half));
-                            all_scales[b * 2]     = __half2float(h_scale); // scale
-                            all_scales[b * 2 + 1] = __half2float(h_min);    // min
-                        }
-
-                        // Map scale/min pairs to projections based on column ranges
-                        size_t q_blocks = DQ / 32;
-                        for (size_t s = 0; s < q_scales_per_row; ++s) {
-                            L.Wq.scales_f[(size_t)row * q_scales_per_row + s] =
-                                (s * 2 < (size_t)all_scales.size() && s * 2 + 1 < (size_t)all_scales.size())
-                                    ? all_scales[s * 2] : 1.0f;
-                        }
-
-                        size_t k_start_block = q_blocks;
-                        size_t k_blocks = DKV / 32;
-                        for (size_t s = 0; s < k_scales_per_row; ++s) {
-                            size_t bi = k_start_block + s;
-                            L.Wk.scales_f[(size_t)row * k_scales_per_row + s] =
-                                (bi * 2 < (size_t)all_scales.size() && bi * 2 + 1 < (size_t)all_scales.size())
-                                    ? all_scales[bi * 2] : 1.0f;
-                        }
-
-                        size_t v_start_block = q_blocks + k_blocks;
-                        for (size_t s = 0; s < v_scales_per_row; ++s) {
-                            size_t bi = v_start_block + s;
-                            L.Wv.scales_f[(size_t)row * v_scales_per_row * 2 + s * 2] =
-                                (bi * 2 < (size_t)all_scales.size() && bi * 2 + 1 < (size_t)all_scales.size())
-                                    ? all_scales[bi * 2] : 1.0f;
-                        }
-                    }
-
-                } else if (t == 7 || t == 8) { // Q8_0 in combined QKV — decode FP16 delta from blocks per projection
-                    fprintf(stderr, "blk.%d: Q8_0 combined QKV — extracting FP16 delta from blocks\n", i);
-
-                    size_t block_bytes_q80 = 34; // 2B delta + 32B int8 values
-                    size_t blocks_per_row_total = total_cols / 32;
-
-                    for (int64_t row = 0; row < E; ++row) {
-                        const unsigned char* src_row = pk + row * blocks_per_row_total * block_bytes_q80;
-
-                        // Extract all deltas from this row's blocks
-                        std::vector<float> all_deltas(blocks_per_row_total);
-                        for (size_t b = 0; b < blocks_per_row_total; ++b) {
-                            const uint8_t* blk = src_row + b * block_bytes_q80;
-                            __half h_delta;
-                            memcpy(&h_delta, blk, sizeof(__half));
-                            all_deltas[b] = __half2float(h_delta);
-                        }
-
-                        // Map scale+min pairs to projections based on column ranges (Q4_1-compatible layout)
-                        size_t q_blocks = DQ / 32;
-                        for (size_t s = 0; s < q_scales_per_row; ++s) {
-                            L.Wq.scales_f[(size_t)row * q_scales_per_row * 2 + s * 2] =
-                                (s < q_blocks && s < all_deltas.size()) ? all_deltas[s] : 1.0f; // scale=delta
-                            L.Wq.scales_f[(size_t)row * q_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0 for Q8_0
-                        }
-
-                        size_t k_start_block = q_blocks;
-                        size_t k_blocks = DKV / 32;
-                        for (size_t s = 0; s < k_scales_per_row; ++s) {
-                            size_t bi = k_start_block + s;
-                            L.Wk.scales_f[(size_t)row * k_scales_per_row * 2 + s * 2] =
-                                (bi < blocks_per_row_total && bi < all_deltas.size()) ? all_deltas[bi] : 1.0f; // scale=delta
-                            L.Wk.scales_f[(size_t)row * k_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0 for Q8_0
-                        }
-
-                        size_t v_start_block = q_blocks + k_blocks;
-                        for (size_t s = 0; s < v_scales_per_row; ++s) {
-                            size_t bi = v_start_block + s;
-                            L.Wv.scales_f[(size_t)row * v_scales_per_row * 2 + s * 2] =
-                                (bi < blocks_per_row_total && bi < all_deltas.size()) ? all_deltas[bi] : 1.0f; // scale=delta
-                            L.Wv.scales_f[(size_t)row * v_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0 for Q8_0
-                        }
-                    }
-
-                } else {
-                    // Unknown self-contained type — fill with unity scale as safe fallback
-                    fprintf(stderr, "blk.%d: unknown type %d in combined QKV, filling unity placeholder\n", i, t);
-                    for (int64_t row = 0; row < E; ++row) {
-                        for (size_t s = 0; s < q_scales_per_row; ++s) {
-                            L.Wq.scales_f[row * q_scales_per_row * 2 + s * 2] = 1.0f;   // scale=1.0
-                            L.Wq.scales_f[row * q_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0
-                        }
-                        for (size_t s = 0; s < k_scales_per_row; ++s) {
-                            L.Wk.scales_f[row * k_scales_per_row * 2 + s * 2] = 1.0f;   // scale=1.0
-                            L.Wk.scales_f[row * k_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0
-                        }
-                        for (size_t s = 0; s < v_scales_per_row; ++s) {
-                            L.Wv.scales_f[row * v_scales_per_row * 2 + s * 2] = 1.0f;   // scale=1.0
-                            L.Wv.scales_f[row * v_scales_per_row * 2 + s * 2 + 1] = 0.0f; // min=0
-                        }
-                    }
-                }
+                snprintf(wname, sizeof(wname), "blk.%d.attn_v.weight", i);
+                snprintf(sname, sizeof(sname), "blk.%d.attn_v.scales", i);
+                if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wv)) return false;
             }
 
-        } else {
-            // Separate Q/K/V tensors — original path (backward compatible with Qwen3-7B)
-            snprintf(wname, sizeof(wname), "blk.%d.attn_q.weight", i);
-            snprintf(sname, sizeof(sname), "blk.%d.attn_q.scales", i);
-            if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wq)) return false;
-
-            snprintf(wname, sizeof(wname), "blk.%d.attn_k.weight", i);
-            snprintf(sname, sizeof(sname), "blk.%d.attn_k.scales", i);
-            if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wk)) return false;
-
-            snprintf(wname, sizeof(wname), "blk.%d.attn_v.weight", i);
-            snprintf(sname, sizeof(sname), "blk.%d.attn_v.scales", i);
-            if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wv)) return false;
-        }
-
-        // Attention O projection — try multiple naming conventions (Phase 15 hybrid architecture)
-        snprintf(wname, sizeof(wname), "blk.%d.attn_o.weight", i);
-        snprintf(sname, sizeof(sname), "blk.%d.attn_o.scales", i);
-        bool has_attn_o = has_tensor(m->gguf, wname);
-        if (has_attn_o) {
-            if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wo)) return false;
-        } else {
-            // Try alternative name used in Qwen3.5 attention-output layout
-            snprintf(wname, sizeof(wname), "blk.%d.attn_output.weight", i);
-            snprintf(sname, sizeof(sname), "blk.%d.attn_output.scales", i);
-            if (has_tensor(m->gguf, wname)) {
+            // Attention O projection — try multiple naming conventions (Phase 15 hybrid architecture)
+            snprintf(wname, sizeof(wname), "blk.%d.attn_o.weight", i);
+            snprintf(sname, sizeof(sname), "blk.%d.attn_o.scales", i);
+            bool has_attn_o = has_tensor(m->gguf, wname);
+            if (has_attn_o) {
                 if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wo)) return false;
             } else {
+                // Try alternative name used in Qwen3.5 attention-output layout
+                snprintf(wname, sizeof(wname), "blk.%d.attn_output.weight", i);
+                snprintf(sname, sizeof(sname), "blk.%d.attn_output.scales", i);
+                if (has_tensor(m->gguf, wname)) {
+                    if (!load_quant_weight_from_gguf(m->gguf, wname, sname, L.Wo)) return false;
+                } else {
+                }
             }
         }
 
@@ -1263,8 +1268,8 @@ inference_model_t* inference_load_model(const char* gguf_path) {
     int64_t n_head = gguf_head_count(m->gguf);
     int64_t n_head_kv = gguf_head_count_kv(m->gguf);
 
-    // head_dim = embedding_length / head_count (derived, not stored)
-    int64_t hd = n_embd / n_head;
+    // head_dim: attention.key_length when present (Qwen3.5: 256, not n_embd/n_head = 160)
+    int64_t hd = gguf_arch_int(m->gguf, "attention.key_length", n_head > 0 ? n_embd / n_head : 0);
 
     // vocab_size: prefer tokenizer.ggml.vocab_size or array length
     int64_t vs = gguf_vocab_size(m->gguf);
@@ -1283,12 +1288,22 @@ inference_model_t* inference_load_model(const char* gguf_path) {
     const char* arch = gguf_arch(m->gguf);
     m->model_name = arch ? arch : "qwen3-unknown";
 
-     m->n_layer = (int)n_layer;
-     m->n_embd = (int)n_embd;
-     m->n_head = (int)n_head;
-     m->n_head_kv = (int)n_head_kv;
-     m->head_dim = (int)hd;
-     m->vocab_size = (int)vs;
+    // block_count includes the trailing MTP (nextn) blocks; they are not part of the decoder stack
+    m->n_nextn = (int)gguf_arch_int(m->gguf, "nextn_predict_layers", 0);
+    m->n_layer = (int)n_layer - m->n_nextn;
+    m->n_embd = (int)n_embd;
+    m->n_head = (int)n_head;
+    m->n_head_kv = (int)n_head_kv;
+    m->head_dim = (int)hd;
+    m->vocab_size = (int)vs;
+    m->n_ff = (int)gguf_arch_int(m->gguf, "feed_forward_length", 0);
+    m->n_rot = (int)gguf_arch_int(m->gguf, "rope.dimension_count", hd);
+    m->rope_freq_base = gguf_arch_float(m->gguf, "rope.freq_base", 10000.0f);
+    m->eps = gguf_arch_float(m->gguf, "attention.layer_norm_rms_epsilon", 1e-6f);
+    m->full_attention_interval = (int)gguf_arch_int(m->gguf, "full_attention_interval", 0);
+    fprintf(stderr, "[LOAD] arch=%s blocks=%lld (decoder %d + nextn %d) E=%d heads=%d/%d head_dim=%d ff=%d "
+            "n_rot=%d rope_base=%g eps=%g\n", arch ? arch : "?", (long long)n_layer, m->n_layer, m->n_nextn,
+            m->n_embd, m->n_head, m->n_head_kv, m->head_dim, m->n_ff, m->n_rot, m->rope_freq_base, m->eps);
 
     m->n_ctx = (int)ctx_len;
 

@@ -1267,7 +1267,27 @@ tool linked against `libggml` that dequantizes one tensor of each type (TYPE100/
 `ggml_get_type_traits()->to_float`; (c) the reference token IDs from `llama-tokenize`. Every later step is
 checked against this, not against "no NaN".
 
-**Step 2: single source of truth for layer types.** In the loader, classify each block by tensor presence
+**Step 2: single source of truth for layer types — DONE ✅ (2026-10-15).**
+- `LayerWeights::kind` (`LAYER_FULL_ATTN` / `LAYER_LINEAR_ATTN`) is set in `load_model_weights()` from
+  `blk.N.ssm_alpha.weight` vs `blk.N.attn_q.weight`; the loader fails if a block is neither or both.
+- The forward pass wraps sections a–i (the token mixer) in `if (L.kind == LAYER_FULL_ATTN)`. Linear layers are
+  identity for now, but still run the FFN. The `l % interval` arithmetic is gone.
+- `n_layer = block_count − nextn_predict_layers`, so the MTP block is no longer run.
+- The batched path returns `INFERENCE_ERR_NOT_IMPLEMENTED` on hybrid models.
+- Verified on the 4B: blocks 3, 7, …, 31 are full attention and the other 24 are linear. `[LOAD] arch=qwen35 blocks=33 (decoder 32 + nextn 1) head_dim=256 ff=9216 n_rot=64 rope_base=1e+07`.
+
+Found and fixed while doing it:
+- **GGUF string values were never stored** (`gguf_mmap.cpp`: "skip for Phase 1"). `general.architecture`, `tokenizer.ggml.model` and `tokenizer.ggml.pre` all read as empty. New `gguf_arch_int/float(m, suffix, def)` read `<arch>.<suffix>`, and the existing getters try the arch key first.
+- The old SSM probe looked up `blk.N.ssm_alpha` (no `.weight`), which never matched. The old loader therefore loaded DeltaNet's `attn_qkv` as if it were attention QKV.
+- `head_dim` was derived as `n_embd / n_head` = 160. It is now `attention.key_length` = 256.
+- FF now comes from `feed_forward_length`. FFNs are still skipped by the shape guard until Step 3 fixes the N/K transpose.
+
+Still open:
+- The FFN pre-norm tensor is `post_attention_norm.weight` (no `ffn_norm`), and the loader's norm path expects FP16 sizes. Handle both in Step 4.
+- 35B: hparams now load (`qwen35moe`, 40 + 1 blocks), then weight loading aborts with `std::length_error` (MoE/TYPE101). Expected; the 35B comes after the 4B.
+- `make clean` deletes `build/ref_dump`, so rerun `make ref_dump` after a clean.
+
+Original text: In the loader, classify each block by tensor presence
 (`ssm_alpha` ⇒ linear, `attn_q` ⇒ full, `nextn` ⇒ MTP/excluded) into `LayerWeights::kind`. The forward pass
 switches on `kind`; delete the `l % interval` arithmetic. Fix `gguf_block_count()` and other key lookups to use
 `general.architecture`.

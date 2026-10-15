@@ -271,8 +271,10 @@ static gguf_model_t *load_gguf(const char *path) {
         int32_t type_id; memcpy(&type_id, p, 4); p += 4;
 
         if (type_id == GGUF_TYPE_STRING) {
-            /* String value: skip for Phase 1. Store in str_val later. */
-            char *s = read_string(&p); free(s);
+            /* String value (general.architecture, tokenizer.ggml.model/pre, ...) */
+            kv->str_val = read_string(&p);
+            if (!kv->str_val) goto fail;
+            kv->scalar.type = GGUF_TYPE_STRING;
         } else if (type_id == GGUF_TYPE_ARRAY) {
             int32_t arr_type; uint64_t arr_n;
             memcpy(&arr_type, p, 4); p += 4;
@@ -661,6 +663,33 @@ static int64_t find_kv_or(const gguf_model_t *m, const char *const *keys, int n_
     return -1;
 }
 
+/* Look up "<general.architecture>.<suffix>" first (e.g. "qwen35moe.block_count"), then the legacy keys. */
+static int64_t find_arch_kv(const gguf_model_t *m, const char *suffix, const char *const *legacy, int n_legacy) {
+    int64_t idx = find_kv_idx(m, "general.architecture");
+    if (idx >= 0 && m->kvs[idx].str_val && m->kvs[idx].str_val[0]) {
+        char key[256];
+        snprintf(key, sizeof(key), "%s.%s", m->kvs[idx].str_val, suffix);
+        int64_t a = find_kv_idx(m, key);
+        if (a >= 0) return a;
+    }
+    return find_kv_or(m, legacy, n_legacy);
+}
+
+int64_t gguf_arch_int(const gguf_model_t *m, const char *suffix, int64_t def) {
+    int64_t idx = find_arch_kv(m, suffix, NULL, 0);
+    return idx >= 0 ? kv_as_int64(m, idx) : def;
+}
+
+float gguf_arch_float(const gguf_model_t *m, const char *suffix, float def) {
+    int64_t idx = find_arch_kv(m, suffix, NULL, 0);
+    if (idx < 0 || m->kvs[idx].is_array) return def;
+    switch (m->kvs[idx].scalar.type) {
+        case GGUF_TYPE_FLOAT32: return m->kvs[idx].scalar.v_f32;
+        case GGUF_TYPE_FLOAT64: return (float)m->kvs[idx].scalar.v_f64;
+        default:                return (float)kv_as_int64(m, idx);
+    }
+}
+
 const char *gguf_arch(const gguf_model_t *m) {
     static char arch_buf[128] = {0};
     /* Architecture key varies by model family */
@@ -722,7 +751,7 @@ int64_t gguf_head_count(const gguf_model_t *m) {
         "attention.head_count", "qwen35.attention.head_count",
         "llama.attention.heads"
     };
-    int64_t idx = find_kv_or(m, keys, 3);
+    int64_t idx = find_arch_kv(m, "attention.head_count", keys, 3);
     if (idx < 0) return 0;
     return kv_as_int64(m, idx);
 }
@@ -732,7 +761,7 @@ int64_t gguf_head_count_kv(const gguf_model_t *m) {
         "attention.head_count_kv", "qwen35.attention.head_count_kv",
         "llama.attention.heads_kv", "attention.kv_heads"
     };
-    int64_t idx = find_kv_or(m, keys, 4);
+    int64_t idx = find_arch_kv(m, "attention.head_count_kv", keys, 4);
     if (idx < 0) return 0;
     return kv_as_int64(m, idx);
 }
@@ -742,7 +771,7 @@ int64_t gguf_context_length(const gguf_model_t *m) {
         "general.context_length", "qwen35.context_length", "qwen2.context_length",
         "context_length", "llama.context_length"
     };
-    int64_t idx = find_kv_or(m, keys, 5);
+    int64_t idx = find_arch_kv(m, "context_length", keys, 5);
     if (idx < 0) return 0;
     return kv_as_int64(m, idx);
 }
@@ -752,7 +781,7 @@ int64_t gguf_embedding_length(const gguf_model_t *m) {
         "embedding_length", "qwen35.embedding_length", "qwen2.embedding_length",
         "llama.embedding_length", "model_dim"
     };
-    int64_t idx = find_kv_or(m, keys, 5);
+    int64_t idx = find_arch_kv(m, "embedding_length", keys, 5);
     if (idx < 0) return 0;
     return kv_as_int64(m, idx);
 }
@@ -762,7 +791,7 @@ int64_t gguf_block_count(const gguf_model_t *m) {
         "block_count", "qwen35.block_count", "qwen2.block_count",
         "llama.n_layer", "n_layer"
     };
-    int64_t idx = find_kv_or(m, keys, 5);
+    int64_t idx = find_arch_kv(m, "block_count", keys, 5);
     if (idx < 0) return 0;
     return kv_as_int64(m, idx);
 }

@@ -202,45 +202,9 @@ struct QwenModel {
         unload_all_kernels();
     }
 
-    // Phase 15.4 helpers: find KV index by key, extract int64 value, read tensor type by name
-
-    static int64_t find_kv_idx_gguf(gguf_model_t* m, const char* key) {
-        if (!m || !key) return -1;
-        for (int64_t i = 0; i < gguf_n_kv(m); ++i) {
-            if (strcmp(gguf_kv_key(m, i), key) == 0) return i;
-        }
-        return -1;
-    }
-
-    static int64_t kv_as_int64_from_gguf(gguf_model_t* m, int64_t idx) {
-        if (!m || idx < 0) return 0;
-        uint8_t u8v; int8_t i8v; uint16_t u16v; int16_t i16v;
-        uint32_t u32v; int32_t i32v; uint64_t u64v; int64_t i64v;
-        switch (gguf_kv_type(m, idx)) {
-            case 0:  (void)gguf_kv_get_u8(m, idx, &u8v);     return u8v;
-            case 1:  (void)gguf_kv_get_i8(m, idx, &i8v);     return i8v;
-            case 2:  (void)gguf_kv_get_u16(m, idx, &u16v);   return u16v;
-            case 3:  (void)gguf_kv_get_i16(m, idx, &i16v);   return i16v;
-            case 4:  (void)gguf_kv_get_u32(m, idx, &u32v);   return u32v;
-            case 5:  (void)gguf_kv_get_i32(m, idx, &i32v);   return i32v;
-            case 10: (void)gguf_kv_get_u64(m, idx, &u64v);   return u64v;
-            case 11: (void)gguf_kv_get_i64(m, idx, &i64v);   return i64v;
-            default: return 0;
-        }
-    }
-
     bool init(inference_model* model) {
         eng_model = model;
         if (!load_all_kernels()) return false;
-
-        // Phase 15.4: Read full_attention_interval from GGUF KV for hybrid architecture support
-        const char* fa_keys[] = {"qwen35.full_attention_interval", "ssm.full_attention_interval"};
-        int64_t fa_idx = -1;
-        for (int i = 0; i < 2 && fa_idx < 0; ++i) {
-            fa_idx = find_kv_idx_gguf(model->gguf, fa_keys[i]);
-        }
-        model->full_attention_interval = (fa_idx >= 0) ? (int)kv_as_int64_from_gguf(model->gguf, fa_idx) : 0;
-        fprintf(stderr, "[INIT] full_attention_interval=%d (fa_idx=%ld)\n", model->full_attention_interval, fa_idx); fflush(stderr);
 
         // Use dynamic dimensions from engine model (Phase 15.1)
         const int E = model->n_embd, HD = model->head_dim, HQ = model->n_head, HKV = model->n_head_kv, CTX = model->n_ctx;
@@ -254,10 +218,8 @@ struct QwenModel {
         vocab_size = model->vocab_size;
         n_ctx = model->n_ctx;
 
-        // FFN width from the loaded ffn_gate/ffn_up tensors (output dim N); falls back to E.
-        int FF = E;
-        for (const auto& L : model->layers)
-            FF = std::max(FF, std::max(L.W_gate.N, L.W_up.N));
+        // FFN width from feed_forward_length (W.N/K are transposed until Step 3 fixes the loader)
+        const int FF = model->n_ff > 0 ? model->n_ff : E;
         fprintf(stderr, "[INIT] ffn width FF=%d\n", FF); fflush(stderr);
 
         fprintf(stderr, "[SCRATCH] Starting scratch allocation for %d layers\n", n_layer); fflush(stderr);
@@ -344,30 +306,14 @@ struct QwenModel {
         __half* residual = layer_scratch[0].h;
 
         // ---- 2) Decoder layers ----
-        const bool has_ssm = eng_model->full_attention_interval > 0;
         for (int l = 0; l < n_layer; ++l) {
-            // Phase 15.4: Skip SSM-only layers in hybrid architecture
-            if (has_ssm && l % eng_model->full_attention_interval != 0) {
-                continue;  // SSM layer — skip during inference (not yet implemented)
-            }
-
             LayerScratch& s = layer_scratch[l];
             LayerWeights& L = eng_model->layers[l];
-
-            // --- Debug Step Z (Phase 20): Trace skip condition for EVERY block ---
-            {
-                int fa_val = eng_model->full_attention_interval;
-                int mod_result = l % fa_val;
-                fprintf(stderr, "[FORWARD] blk %d: has_ssm=%d fa_int=%d l%%fa=%d -> skip=%d\n",
-                        l, has_ssm, fa_val, mod_result, (has_ssm && mod_result != 0) ? 1 : 0); fflush(stderr);
-            }
+            fprintf(stderr, "[FORWARD] blk %d: kind=%s\n", l,
+                    L.kind == LAYER_FULL_ATTN ? "full_attn" : "linear_attn(identity, Step 5)"); fflush(stderr);
 
             // Force GPU sync before reading CPU memory to ensure all writes are visible
             (void)hipDeviceSynchronize();
-            if (has_ssm && l % eng_model->full_attention_interval != 0) {
-                fprintf(stderr, "[FORWARD] blk %d: SKIPPED (SSM-only, l%%interval=%d)\n", l, l % eng_model->full_attention_interval); fflush(stderr);
-                continue;  // SSM layer — skip during inference (not yet implemented)
-            }
 
             // --- Debug Step X (Phase 20): Print scratch[0][0..7] for ALL blocks ---
             fprintf(stderr, "[FORWARD] blk %d: PRE-OP SCRATCH[0][0..7]= ", l); fflush(stderr);
@@ -406,430 +352,434 @@ struct QwenModel {
             fprintf(stderr, "[FORWARD] blk %d: attn_ln_size=%zu mlp_ln_size=%zu\n",
                     l, L.attn_ln_scale.size(), L.mlp_ln_scale.size()); fflush(stderr);
 
-            // --- a) RMSNorm (attention) ---
-            void* ln_args[] = { residual, L.d_attn_ln, s.d_h, &E_local, &E_local, &eps_f };
-            hipError_t herr;
-            fprintf(stderr, "[FORWARD] rmsnorm: res=%p w=%p out=%p\n", (void*)residual, (void*)L.d_attn_ln, (void*)s.d_h); fflush(stderr);
+            // Token mixer. Gated DeltaNet (LAYER_LINEAR_ATTN) is not implemented yet (Phase 20 Step 5):
+            // those layers pass the residual through unchanged and only run the FFN below.
+            if (L.kind == LAYER_FULL_ATTN) {
+                // --- a) RMSNorm (attention) ---
+                void* ln_args[] = { residual, L.d_attn_ln, s.d_h, &E_local, &E_local, &eps_f };
+                hipError_t herr;
+                fprintf(stderr, "[FORWARD] rmsnorm: res=%p w=%p out=%p\n", (void*)residual, (void*)L.d_attn_ln, (void*)s.d_h); fflush(stderr);
 
-            // Qwen3.5-4B has no learnable layer norm weights — skip kernel launch with null gamma
-            if (L.d_attn_ln == nullptr) {
-                fprintf(stderr, "[FORWARD] attn_ln scale is NULL — doing inline RMSNorm\n"); fflush(stderr);
+                // Qwen3.5-4B has no learnable layer norm weights — skip kernel launch with null gamma
+                if (L.d_attn_ln == nullptr) {
+                    fprintf(stderr, "[FORWARD] attn_ln scale is NULL — doing inline RMSNorm\n"); fflush(stderr);
 
-                // Inline RMSNorm on CPU: rsqrt(mean(x^2) + eps), write to scratch buffer
-                float ssq = 0.0f;
-                for (int i = 0; i < E_local; ++i) ssq += (float)residual[i] * (float)residual[i];
-                const float inv_rms = 1.0f / sqrtf(ssq / (float)E_local + eng_model->eps);
-                for (int i = 0; i < E_local; ++i) s.h[i] = (__half)((float)residual[i] * inv_rms);
-                residual = s.h;  // Continue with normalized data in scratch
+                    // Inline RMSNorm on CPU: rsqrt(mean(x^2) + eps), write to scratch buffer
+                    float ssq = 0.0f;
+                    for (int i = 0; i < E_local; ++i) ssq += (float)residual[i] * (float)residual[i];
+                    const float inv_rms = 1.0f / sqrtf(ssq / (float)E_local + eng_model->eps);
+                    for (int i = 0; i < E_local; ++i) s.h[i] = (__half)((float)residual[i] * inv_rms);
+                    residual = s.h;  // Continue with normalized data in scratch
 
-                // Debug block 0: check after RMSNorm
-                if (l == 0) {
-                    fprintf(stderr, "[FORWARD] POST-RMS blk 0: h[0..7]= "); fflush(stderr);
-                    for (int i = 0; i < std::min(E_local, 8); ++i) {
-                        float v = (float)s.h[i];
-                        if (i > 0) fprintf(stderr, " ");
-                        if (v != v) fprintf(stderr, "nan"); else if (__builtin_isinf(v)) fprintf(stderr, "inf"); else fprintf(stderr, "%.4f", v);
-                    }
-                    fprintf(stderr, "\n"); fflush(stderr);
-                    fprintf(stderr, "[FORWARD] POST-RMS blk 0: layer_scratch[0][0..7]= "); fflush(stderr);
-                    for (int i = 0; i < std::min(E_local, 8); ++i) {
-                        float v = (float)layer_scratch[0].h[i];
-                        if (i > 0) fprintf(stderr, " ");
-                        if (v != v) fprintf(stderr, "nan"); else if (__builtin_isinf(v)) fprintf(stderr, "inf"); else fprintf(stderr, "%.4f", v);
-                    }
-                    fprintf(stderr, "\n"); fflush(stderr);
-                }
-            } else {
-                herr = hipModuleLaunchKernel(fn_layernorm, E, 1, 1, 32, 1, 1, 0, 0, ln_args, nullptr);
-                if (herr != hipSuccess) { fprintf(stderr, "[FORWARD] rmsnorm launch failed: %s\n", hipGetErrorString(herr)); return -1; }
-                (void)hipDeviceSynchronize();
-            }
-
-            // --- b) Q/K/V Projections (gemm_act_fp4, M=1) ---
-            {
-                void* h_ptr = s.d_h;
-                void* w_pack = L.Wq.d_packed;
-                void* w_sc = L.Wq.d_scales;
-                void* w_sf = L.Wq.d_scales_f;
-                void* out_q = s.d_q;
-
-                fprintf(stderr, "[FORWARD] gemm_Q: h=%p W_pack=%p W_sc=%p W_sf=%p out=%p\n",
-                        h_ptr, w_pack, w_sc, w_sf, out_q); fflush(stderr);
-
-                // Verify no NULL pointer values before launch
-                if (!h_ptr || !w_pack || !w_sc || !out_q) {
-                    fprintf(stderr, "[FORWARD] FATAL: NULL kernel arg detected!\n"); fflush(stderr);
-                    return -1;
-                }
-
-                void* g4_args[] = { &h_ptr, &w_pack, &w_sc, &w_sf, &out_q, &one, &DQ_local, &E_local };
-                fprintf(stderr, "[FORWARD] Launching gemm_Q with grid=(%d,%d,1) block=(32,1,1)\n", 1, (DQ+15)/16); fflush(stderr);
-                herr = hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DQ+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
-
-            }
-
-            // K projection
-            {
-                void* h_ptr = s.d_h;
-                void* w_pack = L.Wk.d_packed;
-                void* w_sc = L.Wk.d_scales;
-                void* w_sf = L.Wk.d_scales_f;
-                void* out_k = s.d_k;
-
-                fprintf(stderr, "[FORWARD] gemm_K: h=%p W_pack=%p k=%p\n",
-                        h_ptr, w_pack, out_k); fflush(stderr);
-
-                if (!h_ptr || !w_pack || !w_sc || !out_k) {
-                    fprintf(stderr, "[FORWARD] FATAL: NULL kernel arg in gemm_K!\n"); fflush(stderr);
-                    return -1;
-                }
-
-                void* g4k_args[] = { &h_ptr, &w_pack, &w_sc, &w_sf, &out_k, &one, &DKV_local, &E_local };
-                herr = hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DKV+15)/16, 1, 32, 1, 1, 0, 0, g4k_args, nullptr);
-                if (herr != hipSuccess) { fprintf(stderr, "[FORWARD] gemm_K launch failed: %s\n", hipGetErrorString(herr)); return -1; }
-            }
-
-            // V projection
-            {
-                void* h_ptr = s.d_h;
-                void* w_pack = L.Wv.d_packed;
-                void* w_sc = L.Wv.d_scales;
-                void* w_sf = L.Wv.d_scales_f;
-                void* out_v = s.d_v;
-
-                fprintf(stderr, "[FORWARD] gemm_V: h=%p W_pack=%p v=%p\n",
-                        h_ptr, w_pack, out_v); fflush(stderr);
-
-                void* g4v_args[] = { &h_ptr, &w_pack, &w_sc, &w_sf, &out_v, &one, &DKV_local, &E_local };
-                herr = hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DKV+15)/16, 1, 32, 1, 1, 0, 0, g4v_args, nullptr);
-            }
-            if (herr != hipSuccess) { fprintf(stderr, "[FORWARD] gemm_V launch failed: %s\n", hipGetErrorString(herr)); return -1; }
-            (void)hipDeviceSynchronize();
-
-            // --- Debug Step 1 (Phase 20): Read back K/V from CPU to verify V projection output ---
-            fprintf(stderr, "[FORWARD] blk %d: V-proj sync done — reading back k_fp32/v_fp32\n", l); fflush(stderr);
-            {
-                int kv_debug_count = std::min(HKV * HD, 32);
-                fprintf(stderr, "[FORWARD] blk %d: k_fp32[0..%d]: ", l, kv_debug_count-1); fflush(stderr);
-                for (int i = 0; i < kv_debug_count && i < HKV*HD; ++i) {
-                    float v = s.k_fp32[i];
-                    if (i > 0) fprintf(stderr, " ");
-                    if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.4f", v);
-                }
-                fprintf(stderr, "\n"); fflush(stderr);
-
-                int v_debug_count = DKV;
-                fprintf(stderr, "[FORWARD] blk %d: v_fp32[0..%d]: ", l, v_debug_count-1); fflush(stderr);
-                for (int i = 0; i < v_debug_count && i < DKV; ++i) {
-                    float v = s.v_fp32[i];
-                    if (i > 0) fprintf(stderr, " ");
-                    if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.4f", v);
-                }
-                fprintf(stderr, "\n"); fflush(stderr);
-
-                // Also print last few values to check full range validity
-                fprintf(stderr, "[FORWARD] blk %d: k_fp32[last 8]: ", l); fflush(stderr);
-                {
-                    int start_k = std::max(0, HKV*HD - 8);
-                    for (int i = start_k; i < HKV*HD; ++i) {
-                        float v = s.k_fp32[i];
-                        if (i > start_k) fprintf(stderr, " ");
-                        if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.4f", v);
-                    }
-                    fprintf(stderr, "\n"); fflush(stderr);
-
-                    fprintf(stderr, "[FORWARD] blk %d: v_fp32[last 8]: ", l); fflush(stderr);
-                    {
-                        int start_v = std::max(0, DKV - 8);
-                        for (int i = start_v; i < DKV; ++i) {
-                            float v = s.v_fp32[i];
-                            if (i > start_v) fprintf(stderr, " ");
-                            if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.4f", v);
+                    // Debug block 0: check after RMSNorm
+                    if (l == 0) {
+                        fprintf(stderr, "[FORWARD] POST-RMS blk 0: h[0..7]= "); fflush(stderr);
+                        for (int i = 0; i < std::min(E_local, 8); ++i) {
+                            float v = (float)s.h[i];
+                            if (i > 0) fprintf(stderr, " ");
+                            if (v != v) fprintf(stderr, "nan"); else if (__builtin_isinf(v)) fprintf(stderr, "inf"); else fprintf(stderr, "%.4f", v);
+                        }
+                        fprintf(stderr, "\n"); fflush(stderr);
+                        fprintf(stderr, "[FORWARD] POST-RMS blk 0: layer_scratch[0][0..7]= "); fflush(stderr);
+                        for (int i = 0; i < std::min(E_local, 8); ++i) {
+                            float v = (float)layer_scratch[0].h[i];
+                            if (i > 0) fprintf(stderr, " ");
+                            if (v != v) fprintf(stderr, "nan"); else if (__builtin_isinf(v)) fprintf(stderr, "inf"); else fprintf(stderr, "%.4f", v);
                         }
                         fprintf(stderr, "\n"); fflush(stderr);
                     }
+                } else {
+                    herr = hipModuleLaunchKernel(fn_layernorm, E, 1, 1, 32, 1, 1, 0, 0, ln_args, nullptr);
+                    if (herr != hipSuccess) { fprintf(stderr, "[FORWARD] rmsnorm launch failed: %s\n", hipGetErrorString(herr)); return -1; }
+                    (void)hipDeviceSynchronize();
                 }
-            }
 
+                // --- b) Q/K/V Projections (gemm_act_fp4, M=1) ---
+                {
+                    void* h_ptr = s.d_h;
+                    void* w_pack = L.Wq.d_packed;
+                    void* w_sc = L.Wq.d_scales;
+                    void* w_sf = L.Wq.d_scales_f;
+                    void* out_q = s.d_q;
 
+                    fprintf(stderr, "[FORWARD] gemm_Q: h=%p W_pack=%p W_sc=%p W_sf=%p out=%p\n",
+                            h_ptr, w_pack, w_sc, w_sf, out_q); fflush(stderr);
 
-            // --- Debug Step 2 (Phase 20): Check k_fp32 BEFORE FP16 conversion ---
-            fprintf(stderr, "[FORWARD] blk %d: PRE-STAGING k_fp32[0..15]: ", l); fflush(stderr);
-            for (int i = 0; i < std::min(HKV*HD, 16); ++i) {
-                float v = s.k_fp32[i];
-                if (i > 0) fprintf(stderr, " ");
-                if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.4f", v);
-            }
-            fprintf(stderr, "\n"); fflush(stderr);
+                    // Verify no NULL pointer values before launch
+                    if (!h_ptr || !w_pack || !w_sc || !out_q) {
+                        fprintf(stderr, "[FORWARD] FATAL: NULL kernel arg detected!\n"); fflush(stderr);
+                        return -1;
+                    }
 
-            // --- Debug Step 3 (Phase 20): Check k_fp32 AFTER RoPE on K ---
-            // RoPE is applied in-place to qh and kh buffers after this point.
-            // --- c) Per-head staging (FP32 -> FP16) ---
-            fprintf(stderr, "[FORWARD] blk %d: per-head staging (HQ=%d HD=%d)\n", l, HQ, HD); fflush(stderr);
+                    void* g4_args[] = { &h_ptr, &w_pack, &w_sc, &w_sf, &out_q, &one, &DQ_local, &E_local };
+                    fprintf(stderr, "[FORWARD] Launching gemm_Q with grid=(%d,%d,1) block=(32,1,1)\n", 1, (DQ+15)/16); fflush(stderr);
+                    herr = hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DQ+15)/16, 1, 32, 1, 1, 0, 0, g4_args, nullptr);
 
-            // Debug: print first few q_fp32 values before conversion
-            {
-                int debug_count = std::min(HQ * 8, 16); // print first 8*HQ elements (or up to 16 total)
-                fprintf(stderr, "[FORWARD] q_fp32[0..%d]: ", debug_count-1); fflush(stderr);
-                for (int i = 0; i < debug_count && i < HQ*HD; ++i) {
-                    float v = s.q_fp32[i];
-                    if (i > 0) fprintf(stderr, " ");
-                    if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.4f", v); // NaN check
                 }
-                fprintf(stderr, "\n"); fflush(stderr);
 
-                int k_debug_count = std::min(HKV * 8, 16);
-                fprintf(stderr, "[FORWARD] k_fp32[0..%d]: ", k_debug_count-1); fflush(stderr);
-                for (int i = 0; i < k_debug_count && i < HKV*HD; ++i) {
+                // K projection
+                {
+                    void* h_ptr = s.d_h;
+                    void* w_pack = L.Wk.d_packed;
+                    void* w_sc = L.Wk.d_scales;
+                    void* w_sf = L.Wk.d_scales_f;
+                    void* out_k = s.d_k;
+
+                    fprintf(stderr, "[FORWARD] gemm_K: h=%p W_pack=%p k=%p\n",
+                            h_ptr, w_pack, out_k); fflush(stderr);
+
+                    if (!h_ptr || !w_pack || !w_sc || !out_k) {
+                        fprintf(stderr, "[FORWARD] FATAL: NULL kernel arg in gemm_K!\n"); fflush(stderr);
+                        return -1;
+                    }
+
+                    void* g4k_args[] = { &h_ptr, &w_pack, &w_sc, &w_sf, &out_k, &one, &DKV_local, &E_local };
+                    herr = hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DKV+15)/16, 1, 32, 1, 1, 0, 0, g4k_args, nullptr);
+                    if (herr != hipSuccess) { fprintf(stderr, "[FORWARD] gemm_K launch failed: %s\n", hipGetErrorString(herr)); return -1; }
+                }
+
+                // V projection
+                {
+                    void* h_ptr = s.d_h;
+                    void* w_pack = L.Wv.d_packed;
+                    void* w_sc = L.Wv.d_scales;
+                    void* w_sf = L.Wv.d_scales_f;
+                    void* out_v = s.d_v;
+
+                    fprintf(stderr, "[FORWARD] gemm_V: h=%p W_pack=%p v=%p\n",
+                            h_ptr, w_pack, out_v); fflush(stderr);
+
+                    void* g4v_args[] = { &h_ptr, &w_pack, &w_sc, &w_sf, &out_v, &one, &DKV_local, &E_local };
+                    herr = hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (DKV+15)/16, 1, 32, 1, 1, 0, 0, g4v_args, nullptr);
+                }
+                if (herr != hipSuccess) { fprintf(stderr, "[FORWARD] gemm_V launch failed: %s\n", hipGetErrorString(herr)); return -1; }
+                (void)hipDeviceSynchronize();
+
+                // --- Debug Step 1 (Phase 20): Read back K/V from CPU to verify V projection output ---
+                fprintf(stderr, "[FORWARD] blk %d: V-proj sync done — reading back k_fp32/v_fp32\n", l); fflush(stderr);
+                {
+                    int kv_debug_count = std::min(HKV * HD, 32);
+                    fprintf(stderr, "[FORWARD] blk %d: k_fp32[0..%d]: ", l, kv_debug_count-1); fflush(stderr);
+                    for (int i = 0; i < kv_debug_count && i < HKV*HD; ++i) {
+                        float v = s.k_fp32[i];
+                        if (i > 0) fprintf(stderr, " ");
+                        if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.4f", v);
+                    }
+                    fprintf(stderr, "\n"); fflush(stderr);
+
+                    int v_debug_count = DKV;
+                    fprintf(stderr, "[FORWARD] blk %d: v_fp32[0..%d]: ", l, v_debug_count-1); fflush(stderr);
+                    for (int i = 0; i < v_debug_count && i < DKV; ++i) {
+                        float v = s.v_fp32[i];
+                        if (i > 0) fprintf(stderr, " ");
+                        if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.4f", v);
+                    }
+                    fprintf(stderr, "\n"); fflush(stderr);
+
+                    // Also print last few values to check full range validity
+                    fprintf(stderr, "[FORWARD] blk %d: k_fp32[last 8]: ", l); fflush(stderr);
+                    {
+                        int start_k = std::max(0, HKV*HD - 8);
+                        for (int i = start_k; i < HKV*HD; ++i) {
+                            float v = s.k_fp32[i];
+                            if (i > start_k) fprintf(stderr, " ");
+                            if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.4f", v);
+                        }
+                        fprintf(stderr, "\n"); fflush(stderr);
+
+                        fprintf(stderr, "[FORWARD] blk %d: v_fp32[last 8]: ", l); fflush(stderr);
+                        {
+                            int start_v = std::max(0, DKV - 8);
+                            for (int i = start_v; i < DKV; ++i) {
+                                float v = s.v_fp32[i];
+                                if (i > start_v) fprintf(stderr, " ");
+                                if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.4f", v);
+                            }
+                            fprintf(stderr, "\n"); fflush(stderr);
+                        }
+                    }
+                }
+
+
+
+                // --- Debug Step 2 (Phase 20): Check k_fp32 BEFORE FP16 conversion ---
+                fprintf(stderr, "[FORWARD] blk %d: PRE-STAGING k_fp32[0..15]: ", l); fflush(stderr);
+                for (int i = 0; i < std::min(HKV*HD, 16); ++i) {
                     float v = s.k_fp32[i];
                     if (i > 0) fprintf(stderr, " ");
                     if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.4f", v);
                 }
                 fprintf(stderr, "\n"); fflush(stderr);
-            }
-            for (int h = 0; h < HQ; ++h)
-                for (int d = 0; d < HD; ++d)
-                    s.qh[h*HD + d] = __float2half(s.q_fp32[h*HD + d]);
-            for (int h = 0; h < HKV; ++h)
-                for (int d = 0; d < HD; ++d)
-                    s.kh[h*HD + d] = __float2half(s.k_fp32[h*HD + d]);
-            s.d_qh = s.qh;
-            s.d_kh = s.kh;
 
-            // --- d) RoPE on Q/K ---
-            build_rope_tables(pos, s);
-            int HQ_local = HQ, HD2_local = HD/2;
-            void* rope_args[] = { &s.d_qh, &s.d_rc, &s.d_rs, &s.d_qh, &HQ_local, &HD2_local };
-            fprintf(stderr, "[FORWARD] blk %d: RoPE on Q [%d heads] K [%d heads]\n", l, HQ, HKV); fflush(stderr);
-            (void)hipModuleLaunchKernel(fn_rope, HQ, 1, 1, 32, 1, 1, 0, 0, rope_args, nullptr);
-            (void)hipModuleLaunchKernel(fn_rope, HKV, 1, 1, 32, 1, 1, 0, 0, rope_args, nullptr);
-            (void)hipDeviceSynchronize();
+                // --- Debug Step 3 (Phase 20): Check k_fp32 AFTER RoPE on K ---
+                // RoPE is applied in-place to qh and kh buffers after this point.
+                // --- c) Per-head staging (FP32 -> FP16) ---
+                fprintf(stderr, "[FORWARD] blk %d: per-head staging (HQ=%d HD=%d)\n", l, HQ, HD); fflush(stderr);
 
-            // Debug: check q_h values after RoPE
-            if (l == 0) {
-                fprintf(stderr, "[FORWARD] blk %d: q_h[0..7] AFTER ROPE: ", l); fflush(stderr);
-                for (int i = 0; i < 8 && i < HD; ++i) {
-                    float v = (float)((__half*)s.qh)[i];
-                    if (v != v) fprintf(stderr,"nan "); else fprintf(stderr,"%.4f ",v);
-                }
-                fprintf(stderr, "\n"); fflush(stderr);
-
-                fprintf(stderr, "[FORWARD] blk %d: k_h[0..7]: ", l); fflush(stderr);
-                for (int i = 0; i < 8 && i < HD; ++i) {
-                    float v = (float)((__half*)s.kh)[i];
-                    if (v != v) fprintf(stderr,"nan "); else fprintf(stderr,"%.4f ",v);
-                }
-                fprintf(stderr, "\n"); fflush(stderr);
-            }
-
-            // --- e) KV Store ---
-            // Flatten roped K from per-head to token-major rks
-            for (int h = 0; h < HKV; ++h)
-                for (int d = 0; d < HD; ++d)
-                    s.rks[h*HD + d] = s.kh[h*HD + d];
-            s.d_rks = s.rks;
-
-            // Ensure V projection fully completes before KV store reads its output
-            (void)hipDeviceSynchronize();
-
-
-            __half* kdst_base = kv_cache_k_row(eng_model->kvc, l, 0);
-            __half* vdst_base = kv_cache_v_row(eng_model->kvc, l, 0);
-            fprintf(stderr, "[FORWARD] kv_store PRE: rks=%p v=%p kdst=%p vdst=%p DKV=%d pos=%d CTX=%d\n",
-                    (void*)s.d_rks, (void*)s.d_v, (void*)kdst_base, (void*)vdst_base,
-                    DKV_local, pos, CTX); fflush(stderr);
-
-            // Check for NULL pointers before launch
-            if (!s.d_rks || !s.d_v || !kdst_base || !vdst_base) {
-                fprintf(stderr, "[FORWARD] FATAL: NULL pointer in kv_store! rks=%p v=%p kdst=%p vdst=%p\n",
-                        (void*)s.d_rks, (void*)s.d_v, (void*)kdst_base, (void*)vdst_base); fflush(stderr);
-                return -1;
-            }
-            int pos_local = pos, CTX_local2 = CTX;
-            void* kvs_args[] = { &s.d_rks, &s.d_v, &kdst_base, &vdst_base,
-                                &one, &DKV_local, &pos_local, &CTX_local2 };
-            hipError_t herr_kv = hipModuleLaunchKernel(fn_kv_store, 8, 1, 1, 32, 1, 1, 0, 0, kvs_args, nullptr);
-            if (herr_kv != hipSuccess) { fprintf(stderr, "[FORWARD] kv_store launch failed: %s\n", hipGetErrorString(herr_kv)); return -1; }
-            (void)hipDeviceSynchronize();
-
-            // --- f) Attention per head ---
-            {
-                const __half* kc = kv_cache_k_row_const(eng_model->kvc, l, 0);
-                const __half* vc = kv_cache_v_row_const(eng_model->kvc, l, 0);
-
-                // --- Debug Step 4 (Phase 20): Check KV cache read-back BEFORE attention scoring ---
-                fprintf(stderr, "[FORWARD] blk %d: KV store done — checking kc/vc at %p/%p\n", l, (void*)kc, (void*)vc); fflush(stderr);
+                // Debug: print first few q_fp32 values before conversion
                 {
-                    int kv_check_count = std::min(HKV * HD, 16);
-                    fprintf(stderr, "[FORWARD] blk %d: KV cache k[0..%d]: ", l, kv_check_count-1); fflush(stderr);
-                    for (int i = 0; i < kv_check_count && i < DKV; ++i) {
-                        float v = (float)((const __half*)kc)[i];
+                    int debug_count = std::min(HQ * 8, 16); // print first 8*HQ elements (or up to 16 total)
+                    fprintf(stderr, "[FORWARD] q_fp32[0..%d]: ", debug_count-1); fflush(stderr);
+                    for (int i = 0; i < debug_count && i < HQ*HD; ++i) {
+                        float v = s.q_fp32[i];
+                        if (i > 0) fprintf(stderr, " ");
+                        if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.4f", v); // NaN check
+                    }
+                    fprintf(stderr, "\n"); fflush(stderr);
+
+                    int k_debug_count = std::min(HKV * 8, 16);
+                    fprintf(stderr, "[FORWARD] k_fp32[0..%d]: ", k_debug_count-1); fflush(stderr);
+                    for (int i = 0; i < k_debug_count && i < HKV*HD; ++i) {
+                        float v = s.k_fp32[i];
                         if (i > 0) fprintf(stderr, " ");
                         if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.4f", v);
                     }
                     fprintf(stderr, "\n"); fflush(stderr);
-
-                     fprintf(stderr, "[FORWARD] blk %d: KV cache v[0..%d]: ", l, std::min(DKV, 16)-1); fflush(stderr);
-                    for (int i = 0; i < std::min(DKV, 16); ++i) {
-                        float v = (float)((const __half*)vc)[i];
-                        if (i > 0) fprintf(stderr, " ");
-                        if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.4f", v);
-                    }
-                    fprintf(stderr, "\n"); fflush(stderr);
-                }                int CTX_local3 = CTX, HD_local = HD, qpos_local = pos, pos1_local = pos + 1;
-
-                for (int h = 0; h < HQ; ++h) {
-                    int kh_ = h / GRP;
-
-                    // Build kexpB [HD x CTX] and vexpB [CTX x HD]
-                    for (int d = 0; d < HD; ++d)
-                        for (int p = 0; p <= pos; ++p)
-                            s.kh[d*CTX + p] = kc[p*DKV + kh_*HD + d];
-                    for (int p = 0; p <= pos; ++p)
-                        for (int d = 0; d < HD; ++d)
-                            s.vexpB[p*HD + d] = vc[p*DKV + kh_*HD + d];
-
-                    // --- Scores: [1 x CTX] = qh[h] @ kexpB^T (CPU-side to avoid fp16_gemm gfx1151 bug) ---
-                    const __half* q_h = (__half*)((char*)s.d_qh + h*HD*sizeof(__half));
-                    const __half* k_expB = (const __half*)(s.d_vb2);
-                    float* scores_out = (float*)(s.d_sc);
-
-                    fprintf(stderr, "[FORWARD] attn h=%d: CPU gemm_scores [%d x %d] -> [%d]\n",
-                            h, 1, HD, CTX); fflush(stderr);
-
-                    {
-                        // scores[p] = sum_d(q[d] * kexpB[d][p]), d in [0..HD), p in [0..pos]
-                        // Note: scale is applied by softmax_masked kernel, not here
-
-                        // Debug: print first few query/key values for head 0
-                        if (h == 0 && l == 0) {
-                            fprintf(stderr, "[FORWARD] attn h=0 blk 0: q_h[0..7]="); fflush(stderr);
-                            for (int i = 0; i < std::min(HD,8); ++i) {
-                                float v = (float)q_h[i];
-                                if (i>0) fprintf(stderr,", ");
-                                if (v!=v) fprintf(stderr,"nan"); else fprintf(stderr,"%.4f",v);
-                            }
-                            fprintf(stderr, "\n"); fflush(stderr);
-
-                            fprintf(stderr, "[FORWARD] attn h=0 blk 0: k_expB_col0[0..7]="); fflush(stderr);
-                            for (int i = 0; i < std::min(HD,8); ++i) {
-                                float v = (float)k_expB[(size_t)i * CTX + 0];
-                                if (i>0) fprintf(stderr,", ");
-                                if (v!=v) fprintf(stderr,"nan"); else fprintf(stderr,"%.4f",v);
-                            }
-                            fprintf(stderr, "\n"); fflush(stderr);
-
-                            // Print first score value
-                            float acc_debug = 0.0f;
-                            for (int d = 0; d < HD && d < 16; ++d) {
-                                acc_debug += (float)q_h[d] * (float)k_expB[(size_t)d * CTX + 0];
-                            }
-                            fprintf(stderr, "[FORWARD] attn h=0 blk 0: partial dot(q,k)[0..15] = %.4f\n", acc_debug); fflush(stderr);
-
-                            // Print actual scores array
-                            for (int p = 0; p <= pos && p < 4; ++p) {
-                                fprintf(stderr, "[FORWARD] attn h=0 blk 0: score[%d] = %.4f\n", p, scores_out[p]); fflush(stderr);
-                            }
-                        }
-                        for (int p = 0; p <= pos; ++p) {
-                            float acc = 0.0f;
-                            for (int d = 0; d < HD; ++d) {
-                                acc += (float)q_h[d] * (float)k_expB[(size_t)d * CTX + p];
-                            }
-                            scores_out[p] = acc;
-                        }
-                        // Zero out remaining positions beyond pos (causal mask)
-                        for (int p = pos + 1; p < CTX; ++p) {
-                            scores_out[p] = -INFINITY;
-                        }
-                    }
-
-                    // --- Softmax (causal) — CPU-side, properly handles masking ---
-                    {
-                        const int n_rows = 1;
-                        const int n_cols = CTX;
-                        const int qmax = pos;  // causal ceiling (no qpos array needed)
-
-                        // Find max over VALID columns only (0..qmax), skip masked positions
-                        float m = -INFINITY;
-                        for (int c = 0; c <= qmax && c < n_cols; ++c) {
-                            if (scores_out[c] > m) m = scores_out[c];
-                        }
-
-                        fprintf(stderr, "[FORWARD] attn h=%d: softmax max=%.6f\n", h, m == -INFINITY ? 0.0f : m); fflush(stderr);
-
-                        // Handle degenerate case where all values are -INF
-                        if (m == -INFINITY) {
-                            for (int c = 0; c < n_cols; ++c) scores_out[c] = 0.0f;
-                        } else {
-                            // Subtract max and exponentiate ONLY for valid columns
-                            float e_sum = 0.0f;
-                            for (int c = 0; c <= qmax && c < n_cols; ++c) {
-                                scores_out[c] = expf(scores_out[c] - m);
-                                e_sum += scores_out[c];
-                            }
-                            // Masked positions beyond qmax stay at 0.0f (initialized from kernel output)
-
-                            // Normalize by sum ONLY over valid columns
-                            const float inv_sum = 1.0f / e_sum;
-                            for (int c = 0; c <= qmax && c < n_cols; ++c) {
-                                scores_out[c] *= inv_sum;
-                            }
-
-                            fprintf(stderr, "[FORWARD] attn h=%d: softmax done [0..%d], sum=%.6f\n",
-                                    h, qmax, e_sum); fflush(stderr);
-                        }
-                    }
-
-                    // Probs to FP16
-                    for (int p = 0; p <= pos; ++p)
-                        s.probs_fp16[p] = __float2half(s.scores[p]);
-
-                    // --- Out: [HD] = probs @ vexpB (CPU-side to avoid fp16_gemm gfx1151 bug) ---
-                    const __half* prob_h = (const __half*)(s.d_pf);
-                    const __half* v_expB = (const __half*)(s.d_vb2);
-                    float* out_h = (float*)((char*)s.d_oh + h*HD*sizeof(float));
-
-                    fprintf(stderr, "[FORWARD] attn h=%d: CPU gemm_out [%d x %d] -> [%d]\n",
-                            h, CTX, HD, HD); fflush(stderr);
-
-                    {
-                        // out[d] = sum_p(prob[p] * vexpB[p][d]), d in [0..HD), p in [0..pos]
-                        for (int d = 0; d < HD; ++d) {
-                            float acc = 0.0f;
-                            for (int p = 0; p <= pos; ++p) {
-                                acc += (float)prob_h[p] * (float)v_expB[(size_t)p * HD + d];
-                            }
-                            out_h[d] = acc;
-                        }
-                    }
-
                 }
-            }
-            (void)hipDeviceSynchronize();
+                for (int h = 0; h < HQ; ++h)
+                    for (int d = 0; d < HD; ++d)
+                        s.qh[h*HD + d] = __float2half(s.q_fp32[h*HD + d]);
+                for (int h = 0; h < HKV; ++h)
+                    for (int d = 0; d < HD; ++d)
+                        s.kh[h*HD + d] = __float2half(s.k_fp32[h*HD + d]);
+                s.d_qh = s.qh;
+                s.d_kh = s.kh;
 
-            // --- g) Flatten heads -> oin (FP16) ---
-            for (int h = 0; h < HQ; ++h)
-                for (int d = 0; d < HD; ++d)
-                    s.oin[h*HD + d] = __float2half(s.oh[h*HD + d]);
-            s.d_oin = s.oin;
-
-            // --- h) O-Projection (skip if SSM-only layer with no attention output weights) ---
-            if (L.Wo.d_packed != nullptr) {
-                void* o_args[] = { &s.d_oin, &L.Wo.d_packed, &L.Wo.d_scales, &L.Wo.d_scales_f, &s.d_down,
-                                  &one, &E_local, &DQ_local };
-                fprintf(stderr, "[FORWARD] blk %d: O-proj via gemm_act_fp4 [%d x %d]\n", l, E, DQ_local); fflush(stderr);
-                (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (E+15)/16, 1, 32, 1, 1, 0, 0, o_args, nullptr);
+                // --- d) RoPE on Q/K ---
+                build_rope_tables(pos, s);
+                int HQ_local = HQ, HD2_local = HD/2;
+                void* rope_args[] = { &s.d_qh, &s.d_rc, &s.d_rs, &s.d_qh, &HQ_local, &HD2_local };
+                fprintf(stderr, "[FORWARD] blk %d: RoPE on Q [%d heads] K [%d heads]\n", l, HQ, HKV); fflush(stderr);
+                (void)hipModuleLaunchKernel(fn_rope, HQ, 1, 1, 32, 1, 1, 0, 0, rope_args, nullptr);
+                (void)hipModuleLaunchKernel(fn_rope, HKV, 1, 1, 32, 1, 1, 0, 0, rope_args, nullptr);
                 (void)hipDeviceSynchronize();
-            } else {
-                fprintf(stderr, "[FORWARD] blk %d: no attn_o weights — skipping O-projection\n", l); fflush(stderr);
-                // Zero out down_fp32 so residual add doesn't produce NaN from uninitialized values
-                for (int i = 0; i < E; ++i) s.down_fp32[i] = 0.0f;
-            }
 
-            // --- i) Residual add (attention output) ---
-            for (int i = 0; i < E; ++i)
-                residual[i] = __float2half(__half2float(residual[i]) + s.down_fp32[i]);
+                // Debug: check q_h values after RoPE
+                if (l == 0) {
+                    fprintf(stderr, "[FORWARD] blk %d: q_h[0..7] AFTER ROPE: ", l); fflush(stderr);
+                    for (int i = 0; i < 8 && i < HD; ++i) {
+                        float v = (float)((__half*)s.qh)[i];
+                        if (v != v) fprintf(stderr,"nan "); else fprintf(stderr,"%.4f ",v);
+                    }
+                    fprintf(stderr, "\n"); fflush(stderr);
+
+                    fprintf(stderr, "[FORWARD] blk %d: k_h[0..7]: ", l); fflush(stderr);
+                    for (int i = 0; i < 8 && i < HD; ++i) {
+                        float v = (float)((__half*)s.kh)[i];
+                        if (v != v) fprintf(stderr,"nan "); else fprintf(stderr,"%.4f ",v);
+                    }
+                    fprintf(stderr, "\n"); fflush(stderr);
+                }
+
+                // --- e) KV Store ---
+                // Flatten roped K from per-head to token-major rks
+                for (int h = 0; h < HKV; ++h)
+                    for (int d = 0; d < HD; ++d)
+                        s.rks[h*HD + d] = s.kh[h*HD + d];
+                s.d_rks = s.rks;
+
+                // Ensure V projection fully completes before KV store reads its output
+                (void)hipDeviceSynchronize();
+
+
+                __half* kdst_base = kv_cache_k_row(eng_model->kvc, l, 0);
+                __half* vdst_base = kv_cache_v_row(eng_model->kvc, l, 0);
+                fprintf(stderr, "[FORWARD] kv_store PRE: rks=%p v=%p kdst=%p vdst=%p DKV=%d pos=%d CTX=%d\n",
+                        (void*)s.d_rks, (void*)s.d_v, (void*)kdst_base, (void*)vdst_base,
+                        DKV_local, pos, CTX); fflush(stderr);
+
+                // Check for NULL pointers before launch
+                if (!s.d_rks || !s.d_v || !kdst_base || !vdst_base) {
+                    fprintf(stderr, "[FORWARD] FATAL: NULL pointer in kv_store! rks=%p v=%p kdst=%p vdst=%p\n",
+                            (void*)s.d_rks, (void*)s.d_v, (void*)kdst_base, (void*)vdst_base); fflush(stderr);
+                    return -1;
+                }
+                int pos_local = pos, CTX_local2 = CTX;
+                void* kvs_args[] = { &s.d_rks, &s.d_v, &kdst_base, &vdst_base,
+                                    &one, &DKV_local, &pos_local, &CTX_local2 };
+                hipError_t herr_kv = hipModuleLaunchKernel(fn_kv_store, 8, 1, 1, 32, 1, 1, 0, 0, kvs_args, nullptr);
+                if (herr_kv != hipSuccess) { fprintf(stderr, "[FORWARD] kv_store launch failed: %s\n", hipGetErrorString(herr_kv)); return -1; }
+                (void)hipDeviceSynchronize();
+
+                // --- f) Attention per head ---
+                {
+                    const __half* kc = kv_cache_k_row_const(eng_model->kvc, l, 0);
+                    const __half* vc = kv_cache_v_row_const(eng_model->kvc, l, 0);
+
+                    // --- Debug Step 4 (Phase 20): Check KV cache read-back BEFORE attention scoring ---
+                    fprintf(stderr, "[FORWARD] blk %d: KV store done — checking kc/vc at %p/%p\n", l, (void*)kc, (void*)vc); fflush(stderr);
+                    {
+                        int kv_check_count = std::min(HKV * HD, 16);
+                        fprintf(stderr, "[FORWARD] blk %d: KV cache k[0..%d]: ", l, kv_check_count-1); fflush(stderr);
+                        for (int i = 0; i < kv_check_count && i < DKV; ++i) {
+                            float v = (float)((const __half*)kc)[i];
+                            if (i > 0) fprintf(stderr, " ");
+                            if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.4f", v);
+                        }
+                        fprintf(stderr, "\n"); fflush(stderr);
+
+                         fprintf(stderr, "[FORWARD] blk %d: KV cache v[0..%d]: ", l, std::min(DKV, 16)-1); fflush(stderr);
+                        for (int i = 0; i < std::min(DKV, 16); ++i) {
+                            float v = (float)((const __half*)vc)[i];
+                            if (i > 0) fprintf(stderr, " ");
+                            if (v != v) fprintf(stderr, "nan"); else fprintf(stderr, "%.4f", v);
+                        }
+                        fprintf(stderr, "\n"); fflush(stderr);
+                    }                int CTX_local3 = CTX, HD_local = HD, qpos_local = pos, pos1_local = pos + 1;
+
+                    for (int h = 0; h < HQ; ++h) {
+                        int kh_ = h / GRP;
+
+                        // Build kexpB [HD x CTX] and vexpB [CTX x HD]
+                        for (int d = 0; d < HD; ++d)
+                            for (int p = 0; p <= pos; ++p)
+                                s.kh[d*CTX + p] = kc[p*DKV + kh_*HD + d];
+                        for (int p = 0; p <= pos; ++p)
+                            for (int d = 0; d < HD; ++d)
+                                s.vexpB[p*HD + d] = vc[p*DKV + kh_*HD + d];
+
+                        // --- Scores: [1 x CTX] = qh[h] @ kexpB^T (CPU-side to avoid fp16_gemm gfx1151 bug) ---
+                        const __half* q_h = (__half*)((char*)s.d_qh + h*HD*sizeof(__half));
+                        const __half* k_expB = (const __half*)(s.d_vb2);
+                        float* scores_out = (float*)(s.d_sc);
+
+                        fprintf(stderr, "[FORWARD] attn h=%d: CPU gemm_scores [%d x %d] -> [%d]\n",
+                                h, 1, HD, CTX); fflush(stderr);
+
+                        {
+                            // scores[p] = sum_d(q[d] * kexpB[d][p]), d in [0..HD), p in [0..pos]
+                            // Note: scale is applied by softmax_masked kernel, not here
+
+                            // Debug: print first few query/key values for head 0
+                            if (h == 0 && l == 0) {
+                                fprintf(stderr, "[FORWARD] attn h=0 blk 0: q_h[0..7]="); fflush(stderr);
+                                for (int i = 0; i < std::min(HD,8); ++i) {
+                                    float v = (float)q_h[i];
+                                    if (i>0) fprintf(stderr,", ");
+                                    if (v!=v) fprintf(stderr,"nan"); else fprintf(stderr,"%.4f",v);
+                                }
+                                fprintf(stderr, "\n"); fflush(stderr);
+
+                                fprintf(stderr, "[FORWARD] attn h=0 blk 0: k_expB_col0[0..7]="); fflush(stderr);
+                                for (int i = 0; i < std::min(HD,8); ++i) {
+                                    float v = (float)k_expB[(size_t)i * CTX + 0];
+                                    if (i>0) fprintf(stderr,", ");
+                                    if (v!=v) fprintf(stderr,"nan"); else fprintf(stderr,"%.4f",v);
+                                }
+                                fprintf(stderr, "\n"); fflush(stderr);
+
+                                // Print first score value
+                                float acc_debug = 0.0f;
+                                for (int d = 0; d < HD && d < 16; ++d) {
+                                    acc_debug += (float)q_h[d] * (float)k_expB[(size_t)d * CTX + 0];
+                                }
+                                fprintf(stderr, "[FORWARD] attn h=0 blk 0: partial dot(q,k)[0..15] = %.4f\n", acc_debug); fflush(stderr);
+
+                                // Print actual scores array
+                                for (int p = 0; p <= pos && p < 4; ++p) {
+                                    fprintf(stderr, "[FORWARD] attn h=0 blk 0: score[%d] = %.4f\n", p, scores_out[p]); fflush(stderr);
+                                }
+                            }
+                            for (int p = 0; p <= pos; ++p) {
+                                float acc = 0.0f;
+                                for (int d = 0; d < HD; ++d) {
+                                    acc += (float)q_h[d] * (float)k_expB[(size_t)d * CTX + p];
+                                }
+                                scores_out[p] = acc;
+                            }
+                            // Zero out remaining positions beyond pos (causal mask)
+                            for (int p = pos + 1; p < CTX; ++p) {
+                                scores_out[p] = -INFINITY;
+                            }
+                        }
+
+                        // --- Softmax (causal) — CPU-side, properly handles masking ---
+                        {
+                            const int n_rows = 1;
+                            const int n_cols = CTX;
+                            const int qmax = pos;  // causal ceiling (no qpos array needed)
+
+                            // Find max over VALID columns only (0..qmax), skip masked positions
+                            float m = -INFINITY;
+                            for (int c = 0; c <= qmax && c < n_cols; ++c) {
+                                if (scores_out[c] > m) m = scores_out[c];
+                            }
+
+                            fprintf(stderr, "[FORWARD] attn h=%d: softmax max=%.6f\n", h, m == -INFINITY ? 0.0f : m); fflush(stderr);
+
+                            // Handle degenerate case where all values are -INF
+                            if (m == -INFINITY) {
+                                for (int c = 0; c < n_cols; ++c) scores_out[c] = 0.0f;
+                            } else {
+                                // Subtract max and exponentiate ONLY for valid columns
+                                float e_sum = 0.0f;
+                                for (int c = 0; c <= qmax && c < n_cols; ++c) {
+                                    scores_out[c] = expf(scores_out[c] - m);
+                                    e_sum += scores_out[c];
+                                }
+                                // Masked positions beyond qmax stay at 0.0f (initialized from kernel output)
+
+                                // Normalize by sum ONLY over valid columns
+                                const float inv_sum = 1.0f / e_sum;
+                                for (int c = 0; c <= qmax && c < n_cols; ++c) {
+                                    scores_out[c] *= inv_sum;
+                                }
+
+                                fprintf(stderr, "[FORWARD] attn h=%d: softmax done [0..%d], sum=%.6f\n",
+                                        h, qmax, e_sum); fflush(stderr);
+                            }
+                        }
+
+                        // Probs to FP16
+                        for (int p = 0; p <= pos; ++p)
+                            s.probs_fp16[p] = __float2half(s.scores[p]);
+
+                        // --- Out: [HD] = probs @ vexpB (CPU-side to avoid fp16_gemm gfx1151 bug) ---
+                        const __half* prob_h = (const __half*)(s.d_pf);
+                        const __half* v_expB = (const __half*)(s.d_vb2);
+                        float* out_h = (float*)((char*)s.d_oh + h*HD*sizeof(float));
+
+                        fprintf(stderr, "[FORWARD] attn h=%d: CPU gemm_out [%d x %d] -> [%d]\n",
+                                h, CTX, HD, HD); fflush(stderr);
+
+                        {
+                            // out[d] = sum_p(prob[p] * vexpB[p][d]), d in [0..HD), p in [0..pos]
+                            for (int d = 0; d < HD; ++d) {
+                                float acc = 0.0f;
+                                for (int p = 0; p <= pos; ++p) {
+                                    acc += (float)prob_h[p] * (float)v_expB[(size_t)p * HD + d];
+                                }
+                                out_h[d] = acc;
+                            }
+                        }
+
+                    }
+                }
+                (void)hipDeviceSynchronize();
+
+                // --- g) Flatten heads -> oin (FP16) ---
+                for (int h = 0; h < HQ; ++h)
+                    for (int d = 0; d < HD; ++d)
+                        s.oin[h*HD + d] = __float2half(s.oh[h*HD + d]);
+                s.d_oin = s.oin;
+
+                // --- h) O-Projection (skip if SSM-only layer with no attention output weights) ---
+                if (L.Wo.d_packed != nullptr) {
+                    void* o_args[] = { &s.d_oin, &L.Wo.d_packed, &L.Wo.d_scales, &L.Wo.d_scales_f, &s.d_down,
+                                      &one, &E_local, &DQ_local };
+                    fprintf(stderr, "[FORWARD] blk %d: O-proj via gemm_act_fp4 [%d x %d]\n", l, E, DQ_local); fflush(stderr);
+                    (void)hipModuleLaunchKernel(fn_gemm_act_fp4, 1, (E+15)/16, 1, 32, 1, 1, 0, 0, o_args, nullptr);
+                    (void)hipDeviceSynchronize();
+                } else {
+                    fprintf(stderr, "[FORWARD] blk %d: no attn_o weights — skipping O-projection\n", l); fflush(stderr);
+                    // Zero out down_fp32 so residual add doesn't produce NaN from uninitialized values
+                    for (int i = 0; i < E; ++i) s.down_fp32[i] = 0.0f;
+                }
+
+                // --- i) Residual add (attention output) ---
+                for (int i = 0; i < E; ++i)
+                    residual[i] = __float2half(__half2float(residual[i]) + s.down_fp32[i]);
+            }
 
             // --- j) RMSNorm (MLP) ---
             void* ln2_args[] = { &residual, &L.d_mlp_ln, &s.d_hmlp,
@@ -1056,6 +1006,15 @@ int qwen_model_forward_batch(qwen_model_t* model,
     const int E = m->n_embd, HD = m->head_dim, HQ = m->n_head, HKV = m->n_head_kv;
     const int DQ = HQ * HD, DKV = HKV * HD;
     const float eps_f = (float)eng->eps;
+
+    // The batched path still assumes every layer is full attention (and has the old FFN issues).
+    // Refuse hybrid models until the single-token path is validated (Phase 20).
+    for (int l = 0; l < m->n_layer; ++l) {
+        if (eng->layers[l].kind != LAYER_FULL_ATTN) {
+            qwen_set_error("batched forward does not support linear-attention (DeltaNet) layers yet");
+            return INFERENCE_ERR_NOT_IMPLEMENTED;
+        }
+    }
 
     // Allocate temporary GPU buffers for the batch - same pattern as inference_forward_batch
     size_t scores_bytes = (size_t)batch_size * seq_len * seq_len * sizeof(float);

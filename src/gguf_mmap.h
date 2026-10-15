@@ -61,7 +61,12 @@ int64_t      gguf_head_count(const gguf_model_t *model);   /* attention heads */
 int64_t      gguf_head_count_kv(const gguf_model_t *model); /* RoPE dimensions hint */
 int64_t      gguf_context_length(const gguf_model_t *model); /* stored context_len if present */
 int64_t      gguf_embedding_length(const gguf_model_t *model); /* embedding/d_model dimension */
-int64_t      gguf_block_count(const gguf_model_t *model);  /* number of transformer layers */
+int64_t      gguf_block_count(const gguf_model_t *model);  /* number of blocks (incl. MTP/nextn blocks) */
+
+/* Architecture-scoped hyperparameters: reads "<general.architecture>.<suffix>",
+ * e.g. gguf_arch_int(m, "attention.key_length", 0). Returns def if absent. */
+int64_t      gguf_arch_int(const gguf_model_t *model, const char *suffix, int64_t def);
+float        gguf_arch_float(const gguf_model_t *model, const char *suffix, float def);
 
 /* Read scalar KV value as string. Returns NULL if not a string or key not found. */
 const char  *gguf_kv_str_val(const gguf_model_t *model, int64_t idx);
