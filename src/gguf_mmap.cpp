@@ -828,3 +828,9 @@ const void* gguf_mmap_get_tensor(const gguf_model_t* model, const char* name, si
     return gguf_get_tensor_ptr(model, name, out_bytes);
 }
 
+
+const void* gguf_map_base(const gguf_model_t *m, size_t* out_size) {
+    if (!m) return NULL;
+    if (out_size) *out_size = m->map_size;
+    return m->map_ptr;
+}

@@ -83,6 +83,10 @@ int32_t gguf_kv_get_added_tokens(const gguf_model_t *model, const char* key, con
  * out_bytes receives the tensor size in bytes. */
 const void* gguf_get_tensor_ptr(const gguf_model_t *model, const char* name, size_t* out_bytes);
 
+/* Base and size of the whole read-only file mapping, for pinning it once with
+ * hipHostRegister(..., hipHostRegisterReadOnly) so kernels read weights in place. */
+const void* gguf_map_base(const gguf_model_t *model, size_t* out_size);
+
 /* --- Quantization type helpers --- */
 
 /* Check if a tensor type stores scales internally (self-contained).

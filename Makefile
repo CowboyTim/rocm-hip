@@ -70,6 +70,7 @@ ACTFP4_VERIFY    = $(BINDIR)/actfp4_verify
 # Phase 9: Tokenizer verification
 TOKENIZER_VERIFY = $(BINDIR)/tokenizer_verify
 DEQUANT_VERIFY   = $(BINDIR)/dequant_verify
+MATVEC_VERIFY    = $(BINDIR)/matvec_verify
 
 # Phase 3: end-to-end attention block integration test (chains every Phase-3 kernel)
 ATTN_VERIFY      = $(BINDIR)/attn_verify
@@ -88,7 +89,7 @@ QWEN_MODEL_LIB   = $(BUILDDIR)/libqwen.a
 QWEN_DEMO        = $(BINDIR)/qwen_demo
 
 # --- Build Rules ---
-all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(DEQUANT_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO)
+all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(DEQUANT_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO)
 
 $(WMMA_TARGET): $(WMMA_OBJ) $(WMMA_CO)
 	$(CLANG) $(WMMA_OBJ) $(LDFLAGS) -o $@
@@ -154,6 +155,9 @@ $(ACTFP4_VERIFY): $(TESTSDIR)/actfp4_verify.cpp $(CODIR)/gemm_act_fp4.co
 # Phase 9: Tokenizer verification (no .co files needed)
 $(DEQUANT_VERIFY): $(TESTSDIR)/dequant_verify.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/quant_types.h $(SRCDIR)/gguf_mmap.cpp
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/dequant_verify.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
+
+$(MATVEC_VERIFY): $(TESTSDIR)/matvec_verify.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/qmatvec.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(CODIR)/matvec_q.co
+	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/matvec_verify.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(LDFLAGS) -o $@
 
 $(TOKENIZER_VERIFY): $(TESTSDIR)/tokenizer_verify.cpp $(SRCDIR)/tokenizer.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/tokenizer.h
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/tokenizer_verify.cpp $(SRCDIR)/tokenizer.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/quant_types.cpp $(LDFLAGS) -o $@

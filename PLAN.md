@@ -1292,7 +1292,25 @@ Original text: In the loader, classify each block by tensor presence
 switches on `kind`; delete the `l % interval` arithmetic. Fix `gguf_block_count()` and other key lookups to use
 `general.architecture`.
 
-**Step 3: weight decoding.** *(Re-scoped 2026-10-15 after the type correction.)* The loader's `case 13`/`case 14`
+**Step 3: weight decoding — 3a ✅ 3b ✅ 3c TODO.** *(Goal: eventually every GGUF quant type.)*
+- **3a ✅ `src/quant_types.{h,cpp}`**: a per-type table (block size, bytes, `to_float`). It is the single source of
+  truth for block geometry; `gguf_mmap` uses it too, and its old size arrays were wrong (ROCMFP4 17 B, Q6_K 176 B).
+  `tests/dequant_verify` checks it **bit-exact** against `ref_dump dequant`. Verified on real tensors: F32, BF16, Q2_K,
+  Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0_ROCMFP4, Q4_0_ROCMFP4_FAST. Ported but not yet seen in a test
+  model: F16, Q5_0, Q5_1. Test quants: `bartowski/Qwen_Qwen3-0.6B-GGUF` in `/dev/shm/models/hf-qwen3-0.6b/`
+  (Q2_K, Q3_K_M, Q4_0, Q4_1, Q4_K_M, Q8_0), references in `/dev/shm/ref_hf/`.
+- **3b ✅ `src/matvec_q.hip` + `src/qmatvec.{h,cpp}`**: `y = W·x` with one wave per row, reading **raw GGUF blocks in
+  place** from the GGUF mapping pinned once with `hipHostRegister(..., hipHostRegisterReadOnly)`. No repacking and no
+  copies. One kernel per type (`matvec_<type>`), dispatched by type ID; FP32 activations and accumulation.
+  `tests/matvec_verify` (run from `build/co`) checks the first 2-D tensor of every type in a file: all pass, worst
+  relative error ≤ 1.3e-7, including 248k-row LM heads and the 20 GB 35B. Not tuned for speed yet.
+- **3c TODO**: switch the loader and forward pass to this path. A weight becomes {type, N = ne[1], K = ne[0],
+  pointer into the map, row_bytes}. Pin the map once. Every projection calls `qmatvec_launch`. Delete the old
+  `packed`/`scales`/`scales_f`/`true_v` repacking (~500 lines in `load_quant_weight_from_gguf`), the `.scales`
+  lookups and `gemm_act_fp4` on this path. This fixes 3a (N/K transpose), 3b (interleaved bytes) and 3c (wrong value
+  maps) from Step 0 in one go. Norms become F32 vectors read straight from the map.
+
+*(Original re-scope notes, 2026-10-15, after the type correction:)* The loader's `case 13`/`case 14`
 treat Q5_K/Q6_K as invented "UE4M3 custom" formats (144/176-byte blocks); the real ggml blocks are
 `block_q5_K` = 176 B and `block_q6_K` = 210 B per 256 values. The `case 2/3/8` (Q4_0/Q4_1/Q8_0) paths are never hit
 by these models. Norms are F32: read them directly, with no dequant. Needed decoders, each checked bit-exact against

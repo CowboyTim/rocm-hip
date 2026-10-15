@@ -1,0 +1,149 @@
+// matvec_verify — Phase 20 Step 3b: GPU matvec on raw GGUF blocks vs CPU reference.
+//
+//   matvec_verify <model.gguf> [tensor ...]
+//
+// Pins the whole GGUF mapping read-only (zero-copy) and runs matvec_<type> on real 2-D weight
+// tensors: by default the first tensor of every type in the file. The reference decodes each row
+// with qt_to_float (bit-exact vs ggml, see dequant_verify) and accumulates in double.
+// Pass: |gpu - ref| <= 1e-5 * sum_k |w_k x_k| for every row. Run from build/co (loads matvec_q.co).
+
+#include "gguf_mmap.h"
+#include "qmatvec.h"
+#include "quant_types.h"
+
+#include <hip/hip_runtime.h>
+
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <fcntl.h>
+#include <string>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <vector>
+
+// /dev/shm-backed, hipHostRegister'ed buffer (project core pattern)
+struct ShmBuf {
+    void *p = nullptr;
+    size_t n = 0;
+    bool alloc(const char *name, size_t bytes) {
+        std::string path = std::string("/dev/shm/") + name;
+        int fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0 || ftruncate(fd, (off_t)bytes) != 0) return false;
+        p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        close(fd);
+        unlink(path.c_str());
+        if (p == MAP_FAILED) return false;
+        n = bytes;
+        return hipHostRegister(p, bytes, hipHostRegisterMapped) == hipSuccess;
+    }
+    ~ShmBuf() {
+        if (p && p != MAP_FAILED) {
+            (void)hipHostUnregister(p);
+            munmap(p, n);
+        }
+    }
+};
+
+static bool run_one(gguf_model_t *g, int64_t idx, ShmBuf &xb, ShmBuf &yb) {
+    const char *name = gguf_tensor_name(g, idx);
+    const int type = gguf_tensor_type(g, idx);
+    const int64_t *ne = gguf_tensor_ne(g, idx);
+    const qt_traits *tr = qt_get_traits(type);
+    const int K = (int)ne[0];
+    const int N = (int)ne[1];
+    if (!tr || !qmatvec_supported(type)) {
+        printf("  [FAIL] %-32s type %d has no matvec kernel\n", name, type);
+        return false;
+    }
+    const size_t rb = qt_row_size(type, K);
+    size_t bytes = 0;
+    const uint8_t *W = (const uint8_t *)gguf_get_tensor_ptr(g, name, &bytes);
+    if ((size_t)K * sizeof(float) > xb.n || (size_t)N * sizeof(float) > yb.n) {
+        printf("  [SKIP] %-32s shape %dx%d exceeds test buffers\n", name, N, K);
+        return true;
+    }
+
+    float *x = (float *)xb.p, *y = (float *)yb.p;
+    uint32_t s = 12345u;
+    for (int k = 0; k < K; ++k) {
+        s = s * 1664525u + 1013904223u;
+        x[k] = ((int)(s >> 9) - (1 << 22)) / (float)(1 << 22);  // [-1, 1)
+    }
+    memset(y, 0, (size_t)N * sizeof(float));
+
+    hipError_t e = qmatvec_launch(type, W, rb, x, y, N, K, 0);
+    if (e == hipSuccess) e = hipDeviceSynchronize();
+    if (e != hipSuccess) {
+        printf("  [FAIL] %-32s launch: %s\n", name, hipGetErrorString(e));
+        return false;
+    }
+
+    std::vector<float> row((size_t)K);
+    double worst = 0.0;
+    int bad = 0, worst_n = 0;
+    for (int n = 0; n < N; ++n) {
+        qt_to_float(type, W + (size_t)n * rb, row.data(), K);
+        double ref = 0.0, mag = 0.0;
+        for (int k = 0; k < K; ++k) {
+            ref += (double)row[k] * x[k];
+            mag += std::fabs((double)row[k] * x[k]);
+        }
+        const double rel = std::fabs(y[n] - ref) / (mag + 1e-30);
+        if (rel > worst) {
+            worst = rel;
+            worst_n = n;
+        }
+        if (rel > 1e-5) ++bad;
+    }
+    printf("  [%s] %-32s %-18s %6d x %-6d worst rel err %.2e (row %d)%s\n", bad ? "FAIL" : "PASS", name, tr->name,
+           N, K, worst, worst_n, bad ? " <-- rows over 1e-5" : "");
+    return bad == 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <model.gguf> [tensor ...]\n", argv[0]);
+        return 2;
+    }
+    if (qmatvec_init("matvec_q.co") != 0) return 2;
+    gguf_model_t *g = gguf_mmap_open(argv[1]);
+    if (!g) return 2;
+    size_t map_size = 0;
+    void *base = (void *)gguf_map_base(g, &map_size);
+    hipError_t e = hipHostRegister(base, map_size, hipHostRegisterReadOnly);
+    if (e != hipSuccess) {
+        fprintf(stderr, "hipHostRegister(GGUF map, ReadOnly) failed: %s\n", hipGetErrorString(e));
+        return 2;
+    }
+
+    ShmBuf xb, yb;
+    if (!xb.alloc("matvec_verify_x.bin", 64u << 20) || !yb.alloc("matvec_verify_y.bin", 64u << 20)) {
+        fprintf(stderr, "cannot allocate /dev/shm buffers\n");
+        return 2;
+    }
+
+    std::vector<int64_t> todo;
+    if (argc > 2) {
+        for (int a = 2; a < argc; ++a)
+            for (int64_t i = 0; i < gguf_n_tensors(g); ++i)
+                if (strcmp(gguf_tensor_name(g, i), argv[a]) == 0) todo.push_back(i);
+    } else {
+        bool seen[256] = {false};
+        for (int64_t i = 0; i < gguf_n_tensors(g); ++i) {
+            const int t = gguf_tensor_type(g, i);
+            const int64_t *ne = gguf_tensor_ne(g, i);
+            if (t < 0 || t >= 256 || seen[t] || ne[1] <= 1) continue;  // 2-D weights only
+            seen[t] = true;
+            todo.push_back(i);
+        }
+    }
+
+    int fail = 0;
+    for (int64_t i : todo) fail += !run_one(g, i, xb, yb);
+    (void)hipHostUnregister(base);
+    gguf_mmap_close(g);
+    qmatvec_free();
+    printf("matvec_verify: %zu tensors, %d failed\n", todo.size(), fail);
+    return fail ? 1 : 0;
+}
