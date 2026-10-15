@@ -1256,8 +1256,8 @@ reference, and nothing from it goes into `libinference` or the CPAN XS module. S
 
 Reference data (in /dev/shm, regenerate after a container restart):
 - `/dev/shm/ref_qwen35_4b/`: "The capital of France is" → tokens `760 6511 314 9338 369`, 1301 tensors (295 MB),
-  **top-1 next token 11751 " Paris"**; `dequant/` has one tensor per type (Q5_K, ROCMFP4, Q6_K, F32).
-- `/dev/shm/ref_qwen36_35b/dequant/`: BF16 `output.weight`, ROCMFP4_FAST `attn_q` and `ffn_down_exps`, Q6_K `token_embd`.
+  **top-1 next token 11751 " Paris"**. This is the Step 4–7 oracle; keep it.
+- Dequant dumps (`<dir>/dequant/`, `/dev/shm/ref_hf/`) were deleted after 3a verified everything bit-exact. Regenerate with `ref_dump dequant <gguf> <dir> <tensor>...` for new types.
 
 Original Step 1 text, kept for history: oracle available, tooling remaining. `llama.cpp/build-cpu` (ROCmFPX
 main) already runs the 4B and dumps every intermediate tensor (see 20.2a). Remaining work: (a) a script that saves
@@ -1298,7 +1298,7 @@ switches on `kind`; delete the `l % interval` arithmetic. Fix `gguf_block_count(
   `tests/dequant_verify` checks it **bit-exact** against `ref_dump dequant`. Verified on real tensors: F32, BF16, Q2_K,
   Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0_ROCMFP4, Q4_0_ROCMFP4_FAST. Ported but not yet seen in a test
   model: F16, Q5_0, Q5_1. Test quants: `bartowski/Qwen_Qwen3-0.6B-GGUF` in `/dev/shm/models/hf-qwen3-0.6b/`
-  (Q2_K, Q3_K_M, Q4_0, Q4_1, Q4_K_M, Q8_0), references in `/dev/shm/ref_hf/`.
+  (Q2_K, Q3_K_M, Q4_0, Q4_1, Q4_K_M, Q8_0).
 - **3b ✅ `src/matvec_q.hip` + `src/qmatvec.{h,cpp}`**: `y = W·x` with one wave per row, reading **raw GGUF blocks in
   place** from the GGUF mapping pinned once with `hipHostRegister(..., hipHostRegisterReadOnly)`. No repacking and no
   copies. One kernel per type (`matvec_<type>`), dispatched by type ID; FP32 activations and accumulation.
