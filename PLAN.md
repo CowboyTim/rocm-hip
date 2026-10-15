@@ -1179,6 +1179,31 @@ for the symptoms above.
 - **Arch keys**: GGUF key lookups hard-code `qwen35.`. Read `general.architecture` and build `<arch>.<key>`.
 - 14 compiler warnings (were zero after 9b8ba6b).
 
+### 20.2a State re-check (2026-10-15, HEAD 6ca5f18)
+
+- **Build**: clean, 0 errors, 28 warnings (up from 14: format `%d`/`int64_t` and unused variables).
+- **Harnesses**: all 8 `*_verify` pass, **but only when run from `build/co/`**. They load `.co` files by
+  relative path, so from the repo root 7 of 8 "fail" with `*.co: No such file or directory`. `make test` must `cd build/co`.
+- **`qwen_demo` on the 4B**: exit 0, but generates token 0 ×5 with NaN residuals. The log confirms 20.1 #1 directly
+  (`blk 4: has_ssm=1 … l%fa=0 -> skip=0`; attention runs on DeltaNet blocks 0, 4, …, 32, including the MTP
+  block). Every FFN is skipped because `FF` is derived from `W_gate.N`, which is 2560 because of the N/K transpose (3a).
+- **Tokenizer is wrong**: our engine encodes "The capital of France is" as 8 tokens
+  `760 288 62865 288 1020 288 47358 18039`, while llama.cpp gives 5 tokens `760 6511 314 9338 369`.
+- **Reference oracle already exists.** `llama.cpp/` (gitignored, not a submodule) is a clean checkout of
+  ROCmFPX `origin/main` @ `dfeacaf` (github.com/aardbeiplantje/ROCmFPX), with a CPU build in `llama.cpp/build-cpu`.
+  `llama-eval-callback -m Qwen3.5-4B-ROCMFP4.gguf -p "The capital of France is" -n 1 -t 16` runs and dumps every
+  intermediate tensor: `attn_norm-N`, `linear_attn_qkv_mixed`, `conv_output_silu`, `q/k/v_conv_predelta`, `new_state`,
+  `final_output`, `Kcur`/`Vcur`, `ffn_gate/up/swiglu/out`, `l_out-N`, … for 24 DeltaNet + 8 full-attention layers.
+  `llama-tokenize` is there too. This replaces the archived `q4_0_rocmfp4_q8_1` fork as the Step 1 oracle.
+- **Authoritative block layouts** (`llama.cpp/ggml/rocmfp4/rocmfp4.h`):
+  - TYPE100 = `GGML_TYPE_Q4_0_ROCMFP4`, `block_rocmfp4 { uint8_t qs[16]; uint8_t e[2]; }` = **18 bytes**:
+    16 nibble bytes first, then one UE4M3 scale per 16-value half.
+  - TYPE101 = `GGML_TYPE_Q4_0_ROCMFP4_FAST`, `block_rocmfp4_fast { uint8_t qs[16]; uint8_t e; }` = **17 bytes**, one scale.
+  - Dequant reference: `rocmfp4_dequantize_row_q4_0[_fast]` in `ggml/rocmfp4/rocmfp4.c`.
+- **New bug (TYPE100 decode)**: `inference.cpp` (lines 163, 326–338, 540–550, 1369–1374) uses a **17-byte** stride for
+  TYPE100 and reads nibbles at offset `16 + k/2`, i.e. from the scale bytes and the next block. All 164
+  TYPE100 tensors in the 4B decode as garbage. This is a Step 3 fix.
+
 ### 20.3 Plan
 
 **Target model: `Qwen3.5-4B-ROCMFP4.gguf`** (restored to `/dev/shm/models/` on 2026-10-14). It has hybrid
@@ -1207,7 +1232,7 @@ Found during Step 0 (fold into the steps below):
   K=2560). Some call sites compensate (`inference.cpp:753` hard-codes `Wq.N=E, Wq.K=DQ`), and launches use
   config dims, not `W.N/K`.
 - **3b. `w.packed` is raw GGUF block bytes**, with scales/deltas interleaved (Q4_0: 2B delta + 16B qs per 32
-  values; TYPE100: 17-byte blocks). `gemm_act_fp4` expects pure `N × K/2` nibble rows, so it reads scale bytes as
+  values; TYPE100: 18-byte blocks, 16B qs then 2 UE4M3 scales; the loader wrongly uses 17, see 20.2a). `gemm_act_fp4` expects pure `N × K/2` nibble rows, so it reads scale bytes as
   weights. Repack to nibble rows at load time (and record the per-format nibble order: Q4_0/Q4_1 store elements
   0–15 in low nibbles and 16–31 in high nibbles), or teach the kernel the block formats.
 - **3c. The Q4_0/Q4_1 value mapping is not Codebook10.** Q4_0 is `(nib − 8) × d`, Q4_1 is `nib × d + m`, but the
@@ -1221,10 +1246,13 @@ Found during Step 0 (fold into the steps below):
 - The batched path (`qwen_model_forward_batch`, ~`qwen_model.cpp:1295`) still calls `swiglu_fp4` with the same
   FFN-width and missing-down-projection issues. Fix it after the single-token path is validated.
 
-**Step 1: reference oracle** [blocking]. Build the archived `q4_0_rocmfp4_q8_1` llama.cpp fork (it understands
-ftype 107/108). Dump per-layer activations for one prompt token (`llama-eval-callback` or `GGML_SCHED` debug),
-plus the dequantized values of one tensor of each type (TYPE100/101/30, Q8_0, Q4_1). Every later step is checked
-against this, not against "no NaN".
+**Step 1: reference oracle** [blocking] — oracle available, tooling remaining. `llama.cpp/build-cpu` (ROCmFPX
+main) already runs the 4B and dumps every intermediate tensor (see 20.2a). Remaining work: (a) a script that saves
+the full `llama-eval-callback` tensors to `.npy`/binary (the default print is truncated to 3+3 values per row; use
+`GGML_SCHED`/a small custom callback or the `--tensor-filter`-style dump if available) for one token; (b) a tiny
+tool linked against `libggml` that dequantizes one tensor of each type (TYPE100/101/30, Q4_0, Q4_1, Q8_0) via
+`ggml_get_type_traits()->to_float`; (c) the reference token IDs from `llama-tokenize`. Every later step is
+checked against this, not against "no NaN".
 
 **Step 2: single source of truth for layer types.** In the loader, classify each block by tensor presence
 (`ssm_alpha` ⇒ linear, `attn_q` ⇒ full, `nextn` ⇒ MTP/excluded) into `LayerWeights::kind`. The forward pass
