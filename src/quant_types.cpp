@@ -164,6 +164,67 @@ static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t
     }
 }
 
+// Q2_K: scales[16] qs[64] d(f16) dmin(f16) = 84 B
+static void deq_q2_K(const void *src, float *y, int64_t n) {
+    const uint8_t *b = (const uint8_t *)src;
+    for (int64_t i = 0; i < n / 256; ++i, b += 84) {
+        const uint8_t *scales = b;
+        const uint8_t *q = b + 16;
+        const float d   = rd_fp16(b + 80);
+        const float min = rd_fp16(b + 82);
+        int is = 0;
+        for (int nn = 0; nn < 256; nn += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                uint8_t sc = scales[is++];
+                float dl = d * (sc & 0xF), ml = min * (sc >> 4);
+                for (int l = 0; l < 16; ++l) *y++ = dl * ((int8_t)((q[l] >> shift) & 3)) - ml;
+                sc = scales[is++];
+                dl = d * (sc & 0xF);
+                ml = min * (sc >> 4);
+                for (int l = 0; l < 16; ++l) *y++ = dl * ((int8_t)((q[l + 16] >> shift) & 3)) - ml;
+                shift += 2;
+            }
+            q += 32;
+        }
+    }
+}
+
+// Q3_K: hmask[32] qs[64] scales[12] d(f16) = 110 B
+static void deq_q3_K(const void *src, float *y, int64_t n) {
+    const uint32_t kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f;
+    const uint8_t *b = (const uint8_t *)src;
+    uint32_t aux[4];
+    const int8_t *scales = (const int8_t *)aux;
+    for (int64_t i = 0; i < n / 256; ++i, b += 110) {
+        const uint8_t *hm = b;
+        const uint8_t *q = b + 32;
+        const float d_all = rd_fp16(b + 108);
+        memcpy(aux, b + 96, 12);
+        const uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        uint8_t m = 1;
+        int is = 0;
+        for (int nn = 0; nn < 256; nn += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                float dl = d_all * (scales[is++] - 32);
+                for (int l = 0; l < 16; ++l)
+                    *y++ = dl * ((int8_t)((q[l + 0] >> shift) & 3) - ((hm[l + 0] & m) ? 0 : 4));
+                dl = d_all * (scales[is++] - 32);
+                for (int l = 0; l < 16; ++l)
+                    *y++ = dl * ((int8_t)((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
+                shift += 2;
+                m <<= 1;
+            }
+            q += 32;
+        }
+    }
+}
+
 // Q4_K: d(f16) dmin(f16) scales[12] qs[128] = 144 B
 static void deq_q4_K(const void *src, float *y, int64_t n) {
     const uint8_t *b = (const uint8_t *)src;
@@ -290,12 +351,14 @@ static void deq_rocmfp4_fast(const void *src, float *y, int64_t n) {
 static const qt_traits k_traits[] = {
     {QT_F32,               "f32",               1,   4,   deq_f32,          1},
     {QT_F16,               "f16",               1,   2,   deq_f16,          0},
-    {QT_Q4_0,              "q4_0",              32,  18,  deq_q4_0,         0},
-    {QT_Q4_1,              "q4_1",              32,  20,  deq_q4_1,         0},
+    {QT_Q4_0,              "q4_0",              32,  18,  deq_q4_0,         1},
+    {QT_Q4_1,              "q4_1",              32,  20,  deq_q4_1,         1},
     {QT_Q5_0,              "q5_0",              32,  22,  deq_q5_0,         0},
     {QT_Q5_1,              "q5_1",              32,  24,  deq_q5_1,         0},
-    {QT_Q8_0,              "q8_0",              32,  34,  deq_q8_0,         0},
-    {QT_Q4_K,              "q4_K",              256, 144, deq_q4_K,         0},
+    {QT_Q8_0,              "q8_0",              32,  34,  deq_q8_0,         1},
+    {QT_Q2_K,              "q2_K",              256, 84,  deq_q2_K,         1},
+    {QT_Q3_K,              "q3_K",              256, 110, deq_q3_K,         1},
+    {QT_Q4_K,              "q4_K",              256, 144, deq_q4_K,         1},
     {QT_Q5_K,              "q5_K",              256, 176, deq_q5_K,         1},
     {QT_Q6_K,              "q6_K",              256, 210, deq_q6_K,         1},
     {QT_BF16,              "bf16",              1,   2,   deq_bf16,         1},

@@ -24,6 +24,8 @@ enum qt_type {
     QT_Q5_0 = 6,
     QT_Q5_1 = 7,
     QT_Q8_0 = 8,
+    QT_Q2_K = 10,
+    QT_Q3_K = 11,
     QT_Q4_K = 12,
     QT_Q5_K = 13,
     QT_Q6_K = 14,
