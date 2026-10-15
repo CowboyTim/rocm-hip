@@ -4,6 +4,7 @@
  * --------------------------------------------------------------------------- */
 
 #include "gguf_mmap.h"
+#include "quant_types.h"
 
 #include <stdio.h>      /* fprintf, stderr */
 #include <stdlib.h>     /* calloc, free, malloc */
@@ -39,81 +40,15 @@ enum gguf_type {
 };
 
 /* Block sizes (elements per block for quantized types) */
-static const int64_t BLOCK_SIZES[] = {
-    1, 1, 32, 32,          // indices 0-3: Q8_0, Q8_1, ...
-    0, 0,                  // indices 4-5 (reserved)
-    32, 32, 32, 32,        // indices 6-9: FP8 types
-    256, 256, 256, 256, 256, 256,   // indices 10-15: QK types
-    0,                     // index 16
-    0,                     // index 17
-    0,                     // index 18
-    0,                     // index 19
-    0,                     // index 20
-    0,                     // index 21
-    0,                     // index 22
-    0,                     // index 23
-    0,                     // index 24
-    0,                     // index 25
-    0,                     // index 26
-    0,                     // index 27
-    0,                     // index 28
-    0,                     // index 29
-    0,                     // index 30
-    0,                     // index 31
-    0,                     // index 32
-    0,                     // index 33
-    0,                     // index 34
-    0,                     // index 35
-    0,                     // index 36
-    0,                     // index 37
-    0,                     // index 38
-    32,                   // index 39: MXFP4 (ROCmFP4)
-    64                    // index 40: MXFP4 scales (not a weight type)
-};
-
-/* Type sizes (bytes per block) */
-static const size_t TYPE_SIZES[] = {
-    sizeof(float),          // index 0: F32
-    sizeof(ggml_half),      // index 1: F16
-    18,                     // index 2: Q8_0 block
-    20,                     // index 3: Q8_1 block
-    0,                      // index 4 (reserved)
-    0,                      // index 5 (reserved)
-    22,                     // index 6: FP8_E4M3 block
-    24,                     // index 7: FP8_E5M2 block
-    34,                     // index 8: FP8 block
-    36,                     // index 9: FP8 block
-    62,                     // index 10: QK type
-    70,                     // index 11: QK type
-    134,                    // index 12: QK type
-    154,                    // index 13: QK type
-    176,                    // index 14: QK type
-    290,                    // index 15: QK type
-    0,                      // indices 16-38 (unused/reserved)
-    0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0,
-    0, 0, 0,
-    17,                    // index 39: MXFP4 block (32 values + scales)
-    36                     // index 40: MXFP4 scales block
-};
-
+/* Block geometry comes from the single per-type table in quant_types (Phase 20 Step 3). */
 static inline int64_t get_block_size(int type) {
-    if (type >= 0 && type < 43) return BLOCK_SIZES[type];
-    /* Extended types beyond fixed array */
-    switch (type) {
-        case 100: return 32;   /* TYPE100 = ROCmFP4 Codebook10 */
-        default: return -1;
-    }
+    const qt_traits *t = qt_get_traits(type);
+    return t ? t->blck_size : -1;
 }
 
 static inline size_t get_type_size(int type) {
-    if (type >= 0 && type < 43) return TYPE_SIZES[type];
-    /* Extended types beyond fixed array */
-    switch (type) {
-        case 100: return 17;   /* TYPE100 = ROCmFP4 Codebook10: 32 nibbles + scale */
-        default: return (size_t)-1;
-    }
+    const qt_traits *t = qt_get_traits(type);
+    return t ? (size_t)t->type_size : (size_t)-1;
 }
 
 /* Check if a tensor type stores scales internally within each block.
