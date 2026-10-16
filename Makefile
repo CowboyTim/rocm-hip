@@ -71,6 +71,8 @@ ACTFP4_VERIFY    = $(BINDIR)/actfp4_verify
 TOKENIZER_VERIFY = $(BINDIR)/tokenizer_verify
 DEQUANT_VERIFY   = $(BINDIR)/dequant_verify
 MATVEC_VERIFY    = $(BINDIR)/matvec_verify
+# Phase 20 Step 3c: engine pieces vs the llama.cpp reference activations (ref_dump acts). Run from build/co.
+FORWARD_VERIFY   = $(BINDIR)/forward_verify
 
 # Phase 3: end-to-end attention block integration test (chains every Phase-3 kernel)
 ATTN_VERIFY      = $(BINDIR)/attn_verify
@@ -89,7 +91,7 @@ QWEN_MODEL_LIB   = $(BUILDDIR)/libqwen.a
 QWEN_DEMO        = $(BINDIR)/qwen_demo
 
 # --- Build Rules ---
-all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(DEQUANT_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO)
+all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(DEQUANT_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY)
 
 $(WMMA_TARGET): $(WMMA_OBJ) $(WMMA_CO)
 	$(CLANG) $(WMMA_OBJ) $(LDFLAGS) -o $@
@@ -228,20 +230,28 @@ uninstall:
 	rm -f $(INSTALL_PKGCONFIGDIR)/rocm-inference.pc
 
 # Phase 4: Qwen 3 model static library
-$(QWEN_MODEL_LIB): $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_model.h $(SRCDIR)/inference.h $(SRCDIR)/gguf_mmap.h $(SRCDIR)/kv_cache.h
+QWEN_SRCS = $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_ops.cpp $(SRCDIR)/qmatvec.cpp
+QWEN_HDRS = $(SRCDIR)/qwen_model.h $(SRCDIR)/qwen_ops.h $(SRCDIR)/qmatvec.h $(SRCDIR)/inference_internal.h
+
+$(QWEN_MODEL_LIB): $(QWEN_SRCS) $(QWEN_HDRS) $(SRCDIR)/inference.h $(SRCDIR)/gguf_mmap.h $(SRCDIR)/kv_cache.h
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/qwen_model.cpp -o $(OBJDIR)/qwen_model.o
-	ar rcs $@ $(OBJDIR)/qwen_model.o
+	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/qwen_ops.cpp -o $(OBJDIR)/qwen_ops.o
+	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/qmatvec.cpp -o $(OBJDIR)/qmatvec.o
+	ar rcs $@ $(OBJDIR)/qwen_model.o $(OBJDIR)/qwen_ops.o $(OBJDIR)/qmatvec.o
 
 # Phase 4: Qwen 3 demo binary
-$(QWEN_DEMO): $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_model.h $(SRCDIR)/inference.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/demo_qwen.cpp $(INFERENCE_LIB)
-	$(CLANG) $(CXXFLAGS) -I. $(SRCDIR)/qwen_model.cpp $(SRCDIR)/inference.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/demo_qwen.cpp $(INFERENCE_LIB) $(LDFLAGS) -o $@
+$(QWEN_DEMO): $(SRCDIR)/demo_qwen.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/matvec_q.co
+	$(CLANG) $(CXXFLAGS) -I. $(SRCDIR)/demo_qwen.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
+
+$(FORWARD_VERIFY): $(TESTSDIR)/forward_verify.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/matvec_q.co
+	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/forward_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
 
 # End-to-end inference test (real model testing)
 E2E_TEST = $(BINDIR)/inference_e2e_test
 E2E_OBJ = $(OBJDIR)/inference_e2e_test.o
 
 $(E2E_TEST): $(E2E_OBJ) $(CODIR)/embedding_lookup.co copy_co_files
-	$(CLANG) $(CXXFLAGS) -I. $(SRCDIR)/qwen_model.cpp $(SRCDIR)/inference.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/tokenizer.cpp $(E2E_OBJ) $(LDFLAGS) -o $@
+	$(CLANG) $(CXXFLAGS) -I. $(QWEN_SRCS) $(SRCDIR)/inference.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/tokenizer.cpp $(E2E_OBJ) $(LDFLAGS) -o $@
 
 $(OBJDIR)/inference_e2e_test.o: $(SRCDIR)/inference_e2e_test.cpp
 	$(CLANG) $(CXXFLAGS) -I. -c $< -o $@

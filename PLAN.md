@@ -1206,26 +1206,30 @@ for the symptoms above.
 
 ### 20.3 Plan
 
-> **▶ NEXT STEP (as of 2026-10-15, HEAD aee78c5): Step 3c — switch the loader and forward pass to the verified weight path.**
+> **▶ NEXT STEP (as of 2026-10-16): Step 5 — Gated DeltaNet layers.**
 >
-> Steps 1, 2, 3a and 3b are done. The decoders (`quant_types`) and GPU kernels (`matvec_q.hip` / `qmatvec`) are
-> verified on their own, but the engine still uses the old repacking code, so `qwen_demo` still outputs token 0.
+> Step 3c is done: the engine reads every weight in place through `qmatvec`. `tests/forward_verify` checks
+> each piece against the reference: embeddings, norms, all projections, the LM head, and every
+> full-attention piece from Step 4. Only `forward_verify`'s blk.3 is checked; the other full-attention
+> layers run the same code. All pieces pass in isolation, and the LM head picks " Paris" from the reference
+> hidden state. The 24 DeltaNet layers are still identity, so the hidden state drifts from the reference
+> starting at layer 0, and `qwen_demo` produces wrong tokens. Every remaining end-to-end check is blocked
+> on Step 5.
 >
-> 1. **Loader:** a weight becomes {type, N = ne[1], K = ne[0], pointer into the GGUF map, row_bytes}. Pin the whole
->    map once (`gguf_map_base` + `hipHostRegisterReadOnly`). Delete the per-format repacking in
->    `load_quant_weight_from_gguf` (`packed`/`scales`/`scales_f`/`true_v`, `.scales` lookups, ~500 lines). This
->    fixes the N/K transpose, scale bytes read as weights, and wrong value maps (Step 0 findings 3a–3c).
-> 2. **Norms:** read the F32 norm vectors (`attn_norm`, `post_attention_norm`, `attn_q_norm`/`attn_k_norm`,
->    `output_norm`) directly from the map.
-> 3. **Forward:** Q/K/V/O, FFN gate/up/down and the LM head all call `qmatvec_launch` instead of `gemm_act_fp4`.
+> 1. **CPU reference first** (`qwen_ops`), checked piece by piece against `/dev/shm/ref_qwen35_4b`, layer 0
+>    (seq 2–37): `attn_qkv` → `linear_attn_qkv_mixed`; conv1d (kernel 4) with state → `conv_output_silu`;
+>    q/k L2 norm → `q/k_conv_predelta`; `ssm_alpha`/`ssm_a`/`ssm_dt` → `gate`; `ssm_beta` → `beta_sigmoid`;
+>    delta-rule update → `new_state`/`attn_output`; `ssm_norm` → `norm`; `attn_gate` (z) gating →
+>    `final_output`; `ssm_out` → `linear_attn_out`. Extend `forward_verify` with each.
+> 2. **State:** conv state (3 × 8192) and recurrent state (32 heads × 128 × 128) per DeltaNet layer, persisted
+>    across tokens like the KV cache (a /dev/shm buffer, pinned).
+> 3. **Then the end-to-end check:** `l_out-N` for every layer within FP tolerance when running the 5 reference
+>    tokens through `qwen_model_forward`, and top-1 = 11751 " Paris". Feed the reference token IDs directly,
+>    because the tokenizer is still wrong.
 >
-> **Check:** no end-to-end token match yet (attention and DeltaNet arrive in Steps 4–5). Compare isolated pieces
-> against `/dev/shm/ref_qwen35_4b`, e.g. feed the reference `attn_post_norm-0` (or the FFN input) through layer 0's FFN
-> and diff it with `ffn_out-0`. FFNs must stop being skipped by the shape guard.
->
-> **Then:** Step 4 (8 full-attention layers: gated Q, q/k norm, partial-rotary M-RoPE with theta 1e7, diffed per
-> layer against the reference) → Step 5 (Gated DeltaNet) → Step 7 (final norm + LM head; target: next token " Paris",
-> id 11751). **In parallel, any time:** fix the tokenizer (8 tokens vs the reference's 5 `760 6511 314 9338 369`).
+> **In parallel, any time:** fix the tokenizer (8 tokens vs the reference's 5 `760 6511 314 9338 369`).
+> **After 5:** Step 7's checks (output norm + LM head) already pass in isolation, so the remaining work is
+> Step 6 for the 35B (MoE), then speed (fused GPU norms/attention, fewer syncs).
 
 **Target model: `Qwen3.5-4B-ROCMFP4.gguf`** (restored to `/dev/shm/models/` on 2026-10-14). It has hybrid
 DeltaNet + gated attention but a dense FFN, and only F32/ROCMFP4/Q5_K/Q6_K tensors, so no MoE and no
@@ -1304,7 +1308,7 @@ Found and fixed while doing it:
 - FF now comes from `feed_forward_length`. FFNs are still skipped by the shape guard until Step 3 fixes the N/K transpose.
 
 Still open:
-- The FFN pre-norm tensor is `post_attention_norm.weight` (no `ffn_norm`), and the loader's norm path expects FP16 sizes. Handle both in Step 4.
+- ~~The FFN pre-norm tensor is `post_attention_norm.weight` (no `ffn_norm`), and the loader's norm path expects FP16 sizes.~~ Done in 3c: bound as F32 `LayerWeights::ffn_norm`.
 - 35B: hparams now load (`qwen35moe`, 40 + 1 blocks), then weight loading aborts with `std::length_error` (MoE/TYPE101). Expected; the 35B comes after the 4B.
 - `make clean` deletes `build/ref_dump`, so rerun `make ref_dump` after a clean.
 
@@ -1313,7 +1317,7 @@ Original text: In the loader, classify each block by tensor presence
 switches on `kind`; delete the `l % interval` arithmetic. Fix `gguf_block_count()` and other key lookups to use
 `general.architecture`.
 
-**Step 3: weight decoding — 3a ✅ 3b ✅ 3c TODO.** *(Goal: eventually every GGUF quant type.)*
+**Step 3: weight decoding — 3a ✅ 3b ✅ 3c ✅.** *(Goal: eventually every GGUF quant type.)*
 - **3a ✅ `src/quant_types.{h,cpp}`**: a per-type table (block size, bytes, `to_float`). It is the single source of
   truth for block geometry; `gguf_mmap` uses it too, and its old size arrays were wrong (ROCMFP4 17 B, Q6_K 176 B).
   `tests/dequant_verify` checks it **bit-exact** against `ref_dump dequant`. Verified on real tensors: F32, BF16, Q2_K,
@@ -1325,11 +1329,41 @@ switches on `kind`; delete the `l % interval` arithmetic. Fix `gguf_block_count(
   copies. One kernel per type (`matvec_<type>`), dispatched by type ID; FP32 activations and accumulation.
   `tests/matvec_verify` (run from `build/co`) checks the first 2-D tensor of every type in a file: all pass, worst
   relative error ≤ 1.3e-7, including 248k-row LM heads and the 20 GB 35B. Not tuned for speed yet.
-- **3c TODO**: switch the loader and forward pass to this path. A weight becomes {type, N = ne[1], K = ne[0],
-  pointer into the map, row_bytes}. Pin the map once. Every projection calls `qmatvec_launch`. Delete the old
-  `packed`/`scales`/`scales_f`/`true_v` repacking (~500 lines in `load_quant_weight_from_gguf`), the `.scales`
-  lookups and `gemm_act_fp4` on this path. This fixes 3a (N/K transpose), 3b (interleaved bytes) and 3c (wrong value
-  maps) from Step 0 in one go. Norms become F32 vectors read straight from the map.
+- **3c ✅ (2026-10-16) loader + forward on the zero-copy path.**
+  - **Loader** (`inference.cpp`, 1976 → ~580 lines): `QuantWeight` is now `{type, N = ne[1], K = ne[0], row_bytes,
+    data}`, with `data` pointing into the GGUF mapping. The whole map is pinned once with `hipHostRegisterReadOnly`.
+    Deleted: `load_quant_weight_from_gguf` with its `packed`/`scales`/`scales_f`/`true_v` repacking, the
+    combined-QKV splitting, the `.scales` lookups, the per-type embedding dequant, and the FP16 embed-table copy
+    to `hipMalloc` memory. Every tensor is bound by name, and the loader fails on a missing tensor, an unknown
+    type, or a shape that disagrees with the hparams. F32 norms (`attn_norm`, `post_attention_norm`,
+    `attn_q_norm`/`attn_k_norm`, `output_norm`) are read straight from the map. The LM head is `output.weight`,
+    or `token_embd` when tied (4B: tied, Q6_K).
+  - **Forward** (`qwen_model.cpp`, 1334 → ~270 lines): the residual stream is F32 in one pinned /dev/shm scratch
+    buffer. Every projection calls `qmatvec_launch`: Q/K/V/O, FFN gate/up/down, and the LM head. The embedding
+    decodes one `token_embd` row per token with `qt_to_float`. Norms, RoPE, attention and SwiGLU are CPU ops in
+    the new `src/qwen_ops.{h,cpp}`, which the test calls too. Full attention now follows the llama.cpp qwen35
+    graph (Step 4 pieces): [Q | gate] per head in `attn_q`, q/k RMSNorm with gamma, NeoX RoPE over the first
+    `n_rot` = 64 dims with theta 1e7 (M-RoPE reduces to this for text tokens), GQA (head h → KV head h / 4),
+    and a sigmoid output gate. `gemm_act_fp4`/`swiglu_fp4` are no longer used by the engine. The batched path
+    now returns `INFERENCE_ERR_NOT_IMPLEMENTED`; it assumed the old repacked weights.
+  - **`tests/forward_verify <gguf> <ref_dir>`** (run from `build/co`): feeds *reference* inputs through each
+    engine piece and diffs the output for all 5 prompt tokens. Results on the 4B:
+    - Element-wise ops agree to ≤ 2.1e-7 relative: token_embd row, attn_norm, post_attention_norm, SwiGLU,
+      Q split + q_norm, K k_norm, Q/K RoPE, sigmoid gate, gated output, and output_norm. Most are bit-exact.
+      Norm weights are applied as-is (no +1).
+    - Projections, covering every weight type in the 4B (ROCMFP4, Q5_K, Q6_K): blk.0 ffn_gate/up/down, blk.3
+      attn_q/k/v/output, and the LM head. All agree to ≤ 5.5e-7 relative once the input is round-tripped
+      through the reference's activation format. ggml's CPU matmul quantizes activations to the weight's
+      `vec_dot_type` (Q8_0 for ROCMFP4, Q8_K for K-quants); qmatvec keeps FP32. With FP32 input the cosine is
+      0.9992–0.99999. That gap is the reference's own quantization noise, not ours.
+    - Attention over the reference K/V: 8.6e-4 relative (cos 0.9999999), with a 2e-3 bound. ggml's CPU flash
+      attention casts Q to FP16 and accumulates softmax·V in an FP16 buffer (`VKQ16`); ours stays FP32.
+    - The LM head on the reference `result_norm` picks **11751 " Paris"**, matching the reference.
+  - **`qwen_demo`:** runs all 32 layers with no NaNs, in ~2.9 s for 13 tokens (load included). FFNs now run on
+    every layer; the old shape guard skipped them all. Tokens are still wrong because DeltaNet is identity and
+    the tokenizer is wrong. Also fixed: the demo fed token 0 as the first generation step instead of the
+    prefill argmax, and the demo and e2e test double-freed the Qwen model (`inference_free_model` already frees it).
+  - All 8 old `*_verify` harnesses and `matvec_verify` still pass; 0 build warnings in the touched targets.
 
 *(Original re-scope notes, 2026-10-15, after the type correction:)* The loader's `case 13`/`case 14`
 treat Q5_K/Q6_K as invented "UE4M3 custom" formats (144/176-byte blocks); the real ggml blocks are
@@ -1341,7 +1375,7 @@ reference dequant from step 1 (and later add TYPE101/TYPE30 for the 35B). Dequan
 (M=1, N=8192, K=2048), (b) the float-scale path, and (c) one real tensor from the GGUF compared with the reference.
 Fix the Q4_0 34-vs-18 block size.
 
-**Step 4: full-attention layers correct.** Pre-norm with gamma; Q/K/V projections; split Q and gate; per-head
+**Step 4: full-attention layers correct — pieces ✅ (3c), end-to-end layer diff waits on Step 5.** Pre-norm with gamma; Q/K/V projections; split Q and gate; per-head
 q_norm/k_norm; partial-rotary M-RoPE with theta from GGUF; GQA (16 Q heads / 4 KV heads); sigmoid output gate;
 O projection; post-attention norm. Compare layer 3 output with the reference, temporarily treating linear
 layers as identity in both implementations.

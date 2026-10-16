@@ -44,7 +44,6 @@ int main(int argc, char** argv) {
     int32_t* tokens = inference_tokenize(engine, prompt, &n_tokens);
     if (!tokens) {
         fprintf(stderr, "Tokenize failed: %s\n", inference_get_last_error());
-        qwen_model_free(model);
         inference_kv_cache_free(engine);
         inference_free_model(engine);
         return 1;
@@ -54,27 +53,31 @@ int main(int argc, char** argv) {
     for (int i = 0; i < n_tokens; ++i) printf("%d ", tokens[i]);
     printf("\n");
 
-    // Prefill
+    // Prefill; the last prompt token's logits give the first generated token
     int vocab_size = inference_vocab_size(engine);
+    int next = 0;
     for (int i = 0; i < n_tokens; ++i) {
         float* logits = new float[vocab_size];
         if (qwen_model_forward(model, tokens[i], i, logits) != 0) {
             fprintf(stderr, "Forward failed at token %d: %s\n", i, inference_get_last_error());
             delete[] logits;
             inference_free_tokens(tokens, n_tokens);
-            qwen_model_free(model);
             inference_kv_cache_free(engine);
             inference_free_model(engine);
             return 1;
         }
-        // Greedy next token (for prefill, we just run forward to populate KV cache)
+        next = 0;
+        for (int v = 1; v < vocab_size; ++v) {
+            if (logits[v] > logits[next]) next = v;
+        }
         delete[] logits;
     }
     inference_free_tokens(tokens, n_tokens);
 
     // Generate a few continuation tokens
-    int next = 0;
     for (int i = 0; i < 5; ++i) {
+        printf("Generated token %d: %d\n", i, next);
+        if (i == 4) break;
         float* logits = new float[vocab_size];
         if (qwen_model_forward(model, next, n_tokens + i, logits) != 0) {
             fprintf(stderr, "Generation failed: %s\n", inference_get_last_error());
@@ -86,7 +89,6 @@ int main(int argc, char** argv) {
         for (int v = 1; v < vocab_size; ++v) {
             if (logits[v] > logits[next]) next = v;
         }
-        printf("Generated token %d: %d\n", i, next);
         delete[] logits;
     }
 

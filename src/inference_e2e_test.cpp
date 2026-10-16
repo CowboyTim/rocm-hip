@@ -74,7 +74,6 @@ int main(int argc, char** argv) {
     int32_t* tokens = inference_tokenize(engine, prompt, &n_tokens);
     if (!tokens) {
         fprintf(stderr, "FAILED: Tokenize failed: %s\n", inference_get_last_error());
-        qwen_model_free(model);
         inference_kv_cache_free(engine);
         inference_free_model(engine);
         return 1;
@@ -139,7 +138,6 @@ int main(int argc, char** argv) {
 
     if (!success) {
         inference_free_tokens(tokens, n_tokens);
-        qwen_model_free(model);
         inference_kv_cache_free(engine);
         inference_free_model(engine);
         return 1;
@@ -189,7 +187,6 @@ int main(int argc, char** argv) {
 
     if (!success) {
         inference_free_tokens(tokens, n_tokens);
-        qwen_model_free(model);
         inference_kv_cache_free(engine);
         inference_free_model(engine);
         return 1;
@@ -207,7 +204,6 @@ int main(int argc, char** argv) {
     printf("  Generated: %d tokens\n", num_gen_tokens);
 
     inference_free_tokens(tokens, n_tokens);
-    qwen_model_free(model);
     inference_kv_cache_free(engine);
     inference_free_model(engine);
 
