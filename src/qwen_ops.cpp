@@ -49,3 +49,54 @@ void qwen_attention(const float* q, const __half* K, const __half* V, int kv_str
         }
     }
 }
+
+void qwen_ssm_conv_step(float* state, const float* x, const float* w, float* y, int channels, int d_conv) {
+    const int ns = d_conv - 1;
+    for (int c = 0; c < channels; ++c) {
+        float* st = state + (size_t)c * ns;
+        const float* wc = w + (size_t)c * d_conv;
+        float sum = 0.0f;
+        for (int i = 0; i < ns; ++i) sum += st[i] * wc[i];
+        sum += x[c] * wc[ns];
+        y[c] = sum;
+        for (int i = 0; i + 1 < ns; ++i) st[i] = st[i + 1];
+        st[ns - 1] = x[c];
+    }
+}
+
+void qwen_l2norm(const float* x, float* y, int n, float eps) {
+    double ss = 0.0;
+    for (int i = 0; i < n; ++i) ss += (double)(x[i] * x[i]);
+    const float scale = 1.0f / std::fmax(std::sqrt((float)ss), eps);
+    for (int i = 0; i < n; ++i) y[i] = x[i] * scale;
+}
+
+void qwen_gated_delta_step(float* S, const float* q, const float* k, const float* v, const float* g,
+                           const float* beta, int n_v_heads, int n_k_heads, int d, float* out) {
+    const float scale = 1.0f / std::sqrt((float)d);
+    std::vector<float> delta(d);
+    for (int h = 0; h < n_v_heads; ++h) {
+        float* M = S + (size_t)h * d * d;
+        const float* qh = q + (size_t)(h % n_k_heads) * d;
+        const float* kh = k + (size_t)(h % n_k_heads) * d;
+        const float* vh = v + (size_t)h * d;
+        const float decay = std::exp(g[h]);
+        for (size_t i = 0; i < (size_t)d * d; ++i) M[i] *= decay;
+        for (int j = 0; j < d; ++j) {
+            const float* row = M + (size_t)j * d;
+            float sum = 0.0f;
+            for (int i = 0; i < d; ++i) sum += row[i] * kh[i];
+            delta[j] = (vh[j] - sum) * beta[h];
+        }
+        float* oh = out + (size_t)h * d;
+        for (int j = 0; j < d; ++j) {
+            float* row = M + (size_t)j * d;
+            float sum = 0.0f;
+            for (int i = 0; i < d; ++i) {
+                row[i] += kh[i] * delta[j];
+                sum += row[i] * qh[i];
+            }
+            oh[j] = sum * scale;
+        }
+    }
+}

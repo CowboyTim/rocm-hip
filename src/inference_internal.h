@@ -51,6 +51,16 @@ struct LayerWeights {
     const float* ffn_norm = nullptr;                  // [n_embd] F32, post_attention_norm (pre-FFN)
     const float* q_norm = nullptr;                    // [head_dim] F32, full attention only
     const float* k_norm = nullptr;                    // [head_dim] F32, full attention only
+
+    // Gated DeltaNet (LAYER_LINEAR_ATTN only, Phase 20 Step 5)
+    QuantWeight W_qkv;                                // attn_qkv: [Q (n_group*d_state) | K (same) | V (d_inner)]
+    QuantWeight W_z;                                  // attn_gate: output gate z [d_inner]
+    QuantWeight W_alpha, W_beta;                      // ssm_alpha / ssm_beta: [dt_rank] per token
+    QuantWeight W_ssm_out;                            // ssm_out: d_inner -> n_embd
+    const float* ssm_conv1d = nullptr;                // [conv_dim][d_conv] F32, d_conv contiguous per channel
+    const float* ssm_dt = nullptr;                    // [dt_rank] F32, ssm_dt.bias
+    const float* ssm_a = nullptr;                     // [dt_rank] F32, -exp(A_log)
+    const float* ssm_norm = nullptr;                  // [d_state] F32, per-head gated RMSNorm gamma
 };
 
 // The complete inference_model struct - MUST match exactly between all TUs.
@@ -71,6 +81,13 @@ struct inference_model {
     float rope_freq_base = 10000.0f;                    // rope.freq_base
     int vocab_size = 0;                                 // vocabulary size
     int n_ctx = 0;                                      // context window size
+
+    // Gated DeltaNet hparams (ssm.*). V heads = dt_rank, Q/K heads = n_group, head size = d_state.
+    int ssm_d_conv = 0;                                 // conv kernel width (4)
+    int ssm_d_state = 0;                                // head size of q/k/v and of the square state (128)
+    int ssm_n_group = 0;                                // Q/K heads (16)
+    int ssm_dt_rank = 0;                                // V heads (32)
+    int ssm_d_inner = 0;                                // V width = dt_rank * d_state (4096)
 
     std::atomic<int> ref_count{1};                      // reference counting
     std::mutex mtx;                                     // thread safety mutex

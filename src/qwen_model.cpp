@@ -5,9 +5,10 @@
 // pinned once, so the GPU reads and writes them without copies. The small per-token vector ops (norms,
 // RoPE, single-query attention, SwiGLU) run on the CPU via qwen_ops for now.
 //
-// Status: full-attention layers follow the llama.cpp qwen35 graph (gated Q, q/k RMSNorm, partial NeoX
-// RoPE, GQA, sigmoid output gate) but are not yet verified end to end (Step 4). Gated DeltaNet layers
-// are identity (Step 5), so the logits are not meaningful yet.
+// Both token mixers follow the llama.cpp qwen35 graph: gated full attention (gated Q, q/k RMSNorm, partial
+// NeoX RoPE, GQA, sigmoid output gate) and Gated DeltaNet (conv1d with state, L2-normed q/k, gated delta
+// rule over a d_state x d_state state per V head, gated RMSNorm). Their state persists across tokens: the
+// KV cache for attention, RecurrentState (conv + delta-rule state) for DeltaNet. Phase 20 Steps 4-5.
 
 #include "qwen_model.h"
 #include "inference.h"
@@ -27,6 +28,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <vector>
 
 // Thread-local error buffer for qwen_model errors
 static thread_local char g_qwen_error[1024] = {0};
@@ -44,37 +46,19 @@ static bool qwen_debug() {
     return on;
 }
 
-// Per-token activations: one /dev/shm file, mmap(MAP_SHARED), hipHostRegister'ed once (project core pattern)
-struct Scratch {
-    float* x = nullptr;       // residual stream [E]
-    float* xn = nullptr;      // normed input to the projections [E]
-    float* qfull = nullptr;   // attn_q output, [Q | gate] per head [2 * HQ * HD]
-    float* q = nullptr;       // Q after norm + RoPE [HQ * HD]
-    float* gate = nullptr;    // attention output gate [HQ * HD]
-    float* k = nullptr;       // [HKV * HD]
-    float* v = nullptr;       // [HKV * HD]
-    float* attn = nullptr;    // gated attention output, input to attn_output [HQ * HD]
-    float* proj = nullptr;    // attn_output / ffn_down output [E]
-    float* ffg = nullptr;     // ffn_gate output [FF]
-    float* ffu = nullptr;     // ffn_up output [FF]
-    float* act = nullptr;     // SiLU(gate) * up, input to ffn_down [FF]
-    float* logits = nullptr;  // [vocab]
-
+// One /dev/shm file, mmap(MAP_SHARED), hipHostRegister'ed once (project core pattern), carved into
+// 256-byte-aligned float arrays
+struct ShmRegion {
     void* base = nullptr;
     size_t total = 0;
 
-    bool alloc(int E, int HQ, int HKV, int HD, int FF, int V) {
-        const size_t sizes[] = {(size_t)E, (size_t)E, (size_t)2 * HQ * HD, (size_t)HQ * HD, (size_t)HQ * HD,
-                                (size_t)HKV * HD, (size_t)HKV * HD, (size_t)HQ * HD, (size_t)E,
-                                (size_t)FF, (size_t)FF, (size_t)FF, (size_t)V};
-        float** ptrs[] = {&x, &xn, &qfull, &q, &gate, &k, &v, &attn, &proj, &ffg, &ffu, &act, &logits};
-        size_t off[sizeof(sizes) / sizeof(sizes[0])];
+    bool alloc(const char* path, const size_t* sizes, float** const* ptrs, size_t n) {
+        std::vector<size_t> off(n);
         total = 0;
-        for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+        for (size_t i = 0; i < n; ++i) {
             off[i] = total;
             total += (sizes[i] * sizeof(float) + 255) & ~(size_t)255;
         }
-        const char* path = "/dev/shm/qwen_scratch.bin";
         int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
         if (fd < 0) return false;
         const bool sized = ftruncate(fd, (off_t)total) == 0;
@@ -87,7 +71,7 @@ struct Scratch {
             return false;
         }
         base = p;
-        for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) *ptrs[i] = (float*)((char*)p + off[i]);
+        for (size_t i = 0; i < n; ++i) *ptrs[i] = (float*)((char*)p + off[i]);
         return true;
     }
 
@@ -99,12 +83,82 @@ struct Scratch {
     }
 };
 
+// Per-token activations
+struct Scratch {
+    float* x = nullptr;       // residual stream [E]
+    float* xn = nullptr;      // normed input to the projections [E]
+    float* qfull = nullptr;   // attn_q output, [Q | gate] per head [2 * HQ * HD]
+    float* q = nullptr;       // Q after norm + RoPE [HQ * HD]
+    float* gate = nullptr;    // attention output gate [HQ * HD]
+    float* k = nullptr;       // [HKV * HD]
+    float* v = nullptr;       // [HKV * HD]
+    float* attn = nullptr;    // gated attention output, input to attn_output [HQ * HD]
+    float* proj = nullptr;    // attn_output / ssm_out / ffn_down output [E]
+    float* ffg = nullptr;     // ffn_gate output [FF]
+    float* ffu = nullptr;     // ffn_up output [FF]
+    float* act = nullptr;     // SiLU(gate) * up, input to ffn_down [FF]
+    float* logits = nullptr;  // [vocab]
+    // Gated DeltaNet
+    float* qkv = nullptr;     // attn_qkv output [conv_dim]
+    float* conv = nullptr;    // SiLU(conv1d(qkv)) = [q | k | v] [conv_dim]
+    float* z = nullptr;       // attn_gate output [d_inner]
+    float* alpha = nullptr;   // ssm_alpha output, then the decay gate [dt_rank]
+    float* beta = nullptr;    // ssm_beta output, then sigmoid [dt_rank]
+    float* lin = nullptr;     // delta-rule output, then gated-normed: input to ssm_out [d_inner]
+
+    ShmRegion mem;
+
+    bool alloc(int E, int HQ, int HKV, int HD, int FF, int V, int conv_dim, int DI, int NV) {
+        const size_t sizes[] = {(size_t)E, (size_t)E, (size_t)2 * HQ * HD, (size_t)HQ * HD, (size_t)HQ * HD,
+                                (size_t)HKV * HD, (size_t)HKV * HD, (size_t)HQ * HD, (size_t)E,
+                                (size_t)FF, (size_t)FF, (size_t)FF, (size_t)V,
+                                (size_t)conv_dim, (size_t)conv_dim, (size_t)DI, (size_t)NV, (size_t)NV, (size_t)DI};
+        float** const ptrs[] = {&x, &xn, &qfull, &q, &gate, &k, &v, &attn, &proj, &ffg, &ffu, &act, &logits,
+                                &qkv, &conv, &z, &alpha, &beta, &lin};
+        static_assert(sizeof(sizes) / sizeof(sizes[0]) == sizeof(ptrs) / sizeof(ptrs[0]), "scratch table");
+        return mem.alloc("/dev/shm/qwen_scratch.bin", sizes, ptrs, sizeof(sizes) / sizeof(sizes[0]));
+    }
+};
+
+// Recurrent state of the Gated DeltaNet layers, persisted across tokens like the KV cache: per linear
+// layer a conv state [conv_dim][d_conv - 1] and a delta-rule state [dt_rank][d_state][d_state] (ggml's
+// transposed per-head layout). One sequence; zeroed when a sequence starts at pos 0.
+struct RecurrentState {
+    std::vector<float*> conv, ssm;   // indexed by layer; nullptr for full-attention layers
+    ShmRegion mem;
+
+    bool alloc(const inference_model* eng) {
+        const int conv_dim = 2 * eng->ssm_n_group * eng->ssm_d_state + eng->ssm_d_inner;
+        conv.assign(eng->n_layer, nullptr);
+        ssm.assign(eng->n_layer, nullptr);
+        std::vector<size_t> sizes;
+        std::vector<float**> ptrs;
+        for (int l = 0; l < eng->n_layer; ++l) {
+            if (eng->layers[l].kind != LAYER_LINEAR_ATTN) continue;
+            sizes.push_back((size_t)conv_dim * (eng->ssm_d_conv - 1));
+            ptrs.push_back(&conv[l]);
+            sizes.push_back((size_t)eng->ssm_dt_rank * eng->ssm_d_state * eng->ssm_d_state);
+            ptrs.push_back(&ssm[l]);
+        }
+        if (sizes.empty()) return true;
+        return mem.alloc("/dev/shm/qwen_recurrent_state.bin", sizes.data(), ptrs.data(), sizes.size());
+    }
+
+    void reset() {
+        if (mem.base) memset(mem.base, 0, mem.total);
+    }
+};
+
 struct QwenModel {
     inference_model* eng = nullptr;
     Scratch s;
+    RecurrentState rs;
+    qwen_layer_cb layer_cb = nullptr;
+    void* layer_cb_user = nullptr;
 
     ~QwenModel() {
-        s.free();
+        rs.mem.free();
+        s.mem.free();
         qmatvec_free();
     }
 
@@ -114,8 +168,14 @@ struct QwenModel {
             qwen_set_error("cannot load matvec_q.co (run from build/co)");
             return false;
         }
-        if (!s.alloc(eng->n_embd, eng->n_head, eng->n_head_kv, eng->head_dim, eng->n_ff, eng->vocab_size)) {
+        const int conv_dim = 2 * eng->ssm_n_group * eng->ssm_d_state + eng->ssm_d_inner;
+        if (!s.alloc(eng->n_embd, eng->n_head, eng->n_head_kv, eng->head_dim, eng->n_ff, eng->vocab_size, conv_dim,
+                     eng->ssm_d_inner, eng->ssm_dt_rank)) {
             qwen_set_error("scratch allocation failed");
+            return false;
+        }
+        if (!rs.alloc(eng)) {
+            qwen_set_error("recurrent state allocation failed");
             return false;
         }
         return true;
@@ -178,6 +238,43 @@ struct QwenModel {
         return true;
     }
 
+    // Gated DeltaNet token mixer for one token; updates the layer's conv and delta-rule state and adds its
+    // output to the residual. Follows llama.cpp's qwen35 build_layer_attn_linear.
+    bool linear_attention(int l, const LayerWeights& L) {
+        const int E = eng->n_embd, DS = eng->ssm_d_state, NG = eng->ssm_n_group, NV = eng->ssm_dt_rank;
+        const int DI = eng->ssm_d_inner, KD = NG * DS, conv_dim = 2 * KD + DI;
+        const float eps = (float)eng->eps;
+
+        qwen_rmsnorm(s.x, L.attn_norm, s.xn, E, eps);
+        if (!matvec(L.W_qkv, s.xn, s.qkv) || !matvec(L.W_z, s.xn, s.z) || !matvec(L.W_alpha, s.xn, s.alpha) ||
+            !matvec(L.W_beta, s.xn, s.beta) || !sync())
+            return false;
+
+        // Causal conv1d over [q | k | v] channels, then SiLU; q and k heads get L2-normed
+        qwen_ssm_conv_step(rs.conv[l], s.qkv, L.ssm_conv1d, s.conv, conv_dim, eng->ssm_d_conv);
+        for (int i = 0; i < conv_dim; ++i) s.conv[i] = qwen_silu(s.conv[i]);
+        for (int h = 0; h < 2 * NG; ++h) qwen_l2norm(s.conv + (size_t)h * DS, s.conv + (size_t)h * DS, DS, eps);
+
+        // Per V head: decay gate g = softplus(alpha + dt_bias) * ssm_a (ssm_a = -exp(A_log)), beta = sigmoid
+        for (int h = 0; h < NV; ++h) {
+            s.alpha[h] = qwen_softplus(s.alpha[h] + L.ssm_dt[h]) * L.ssm_a[h];
+            s.beta[h] = qwen_sigmoid(s.beta[h]);
+        }
+        qwen_gated_delta_step(rs.ssm[l], s.conv, s.conv + KD, s.conv + 2 * KD, s.alpha, s.beta, NV, NG, DS, s.lin);
+
+        // Gated RMSNorm per V head: norm(o) * ssm_norm * SiLU(z)
+        for (int h = 0; h < NV; ++h) {
+            float* o = s.lin + (size_t)h * DS;
+            const float* z = s.z + (size_t)h * DS;
+            qwen_rmsnorm(o, L.ssm_norm, o, DS, eps);
+            for (int i = 0; i < DS; ++i) o[i] *= qwen_silu(z[i]);
+        }
+
+        if (!matvec(L.W_ssm_out, s.lin, s.proj) || !sync()) return false;
+        for (int i = 0; i < E; ++i) s.x[i] += s.proj[i];
+        return true;
+    }
+
     // SwiGLU FFN; adds its output to the residual
     bool ffn(const LayerWeights& L) {
         const int E = eng->n_embd, FF = eng->n_ff;
@@ -200,11 +297,15 @@ struct QwenModel {
             return -1;
         }
 
+        // A sequence starting at position 0 starts from zero recurrent state (the KV cache needs no reset:
+        // attention only reads positions 0..pos)
+        if (pos == 0) rs.reset();
+
         for (int l = 0; l < eng->n_layer; ++l) {
             const LayerWeights& L = eng->layers[l];
-            // TODO(Phase 20 Step 5): Gated DeltaNet token mixer; linear layers are identity until then
-            if (L.kind == LAYER_FULL_ATTN && !full_attention(l, L, pos)) return -1;
-            if (!ffn(L)) return -1;
+            const bool ok = L.kind == LAYER_FULL_ATTN ? full_attention(l, L, pos) : linear_attention(l, L);
+            if (!ok || !ffn(L)) return -1;
+            if (layer_cb) layer_cb(l, pos, s.x, E, layer_cb_user);
             if (qwen_debug()) {
                 double ss = 0.0;
                 for (int i = 0; i < E; ++i) ss += (double)s.x[i] * s.x[i];
@@ -230,6 +331,12 @@ qwen_model_t* qwen_model_create(inference_model_t* engine_model) {
 
 void qwen_model_free(qwen_model_t* model) {
     delete model;
+}
+
+void qwen_model_set_layer_callback(qwen_model_t* model, qwen_layer_cb cb, void* user) {
+    if (!model) return;
+    model->layer_cb = cb;
+    model->layer_cb_user = user;
 }
 
 int qwen_model_forward(qwen_model_t* model, int token_id, int pos, float* logits) {

@@ -11,6 +11,8 @@
 
 #include <hip/hip_fp16.h>
 
+#include <math.h>
+
 // y[i] = x[i] / sqrt(mean(x^2) + eps) * w[i]. w may be NULL (no gamma). x and y may alias.
 void qwen_rmsnorm(const float* x, const float* w, float* y, int n, float eps);
 
@@ -23,6 +25,25 @@ void qwen_rope_neox(float* v, int n_rot, int pos, float freq_base);
 void qwen_attention(const float* q, const __half* K, const __half* V, int kv_stride, int n_kv,
                     int n_head, int n_head_kv, int head_dim, float scale, float* out);
 
+// ---- Gated DeltaNet (Phase 20 Step 5), following ggml's SSM_CONV, L2_NORM and GATED_DELTA_NET CPU ops
+
+// One token of the causal depthwise conv1d. state: [channels][d_conv - 1], oldest first, updated in place
+// (shifted by one, x appended). w: [channels][d_conv] (ssm_conv1d, d_conv contiguous). y: raw conv output
+// [channels], before SiLU. y must not alias state or x.
+void qwen_ssm_conv_step(float* state, const float* x, const float* w, float* y, int channels, int d_conv);
+
+// y = x / max(||x||_2, eps). x and y may alias.
+void qwen_l2norm(const float* x, float* y, int n, float eps);
+
+// One token of the gated delta rule for all V heads. Per V head h (K/Q head h % n_k_heads, as ggml
+// broadcasts), with S the d x d state, S_h[j * d + i] = S[i][j] (ggml's transposed layout, so it diffs
+// directly against the reference new_state):
+//   S *= exp(g[h]);  delta = (v - S^T k) * beta[h];  S += k delta^T;  out = S^T q / sqrt(d)
+// q, k: [n_k_heads * d] (already L2-normed); v, out: [n_v_heads * d]; g, beta: [n_v_heads].
+void qwen_gated_delta_step(float* S, const float* q, const float* k, const float* v, const float* g,
+                           const float* beta, int n_v_heads, int n_k_heads, int d, float* out);
+
+static inline float qwen_softplus(float x) { return x > 20.0f ? x : logf(1.0f + expf(x)); }
 static inline float qwen_silu(float x) { return x / (1.0f + __builtin_expf(-x)); }
 static inline float qwen_sigmoid(float x) { return 1.0f / (1.0f + __builtin_expf(-x)); }
 

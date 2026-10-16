@@ -126,6 +126,23 @@ static bool bind_norm(gguf_model_t* gguf, const char* name, int n, const float*&
     return true;
 }
 
+// Bind an F32 tensor of ne0 x ne1 values (ne0 contiguous), e.g. ssm_conv1d [d_conv x conv_dim]
+static bool bind_f32(gguf_model_t* gguf, const char* name, int ne0, int ne1, const float*& out) {
+    const int idx = find_tensor_index(gguf, name);
+    if (idx < 0) { set_error("missing tensor %s", name); return false; }
+    const int64_t* ne = gguf_tensor_ne(gguf, idx);
+    const int nd = gguf_tensor_dims(gguf, idx);
+    size_t bytes = 0;
+    const void* p = gguf_get_tensor_ptr(gguf, name, &bytes);
+    if (gguf_tensor_type(gguf, idx) != QT_F32 || !ne || ne[0] != ne0 || (nd > 1 ? ne[1] : 1) != ne1 || !p ||
+        bytes != (size_t)ne0 * ne1 * sizeof(float)) {
+        set_error("%s: expected F32[%d x %d] (type %d, %zu bytes)", name, ne0, ne1, gguf_tensor_type(gguf, idx), bytes);
+        return false;
+    }
+    out = (const float*)p;
+    return true;
+}
+
 static bool check_shape(const char* what, int layer, const QuantWeight& w, int N, int K) {
     if (w.N == N && w.K == K) return true;
     set_error("blk.%d.%s: shape %dx%d, expected %dx%d (rows x cols)", layer, what, w.N, w.K, N, K);
@@ -156,8 +173,29 @@ static bool load_model_weights(inference_model* m) {
         if (!bind_norm(m->gguf, nm(i, "attn_norm.weight"), E, L.attn_norm, true)) return false;
         if (!bind_norm(m->gguf, nm(i, "post_attention_norm.weight"), E, L.ffn_norm, true)) return false;
 
-        // TODO(Phase 20 Step 5): bind the Gated DeltaNet tensors for LAYER_LINEAR_ATTN.
-        if (L.kind == LAYER_FULL_ATTN) {
+        if (L.kind == LAYER_LINEAR_ATTN) {
+            const int DS = m->ssm_d_state, NG = m->ssm_n_group, NV = m->ssm_dt_rank, DI = m->ssm_d_inner;
+            const int conv_dim = 2 * NG * DS + DI;
+            if (m->ssm_d_conv < 2 || DS <= 0 || NG <= 0 || NV <= 0 || NV % NG != 0 || DI != NV * DS) {
+                set_error("blk.%d: bad ssm hparams (d_conv %d d_state %d n_group %d dt_rank %d d_inner %d)", i,
+                          m->ssm_d_conv, DS, NG, NV, DI);
+                return false;
+            }
+            if (!bind_weight(m->gguf, nm(i, "attn_qkv.weight"), L.W_qkv, true)) return false;
+            if (!bind_weight(m->gguf, nm(i, "attn_gate.weight"), L.W_z, true)) return false;
+            if (!bind_weight(m->gguf, nm(i, "ssm_alpha.weight"), L.W_alpha, true)) return false;
+            if (!bind_weight(m->gguf, nm(i, "ssm_beta.weight"), L.W_beta, true)) return false;
+            if (!bind_weight(m->gguf, nm(i, "ssm_out.weight"), L.W_ssm_out, true)) return false;
+            if (!bind_f32(m->gguf, nm(i, "ssm_conv1d.weight"), m->ssm_d_conv, conv_dim, L.ssm_conv1d)) return false;
+            if (!bind_norm(m->gguf, nm(i, "ssm_dt.bias"), NV, L.ssm_dt, true)) return false;
+            if (!bind_norm(m->gguf, nm(i, "ssm_a"), NV, L.ssm_a, true)) return false;
+            if (!bind_norm(m->gguf, nm(i, "ssm_norm.weight"), DS, L.ssm_norm, true)) return false;
+            if (!check_shape("attn_qkv", i, L.W_qkv, conv_dim, E) ||
+                !check_shape("attn_gate", i, L.W_z, DI, E) ||
+                !check_shape("ssm_alpha", i, L.W_alpha, NV, E) ||
+                !check_shape("ssm_beta", i, L.W_beta, NV, E) ||
+                !check_shape("ssm_out", i, L.W_ssm_out, E, DI)) return false;
+        } else {
             if (!bind_weight(m->gguf, nm(i, "attn_q.weight"), L.Wq, true)) return false;
             if (!bind_weight(m->gguf, nm(i, "attn_k.weight"), L.Wk, true)) return false;
             if (!bind_weight(m->gguf, nm(i, "attn_v.weight"), L.Wv, true)) return false;
@@ -235,6 +273,11 @@ inference_model_t* inference_load_model(const char* gguf_path) {
     m->rope_freq_base = gguf_arch_float(m->gguf, "rope.freq_base", 10000.0f);
     m->eps = gguf_arch_float(m->gguf, "attention.layer_norm_rms_epsilon", 1e-6f);
     m->full_attention_interval = (int)gguf_arch_int(m->gguf, "full_attention_interval", 0);
+    m->ssm_d_conv = (int)gguf_arch_int(m->gguf, "ssm.conv_kernel", 0);
+    m->ssm_d_state = (int)gguf_arch_int(m->gguf, "ssm.state_size", 0);
+    m->ssm_n_group = (int)gguf_arch_int(m->gguf, "ssm.group_count", 0);
+    m->ssm_dt_rank = (int)gguf_arch_int(m->gguf, "ssm.time_step_rank", 0);
+    m->ssm_d_inner = (int)gguf_arch_int(m->gguf, "ssm.inner_size", 0);
     fprintf(stderr, "[LOAD] arch=%s blocks=%lld (decoder %d + nextn %d) E=%d heads=%d/%d head_dim=%d ff=%d "
             "n_rot=%d rope_base=%g eps=%g\n", arch ? arch : "?", (long long)n_layer, m->n_layer, m->n_nextn,
             m->n_embd, m->n_head, m->n_head_kv, m->head_dim, m->n_ff, m->n_rot, m->rope_freq_base, m->eps);

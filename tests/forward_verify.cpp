@@ -12,13 +12,19 @@
 // projection runs twice: on the FP32 input (reported, cosine ~0.999) and on the input round-tripped
 // through that Q8 format, which must match the reference to 1e-4 relative. That second number checks
 // the weight bindings and kernels; the first shows the reference's own activation-quantization noise.
-// Element-wise ops (norms, RoPE, SwiGLU, gating) must agree to 1e-4 relative; attention to 2e-3, since
-// the reference's flash attention rounds to FP16 internally.
+// Element-wise ops (norms, RoPE, SwiGLU, gating, conv1d, delta rule) must agree to 1e-4 relative;
+// attention to 2e-3, since the reference's flash attention rounds to FP16 internally.
+//
+// The last section runs the whole engine (qwen_model_forward, one token at a time) on the reference
+// tokens and diffs the residual stream after every layer with l_out-N, then the next-token argmax.
+// Errors compound there, and the reference quantizes activations to Q8 for every matmul, so that
+// section passes on cosine similarity (> 0.99 per layer, the Phase 20 success criterion).
 
 #include "inference.h"
 #include "inference_internal.h"
 #include "qmatvec.h"
 #include "quant_types.h"
+#include "qwen_model.h"
 #include "qwen_ops.h"
 
 #include <hip/hip_runtime.h>
@@ -26,6 +32,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
@@ -66,10 +73,11 @@ static bool load_index() {
     return !g_index.empty();
 }
 
-// First tensor with this name (and op, if given), read as rows of ne[0] floats
-static bool ref(const char* name, const char* op, std::vector<float>& out, int64_t* row_len = nullptr) {
+// First tensor with this name (and op and ne[0], if given), read as rows of ne[0] floats
+static bool ref(const char* name, const char* op, std::vector<float>& out, int64_t* row_len = nullptr,
+                int64_t ne0 = 0) {
     for (const RefTensor& t : g_index) {
-        if (t.name != name || (op && t.op != op)) continue;
+        if (t.name != name || (op && t.op != op) || (ne0 && t.ne[0] != ne0)) continue;
         const int64_t n = t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3];
         out.resize((size_t)n);
         FILE* f = fopen((g_dir + "/" + t.file).c_str(), "rb");
@@ -123,13 +131,15 @@ static void ref_act_roundtrip(int wtype, const float* x, float* out, int K) {
             const float iscale = -127.0f / mx, d = 1.0f / iscale;
             for (int j = 0; j < 256; ++j) out[b + j] = d * (float)std::min(127, (int)nearbyintf(iscale * x[b + j]));
         }
-    } else if (q80) {  // quantize_row_q8_0_ref: d = amax / 127 stored as FP16, q = roundf(x / d)
+    } else if (q80) {  // x86 SIMD quantize_row_q8_0 (the reference CPU build's path, not the _ref one):
+        // d = amax / 127 stored as FP16, q = round-half-even(x * (127 / amax)). The _ref variant's
+        // roundf(x * (1 / d)) differs by one step near ties, which blk.0's Q6_K-embedding inputs hit.
         for (int b = 0; b < K; b += 32) {
             float amax = 0.0f;
             for (int j = 0; j < 32; ++j) amax = fmaxf(amax, fabsf(x[b + j]));
-            const float d = amax / 127.0f, id = d ? 1.0f / d : 0.0f;
+            const float d = amax / 127.0f, id = amax != 0.0f ? 127.0f / amax : 0.0f;
             const float dh = __half2float(__float2half(d));
-            for (int j = 0; j < 32; ++j) out[b + j] = dh * roundf(x[b + j] * id);
+            for (int j = 0; j < 32; ++j) out[b + j] = dh * nearbyintf(x[b + j] * id);
         }
     } else {
         memcpy(out, x, (size_t)K * sizeof(float));
@@ -137,6 +147,9 @@ static void ref_act_roundtrip(int wtype, const float* x, float* out, int K) {
 }
 
 static int g_fail = 0;
+
+// FORWARD_VERIFY_LAYERS=1 prints the per-layer end-to-end diff
+static bool verbose_layers() { return getenv("FORWARD_VERIFY_LAYERS") != nullptr; }
 
 // Worst case over all tokens of one check
 struct Stat {
@@ -286,6 +299,100 @@ int main(int argc, char** argv) {
         report("blk.0 ffn_down (qmatvec)", sd);
     }
 
+    // ---- first Gated DeltaNet layer: projections, conv1d with state, L2 norm, gates, delta rule, gated norm
+    int ll = -1;
+    for (int l = 0; l < m->n_layer && ll < 0; ++l)
+        if (m->layers[l].kind == LAYER_LINEAR_ATTN) ll = l;
+    if (ll >= 0) {
+        const LayerWeights& L = m->layers[ll];
+        auto nm = [&](const char* base) { return std::string(base) + "-" + std::to_string(ll); };
+        const int DS = m->ssm_d_state, NG = m->ssm_n_group, NV = m->ssm_dt_rank, DI = m->ssm_d_inner;
+        const int KD = NG * DS, CD = 2 * KD + DI, DC = m->ssm_d_conv;
+        std::vector<float> xn, qkv, cst, csilu, qn, kn, alpha, gate, beta, bsig, st0, st1, ao, nrm, z, fo, lo;
+        if (!ref(nm("attn_norm").c_str(), nullptr, xn) || !ref(nm("linear_attn_qkv_mixed").c_str(), nullptr, qkv) ||
+            !ref(nm("conv_states").c_str(), nullptr, cst) || !ref(nm("conv_output_silu").c_str(), nullptr, csilu) ||
+            !ref(nm("q_conv_predelta").c_str(), nullptr, qn) || !ref(nm("k_conv_predelta").c_str(), nullptr, kn) ||
+            !ref(nm("alpha").c_str(), nullptr, alpha) || !ref(nm("gate").c_str(), "MUL", gate) ||
+            !ref(nm("beta").c_str(), nullptr, beta) || !ref(nm("beta_sigmoid").c_str(), nullptr, bsig) ||
+            !ref(nm("state_predelta").c_str(), nullptr, st0) || !ref(nm("new_state").c_str(), nullptr, st1) ||
+            !ref(nm("attn_output").c_str(), nullptr, ao) || !ref(nm("norm").c_str(), "RMS_NORM", nrm, nullptr, DS) ||
+            !ref(nm("z").c_str(), "MUL_MAT", z) || !ref(nm("final_output").c_str(), nullptr, fo) ||
+            !ref(nm("linear_attn_out").c_str(), "MUL_MAT", lo))
+            return 1;
+        if ((int)cst.size() != CD * (DC - 1) || (int)st0.size() != NV * DS * DS) {
+            fprintf(stderr, "blk.%d: unexpected recurrent state sizes %zu %zu\n", ll, cst.size(), st0.size());
+            return 1;
+        }
+
+        Stat sconv, sqn, skn, sgate, sbeta, sdelta, sstate, snorm, sfo;
+        ProjStat sqkv, sz, sal, sbe, sout;
+        std::vector<float> conv(CD), h(DS), gt(NV), bt(NV), o(DI), fin(DI);
+        std::vector<float> cs = cst, S = st0;  // carried across tokens, starting from the reference state
+        for (int t = 0; t < T; ++t) {
+            const float* xt = &xn[(size_t)t * E];
+            if (!proj(L.W_qkv, xt, &qkv[(size_t)t * CD], sqkv) || !proj(L.W_z, xt, &z[(size_t)t * DI], sz) ||
+                !proj(L.W_alpha, xt, &alpha[(size_t)t * NV], sal) || !proj(L.W_beta, xt, &beta[(size_t)t * NV], sbe))
+                return 1;
+
+            // conv1d + SiLU on the reference qkv, our own conv state
+            qwen_ssm_conv_step(cs.data(), &qkv[(size_t)t * CD], L.ssm_conv1d, conv.data(), CD, DC);
+            for (int i = 0; i < CD; ++i) conv[i] = qwen_silu(conv[i]);
+            sconv.add(conv.data(), &csilu[(size_t)t * CD], CD);
+
+            // L2 norm of the reference conv output's q and k heads
+            for (int hh = 0; hh < NG; ++hh) {
+                qwen_l2norm(&csilu[(size_t)t * CD + (size_t)hh * DS], h.data(), DS, eps);
+                sqn.add(h.data(), &qn[((size_t)t * NG + hh) * DS], DS);
+                qwen_l2norm(&csilu[(size_t)t * CD + KD + (size_t)hh * DS], h.data(), DS, eps);
+                skn.add(h.data(), &kn[((size_t)t * NG + hh) * DS], DS);
+            }
+
+            for (int hh = 0; hh < NV; ++hh) {
+                gt[hh] = qwen_softplus(alpha[(size_t)t * NV + hh] + L.ssm_dt[hh]) * L.ssm_a[hh];
+                bt[hh] = qwen_sigmoid(beta[(size_t)t * NV + hh]);
+            }
+            sgate.add(gt.data(), &gate[(size_t)t * NV], NV);
+            sbeta.add(bt.data(), &bsig[(size_t)t * NV], NV);
+
+            // Delta rule on the reference q/k/v/gate/beta, our own state
+            qwen_gated_delta_step(S.data(), &qn[(size_t)t * KD], &kn[(size_t)t * KD], &csilu[(size_t)t * CD + 2 * KD],
+                                  &gate[(size_t)t * NV], &bsig[(size_t)t * NV], NV, NG, DS, o.data());
+            sdelta.add(o.data(), &ao[(size_t)t * DI], DI);
+
+            // Gated RMSNorm on the reference delta output and z
+            for (int hh = 0; hh < NV; ++hh) {
+                const float* src = &ao[(size_t)t * DI + (size_t)hh * DS];
+                qwen_rmsnorm(src, nullptr, h.data(), DS, eps);
+                snorm.add(h.data(), &nrm[(size_t)t * DI + (size_t)hh * DS], DS);
+                qwen_rmsnorm(src, L.ssm_norm, &fin[(size_t)hh * DS], DS, eps);
+                for (int i = 0; i < DS; ++i)
+                    fin[(size_t)hh * DS + i] *= qwen_silu(z[(size_t)t * DI + (size_t)hh * DS + i]);
+            }
+            sfo.add(fin.data(), &fo[(size_t)t * DI], DI);
+
+            if (!proj(L.W_ssm_out, &fo[(size_t)t * DI], &lo[(size_t)t * E], sout)) return 1;
+        }
+        sstate.add(S.data(), st1.data(), NV * DS * DS);
+
+        printf("  (blk.%d types: attn_qkv %d, attn_gate %d, ssm_alpha %d, ssm_beta %d, ssm_out %d)\n", ll,
+               L.W_qkv.type, L.W_z.type, L.W_alpha.type, L.W_beta.type, L.W_ssm_out.type);
+        char what[64];
+        snprintf(what, sizeof(what), "blk.%d attn_qkv (qmatvec)", ll); report(what, sqkv);
+        snprintf(what, sizeof(what), "blk.%d attn_gate z (qmatvec)", ll); report(what, sz);
+        snprintf(what, sizeof(what), "blk.%d ssm_alpha (qmatvec)", ll); report(what, sal);
+        snprintf(what, sizeof(what), "blk.%d ssm_beta (qmatvec)", ll); report(what, sbe);
+        snprintf(what, sizeof(what), "blk.%d conv1d + SiLU (with state)", ll); report(what, sconv);
+        snprintf(what, sizeof(what), "blk.%d q L2 norm", ll); report(what, sqn);
+        snprintf(what, sizeof(what), "blk.%d k L2 norm", ll); report(what, skn);
+        snprintf(what, sizeof(what), "blk.%d decay gate (softplus * a)", ll); report(what, sgate);
+        snprintf(what, sizeof(what), "blk.%d beta sigmoid", ll); report(what, sbeta);
+        snprintf(what, sizeof(what), "blk.%d delta rule output", ll); report(what, sdelta);
+        snprintf(what, sizeof(what), "blk.%d delta rule final state", ll); report(what, sstate);
+        snprintf(what, sizeof(what), "blk.%d ssm_norm (no gamma)", ll); report(what, snorm);
+        snprintf(what, sizeof(what), "blk.%d gated norm (final_output)", ll); report(what, sfo);
+        snprintf(what, sizeof(what), "blk.%d ssm_out (qmatvec)", ll); report(what, sout);
+    }
+
     // ---- first full-attention layer: projections, q/k norm, RoPE, attention, gate, output
     int la = -1;
     for (int l = 0; l < m->n_layer && la < 0; ++l)
@@ -388,6 +495,49 @@ int main(int argc, char** argv) {
         const bool ok = best == next_token;
         if (!ok) ++g_fail;
         printf("  [%s] LM head argmax on reference hidden state: %d (reference %d)\n", ok ? "PASS" : "FAIL", best,
+               next_token);
+    }
+
+    // ---- end to end: the engine on the reference tokens, residual stream vs l_out-N after every layer
+    {
+        if (inference_kv_cache_init(m, 64) != 0) { fprintf(stderr, "kv init: %s\n", inference_get_last_error()); return 1; }
+        qwen_model_t* qm = inference_get_qwen_model(m);
+        struct Ctx { std::vector<float> l_out; int T; };
+        Ctx ctx;
+        ctx.T = T;
+        ctx.l_out.resize((size_t)m->n_layer * T * E);
+        qwen_model_set_layer_callback(qm, [](int l, int pos, const float* x, int n, void* u) {
+            Ctx* c = (Ctx*)u;
+            memcpy(&c->l_out[((size_t)l * c->T + pos) * n], x, (size_t)n * sizeof(float));
+        }, &ctx);
+        std::vector<float> logits(V);
+        for (int t = 0; t < T; ++t)
+            if (qwen_model_forward(qm, tokens[t], t, logits.data()) != 0) { fprintf(stderr, "forward failed\n"); return 1; }
+        qwen_model_set_layer_callback(qm, nullptr, nullptr);
+
+        double worst = 1.0;
+        int worst_l = -1, n_bad = 0;
+        for (int l = 0; l < m->n_layer; ++l) {
+            if (!ref(("l_out-" + std::to_string(l)).c_str(), nullptr, a)) return 1;
+            Stat s;
+            for (int t = 0; t < T; ++t) s.add(&ctx.l_out[((size_t)l * T + t) * E], &a[(size_t)t * E], E);
+            if (s.min_cos < worst) { worst = s.min_cos; worst_l = l; }
+            if (s.min_cos <= 0.99) ++n_bad;
+            if (verbose_layers())
+                printf("    l_out-%-2d %-6s cos %.6f  max|d|/max|ref| %.2e\n", l,
+                       m->layers[l].kind == LAYER_FULL_ATTN ? "attn" : "linear", s.min_cos, s.max_rel);
+        }
+        const bool ok = n_bad == 0;
+        if (!ok) ++g_fail;
+        printf("  [%s] engine l_out, all %d layers x %d tokens   worst cos %.6f (layer %d), %d below 0.99\n",
+               ok ? "PASS" : "FAIL", m->n_layer, T, worst, worst_l, n_bad);
+
+        int best = 0;
+        for (int i = 1; i < V; ++i)
+            if (logits[i] > logits[best]) best = i;
+        const bool tok_ok = best == next_token;
+        if (!tok_ok) ++g_fail;
+        printf("  [%s] engine next token after the prompt: %d (reference %d)\n", tok_ok ? "PASS" : "FAIL", best,
                next_token);
     }
 

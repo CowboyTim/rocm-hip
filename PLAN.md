@@ -1206,30 +1206,21 @@ for the symptoms above.
 
 ### 20.3 Plan
 
-> **▶ NEXT STEP (as of 2026-10-16): Step 5 — Gated DeltaNet layers.**
+> **▶ NEXT STEP (as of 2026-10-16): fix the tokenizer, then Step 6 (35B MoE).**
 >
-> Step 3c is done: the engine reads every weight in place through `qmatvec`. `tests/forward_verify` checks
-> each piece against the reference: embeddings, norms, all projections, the LM head, and every
-> full-attention piece from Step 4. Only `forward_verify`'s blk.3 is checked; the other full-attention
-> layers run the same code. All pieces pass in isolation, and the LM head picks " Paris" from the reference
-> hidden state. The 24 DeltaNet layers are still identity, so the hidden state drifts from the reference
-> starting at layer 0, and `qwen_demo` produces wrong tokens. Every remaining end-to-end check is blocked
-> on Step 5.
+> Step 5 is done: the 4B forward pass matches the reference end to end. Fed the reference token IDs,
+> `qwen_model_forward` tracks `l_out-N` on all 32 layers × 5 tokens (worst cos 0.99595, layer 19) and
+> predicts **11751 " Paris"**. `qwen_demo` still produces wrong tokens only because the tokenizer is wrong
+> (8 tokens `760 288 62865 288 1020 288 47358 18039` vs the reference `760 6511 314 9338 369`).
 >
-> 1. **CPU reference first** (`qwen_ops`), checked piece by piece against `/dev/shm/ref_qwen35_4b`, layer 0
->    (seq 2–37): `attn_qkv` → `linear_attn_qkv_mixed`; conv1d (kernel 4) with state → `conv_output_silu`;
->    q/k L2 norm → `q/k_conv_predelta`; `ssm_alpha`/`ssm_a`/`ssm_dt` → `gate`; `ssm_beta` → `beta_sigmoid`;
->    delta-rule update → `new_state`/`attn_output`; `ssm_norm` → `norm`; `attn_gate` (z) gating →
->    `final_output`; `ssm_out` → `linear_attn_out`. Extend `forward_verify` with each.
-> 2. **State:** conv state (3 × 8192) and recurrent state (32 heads × 128 × 128) per DeltaNet layer, persisted
->    across tokens like the KV cache (a /dev/shm buffer, pinned).
-> 3. **Then the end-to-end check:** `l_out-N` for every layer within FP tolerance when running the 5 reference
->    tokens through `qwen_model_forward`, and top-1 = 11751 " Paris". Feed the reference token IDs directly,
->    because the tokenizer is still wrong.
->
-> **In parallel, any time:** fix the tokenizer (8 tokens vs the reference's 5 `760 6511 314 9338 369`).
-> **After 5:** Step 7's checks (output norm + LM head) already pass in isolation, so the remaining work is
-> Step 6 for the 35B (MoE), then speed (fused GPU norms/attention, fewer syncs).
+> 1. **Tokenizer:** match `ref_dump tokens` on a handful of prompts (GPT-2 byte-level BPE with the qwen35
+>    pre-tokenizer regex; `Ġ` must merge into the next word). Then `qwen_demo "The capital of France is"`
+>    should print " Paris" first, and a few greedy tokens should match `llama-completion`.
+> 2. **Step 6 (35B-A3B):** TYPE101/BF16 are already in `qmatvec`; add the router, top-8 experts and the
+>    shared expert, and a `forward_verify` section for one MoE layer. Reference: `ref_dump acts` on the 35B.
+> 3. **Then speed:** the DeltaNet and attention token mixers, norms and SwiGLU are CPU ops (`qwen_ops`);
+>    port them to kernels (the recurrent state is already a pinned /dev/shm buffer) and cut the per-matvec
+>    syncs. Re-run `forward_verify` after each port.
 
 **Target model: `Qwen3.5-4B-ROCMFP4.gguf`** (restored to `/dev/shm/models/` on 2026-10-14). It has hybrid
 DeltaNet + gated attention but a dense FFN, and only F32/ROCMFP4/Q5_K/Q6_K tensors, so no MoE and no
@@ -1375,14 +1366,38 @@ reference dequant from step 1 (and later add TYPE101/TYPE30 for the 35B). Dequan
 (M=1, N=8192, K=2048), (b) the float-scale path, and (c) one real tensor from the GGUF compared with the reference.
 Fix the Q4_0 34-vs-18 block size.
 
-**Step 4: full-attention layers correct — pieces ✅ (3c), end-to-end layer diff waits on Step 5.** Pre-norm with gamma; Q/K/V projections; split Q and gate; per-head
+**Step 4: full-attention layers correct — DONE ✅ (pieces in 3c, end-to-end layer diff in Step 5).** Pre-norm with gamma; Q/K/V projections; split Q and gate; per-head
 q_norm/k_norm; partial-rotary M-RoPE with theta from GGUF; GQA (16 Q heads / 4 KV heads); sigmoid output gate;
 O projection; post-attention norm. Compare layer 3 output with the reference, temporarily treating linear
 layers as identity in both implementations.
 
-**Step 5: Gated DeltaNet layers.** CPU reference implementation first: conv1d (kernel 4) with state, alpha/beta
-gating, the delta-rule recurrent state update (128-dim state per head), ssm_norm, output gate, ssm_out. Then
-port to GPU. Recurrent and conv state must persist across tokens, like the KV cache.
+**Step 5: Gated DeltaNet layers — DONE ✅ (2026-10-16), CPU ops; GPU port is speed work.**
+- **Loader:** each linear layer binds `attn_qkv`, `attn_gate` (z), `ssm_alpha`, `ssm_beta`, `ssm_out` (qmatvec)
+  and the F32 `ssm_conv1d` [conv_dim × 4], `ssm_dt.bias`, `ssm_a`, `ssm_norm`, all in place. Hparams come from
+  `ssm.{conv_kernel,state_size,group_count,time_step_rank,inner_size}` (4B: 4, 128, 16 Q/K heads, 32 V heads,
+  4096), with shape checks.
+- **Forward** (`QwenModel::linear_attention`, following llama.cpp `build_layer_attn_linear`): attn_norm →
+  qkv/z/alpha/beta projections → causal conv1d (kernel 4) with state + SiLU over the 8192 `[q | k | v]`
+  channels → L2 norm of the q and k heads (eps = rms eps) → decay `g = softplus(alpha + dt_bias) * ssm_a` and
+  `beta = sigmoid` per V head → delta rule per V head (`S *= exp(g); delta = (v - Sᵀk)·beta; S += k deltaᵀ;
+  o = Sᵀq / sqrt(128)`) → per-head RMSNorm with `ssm_norm` × SiLU(z) → `ssm_out` → residual.
+  - V head h reads Q/K head **h % 16** (ggml's broadcast tiles), not h / 2.
+  - The state uses ggml's transposed layout (`S_h[j*d + i] = S[i][j]`), so it diffs directly against
+    `new_state`.
+  - New ops in `qwen_ops`: `qwen_ssm_conv_step`, `qwen_l2norm`, `qwen_gated_delta_step`, `qwen_softplus`.
+- **State:** `RecurrentState`, one pinned /dev/shm buffer: per linear layer a conv state (8192 × 3) and a
+  delta-rule state (32 × 128 × 128), 53 MB for the 4B (24 layers). It is zeroed when a sequence starts at `pos == 0`
+  (one sequence for now, like the KV cache).
+- **`forward_verify`** adds blk.0 DeltaNet pieces, each from reference inputs: the five projections pass
+  (≤ 6e-7), and conv1d with carried state, L2 norm, gate, beta, delta-rule output and final state, ssm_norm
+  and the gated norm agree to ≤ 6e-7. **End to end:** the engine runs the 5 reference tokens through
+  `qwen_model_forward` and diffs the residual after every layer (new `qwen_model_set_layer_callback`) against
+  `l_out-N`. Every layer has cos > 0.995 and the argmax is 11751 " Paris". `FORWARD_VERIFY_LAYERS=1` prints
+  the per-layer table.
+- **Test fix:** the Q8_0 activation emulation now copies the x86 SIMD `quantize_row_q8_0` that the reference
+  build actually runs (`id = 127 / amax`, round half to even), not `quantize_row_q8_0_ref`. Blk.0's inputs
+  come from Q6_K embeddings, so they sit near rounding ties, and z/alpha/beta were off by whole Q8 steps
+  (2.5e-4).
 
 **Step 6: FFN.** 4B: dense SwiGLU. Revisit the old SwiGLU scale question here, now with correct inputs and a
 reference to diff against. 35B: router + top-8 experts + shared expert.
