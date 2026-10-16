@@ -76,6 +76,14 @@ const char  *gguf_kv_str_val(const gguf_model_t *model, int64_t idx);
 int32_t gguf_kv_get_string_array(const gguf_model_t *model, const char* key, const char*** out_strings, size_t* out_count);
 void gguf_free_string_array(const char** strings, size_t count);
 
+/* Get a numeric array (e.g. tokenizer.ggml.token_type, INT32) from KV by key, in place in the mapping.
+ * out_type is the GGUF element type id. Returns 0 on success, -1 if not found or not a numeric array. */
+int32_t gguf_kv_get_array(const gguf_model_t *model, const char* key, int32_t* out_type, const void** out_data,
+                          size_t* out_count);
+
+/* KV index of key for the gguf_kv_get_<type>(idx) getters, or -1 if absent. */
+int64_t gguf_find_kv(const gguf_model_t *model, const char* key);
+
 /* Get added_tokens array (array of strings) from KV by key. Returns 0 on success, -1 if not found or not a string array. */
 int32_t gguf_kv_get_added_tokens(const gguf_model_t *model, const char* key, const char*** out_strings, size_t* out_count);
 

@@ -1,19 +1,22 @@
-// demo_qwen.cpp -- Phase 4: minimal demo of Qwen 3 forward pass.
-// Usage: ./qwen_demo <model.gguf> "prompt text"
+// demo_qwen.cpp -- greedy generation with the Qwen3.5 forward pass.
+// Usage: ./qwen_demo <model.gguf> "prompt text" [n_gen]   (run from build/co)
 
 #include "qwen_model.h"
 #include "inference.h"
+#include "tokenizer.h"
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        printf("Usage: %s <model.gguf> \"prompt text\"\n", argv[0]);
+        printf("Usage: %s <model.gguf> \"prompt text\" [n_gen]\n", argv[0]);
         return 1;
     }
 
     const char* model_path = argv[1];
     const char* prompt = argv[2];
+    const int n_gen = argc > 3 ? atoi(argv[3]) : 16;
 
     printf("Loading model: %s\n", model_path);
     inference_model_t* engine = inference_load_model(model_path);
@@ -74,23 +77,29 @@ int main(int argc, char** argv) {
     }
     inference_free_tokens(tokens, n_tokens);
 
-    // Generate a few continuation tokens
-    for (int i = 0; i < 5; ++i) {
-        printf("Generated token %d: %d\n", i, next);
-        if (i == 4) break;
+    // Greedy generation; stops at n_gen tokens or EOS
+    tokenizer_t* tok = inference_get_tokenizer(engine);
+    const int eos = tokenizer_eos_id(tok);
+    std::string text;
+    char piece[256];
+    for (int i = 0; i < n_gen; ++i) {
+        tokenizer_decode(tok, &next, 1, piece, sizeof(piece));
+        text += piece;
+        printf("Generated token %d: %d '%s'\n", i, next, piece);
+        if (next == eos || i + 1 == n_gen) break;
         float* logits = new float[vocab_size];
         if (qwen_model_forward(model, next, n_tokens + i, logits) != 0) {
             fprintf(stderr, "Generation failed: %s\n", inference_get_last_error());
             delete[] logits;
             break;
         }
-        // Greedy sampling
         next = 0;
         for (int v = 1; v < vocab_size; ++v) {
             if (logits[v] > logits[next]) next = v;
         }
         delete[] logits;
     }
+    printf("Prompt + generation: %s%s\n", prompt, text.c_str());
 
     inference_kv_cache_free(engine);
     inference_free_model(engine);

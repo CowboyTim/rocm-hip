@@ -1206,21 +1206,36 @@ for the symptoms above.
 
 ### 20.3 Plan
 
-> **▶ NEXT STEP (as of 2026-10-16): fix the tokenizer, then Step 6 (35B MoE).**
+> **▶ NEXT STEP (as of 2026-10-16): Step 6 — the 35B-A3B (MoE).**
 >
-> Step 5 is done: the 4B forward pass matches the reference end to end. Fed the reference token IDs,
-> `qwen_model_forward` tracks `l_out-N` on all 32 layers × 5 tokens (worst cos 0.99595, layer 19) and
-> predicts **11751 " Paris"**. `qwen_demo` still produces wrong tokens only because the tokenizer is wrong
-> (8 tokens `760 288 62865 288 1020 288 47358 18039` vs the reference `760 6511 314 9338 369`).
+> The 4B now works from text to text. The tokenizer matches llama.cpp on a 21-prompt corpus, and
+> `qwen_demo` greedy output is identical to `llama-completion -no-cnv --temp 0` for 24 tokens of
+> "The capital of France is" (" Paris.\nA. True\nB. False\nAnswer: …") and 32 tokens of a Python prompt.
 >
-> 1. **Tokenizer:** match `ref_dump tokens` on a handful of prompts (GPT-2 byte-level BPE with the qwen35
->    pre-tokenizer regex; `Ġ` must merge into the next word). Then `qwen_demo "The capital of France is"`
->    should print " Paris" first, and a few greedy tokens should match `llama-completion`.
-> 2. **Step 6 (35B-A3B):** TYPE101/BF16 are already in `qmatvec`; add the router, top-8 experts and the
->    shared expert, and a `forward_verify` section for one MoE layer. Reference: `ref_dump acts` on the 35B.
-> 3. **Then speed:** the DeltaNet and attention token mixers, norms and SwiGLU are CPU ops (`qwen_ops`);
->    port them to kernels (the recurrent state is already a pinned /dev/shm buffer) and cut the per-matvec
->    syncs. Re-run `forward_verify` after each port.
+> 1. **Step 6 (35B-A3B):** TYPE101/BF16 already work in `qmatvec`, and the 35B's hparams load. Add the
+>    MoE FFN: router, top-8 of 256 experts, and the shared expert. Bind the expert tensors in place, and
+>    add a `forward_verify` section for one MoE layer plus the end-to-end `l_out` check. Reference: run
+>    `ref_dump acts` on the 35B (into its own /dev/shm directory).
+> 2. **Then speed:** the DeltaNet and attention token mixers, norms and SwiGLU are CPU ops (`qwen_ops`).
+>    Port them to kernels (the recurrent state is already a pinned /dev/shm buffer) and cut the
+>    per-matvec syncs. Re-run `forward_verify` after each port.
+>
+> **Tokenizer — DONE ✅ (2026-10-16).** `src/tokenizer.cpp` is rewritten as GPT-2 byte-level BPE following
+> llama.cpp's `llm_tokenizer_bpe`:
+> - Special tokens (token_type CONTROL/USER_DEFINED/UNKNOWN) are split out first, longest first.
+> - Then the qwen35/qwen2 pre-tokenizer (a port of llama.cpp's custom splitters; qwen35 counts `\p{M}`
+>   as part of letter runs), then `bytes_to_unicode` encoding, then rank-ordered merges.
+> - Unicode category flags come from `src/unicode_flags.inc`, generated from the reference's
+>   `unicode-data.cpp` by `tools/gen_unicode_flags.py`.
+> - `gguf_mmap` gained `gguf_kv_get_array` (numeric arrays in place, for `token_type`) and `gguf_find_kv`.
+> - An unknown `tokenizer.ggml.model`/`pre` fails loudly instead of tokenizing wrongly.
+>
+> `tests/tokenizer_gguf_verify <gguf> tests/data/<model>_tokenizer.tsv` diffs the encoding against
+> reference ids recorded by `tools/gen_tokenizer_ref.py` (ref_dump) and checks the decode round trip.
+> It covers contractions, digits, CR/LF, tabs and \v\f, whitespace runs, accents, combining marks, CJK,
+> Cyrillic/Greek/Arabic, emoji and flags, code, chat special tokens, and invalid UTF-8. It passes 21/21
+> on the 4B (qwen35) and on Qwen3-0.6B (qwen2). `qwen_demo` takes an optional `n_gen` and prints the
+> decoded text.
 
 **Target model: `Qwen3.5-4B-ROCMFP4.gguf`** (restored to `/dev/shm/models/` on 2026-10-14). It has hybrid
 DeltaNet + gated attention but a dense FFN, and only F32/ROCMFP4/Q5_K/Q6_K tensors, so no MoE and no

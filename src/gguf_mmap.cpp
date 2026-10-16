@@ -110,6 +110,7 @@ struct kv_entry {
     char             *str_val;    /* allocated string (for string-type scalars) */
     char            **arr_strings;/* for string arrays: array of strings */
     size_t           arr_str_n;   /* number of strings in arr_strings */
+    const void      *arr_data;    /* for numeric arrays: elements, in place in the file mapping */
 };
 
 /* Opaque handle matching the public API declaration */
@@ -234,6 +235,7 @@ static gguf_model_t *load_gguf(const char *path) {
                     case GGUF_TYPE_UINT64:  elem_sz=8; break; case GGUF_TYPE_INT64:   elem_sz=8; break;
                     case GGUF_TYPE_FLOAT64: elem_sz=8; break; default: goto fail;
                 }
+                kv->arr_data = p;
                 p += arr_n * elem_sz;
             }
 
@@ -751,6 +753,23 @@ int32_t gguf_kv_get_string_array(const gguf_model_t *model, const char* key, con
     *out_strings = (const char**)kv->arr_strings;
     *out_count = kv->arr_str_n;
     return 0;
+}
+
+int32_t gguf_kv_get_array(const gguf_model_t *model, const char* key, int32_t* out_type, const void** out_data,
+                          size_t* out_count) {
+    if (!model || !key || !out_type || !out_data || !out_count) return -1;
+    int64_t idx = find_kv_idx(model, key);
+    if (idx < 0) return -1;
+    const struct kv_entry *kv = &model->kvs[idx];
+    if (!kv->is_array || kv->arr_type == GGUF_TYPE_STRING || !kv->arr_data) return -1;
+    *out_type = kv->arr_type;
+    *out_data = kv->arr_data;
+    *out_count = (size_t)kv->arr_n;
+    return 0;
+}
+
+int64_t gguf_find_kv(const gguf_model_t *model, const char* key) {
+    return find_kv_idx(model, key);
 }
 
 void gguf_free_string_array(const char** strings, size_t count) {

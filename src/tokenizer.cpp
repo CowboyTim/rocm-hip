@@ -1,301 +1,463 @@
-// tokenizer.cpp -- Phase 5: minimal BPE tokenizer for GGUF vocab+merges.
-// Implements encode/decode using the merge rules as in GPT-2 / LLaMA tokenizers.
+// tokenizer.cpp -- GPT-2-style byte-level BPE for GGUF vocabularies (tokenizer.ggml.model = "gpt2").
+//
+// Matches llama.cpp's llm_tokenizer_bpe (the reference, Phase 20), in four stages:
+//   1. Special tokens: CONTROL / USER_DEFINED / UNKNOWN tokens found literally in the text are emitted as
+//      themselves, longest first; only the text between them is tokenized further.
+//   2. Pre-tokenizer: the text is split into words by the model's regex (tokenizer.ggml.pre). Implemented
+//      by hand like llama.cpp's custom splitters, using Unicode category flags from unicode_flags.inc.
+//   3. Byte encoding: each UTF-8 byte of a word maps to one printable codepoint (GPT-2 bytes_to_unicode,
+//      so ' ' becomes 'Ġ'), the alphabet the vocab and merges are written in.
+//   4. BPE: adjacent symbols are merged lowest merge rank first (leftmost on ties) until no pair is in
+//      the merge table; each final symbol is looked up in the vocab.
+// Supported pre-tokenizers: qwen35, qwen2 (and models that share their regex).
 
 #include "tokenizer.h"
 #include "gguf_mmap.h"
-#include <string>
-#include <vector>
-#include <unordered_map>
-#include <unordered_set>
-#include <algorithm>
-#include <cstring>
-#include <cstdlib>
-#include <cstdio>
-#include <climits>
 
-struct Tokenizer {
-    std::vector<std::string> vocab;                 // id -> token string
-    std::unordered_map<std::string, int> vocab_map; // token string -> id
-    std::vector<std::pair<std::string,std::string>> merges; // ordered merges
-    std::unordered_map<std::string, int> merge_rank; // "a b" -> rank (lower = earlier)
-    int bos_id = -1;
-    int eos_id = -1;
-    int pad_id = -1;
-    int unk_id = -1;
-    // special token maps
-    std::unordered_map<std::string, int> special_str_to_id;
-    std::unordered_map<int, std::string> id_to_special_str;
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <queue>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "unicode_flags.inc"
+
+namespace {
+
+// ---------------------------------------------------------------- Unicode helpers
+
+enum : uint16_t {
+    CPT_UNDEFINED = 0x0001,
+    CPT_NUMBER = 0x0002,      // \p{N}
+    CPT_LETTER = 0x0004,      // \p{L}
+    CPT_ACCENT_MARK = 0x0010, // \p{M}
+    CPT_WHITESPACE = 0x0100,  // \s
 };
 
-extern "C" {
+const uint32_t OUT_OF_RANGE = 0xFFFFFFFF;
 
-tokenizer_t* tokenizer_create(const char** vocab, size_t vocab_size,
-                              const char** merges, size_t merges_size)
-{
-    Tokenizer* t = new Tokenizer();
-    t->vocab.reserve(vocab_size);
-    for (size_t i = 0; i < vocab_size; ++i) {
-        t->vocab.emplace_back(vocab[i]);
-        t->vocab_map[t->vocab.back()] = (int)i;
-    }
-    t->merges.reserve(merges_size);
-    for (size_t i = 0; i < merges_size; ++i) {
-        const char* s = merges[i];
-        // format: "token1 token2"
-        const char* space = strchr(s, ' ');
-        if (!space) continue;
-        std::string left(s, space - s);
-        std::string right(space + 1);
-        t->merges.emplace_back(left, right);
-        t->merge_rank[left + " " + right] = (int)t->merges.size() - 1;
-    }
-    return (tokenizer_t*)t;
+// Category flags of every codepoint (0x110000 entries), expanded once from the range table
+const std::vector<uint16_t>& cpt_flag_table() {
+    static const std::vector<uint16_t> table = [] {
+        std::vector<uint16_t> t(0x110000, CPT_UNDEFINED);
+        const size_t n = sizeof(UNICODE_RANGES) / sizeof(UNICODE_RANGES[0]);
+        for (size_t i = 0; i + 1 < n; ++i)
+            for (uint32_t c = UNICODE_RANGES[i].start; c < UNICODE_RANGES[i + 1].start; ++c) t[c] = UNICODE_RANGES[i].flags;
+        for (uint32_t c : UNICODE_WHITESPACE) t[c] |= CPT_WHITESPACE;
+        return t;
+    }();
+    return table;
 }
 
-void tokenizer_free(tokenizer_t* tok) {
-    delete (Tokenizer*)tok;
+uint16_t cpt_flags(uint32_t c) {
+    if (c == OUT_OF_RANGE) return 0;
+    const std::vector<uint16_t>& t = cpt_flag_table();
+    return c < t.size() ? t[c] : CPT_UNDEFINED;
 }
 
-static std::vector<std::string> split_utf8(const std::string& str) {
-    // Very simple: treat each byte as a character for now (ASCII only).
-    // For real UTF-8 need proper decoding; omitted for brevity.
-    std::vector<std::string> out;
-    for (unsigned char c : str) {
-        char buf[2] = { (char)c, 0 };
-        out.emplace_back(buf);
+// UTF-8 decoding as llama.cpp's unicode_cpts_from_utf8: an invalid lead or truncated sequence becomes
+// U+FFFD and consumes one byte
+std::vector<uint32_t> utf8_to_cpts(const std::string& s) {
+    std::vector<uint32_t> out;
+    out.reserve(s.size());
+    const unsigned char* p = (const unsigned char*)s.data();
+    const size_t n = s.size();
+    auto cont = [&](size_t i) { return i < n && (p[i] & 0xC0) == 0x80; };
+    for (size_t i = 0; i < n;) {
+        const unsigned char c = p[i];
+        if (!(c & 0x80)) { out.push_back(c); i += 1; }
+        else if (!(c & 0x40)) { out.push_back(0xFFFD); i += 1; }
+        else if (!(c & 0x20)) {
+            if (cont(i + 1)) { out.push_back(((c & 0x1F) << 6) | (p[i + 1] & 0x3F)); i += 2; }
+            else { out.push_back(0xFFFD); i += 1; }
+        } else if (!(c & 0x10)) {
+            if (cont(i + 1) && cont(i + 2)) {
+                out.push_back(((c & 0x0F) << 12) | ((p[i + 1] & 0x3F) << 6) | (p[i + 2] & 0x3F));
+                i += 3;
+            } else { out.push_back(0xFFFD); i += 1; }
+        } else if (!(c & 0x08)) {
+            if (cont(i + 1) && cont(i + 2) && cont(i + 3)) {
+                out.push_back(((c & 0x07) << 18) | ((p[i + 1] & 0x3F) << 12) | ((p[i + 2] & 0x3F) << 6) | (p[i + 3] & 0x3F));
+                i += 4;
+            } else { out.push_back(0xFFFD); i += 1; }
+        } else { out.push_back(0xFFFD); i += 1; }
     }
     return out;
 }
 
+void append_utf8(std::string& s, uint32_t c) {
+    if (c < 0x80) s += (char)c;
+    else if (c < 0x800) { s += (char)(0xC0 | (c >> 6)); s += (char)(0x80 | (c & 0x3F)); }
+    else if (c < 0x10000) {
+        s += (char)(0xE0 | (c >> 12)); s += (char)(0x80 | ((c >> 6) & 0x3F)); s += (char)(0x80 | (c & 0x3F));
+    } else {
+        s += (char)(0xF0 | (c >> 18)); s += (char)(0x80 | ((c >> 12) & 0x3F));
+        s += (char)(0x80 | ((c >> 6) & 0x3F)); s += (char)(0x80 | (c & 0x3F));
+    }
+}
+
+// GPT-2 bytes_to_unicode: printable Latin-1 bytes map to themselves, the other 68 to U+0100 upward
+struct ByteMap {
+    std::string byte_to_utf8[256];
+    std::unordered_map<uint32_t, uint8_t> cpt_to_byte;
+    ByteMap() {
+        int n = 0;
+        for (int b = 0; b < 256; ++b) {
+            const bool printable = (b >= 0x21 && b <= 0x7E) || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF);
+            const uint32_t c = printable ? (uint32_t)b : 256u + n++;
+            append_utf8(byte_to_utf8[b], c);
+            cpt_to_byte[c] = (uint8_t)b;
+        }
+    }
+};
+
+const ByteMap& byte_map() {
+    static const ByteMap m;
+    return m;
+}
+
+uint32_t ascii_lower(uint32_t c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+
+// ---------------------------------------------------------------- pre-tokenizers
+
+enum PreType { PRE_QWEN2, PRE_QWEN35 };
+
+// Word lengths (in codepoints) for llama.cpp's qwen2 / qwen35 regex:
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N} | ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+// qwen35 treats combining marks (\p{M}) as letters in the letter run and the punctuation run.
+// Port of unicode_regex_split_custom_qwen2/_qwen35.
+std::vector<size_t> split_qwen(const std::vector<uint32_t>& cpts, bool marks) {
+    std::vector<size_t> words;
+    const size_t end = cpts.size();
+    const uint16_t letter = marks ? (CPT_LETTER | CPT_ACCENT_MARK) : CPT_LETTER;
+    auto cpt = [&](size_t i) { return i < end ? cpts[i] : OUT_OF_RANGE; };
+    auto flags = [&](size_t i) { return cpt_flags(cpt(i)); };
+
+    size_t prev = 0;
+    auto add = [&](size_t to) {
+        const size_t len = to - prev;
+        if (len > 0) words.push_back(len);
+        prev = to;
+        return len;
+    };
+
+    for (size_t pos = 0; pos < end;) {
+        const uint32_t c = cpt(pos);
+        const uint16_t f = flags(pos);
+
+        // (?i:'s|'t|'re|'ve|'m|'ll|'d)
+        if (c == '\'' && pos + 1 < end) {
+            const uint32_t n1 = ascii_lower(cpt(pos + 1));
+            if (n1 == 's' || n1 == 't' || n1 == 'm' || n1 == 'd') { pos += add(pos + 2); continue; }
+            if (pos + 2 < end) {
+                const uint32_t n2 = ascii_lower(cpt(pos + 2));
+                if ((n1 == 'r' && n2 == 'e') || (n1 == 'v' && n2 == 'e') || (n1 == 'l' && n2 == 'l')) {
+                    pos += add(pos + 3);
+                    continue;
+                }
+            }
+        }
+
+        // [^\r\n\p{L}\p{N}]?[\p{L}(\p{M})]+
+        if (!(c == '\r' || c == '\n' || (f & CPT_NUMBER))) {
+            if ((f & letter) || (flags(pos + 1) & letter)) {
+                pos++;
+                while (flags(pos) & letter) pos++;
+                add(pos);
+                continue;
+            }
+        }
+
+        // \p{N}
+        if (f & CPT_NUMBER) { add(++pos); continue; }
+
+        // <space>?[^\s\p{L}(\p{M})\p{N}]+[\r\n]*
+        const uint16_t stop = CPT_WHITESPACE | letter | CPT_NUMBER;
+        uint16_t f2 = c == ' ' ? flags(pos + 1) : f;
+        if (!(f2 & stop) && f) {
+            pos += (c == ' ');
+            while (!(f2 & stop) && f2) f2 = flags(++pos);
+            uint32_t c2 = cpt(pos);
+            while (c2 == '\r' || c2 == '\n') c2 = cpt(++pos);
+            add(pos);
+            continue;
+        }
+
+        size_t n_ws = 0, last_rn_end = 0;
+        while (flags(pos + n_ws) & CPT_WHITESPACE) {
+            const uint32_t c2 = cpt(pos + n_ws);
+            if (c2 == '\r' || c2 == '\n') last_rn_end = pos + n_ws + 1;
+            n_ws++;
+        }
+        if (last_rn_end > 0) { pos = last_rn_end; add(pos); continue; }               // \s*[\r\n]+
+        if (n_ws > 1 && cpt(pos + n_ws) != OUT_OF_RANGE) { pos += n_ws - 1; add(pos); continue; }  // \s+(?!\S)
+        if (n_ws > 0) { pos += n_ws; add(pos); continue; }                               // \s+
+        add(++pos);                                                                     // no match
+    }
+    return words;
+}
+
+// ---------------------------------------------------------------- tokenizer
+
+enum TokenType { TT_NORMAL = 1, TT_UNKNOWN = 2, TT_CONTROL = 3, TT_USER_DEFINED = 4, TT_UNUSED = 5, TT_BYTE = 6 };
+
+} // namespace
+
+struct tokenizer {
+    std::vector<std::string> vocab;                    // id -> token text (byte-encoded for normal tokens)
+    std::vector<int> type;                             // id -> TokenType
+    std::unordered_map<std::string, int> vocab_map;    // token text -> id
+    std::unordered_map<std::string, int> merge_rank;   // "left right" -> rank (lower merges first)
+    std::vector<int> specials;                         // CONTROL/USER_DEFINED/UNKNOWN ids, longest text first
+    PreType pre = PRE_QWEN2;
+    int bos_id = -1, eos_id = -1, pad_id = -1, unk_id = -1;
+    bool add_bos = false;
+
+    int lookup(const std::string& s) const {
+        auto it = vocab_map.find(s);
+        return it == vocab_map.end() ? -1 : it->second;
+    }
+
+    void build_specials() {
+        specials.clear();
+        for (int id = 0; id < (int)vocab.size(); ++id)
+            if (type[id] == TT_CONTROL || type[id] == TT_USER_DEFINED || type[id] == TT_UNKNOWN) specials.push_back(id);
+        std::stable_sort(specials.begin(), specials.end(),
+                         [&](int a, int b) { return vocab[a].size() > vocab[b].size(); });
+    }
+
+    // BPE over one byte-encoded word; appends the token ids
+    void bpe_word(const std::string& word, std::vector<int>& out) const {
+        struct Sym { int prev, next; size_t off, n; };
+        std::vector<Sym> sym;
+        for (size_t off = 0; off < word.size();) {
+            const unsigned char c = (unsigned char)word[off];
+            const size_t len = std::min(word.size() - off, (size_t)(c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4));
+            sym.push_back({(int)sym.size() - 1, -1, off, len});
+            off += len;
+        }
+        for (size_t i = 0; i + 1 < sym.size(); ++i) sym[i].next = (int)i + 1;
+
+        struct Bigram { int rank, left, right; std::string text; };
+        auto later = [](const Bigram& a, const Bigram& b) { return a.rank > b.rank || (a.rank == b.rank && a.left > b.left); };
+        std::priority_queue<Bigram, std::vector<Bigram>, decltype(later)> q(later);
+        auto add_bigram = [&](int l, int r) {
+            if (l < 0 || r < 0) return;
+            const std::string a = word.substr(sym[l].off, sym[l].n), b = word.substr(sym[r].off, sym[r].n);
+            auto it = merge_rank.find(a + " " + b);
+            if (it != merge_rank.end()) q.push({it->second, l, r, a + b});
+        };
+        for (size_t i = 1; i < sym.size(); ++i) add_bigram((int)i - 1, (int)i);
+
+        while (!q.empty()) {
+            const Bigram bg = q.top();
+            q.pop();
+            Sym& L = sym[bg.left];
+            Sym& R = sym[bg.right];
+            if (L.n == 0 || R.n == 0 || L.n + R.n != bg.text.size() ||
+                word.compare(L.off, L.n + R.n, bg.text) != 0 || L.next != bg.right)
+                continue;  // stale
+            L.n += R.n;
+            R.n = 0;
+            L.next = R.next;
+            if (R.next >= 0) sym[R.next].prev = bg.left;
+            add_bigram(L.prev, bg.left);
+            add_bigram(bg.left, L.next);
+        }
+
+        for (int i = sym.empty() ? -1 : 0; i >= 0; i = sym[i].next) {
+            if (sym[i].n == 0) continue;
+            const std::string s = word.substr(sym[i].off, sym[i].n);
+            const int id = lookup(s);
+            if (id >= 0) { out.push_back(id); continue; }
+            for (char ch : s) {  // byte fallback, as llama.cpp: single-byte tokens if the vocab has them
+                const int b = lookup(std::string(1, ch));
+                if (b >= 0) out.push_back(b);
+            }
+        }
+    }
+
+    // Pre-tokenize + byte-encode + BPE one span of plain text
+    void encode_text(const std::string& text, std::vector<int>& out) const {
+        const std::vector<uint32_t> cpts = utf8_to_cpts(text);
+        const std::vector<size_t> words = split_qwen(cpts, pre == PRE_QWEN35);
+        const ByteMap& bm = byte_map();
+        size_t start = 0;
+        for (size_t len : words) {
+            std::string raw, enc;
+            for (size_t i = start; i < start + len; ++i) append_utf8(raw, cpts[i]);
+            start += len;
+            for (unsigned char ch : raw) enc += bm.byte_to_utf8[ch];
+            bpe_word(enc, out);
+        }
+    }
+
+    // Split on special tokens (longest first, as llama.cpp's tokenizer_st_partition), BPE the rest
+    void encode(const std::string& text, std::vector<int>& out) const {
+        struct Frag { int id; size_t off, len; };  // id >= 0: special token; else text[off, off + len)
+        std::vector<Frag> frags = {{-1, 0, text.size()}};
+        for (int sid : specials) {
+            const std::string& st = vocab[sid];
+            if (st.empty()) continue;
+            std::vector<Frag> next;
+            for (const Frag& f : frags) {
+                if (f.id >= 0) { next.push_back(f); continue; }
+                size_t pos = f.off;
+                const size_t fend = f.off + f.len;
+                while (true) {
+                    const size_t m = text.find(st, pos);
+                    if (m == std::string::npos || m + st.size() > fend) break;
+                    if (m > pos) next.push_back({-1, pos, m - pos});
+                    next.push_back({sid, m, st.size()});
+                    pos = m + st.size();
+                }
+                if (pos < fend) next.push_back({-1, pos, fend - pos});
+            }
+            frags.swap(next);
+        }
+        if (add_bos && bos_id >= 0) out.push_back(bos_id);
+        for (const Frag& f : frags) {
+            if (f.id >= 0) out.push_back(f.id);
+            else encode_text(text.substr(f.off, f.len), out);
+        }
+    }
+
+    // One token's text: byte-decoded for normal tokens, verbatim for control/user-defined ones
+    void piece(int id, std::string& out) const {
+        if (id < 0 || id >= (int)vocab.size()) return;
+        const std::string& t = vocab[id];
+        if (type[id] == TT_CONTROL || type[id] == TT_USER_DEFINED || type[id] == TT_UNKNOWN) { out += t; return; }
+        const ByteMap& bm = byte_map();
+        for (uint32_t c : utf8_to_cpts(t)) {
+            auto it = bm.cpt_to_byte.find(c);
+            if (it != bm.cpt_to_byte.end()) out += (char)it->second;
+            else append_utf8(out, c);
+        }
+    }
+};
+
+extern "C" {
+
+tokenizer_t* tokenizer_create(const char** vocab, size_t vocab_size, const char** merges, size_t merges_size) {
+    if (!vocab || vocab_size == 0) return nullptr;
+    tokenizer* t = new tokenizer();
+    t->vocab.reserve(vocab_size);
+    t->vocab_map.reserve(vocab_size);
+    for (size_t i = 0; i < vocab_size; ++i) {
+        t->vocab.emplace_back(vocab[i] ? vocab[i] : "");
+        t->vocab_map.emplace(t->vocab.back(), (int)i);
+    }
+    t->type.assign(vocab_size, TT_NORMAL);
+    t->merge_rank.reserve(merges_size);
+    for (size_t i = 0; i < merges_size; ++i) {
+        // "left right"; split at the first space after position 0, as llama.cpp does
+        const char* s = merges[i];
+        const char* sp = s && s[0] ? strchr(s + 1, ' ') : nullptr;
+        if (!sp) continue;
+        t->merge_rank.emplace(std::string(s, sp - s) + " " + std::string(sp + 1), (int)i);
+    }
+    return t;
+}
+
+void tokenizer_free(tokenizer_t* tok) {
+    delete tok;
+}
+
 int tokenizer_encode(tokenizer_t* tok, const char* text, int* out_ids, int max_ids) {
-    Tokenizer* t = (Tokenizer*)tok;
-    if (!t || !text || !out_ids || max_ids <= 0) return -1;
-
-    // Check for special token strings that map to a single token ID
-    auto it_special = t->special_str_to_id.find(text);
-    if (it_special != t->special_str_to_id.end()) {
-        if (max_ids >= 1) {
-            out_ids[0] = it_special->second;
-            return 1;
-        }
-        return -1;
-    }
-
-    // Initial tokenization: split into bytes (or use vocab tokens if present)
-    std::string input(text);
-    std::vector<std::string> tokens = split_utf8(input);
-
-    // Map initial tokens to ids (fallback to byte fallback if unknown)
+    if (!tok || !text || !out_ids || max_ids < 0) return -1;
     std::vector<int> ids;
-    ids.reserve(tokens.size());
-    for (const auto& tok_str : tokens) {
-        auto it = t->vocab_map.find(tok_str);
-        if (it != t->vocab_map.end()) ids.push_back(it->second);
-        else {
-            // byte fallback: use 256..511 for bytes 0..255
-            unsigned char b = (unsigned char)tok_str[0];
-            ids.push_back(256 + b);
-        }
-    }
-
-    // Apply BPE merges in order
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        int best_rank = INT_MAX;
-        int best_idx = -1;
-        for (size_t i = 0; i + 1 < ids.size(); ++i) {
-            std::string pair = t->vocab[ids[i]] + " " + t->vocab[ids[i+1]];
-            auto it = t->merge_rank.find(pair);
-            if (it != t->merge_rank.end() && it->second < best_rank) {
-                best_rank = it->second;
-                best_idx = (int)i;
-            }
-        }
-        if (best_idx >= 0) {
-            // merge
-            std::string merged = t->vocab[ids[best_idx]] + t->vocab[ids[best_idx+1]];
-            int merged_id = -1;
-            auto itv = t->vocab_map.find(merged);
-            if (itv != t->vocab_map.end()) merged_id = itv->second;
-            else {
-                // new token not in vocab -> assign new id (extend vocab)
-                merged_id = (int)t->vocab.size();
-                t->vocab.push_back(merged);
-                t->vocab_map[merged] = merged_id;
-            }
-            ids[best_idx] = merged_id;
-            ids.erase(ids.begin() + best_idx + 1);
-            changed = true;
-        }
-    }
-
-    int n = (int)ids.size();
-    if (n > max_ids) n = max_ids;
-    for (int i = 0; i < n; ++i) out_ids[i] = ids[i];
-    return n;
+    tok->encode(text, ids);
+    if ((int)ids.size() > max_ids) return -1;
+    std::copy(ids.begin(), ids.end(), out_ids);
+    return (int)ids.size();
 }
 
 int tokenizer_decode(tokenizer_t* tok, const int* ids, int n_ids, char* out_str, int max_len) {
-    Tokenizer* t = (Tokenizer*)tok;
-    if (!t || !ids || n_ids <= 0 || !out_str || max_len <= 0) return -1;
-    std::string result;
-    result.reserve(n_ids * 4);
-    for (int i = 0; i < n_ids; ++i) {
-        int id = ids[i];
-        // Check for special token ID
-        auto it_special = t->id_to_special_str.find(id);
-        if (it_special != t->id_to_special_str.end()) {
-            result += it_special->second;
-        } else if (id >= 0 && id < (int)t->vocab.size()) {
-            result += t->vocab[id];
-        } else if (id >= 256 && id < 512) {
-            // byte fallback
-            char c = (char)(id - 256);
-            result.push_back(c);
-        }
-    }
-    int len = (int)result.size();
+    if (!tok || !out_str || max_len <= 0 || (n_ids > 0 && !ids)) return -1;
+    std::string s;
+    for (int i = 0; i < n_ids; ++i) tok->piece(ids[i], s);
+    int len = (int)s.size();
     if (len >= max_len) len = max_len - 1;
-    memcpy(out_str, result.c_str(), len);
+    memcpy(out_str, s.data(), (size_t)len);
     out_str[len] = '\0';
     return len;
 }
 
-size_t tokenizer_vocab_size(tokenizer_t* tok) {
-    Tokenizer* t = (Tokenizer*)tok;
-    return t ? t->vocab.size() : 0;
+size_t tokenizer_vocab_size(tokenizer_t* tok) { return tok ? tok->vocab.size() : 0; }
+int tokenizer_bos_id(tokenizer_t* tok) { return tok ? tok->bos_id : -1; }
+int tokenizer_eos_id(tokenizer_t* tok) { return tok ? tok->eos_id : -1; }
+int tokenizer_pad_id(tokenizer_t* tok) { return tok ? tok->pad_id : -1; }
+int tokenizer_unk_id(tokenizer_t* tok) { return tok ? tok->unk_id : -1; }
+
+// Integer KV by key (any integer GGUF type), or def
+static int64_t kv_int(const gguf_model_t* m, const char* key, int64_t def) {
+    const int64_t idx = gguf_find_kv(m, key);
+    if (idx < 0) return def;
+    uint32_t u32; int32_t i32; uint64_t u64; int64_t i64;
+    if (gguf_kv_get_u32(m, idx, &u32) == 0) return u32;
+    if (gguf_kv_get_i32(m, idx, &i32) == 0) return i32;
+    if (gguf_kv_get_u64(m, idx, &u64) == 0) return (int64_t)u64;
+    if (gguf_kv_get_i64(m, idx, &i64) == 0) return i64;
+    return def;
 }
 
-int tokenizer_bos_id(tokenizer_t* tok) {
-    Tokenizer* t = (Tokenizer*)tok;
-    return t ? t->bos_id : -1;
+static bool kv_bool(const gguf_model_t* m, const char* key, bool def) {
+    const int64_t idx = gguf_find_kv(m, key);
+    uint8_t v;
+    return (idx >= 0 && gguf_kv_get_u8(m, idx, &v) == 0) ? v != 0 : def;
 }
 
-int tokenizer_eos_id(tokenizer_t* tok) {
-    Tokenizer* t = (Tokenizer*)tok;
-    return t ? t->eos_id : -1;
-}
-
-int tokenizer_pad_id(tokenizer_t* tok) {
-    Tokenizer* t = (Tokenizer*)tok;
-    return t ? t->pad_id : -1;
-}
-
-int tokenizer_unk_id(tokenizer_t* tok) {
-    Tokenizer* t = (Tokenizer*)tok;
-    return t ? t->unk_id : -1;
-}
-
-// Helper to read a uint32 scalar from GGUF KV by key using public API
-static int gguf_kv_get_u32_by_key(const gguf_model_t* model, const char* key, uint32_t* out) {
-    if (!model || !key || !out) return -1;
-    int64_t n_kv = gguf_n_kv(model);
-    for (int64_t i = 0; i < n_kv; ++i) {
-        const char* k = gguf_kv_key(model, i);
-        if (k && strcmp(k, key) == 0) {
-            int type = gguf_kv_type(model, i);
-            if (type == 4) { // GGUF_TYPE_UINT32
-                if (gguf_kv_get_u32(model, i, out) == 0) return 0;
-            } else if (type == 5) { // GGUF_TYPE_INT32
-                if (gguf_kv_get_i32(model, i, (int32_t*)out) == 0) return 0;
-            } else if (type == 10) { // GGUF_TYPE_UINT64
-                if (gguf_kv_get_u64(model, i, (uint64_t*)out) == 0) return 0;
-            } else if (type == 11) { // GGUF_TYPE_INT64
-                if (gguf_kv_get_i64(model, i, (int64_t*)out) == 0) return 0;
-            }
-            return -1;
-        }
-    }
-    return -1;
-}
-
-// Load tokenizer from GGUF model metadata (vocab, merges, added_tokens)
-// Returns NULL on failure.
 tokenizer_t* tokenizer_load_from_gguf(void* gguf_model) {
-    if (!gguf_model) return nullptr;
-    // Get vocab array
-    const char** vocab_ptrs = nullptr;
-    size_t vocab_count = 0;
-    if (gguf_kv_get_string_array((const gguf_model_t*)gguf_model, "tokenizer.ggml.tokens", &vocab_ptrs, &vocab_count) != 0 || vocab_count == 0) {
+    const gguf_model_t* m = (const gguf_model_t*)gguf_model;
+    if (!m) return nullptr;
+
+    const char* model = gguf_tokenizer_type(m);
+    if (!model || strcmp(model, "gpt2") != 0) {
+        fprintf(stderr, "[tokenizer] unsupported tokenizer.ggml.model '%s' (only gpt2 BPE)\n", model ? model : "");
         return nullptr;
     }
-    // Get merges array
-    const char** merges_ptrs = nullptr;
-    size_t merges_count = 0;
-    gguf_kv_get_string_array((const gguf_model_t*)gguf_model, "tokenizer.ggml.merges", &merges_ptrs, &merges_count);
-    // Create tokenizer using existing create function
-    tokenizer_t* tok = tokenizer_create(vocab_ptrs, vocab_count, merges_ptrs, merges_count);
-    if (!tok) return nullptr;
-    Tokenizer* t = (Tokenizer*)tok;
-    // Try to read special token IDs from GGUF metadata (common keys)
-    uint32_t val;
-    if (gguf_kv_get_u32_by_key((const gguf_model_t*)gguf_model, "tokenizer.ggml.bos_token_id", &val) == 0) t->bos_id = (int)val;
-    if (gguf_kv_get_u32_by_key((const gguf_model_t*)gguf_model, "tokenizer.ggml.eos_token_id", &val) == 0) t->eos_id = (int)val;
-    if (gguf_kv_get_u32_by_key((const gguf_model_t*)gguf_model, "tokenizer.ggml.pad_token_id", &val) == 0) t->pad_id = (int)val;
-    if (gguf_kv_get_u32_by_key((const gguf_model_t*)gguf_model, "tokenizer.ggml.unk_token_id", &val) == 0) t->unk_id = (int)val;
-    // Try to read added_tokens array (strings) and map known special tokens
-    const char** added_ptrs = nullptr;
-    size_t added_count = 0;
-    if (gguf_kv_get_added_tokens((const gguf_model_t*)gguf_model, "tokenizer.ggml.added_tokens", &added_ptrs, &added_count) == 0) {
-        for (size_t i = 0; i < added_count; ++i) {
-            const char* s = added_ptrs[i];
-            if (!s) continue;
-            auto it = t->vocab_map.find(s);
-            if (it != t->vocab_map.end()) {
-                int id = it->second;
-                // Map known special token strings
-                if (strcmp(added_ptrs[i], "<|endoftext|>") == 0) {
-                    t->eos_id = id;
-                    t->special_str_to_id[s] = id;
-                    t->id_to_special_str[id] = s;
-                } else if (strcmp(added_ptrs[i], "<|pad|>") == 0) {
-                    t->pad_id = id;
-                    t->special_str_to_id[s] = id;
-                    t->id_to_special_str[id] = s;
-                } else if (strcmp(added_ptrs[i], "<|unk|>") == 0) {
-                    t->unk_id = id;
-                    t->special_str_to_id[s] = id;
-                    t->id_to_special_str[id] = s;
-                } else if (strcmp(added_ptrs[i], "<|bos|>") == 0) {
-                    t->bos_id = id;
-                    t->special_str_to_id[s] = id;
-                    t->id_to_special_str[id] = s;
-                }
-            }
+    const char* pre = gguf_pre_type(m);
+    PreType pt;
+    if (pre && strcmp(pre, "qwen35") == 0) pt = PRE_QWEN35;
+    else if (pre && strcmp(pre, "qwen2") == 0) pt = PRE_QWEN2;
+    else {
+        fprintf(stderr, "[tokenizer] unsupported tokenizer.ggml.pre '%s' (supported: qwen35, qwen2)\n", pre ? pre : "");
+        return nullptr;
+    }
+
+    const char** vocab = nullptr;
+    size_t n_vocab = 0;
+    if (gguf_kv_get_string_array(m, "tokenizer.ggml.tokens", &vocab, &n_vocab) != 0 || n_vocab == 0) return nullptr;
+    const char** merges = nullptr;
+    size_t n_merges = 0;
+    gguf_kv_get_string_array(m, "tokenizer.ggml.merges", &merges, &n_merges);
+
+    tokenizer* t = tokenizer_create(vocab, n_vocab, merges, n_merges);
+    if (!t) return nullptr;
+    t->pre = pt;
+
+    int32_t at = -1;
+    const void* types = nullptr;
+    size_t n_types = 0;
+    if (gguf_kv_get_array(m, "tokenizer.ggml.token_type", &at, &types, &n_types) == 0 && n_types == n_vocab &&
+        (at == 5 /* INT32 */ || at == 4 /* UINT32 */)) {
+        for (size_t i = 0; i < n_vocab; ++i) {
+            int32_t v;
+            memcpy(&v, (const char*)types + i * 4, 4);
+            t->type[i] = v;
         }
     }
-    // Populate special token maps from IDs we have
-    if (t->bos_id >= 0) {
-        // find string for bos_id
-        if ((size_t)t->bos_id < t->vocab.size()) {
-            const std::string& s = t->vocab[t->bos_id];
-            t->special_str_to_id[s] = t->bos_id;
-            t->id_to_special_str[t->bos_id] = s;
-        }
-    }
-    if (t->eos_id >= 0) {
-        if ((size_t)t->eos_id < t->vocab.size()) {
-            const std::string& s = t->vocab[t->eos_id];
-            t->special_str_to_id[s] = t->eos_id;
-            t->id_to_special_str[t->eos_id] = s;
-        }
-    }
-    if (t->pad_id >= 0) {
-        if ((size_t)t->pad_id < t->vocab.size()) {
-            const std::string& s = t->vocab[t->pad_id];
-            t->special_str_to_id[s] = t->pad_id;
-            t->id_to_special_str[t->pad_id] = s;
-        }
-    }
-    if (t->unk_id >= 0) {
-        if ((size_t)t->unk_id < t->vocab.size()) {
-            const std::string& s = t->vocab[t->unk_id];
-            t->special_str_to_id[s] = t->unk_id;
-            t->id_to_special_str[t->unk_id] = s;
-        }
-    }
-    return tok;
+    t->build_specials();
+
+    t->bos_id = (int)kv_int(m, "tokenizer.ggml.bos_token_id", -1);
+    t->eos_id = (int)kv_int(m, "tokenizer.ggml.eos_token_id", -1);
+    t->pad_id = (int)kv_int(m, "tokenizer.ggml.padding_token_id", -1);
+    t->unk_id = (int)kv_int(m, "tokenizer.ggml.unknown_token_id", -1);
+    t->add_bos = kv_bool(m, "tokenizer.ggml.add_bos_token", false);
+    return t;
 }
 
 } // extern "C"
