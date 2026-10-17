@@ -115,6 +115,17 @@ hipError_t qmatvec_quantize(const float *x, int K, const qmatvec_q8 *q, hipStrea
     return hipModuleLaunchKernel(g_quant, (unsigned)(K / 256), 1, 1, 256, 1, 1, 0, stream, args, nullptr);
 }
 
+// Lanes per row for the int8 matvec kernels: the smallest power of two (>= 4, >= 8 for K-quants, which use 8
+// lanes per 256-value block) that still gives every lane a task, so short rows (K = 512 MoE experts) don't
+// leave most of the wave idle. See Q8_ROW_INDEX in matvec_q.hip.
+static int q8_lanes_per_row(int type, int K) {
+    const bool kq = type != QT_Q4_0_ROCMFP4 && type != QT_Q4_0_ROCMFP4_FAST;
+    const int tasks = type == QT_Q4_0_ROCMFP4 ? K / 64 : type == QT_Q4_0_ROCMFP4_FAST ? K / 128 : K / 256 * 8;
+    int L = 32;
+    while (L > (kq ? 8 : 4) && L / 2 >= tasks) L /= 2;
+    return L;
+}
+
 hipError_t qmatvec_launch_q8_pair(int type, const void *W, int N, float *y, const void *W2, int N2, float *y2,
                                   size_t row_bytes, const qmatvec_q8 *q, int K, hipStream_t stream) {
     if (!qmatvec_q8_supported(type, K)) return hipErrorInvalidDeviceFunction;
@@ -126,10 +137,11 @@ hipError_t qmatvec_launch_q8_pair(int type, const void *W, int N, float *y, cons
     const float *d8 = kq ? q->dK : q->d0;
     const int32_t *bs = q->bsK;
     long long rb = (long long)row_bytes;
-    int N1 = N, Nt = N + N2;
+    int N1 = N, Nt = N + N2, L = q8_lanes_per_row(type, K);
     void *args[] = {(void *)&W, (void *)&W2, &N1, &rb, (void *)&q8, (void *)&d8, (void *)&bs, (void *)&y, (void *)&y2,
-                    &Nt, &K};
-    const unsigned grid = (unsigned)((Nt + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);
+                    &Nt, &K, &L};
+    const int rows = QMV_ROWS_PER_BLOCK * 32 / L;
+    const unsigned grid = (unsigned)((Nt + rows - 1) / rows);
     return hipModuleLaunchKernel(g_fn_q8[type], grid, 1, 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream, args, nullptr);
 }
 
@@ -167,9 +179,11 @@ hipError_t qmatvec_launch_q8_id(int type, const void *W, size_t row_bytes, const
     const float *d8 = kq ? q->dK : q->d0;
     const int32_t *bs = q->bsK;
     long long rb = (long long)row_bytes;
+    int L = q8_lanes_per_row(type, K);
     void *args[] = {(void *)&W, &rb, (void *)&ids, &n_used, &x_per_slot, (void *)&q8, (void *)&d8, (void *)&bs,
-                    (void *)&y, &N, &K};
-    const unsigned gx = (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);
+                    (void *)&y, &N, &K, &L};
+    const int rows = QMV_ROWS_PER_BLOCK * 32 / L;
+    const unsigned gx = (unsigned)((N + rows - 1) / rows);
     return hipModuleLaunchKernel(g_fn_q8_id[type], gx, (unsigned)n_used, (unsigned)T, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0,
                                  stream, args, nullptr);
 }
