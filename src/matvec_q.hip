@@ -1053,3 +1053,132 @@ MATMUL_Q8_KERNELS(q4_0_rocmfp4_fast, mmb_rocmfp4_fast<RowsLinear>, mmb_rocmfp4_f
 MATMUL_Q8_KERNELS(q6_K, mmb_q6_K<RowsLinear>, mmb_q6_K<RowsExpert>)
 MATMUL_Q8_KERNELS(q4_K, mmb_q4_K_lin, mmb_q4_K_exp)
 MATMUL_Q8_KERNELS(q5_K, mmb_q5_K_lin, mmb_q5_K_exp)
+
+// ================================================================ WMMA tiled matmul (prefill, Phase 20 W2)
+//
+// Y[t][n] = sum_k W[n][k] X[t][k] for T tokens with v_wmma_i32_16x16x16_iu8 (55.5 TOPS on gfx1151, vs 29 for
+// v_dot4). A workgroup of 4 waves computes a 64 weight-row x 64 token tile; wave w owns rows 16w..16w+15 and
+// all 64 tokens (4 float accumulator tiles of 16 x 16). Per 128-value K chunk the workgroup decodes the 64
+// rows' weights to int8 into LDS once (with their scales) and copies the 64 tokens' Q8_0 bytes and scales into
+// LDS; each 16-value step is then one WMMA per 16 x 16 sub-tile, an exact int32 dot over one ROCmFP4
+// half-block, accumulated as (float)dot * e_w[row] * d_x[token] (the same integer sums and scale products as
+// ggml; only the float accumulation order differs from the dot4 kernels).
+// WMMA wave32 layout (tests/wmma_layout_verify): A row i / B column i in lanes i and i + 16, 16 int8 each;
+// C column l % 16, row 2r + l / 16.
+// grid (ceil(N / 64), ceil(T / 64)), block 128. Requires K % 128 == 0.
+
+typedef int v4i_t __attribute__((ext_vector_type(4)));
+typedef int v8i_t __attribute__((ext_vector_type(8)));
+
+#define WM_TILE 64
+#define WM_KC 128
+
+extern "C" __global__ void __launch_bounds__(128)
+matmul_wmma_q4_0_rocmfp4(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, float *y,
+                         long long ldy, int N, int K, int T) {
+    // Rows padded by 16 bytes: the WMMA operand loads read 16 bytes from 16 consecutive rows, and an unpadded
+    // 128-byte row stride would put them all in the same LDS banks
+    __shared__ __attribute__((aligned(16))) int8_t sw[WM_TILE][WM_KC + 16];  // decoded weights
+    __shared__ __attribute__((aligned(16))) int8_t sx[WM_TILE][WM_KC + 16];  // token activations
+    __shared__ float sew[WM_TILE][WM_KC / 16];                               // weight half-block scales
+    __shared__ float sdx[WM_TILE][WM_KC / 32];                               // token block scales
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int r0 = blockIdx.x * WM_TILE, t0 = blockIdx.y * WM_TILE;
+    const int nb = K / 32;
+
+    float acc[4][8];
+#pragma unroll
+    for (int n = 0; n < 4; ++n)
+#pragma unroll
+        for (int r = 0; r < 8; ++r) acc[n][r] = 0.0f;
+
+    // Global data of one K chunk held in registers, so the next chunk's loads overlap this chunk's WMMAs:
+    // weights: blocks (row tid / 2, blocks 2 * (tid & 1) and + 1), 9 dwords each from 2-aligned 16-bit loads;
+    // activations: 4 uint4 = half (tid & 1) of token tid / 2's 128 bytes.
+    uint32_t gq[2][5];
+    uint4 gx[4];
+    const int wr_row = tid >> 1, wr_b = 2 * (tid & 1);
+    const int xt0 = tid >> 1, xc = (tid & 1) * 64;
+    auto load_chunk = [&](int k0) {
+        const int b0 = k0 / 32, row = r0 + wr_row;
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            if (row < N) {
+                const uint8_t *b = W + (long long)row * row_bytes + (long long)(b0 + wr_b + j) * 18;
+#pragma unroll
+                for (int k = 0; k < 4; ++k) gq[j][k] = ld32_a2(b + 4 * k);
+                gq[j][4] = *(const uint16_t *)(b + 16);
+            } else {
+#pragma unroll
+                for (int k = 0; k < 5; ++k) gq[j][k] = 0;
+            }
+        }
+        const int t = t0 + xt0;
+#pragma unroll
+        for (int c = 0; c < 4; ++c)
+            gx[c] = t < T ? *(const uint4 *)(q8 + (long long)t * K + k0 + xc + 16 * c) : uint4{0, 0, 0, 0};
+    };
+    auto store_chunk = [&](int k0) {
+        const int b0 = k0 / 32;
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            uint32_t *dst = (uint32_t *)&sw[wr_row][(wr_b + j) * 32];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                dst[k] = (uint32_t)rocmfp4_dec4(gq[j][k] & 0x0F0F0F0Fu);
+                dst[4 + k] = (uint32_t)rocmfp4_dec4((gq[j][k] >> 4) & 0x0F0F0F0Fu);
+            }
+            sew[wr_row][(wr_b + j) * 2] = ue4m3_half((uint8_t)(gq[j][4] & 0xFF));
+            sew[wr_row][(wr_b + j) * 2 + 1] = ue4m3_half((uint8_t)(gq[j][4] >> 8));
+        }
+#pragma unroll
+        for (int c = 0; c < 4; ++c) *(uint4 *)&sx[xt0][xc + 16 * c] = gx[c];
+        // token block scales: 64 tokens x 4 blocks, two per thread
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int task = tid + 128 * j, tt = task >> 2, c = task & 3, t = t0 + tt;
+            sdx[tt][c] = t < T ? d8[(long long)t * nb + b0 + c] : 0.0f;
+        }
+    };
+
+    load_chunk(0);
+    const int i = lane & 15, hi = lane >> 4;
+    for (int k0 = 0; k0 < K; k0 += WM_KC) {
+        store_chunk(k0);
+        __syncthreads();
+        if (k0 + WM_KC < K) load_chunk(k0 + WM_KC);  // in flight during the WMMAs below
+        // Not unrolled: unrolling all 8 steps let the compiler hoist every step's operand loads and spill
+        // (256 VGPRs + 260 spilled)
+#pragma unroll 1
+        for (int h = 0; h < WM_KC / 16; ++h) {
+            const v4i_t a = *(const v4i_t *)&sw[16 * w + i][16 * h];
+            v8i_t c[4];
+#pragma unroll
+            for (int n = 0; n < 4; ++n) {  // issue the four WMMAs first, then their epilogues
+                const v4i_t bx = *(const v4i_t *)&sx[16 * n + i][16 * h];
+                c[n] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, bx, v8i_t{}, false);
+            }
+            float ew[8];
+#pragma unroll
+            for (int r = 0; r < 8; ++r) ew[r] = sew[16 * w + 2 * r + hi][h];
+#pragma unroll
+            for (int n = 0; n < 4; ++n) {
+                const float dx = sdx[16 * n + i][h / 2];
+#pragma unroll
+                for (int r = 0; r < 8; ++r) acc[n][r] += (float)c[n][r] * (ew[r] * dx);
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int n = 0; n < 4; ++n) {
+        const int t = t0 + 16 * n + i;
+        if (t >= T) continue;
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int row = r0 + 16 * w + 2 * r + hi;
+            if (row < N) y[(long long)t * ldy + row] = acc[n][r];
+        }
+    }
+}

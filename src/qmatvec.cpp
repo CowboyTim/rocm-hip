@@ -5,6 +5,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define QMV_ROWS_PER_BLOCK 4  // must match ROWS_PER_BLOCK in matvec_q.hip
@@ -18,6 +19,9 @@ static hipFunction_t g_fn_mm[QMV_MAX_TYPE];  // batched int8 kernels, matmul_q8_
 static hipFunction_t g_fn_q8_id[QMV_MAX_TYPE];  // expert-indexed int8 kernels, matvec_q8_id_<type>
 static hipFunction_t g_fn_id[QMV_MAX_TYPE];     // expert-indexed float kernels, matvec_id_<type>
 static hipFunction_t g_fn_mm_id[QMV_MAX_TYPE];  // expert-tiled batched int8 kernels, matmul_q8_id_<type>
+static hipFunction_t g_fn_wmma[QMV_MAX_TYPE];   // WMMA tiled int8 kernels, matmul_wmma_<type> (Phase 20 W2)
+static bool g_use_wmma = true;
+static int g_wmma_min_t = 32;  // smaller batches, and N < 64 (a 64-row tile mostly padding), stay on matmul_q8_<type>
 #define QMV_MM_TB 16  // tokens per tile, must match MM_TB in matvec_q.hip
 
 int qmatvec_init(const char *co_path) {
@@ -33,6 +37,7 @@ int qmatvec_init(const char *co_path) {
     memset(g_fn_q8_id, 0, sizeof(g_fn_q8_id));
     memset(g_fn_id, 0, sizeof(g_fn_id));
     memset(g_fn_mm_id, 0, sizeof(g_fn_mm_id));
+    memset(g_fn_wmma, 0, sizeof(g_fn_wmma));
     for (int t = 0; t < QMV_MAX_TYPE; ++t) {
         const qt_traits *tr = qt_get_traits(t);
         if (!tr) continue;
@@ -49,8 +54,12 @@ int qmatvec_init(const char *co_path) {
         if (hipModuleGetFunction(&g_fn_id[t], g_mod, name) != hipSuccess) g_fn_id[t] = nullptr;
         snprintf(name, sizeof(name), "matmul_q8_id_%s", tr->name);
         if (hipModuleGetFunction(&g_fn_mm_id[t], g_mod, name) != hipSuccess) g_fn_mm_id[t] = nullptr;
+        snprintf(name, sizeof(name), "matmul_wmma_%s", tr->name);
+        if (hipModuleGetFunction(&g_fn_wmma[t], g_mod, name) != hipSuccess) g_fn_wmma[t] = nullptr;
     }
     if (hipModuleGetFunction(&g_quant, g_mod, "quantize_q8") != hipSuccess) g_quant = nullptr;
+    g_use_wmma = getenv("QMATVEC_NO_WMMA") == nullptr;  // A/B switch
+    if (const char *v = getenv("QMATVEC_WMMA_MIN_T")) g_wmma_min_t = atoi(v);  // tests: route small batches to WMMA
     return 0;
 }
 
@@ -63,6 +72,7 @@ void qmatvec_free(void) {
     memset(g_fn_q8_id, 0, sizeof(g_fn_q8_id));
     memset(g_fn_id, 0, sizeof(g_fn_id));
     memset(g_fn_mm_id, 0, sizeof(g_fn_mm_id));
+    memset(g_fn_wmma, 0, sizeof(g_fn_wmma));
     g_quant = nullptr;
 }
 
@@ -166,6 +176,12 @@ hipError_t qmatvec_launch_q8_batch(int type, const void *W, size_t row_bytes, co
     const float *d8 = kq ? q->dK : q->d0;
     const int32_t *bs = q->bsK;
     long long rb = (long long)row_bytes;
+    if (g_use_wmma && g_fn_wmma[type] && T >= g_wmma_min_t && N >= 64 && K % 128 == 0) {
+        // 64 x 64 tiles; the WMMA kernels take no group sums (none of their types has mins)
+        void *wargs[] = {(void *)&W, &rb, (void *)&q8, (void *)&d8, (void *)&y, &ldy, &N, &K, &T};
+        return hipModuleLaunchKernel(g_fn_wmma[type], (unsigned)((N + 63) / 64), (unsigned)((T + 63) / 64), 1, 128, 1, 1,
+                                     0, stream, wargs, nullptr);
+    }
     void *args[] = {(void *)&W, &rb, (void *)&q8, (void *)&d8, (void *)&bs, (void *)&y, &ldy, &N, &K, &T};
     const unsigned gx = (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);
     const unsigned gy = (unsigned)((T + QMV_MM_TB - 1) / QMV_MM_TB);

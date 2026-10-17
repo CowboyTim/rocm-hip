@@ -171,41 +171,56 @@ static bool run_one(gguf_model_t *g, int64_t idx, ShmBuf &xb, ShmBuf &yb) {
     printf("  [%s] %-32s %-18s int8 path (q8 x)   worst rel err %.2e (row %d)%s\n", bad8 ? "FAIL" : "PASS", name,
            tr->name, worst8, worst8_n, bad8 ? " <-- rows over 1e-5" : "");
 
-    // Batched (prefill) kernel on T = 11 tokens (a full tile of 8 plus a partial one): every token row must
-    // equal the single-token int8 matvec on that token
-    const int T = 11;
-    if ((size_t)T * K * sizeof(float) > xb.n || (size_t)T * N * sizeof(float) > yb.n || T * K > g_q8.max_k) {
-        printf("  [SKIP] %-32s batched check exceeds test buffers\n", name);
-        return bad == 0 && bad8 == 0;
-    }
-    std::vector<float> xs((size_t)T * K), single((size_t)T * N);
-    uint32_t s2 = 777u;
-    for (size_t i = 0; i < xs.size(); ++i) {
-        s2 = s2 * 1664525u + 1013904223u;
-        xs[i] = ((int)(s2 >> 9) - (1 << 22)) / (float)(1 << 22);
-    }
-    for (int t = 0; t < T; ++t) {
-        memcpy(x, &xs[(size_t)t * K], (size_t)K * sizeof(float));
-        e = qmatvec_quantize(x, K, &g_q8, 0);
-        if (e == hipSuccess) e = qmatvec_launch_q8(type, W, rb, &g_q8, y, N, K, 0);
+    // Batched (prefill) kernels on T = 11 tokens (a full tile of 16 is not reached; dot4 path, must be
+    // bit-identical to the single-token matvecs) and T = 70 (a full 64-token WMMA tile plus a partial one where
+    // the type has a WMMA kernel: same integer sums, different float accumulation order, so 1e-5 relative)
+    bool okb_all = true;
+    for (const int T : {11, 70}) {
+        if ((size_t)T * K * sizeof(float) > xb.n || (size_t)T * N * sizeof(float) > yb.n || T * K > g_q8.max_k ||
+            (T > 11 && N > 65536)) {
+            printf("  [SKIP] %-32s batched check, %d tokens, exceeds test buffers\n", name, T);
+            continue;
+        }
+        std::vector<float> xs((size_t)T * K), single((size_t)T * N);
+        uint32_t s2 = 777u;
+        for (size_t i = 0; i < xs.size(); ++i) {
+            s2 = s2 * 1664525u + 1013904223u;
+            xs[i] = ((int)(s2 >> 9) - (1 << 22)) / (float)(1 << 22);
+        }
+        for (int t = 0; t < T; ++t) {
+            memcpy(x, &xs[(size_t)t * K], (size_t)K * sizeof(float));
+            e = qmatvec_quantize(x, K, &g_q8, 0);
+            if (e == hipSuccess) e = qmatvec_launch_q8(type, W, rb, &g_q8, y, N, K, 0);
+            if (e == hipSuccess) e = hipDeviceSynchronize();
+            if (e != hipSuccess) { printf("  [FAIL] %-32s int8 launch: %s\n", name, hipGetErrorString(e)); return false; }
+            memcpy(&single[(size_t)t * N], y, (size_t)N * sizeof(float));
+        }
+        memcpy(x, xs.data(), xs.size() * sizeof(float));
+        e = qmatvec_quantize(x, T * K, &g_q8, 0);
+        if (e == hipSuccess) e = qmatvec_launch_q8_batch(type, W, rb, &g_q8, y, N, N, K, T, 0);
         if (e == hipSuccess) e = hipDeviceSynchronize();
-        if (e != hipSuccess) { printf("  [FAIL] %-32s int8 launch: %s\n", name, hipGetErrorString(e)); return false; }
-        memcpy(&single[(size_t)t * N], y, (size_t)N * sizeof(float));
+        if (e != hipSuccess) { printf("  [FAIL] %-32s batched launch: %s\n", name, hipGetErrorString(e)); return false; }
+        // Row scale: sum_k |w_k| over the row (|x| <= 1), so the bound is relative to the size of the terms
+        std::vector<double> rmag((size_t)N);
+        for (int n = 0; n < N; ++n) {
+            qt_to_float(type, W + (size_t)n * rb, row.data(), K);
+            double m = 0.0;
+            for (int k = 0; k < K; ++k) m += std::fabs((double)row[k]);
+            rmag[n] = m;
+        }
+        double worstb = 0.0;
+        for (int t = 0; t < T; ++t)
+            for (int n = 0; n < N; ++n) {
+                const size_t i = (size_t)t * N + n;
+                worstb = std::max(worstb, std::fabs((double)y[i] - single[i]) / (rmag[n] + 1e-30));
+            }
+        const bool exact = T == 11;
+        const bool okb = exact ? worstb == 0.0 : worstb <= 1e-5;
+        okb_all = okb_all && okb;
+        printf("  [%s] %-32s %-18s batched, %d tokens  worst diff vs single %.2e of sum|w|%s\n", okb ? "PASS" : "FAIL",
+               name, tr->name, T, worstb, exact ? " (must be 0)" : "");
     }
-    memcpy(x, xs.data(), xs.size() * sizeof(float));
-    e = qmatvec_quantize(x, T * K, &g_q8, 0);
-    if (e == hipSuccess) e = qmatvec_launch_q8_batch(type, W, rb, &g_q8, y, N, N, K, T, 0);
-    if (e == hipSuccess) e = hipDeviceSynchronize();
-    if (e != hipSuccess) { printf("  [FAIL] %-32s batched launch: %s\n", name, hipGetErrorString(e)); return false; }
-    double worstb = 0.0;
-    for (size_t i = 0; i < single.size(); ++i) {
-        const double d = std::fabs((double)y[i] - single[i]) / (std::fabs((double)single[i]) + 1e-3);
-        worstb = std::max(worstb, d);
-    }
-    const bool okb = worstb <= 1e-5;
-    printf("  [%s] %-32s %-18s batched, %d tokens  worst rel diff vs single %.2e\n", okb ? "PASS" : "FAIL", name,
-           tr->name, T, worstb);
-    return bad == 0 && bad8 == 0 && okb;
+    return bad == 0 && bad8 == 0 && okb_all;
 }
 
 int main(int argc, char **argv) {
@@ -246,7 +261,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    const int max_k = 1 << 16;
+    const int max_k = (1 << 16) * 80;  // the 70-token batched check of K up to 65536
     if (!g_q8mem.alloc("matvec_verify_q8.bin", qmatvec_q8_bytes(max_k))) {
         fprintf(stderr, "cannot allocate /dev/shm buffers\n");
         return 2;

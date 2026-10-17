@@ -13,6 +13,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstdlib>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -108,12 +109,29 @@ int main(int argc, char** argv) {
         for (int i = 0; i < n && rc2 == 0; ++i) rc2 = inference_decode_token(m, lt[i], &nx);
         inference_get_logits(m, ids.data(), b.data());
         inference_free_tokens(lt, n);
-        double d = 0.0;
-        for (int i = 0; i < V; ++i) d = std::max(d, (double)std::fabs(a[i] - b[i]));
-        char what[128];
-        snprintf(what, sizeof(what), "prefill of %d tokens == token by token (max |d| logits %.3g, batch %d)", n, d,
-                 qwen_model_max_batch(inference_get_qwen_model(m)));
-        check(rc1 == 0 && rc2 == 0 && d == 0.0, what);
+        // The dot4 kernels give each output row the same arithmetic in a batch as alone, so prefill is
+        // bit-identical to token by token. The WMMA kernels (batches of 32+ tokens) sum in a different float
+        // order, and tiny differences flip int8 activation roundings that then propagate (see forward_verify):
+        // then the bound is the same top-1 token and logit cosine >= 0.995 (measured on 561 tokens: dense 4B
+        // 0.9991, MoE 35B 0.9988; MoE routing near-ties make it the more sensitive one).
+        double d = 0.0, dot = 0.0, na = 0.0, nb = 0.0;
+        int ta = 0, tb = 0;
+        for (int i = 0; i < V; ++i) {
+            d = std::max(d, (double)std::fabs(a[i] - b[i]));
+            dot += (double)a[i] * b[i];
+            na += (double)a[i] * a[i];
+            nb += (double)b[i] * b[i];
+            if (a[i] > a[ta]) ta = i;
+            if (b[i] > b[tb]) tb = i;
+        }
+        const double cs = dot / std::sqrt(na * nb);
+        const bool exact = getenv("QMATVEC_NO_WMMA") != nullptr;
+        char what[200];
+        snprintf(what, sizeof(what),
+                 "prefill of %d tokens vs token by token (batch %d): max |d| logits %.3g, cos %.7f, top-1 %d / %d%s", n,
+                 qwen_model_max_batch(inference_get_qwen_model(m)), d, cs, ta, tb,
+                 exact ? " (WMMA off: must be identical)" : "");
+        check(rc1 == 0 && rc2 == 0 && (exact ? d == 0.0 : ta == tb && cs >= 0.995), what);
     }
 
     sampler_params p = sampler_default_params();  // temperature 0.8, top_k 40, top_p 0.95, min_p 0.05

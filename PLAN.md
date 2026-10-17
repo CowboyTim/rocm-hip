@@ -1309,6 +1309,31 @@ for the symptoms above.
 >   - An L2/LDS bandwidth probe, to confirm the activation re-read diagnosis on the current kernels
 >     (`rocprofv3` counters if available).
 >   - Keep `/tmp`-style scratch out of the repo; the benchmarks go in `tools/`.
+> - **W2 — DONE ✅ (2026-10-17): `matmul_wmma_q4_0_rocmfp4`.** 4B prefill 667 → **915 tokens/s**.
+>   - Tiles: 64 rows × 64 tokens, 4 waves, 128-value K chunks. Weights are decoded to int8 in LDS with
+>     their half-block scales; Q8_0 activations and scales are staged in LDS. The next chunk's global
+>     data is prefetched into registers. LDS rows are padded to 144 B, because 128 B put the 16 operand
+>     rows in the same banks.
+>   - Each WMMA covers one half-block, and the epilogue adds `(float)dot · e_w · d_x`. All four WMMAs of
+>     a step are issued before their epilogues.
+>   - **The first version spilled** (256 VGPRs + 260 spilled): the fully unrolled K-step loop hoisted
+>     every operand load. With `#pragma unroll 1` it uses 149 VGPRs and no spills, and went from 2×
+>     *slower* than dot4 to **3.1–3.4× faster** (`ffn_up` T=256: 19.1 vs 64.3 ms, ~20 TOPS).
+>   - Dispatch (`qmatvec_launch_q8_batch`): T ≥ 32 and N ≥ 64. A 64-row tile on N = 32 is mostly
+>     padding and was 2.5× slower. `QMATVEC_NO_WMMA=1` turns it off; `QMATVEC_WMMA_MIN_T` (for tests)
+>     sends small batches to it.
+>   - **Accuracy:** `matvec_verify` checks the kernel against the single-token kernels on 70 tokens (full
+>     and partial tiles) and on 11 when forced: ≤ 4.4e-8 of Σ|w|, i.e. float summation order.
+>     - End to end, prefill is no longer bit-identical to token by token. A ~1e-9 difference can flip an
+>       int8 activation rounding (one Q8 step), and in the MoE a near-tie expert choice; both propagate.
+>     - Measured per layer: 4B layer 0 3.7e-9 → layer 1 8e-6; 35B smooth to 1e-5, then a jump at a
+>       routing flip. ggml behaves the same under any reordering.
+>     - Against the llama.cpp reference, WMMA prefill is as good as token by token (4B worst layer
+>       0.99919 vs 0.99937).
+>     - Test criteria: exact without WMMA. With it: per-layer cos ≥ 0.99 vs token by token and vs the
+>       reference, plus the reference's top-1. On 561 tokens, the same top-1 and logit cos ≥ 0.995
+>       (measured 0.9991 dense, 0.9988 MoE).
+>   - Original W2 text:
 > - **W2. One type end to end: ROCmFP4 (Q4_0_ROCMFP4) × Q8_0.**
 >   - Workgroup tile: 64 weight rows × 64 tokens, 4 waves, each wave 16 rows × 64 tokens (4 WMMA
 >     accumulators, 32 VGPRs).

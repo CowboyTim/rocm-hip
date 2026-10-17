@@ -906,14 +906,38 @@ int main(int argc, char** argv) {
         std::vector<float> plogits(V);
         if (qwen_model_prefill(qm, tokens.data(), T, 0, plogits.data()) != 0) { fprintf(stderr, "prefill failed\n"); return 1; }
         qwen_model_set_layer_callback(qm, nullptr, nullptr);
+        // With the WMMA prefill kernels (batches of 32+ tokens, or QMATVEC_WMMA_MIN_T for tests) the float
+        // accumulation order differs. A ~1e-9 difference can flip an int8 activation rounding (one Q8 step) and,
+        // in the MoE, a near-tie expert choice; both propagate (measured: 4B layer 0 3.7e-9, layer 1 8e-6; 35B
+        // smooth to 1e-5, then a jump at a routing flip). ggml behaves the same under any reordering. So the check
+        // becomes: every layer within cos 0.99 of token by token and of the reference, and the reference's top-1.
         double dmax = 0.0;
         for (size_t i = 0; i < ctx.l_out.size(); ++i) dmax = std::max(dmax, (double)std::fabs(pctx.l_out[i] - ctx.l_out[i]));
         double lmax = 0.0;
         for (int i = 0; i < V; ++i) lmax = std::max(lmax, (double)std::fabs(plogits[i] - logits[i]));
-        const bool pok = dmax == 0.0 && lmax == 0.0;
+        double pcos = 1.0, rcos = 1.0;
+        for (int l = 0; l < m->n_layer; ++l) {
+            if (!ref(("l_out-" + std::to_string(l)).c_str(), nullptr, a)) return 1;
+            Stat sp, sr;
+            for (int t = 0; t < T; ++t) {
+                sp.add(&pctx.l_out[((size_t)l * T + t) * E], &ctx.l_out[((size_t)l * T + t) * E], E);
+                sr.add(&pctx.l_out[((size_t)l * T + t) * E], &a[(size_t)t * E], E);
+            }
+            pcos = std::min(pcos, sp.min_cos);
+            rcos = std::min(rcos, sr.min_cos);
+            if (verbose_layers())
+                printf("    prefill l_out-%-2d %-6s 1 - cos vs token by token %.2e, max rel %.2e\n", l,
+                       m->layers[l].kind == LAYER_FULL_ATTN ? "attn" : "linear", 1.0 - sp.min_cos, sp.max_rel);
+        }
+        int pbest = 0;
+        for (int i = 1; i < V; ++i)
+            if (plogits[i] > plogits[pbest]) pbest = i;
+        const bool exact = dmax == 0.0 && lmax == 0.0;
+        const bool pok = exact || (pcos >= 0.99 && rcos > 0.99 && pbest == next_token);
         if (!pok) ++g_fail;
-        printf("  [%s] prefill (%d tokens, one call, max batch %d) vs token by token: max |d| l_out %.3g, logits %.3g\n",
-               pok ? "PASS" : "FAIL", T, qwen_model_max_batch(qm), dmax, lmax);
+        printf("  [%s] prefill (%d tokens, one call, max batch %d) vs token by token: %s max |d| l_out %.3g, logits %.3g;"
+               " worst layer cos vs token by token %.6f, vs reference %.6f\n",
+               pok ? "PASS" : "FAIL", T, qwen_model_max_batch(qm), exact ? "identical," : "", dmax, lmax, pcos, rcos);
     }
 
     deltanet_free();
