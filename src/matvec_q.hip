@@ -405,7 +405,42 @@ __device__ void matvec_coop_impl(const uint8_t *W, long long row_bytes, const fl
 
 MATVEC_KERNEL(f32, BlkF32)
 MATVEC_KERNEL(f16, BlkF16)
-MATVEC_KERNEL(bf16, BlkBF16)
+// BF16: a dedicated kernel instead of the generic one-value-per-lane loop (that read 2 bytes per load and
+// reached ~140 GB/s on the 35B's 1 GB BF16 LM head). Each lane loads 8 weights (16 bytes) and 8 activations at
+// a time. The activations are rounded to BF16 (round to nearest even) first: BF16's vec_dot_type in ggml is
+// BF16, so the reference converts the activations before the dot product, and this matches it.
+__device__ __forceinline__ float bf16_round(float v) {
+    uint32_t u = __float_as_uint(v);
+    u = (u + 0x7fffu + ((u >> 16) & 1u)) & 0xffff0000u;
+    return __uint_as_float(u);
+}
+
+__device__ __forceinline__ float bf16_lo(uint32_t w) { return __uint_as_float(w << 16); }
+__device__ __forceinline__ float bf16_hi(uint32_t w) { return __uint_as_float(w & 0xffff0000u); }
+
+extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
+matvec_bf16(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= N) return;
+    const uint8_t *wr = W + (long long)row * row_bytes;
+    float acc = 0.0f;
+    int k0 = 0;
+    if ((((uintptr_t)wr | (uintptr_t)x) & 15) == 0) {  // uniform per row
+        const int n8 = K / 8;
+        for (int i = lane; i < n8; i += 32) {
+            const uint4 u = ((const uint4 *)wr)[i];
+            const float4 xa = ((const float4 *)x)[2 * i], xb = ((const float4 *)x)[2 * i + 1];
+            acc += bf16_lo(u.x) * bf16_round(xa.x) + bf16_hi(u.x) * bf16_round(xa.y) + bf16_lo(u.y) * bf16_round(xa.z) +
+                   bf16_hi(u.y) * bf16_round(xa.w) + bf16_lo(u.z) * bf16_round(xb.x) + bf16_hi(u.z) * bf16_round(xb.y) +
+                   bf16_lo(u.w) * bf16_round(xb.z) + bf16_hi(u.w) * bf16_round(xb.w);
+        }
+        k0 = n8 * 8;
+    }
+    for (int k = k0 + lane; k < K; k += 32) acc += bf16(wr + 2 * k) * bf16_round(x[k]);
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
+    if (lane == 0) y[row] = acc;
+}
 MATVEC_KERNEL(q4_0, BlkQ4_0)
 MATVEC_KERNEL(q4_1, BlkQ4_1)
 MATVEC_KERNEL(q5_0, BlkQ5_0)

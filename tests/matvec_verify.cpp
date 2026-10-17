@@ -112,14 +112,23 @@ static bool run_one(gguf_model_t *g, int64_t idx, ShmBuf &xb, ShmBuf &yb) {
     }
 
     std::vector<float> row((size_t)K);
+    // The BF16 kernel rounds x to BF16 first, as ggml (BF16's vec_dot_type is BF16)
+    std::vector<float> xr(x, x + K);
+    if (type == QT_BF16)
+        for (int k = 0; k < K; ++k) {
+            uint32_t u;
+            memcpy(&u, &xr[k], 4);
+            u = (u + 0x7fffu + ((u >> 16) & 1u)) & 0xffff0000u;
+            memcpy(&xr[k], &u, 4);
+        }
     double worst = 0.0;
     int bad = 0, worst_n = 0;
     for (int n = 0; n < N; ++n) {
         qt_to_float(type, W + (size_t)n * rb, row.data(), K);
         double ref = 0.0, mag = 0.0;
         for (int k = 0; k < K; ++k) {
-            ref += (double)row[k] * x[k];
-            mag += std::fabs((double)row[k] * x[k]);
+            ref += (double)row[k] * xr[k];
+            mag += std::fabs((double)row[k] * xr[k]);
         }
         const double rel = std::fabs(y[n] - ref) / (mag + 1e-30);
         if (rel > worst) {
