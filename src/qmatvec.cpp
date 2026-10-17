@@ -177,8 +177,10 @@ hipError_t qmatvec_launch_q8_batch(int type, const void *W, size_t row_bytes, co
     const int32_t *bs = q->bsK;
     long long rb = (long long)row_bytes;
     if (g_use_wmma && g_fn_wmma[type] && T >= g_wmma_min_t && N >= 64 && K % 128 == 0) {
-        // 64 x 64 tiles; the WMMA kernels take no group sums (none of their types has mins)
-        void *wargs[] = {(void *)&W, &rb, (void *)&q8, (void *)&d8, (void *)&y, &ldy, &N, &K, &T};
+        // 64 x 64 tiles; the K-quant kernels also take the Q8_K group sums (for the mins)
+        void *wargs_q80[] = {(void *)&W, &rb, (void *)&q8, (void *)&d8, (void *)&y, &ldy, &N, &K, &T};
+        void *wargs_q8k[] = {(void *)&W, &rb, (void *)&q8, (void *)&d8, (void *)&bs, (void *)&y, &ldy, &N, &K, &T};
+        void **wargs = kq ? wargs_q8k : wargs_q80;
         return hipModuleLaunchKernel(g_fn_wmma[type], (unsigned)((N + 63) / 64), (unsigned)((T + 63) / 64), 1, 128, 1, 1,
                                      0, stream, wargs, nullptr);
     }

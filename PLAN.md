@@ -1218,10 +1218,12 @@ for the symptoms above.
 >
 > | Model | Generation | Prefill (561-token prompt) |
 > |---|---|---|
-> | Qwen3.5-4B | **62.6 tok/s** | **667 tok/s** |
-> | Qwen3.6-35B-A3B (MoE) | **57.1 tok/s** | **515 tok/s** |
+> | Qwen3.5-4B | **62.6 tok/s** | **1,497 tok/s** |
+> | Qwen3.6-35B-A3B (MoE) | **57.1 tok/s** | **581 tok/s** |
 >
-> 1. **Prefill via WMMA (next)** — see "TODO: prefill via WMMA" below.
+> 1. **Prefill via WMMA (in progress: W1–W3 done).** Next, W4 for the 35B: WMMA on the expert tiles
+>    (`matmul_q8_id_*` → a 16- or 32-token-wide WMMA tile per expert group). Then W5: long-prompt
+>    attention. See "TODO: prefill via WMMA" below.
 > 2. **35B generation (16.5 ms GPU per token):**
 >    - BF16 LM head: 5.1 ms at ~200 GB/s (1 GB, the bandwidth floor is ~4.2 ms).
 >    - Expert matvecs: 3.3 ms at ~160 GB/s.
@@ -1350,6 +1352,20 @@ for the symptoms above.
 >     order differs, so the bound is 1e-5 relative to sum |w x|. The prefill-vs-token-by-token checks
 >     move from "bit-identical" to that bound for the WMMA path.
 >   - Benchmark with `matvec_bench batch T`.
+> - **ROCMFP4_FAST WMMA — DONE ✅.** The kernel body (`wmma_q80`) is a template over a weight staging
+>   policy (`WStageFP4`, `WStageFast`: 68-byte block quads split with `v_alignbyte`).
+> - **W3 — DONE ✅ (2026-10-17): `matmul_wmma_q{4,5,6}_K` (`wmma_q8k<KT>`).** 4B prefill **915 → 1,497
+>   tokens/s** (561 tokens); 2,101 tokens in 1.48 s.
+>   - Per 128-value chunk (half a super-block), 8 WMMAs accumulate `isum += sc[row][g] · dot` in int32,
+>     then one float step: `acc += d_x · (d_w · isum − dmin · msum)`, with the mins through the Q8_K
+>     group sums.
+>   - Q6_K values are decoded to signed `q − 32` with a carry-free per-byte subtract, so it needs no
+>     offset correction.
+>   - 216–224 VGPRs, no spills. Correct on the first try: ≤ 3.7e-8 of Σ|w| vs the single-token kernels,
+>     Q4_K included (Qwen3-0.6B).
+>   - All of a token's matmuls: **2,042 tokens/s at T = 256** (dot4: 644; T = 64: 1,742 vs 604).
+>   - The 35B gets 581 tokens/s; its experts (75% of its prefill) still use the dot4 expert-tiled kernel.
+>   - Original W3 text:
 > - **W3. K-quants (Q4_K, Q5_K, Q6_K) × Q8_K.** Same tiling; the K-chunk is one 256-value super-block.
 >   - Sub-block scales are integers: keep int32 accumulators per super-block, with
 >     `C_int += sc[row][sub] · WMMA(...)` (an integer multiply of the C tile by a per-row vector).

@@ -1233,3 +1233,253 @@ matmul_wmma_q4_0_rocmfp4_fast(const uint8_t *W, long long row_bytes, const int8_
                               long long ldy, int N, int K, int T) {
     wmma_q80<WStageFast>(W, row_bytes, q8, d8, y, ldy, N, K, T);
 }
+
+// ---------------------------------------------------------------- WMMA for K-quants x Q8_K (Phase 20 W3)
+//
+// Same tiling as wmma_q80 (64 rows x 64 tokens, 4 waves, 128-value chunks = half a 256-value super-block), with
+// the K-quant arithmetic of ggml's vec_dot_q*_K_q8_K: per chunk, 8 WMMAs of 16 values each (Q6_K: one 16-value
+// scale group each; Q4_K/Q5_K: two per 32-value sub-block) accumulate into int32 as isum += sc[row][g] * dot,
+// then one float step per chunk: acc += d_x * (d_w * isum - dmin_w * msum), msum = sum over the chunk's sub-blocks
+// of m[row][sub] * (bs[2 sub] + bs[2 sub + 1]) (Q4_K/Q5_K mins; Q6_K has none: its -32 offset is applied while
+// decoding, since q - 32 fits int8).
+// Staging: thread tid takes weight row tid / 2, half `part` = tid & 1 of the chunk (64 values).
+
+// Per byte: b - 32 for b in 0..63, as a signed int8, without carries between bytes
+__device__ __forceinline__ uint32_t sub32_bytes(uint32_t b) {
+    const uint32_t r = b ^ 0x20202020u;
+    const uint32_t m = r & 0x20202020u;  // set where b < 32: the result is negative
+    return r | (m << 1) | (m << 2);
+}
+
+template <int KT>  // 4: Q4_K, 5: Q5_K, 6: Q6_K
+struct WStageK {
+    static constexpr int BYTES = KT == 6 ? 210 : KT == 5 ? 176 : 144;
+    uint32_t q[16];   // Q4/5: 8 dwords of qs for this part's 64-value sub-chunk; Q6: 16 dwords of ql (both parts)
+    uint32_t qh[8];   // Q5 / Q6 high bits (32 bytes at the chunk's qh offset)
+    uint32_t sc[3];   // Q4/5: the 12 scale bytes; Q6: 8 group scales (2 dwords)
+    uint32_t dd;      // fp16 d (and dmin for Q4/5)
+    __device__ void load(const uint8_t *W, long long rb, int row, bool ok, int k0, int part) {
+        const int hh = (k0 / 128) & 1;  // which half of the super-block
+        const uint8_t *b = W + (long long)row * rb + (long long)(k0 / 256) * BYTES;
+        if (!ok) {
+#pragma unroll
+            for (int k = 0; k < 16; ++k) q[k] = 0;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) qh[k] = 0;
+            sc[0] = sc[1] = sc[2] = 0;
+            dd = 0;
+            return;
+        }
+        if (KT == 6) {  // 2-aligned blocks
+#pragma unroll
+            for (int k = 0; k < 16; ++k) q[k] = ld32_a2(b + 64 * hh + 4 * k);
+#pragma unroll
+            for (int k = 0; k < 8; ++k) qh[k] = ld32_a2(b + 128 + 32 * hh + 4 * k);
+            sc[0] = ld32_a2(b + 192 + 8 * hh);
+            sc[1] = ld32_a2(b + 196 + 8 * hh);
+            sc[2] = 0;
+            dd = *(const uint16_t *)(b + 208);
+        } else {  // 4-aligned blocks
+            const int c = 2 * hh + part;  // 64-value chunk of the super-block this thread decodes
+#pragma unroll
+            for (int k = 0; k < 8; ++k) q[k] = ld32(b + (KT == 5 ? 48 : 16) + 32 * c + 4 * k);
+#pragma unroll
+            for (int k = 8; k < 16; ++k) q[k] = 0;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) qh[k] = KT == 5 ? ld32(b + 16 + 4 * k) : 0;
+#pragma unroll
+            for (int k = 0; k < 3; ++k) sc[k] = ld32(b + 4 + 4 * k);
+            dd = ld32(b);
+        }
+    }
+    // Decodes this thread's 64 values into srow[64 * part ..], and (part 0) the row's group scales, d and mins
+    __device__ void store(int8_t *srow, int *gsc, float *dw, float *dmin, int *mins, int k0, int part) const {
+        const int hh = (k0 / 128) & 1;
+        uint32_t *dst = (uint32_t *)(srow + 64 * part);
+        if (KT == 6) {
+            // local values 64 part + 32 j + l: quarter qd = 2 part + j, ql byte l + 32 (qd & 1), nibble qd >> 1
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const int qd = 2 * part + j;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    const uint32_t qlw = q[(qd & 1) * 8 + k];
+                    const uint32_t nib = (qd >> 1) ? (qlw >> 4) & 0x0F0F0F0Fu : qlw & 0x0F0F0F0Fu;
+                    const uint32_t hb = (qh[k] >> (2 * qd)) & 0x03030303u;
+                    dst[8 * j + k] = sub32_bytes(nib | (hb << 4));
+                }
+            }
+            if (part == 0) {
+#pragma unroll
+                for (int g = 0; g < 8; ++g) gsc[g] = (int)(int8_t)((sc[g / 4] >> (8 * (g % 4))) & 0xFF);
+                *dw = __half2float(__ushort_as_half((uint16_t)dd));
+                *dmin = 0.0f;
+            }
+        } else {
+            const int c = 2 * hh + part;
+#pragma unroll
+            for (int j = 0; j < 2; ++j)  // j = 0: low nibbles (sub-block 2c), 1: high nibbles (2c + 1)
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    uint32_t v = j ? (q[k] >> 4) & 0x0F0F0F0Fu : q[k] & 0x0F0F0F0Fu;
+                    if (KT == 5) v |= ((qh[k] >> (2 * c + j)) & 0x01010101u) << 4;
+                    dst[8 * j + k] = v;
+                }
+            uint8_t sb[12];
+#pragma unroll
+            for (int k = 0; k < 12; ++k) sb[k] = (uint8_t)(sc[k / 4] >> (8 * (k % 4)));
+#pragma unroll
+            for (int s2 = 0; s2 < 2; ++s2) {  // this part's two sub-blocks 2c, 2c + 1: local groups 4 part + 2 s2 (+1)
+                uint8_t s, mm;
+                scale_min_k4(2 * c + s2, sb, s, mm);
+                gsc[4 * part + 2 * s2] = s;
+                gsc[4 * part + 2 * s2 + 1] = s;
+                mins[2 * part + s2] = mm;
+            }
+            if (part == 0) {
+                *dw = __half2float(__ushort_as_half((uint16_t)(dd & 0xFFFF)));
+                *dmin = __half2float(__ushort_as_half((uint16_t)(dd >> 16)));
+            }
+        }
+    }
+};
+
+template <int KT>
+__device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8,
+                                         const int *bs, float *y, long long ldy, int N, int K, int T) {
+    __shared__ __attribute__((aligned(16))) int8_t sw[WM_TILE][WM_KC + 16];
+    __shared__ __attribute__((aligned(16))) int8_t sx[WM_TILE][WM_KC + 16];
+    __shared__ int sgsc[WM_TILE][8];   // integer scale of each local 16-value group
+    __shared__ int smin[WM_TILE][4];   // Q4/5: mins of the chunk's 4 sub-blocks
+    __shared__ float sdw[WM_TILE], sdm[WM_TILE];
+    __shared__ float sdx[WM_TILE];     // token Q8_K scale of this super-block
+    __shared__ int sbs[WM_TILE][4];    // Q4/5: token group sums per sub-block (bs[2 sub] + bs[2 sub + 1])
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int r0 = blockIdx.x * WM_TILE, t0 = blockIdx.y * WM_TILE;
+    const int nbk = K / 256;
+
+    float acc[4][8];
+#pragma unroll
+    for (int n = 0; n < 4; ++n)
+#pragma unroll
+        for (int r = 0; r < 8; ++r) acc[n][r] = 0.0f;
+
+    WStageK<KT> ws;
+    uint4 gx[4];
+    const int wr_row = tid >> 1, part = tid & 1;
+    const int xt0 = tid >> 1, xc = (tid & 1) * 64;
+    auto load_chunk = [&](int k0) {
+        ws.load(W, row_bytes, r0 + wr_row, r0 + wr_row < N, k0, part);
+        const int t = t0 + xt0;
+#pragma unroll
+        for (int c = 0; c < 4; ++c)
+            gx[c] = t < T ? *(const uint4 *)(q8 + (long long)t * K + k0 + xc + 16 * c) : uint4{0, 0, 0, 0};
+    };
+    auto store_chunk = [&](int k0) {
+        ws.store(&sw[wr_row][0], &sgsc[wr_row][0], &sdw[wr_row], &sdm[wr_row], &smin[wr_row][0], k0, part);
+#pragma unroll
+        for (int c = 0; c < 4; ++c) *(uint4 *)&sx[xt0][xc + 16 * c] = gx[c];
+        const int bk = k0 / 256, hh = (k0 / 128) & 1;
+        if (tid < 64) {
+            const int t = t0 + tid;
+            sdx[tid] = t < T ? d8[(long long)t * nbk + bk] : 0.0f;
+        } else if (KT != 6) {
+            const int tt = tid - 64, t = t0 + tt;
+#pragma unroll
+            for (int s2 = 0; s2 < 4; ++s2) {
+                const int sub = 4 * hh + s2;
+                sbs[tt][s2] = t < T ? bs[(long long)t * (K / 16) + bk * 16 + 2 * sub] +
+                                          bs[(long long)t * (K / 16) + bk * 16 + 2 * sub + 1]
+                                    : 0;
+            }
+        }
+    };
+
+    load_chunk(0);
+    const int i = lane & 15, hi = lane >> 4;
+    for (int k0 = 0; k0 < K; k0 += WM_KC) {
+        store_chunk(k0);
+        __syncthreads();
+        if (k0 + WM_KC < K) load_chunk(k0 + WM_KC);
+
+        int isum[4][8];
+#pragma unroll
+        for (int n = 0; n < 4; ++n)
+#pragma unroll
+            for (int r = 0; r < 8; ++r) isum[n][r] = 0;
+#pragma unroll 1
+        for (int g = 0; g < WM_KC / 16; ++g) {
+            const v4i_t a = *(const v4i_t *)&sw[16 * w + i][16 * g];
+            v8i_t c[4];
+#pragma unroll
+            for (int n = 0; n < 4; ++n) {
+                const v4i_t bx = *(const v4i_t *)&sx[16 * n + i][16 * g];
+                c[n] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, bx, v8i_t{}, false);
+            }
+            int gs[8];
+#pragma unroll
+            for (int r = 0; r < 8; ++r) gs[r] = sgsc[16 * w + 2 * r + hi][g];
+#pragma unroll
+            for (int n = 0; n < 4; ++n)
+#pragma unroll
+                for (int r = 0; r < 8; ++r) isum[n][r] += gs[r] * c[n][r];
+        }
+        // float step for this chunk
+        float dwr[8], dmr[8];
+        int mr[8][4];
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int rr = 16 * w + 2 * r + hi;
+            dwr[r] = sdw[rr];
+            dmr[r] = sdm[rr];
+#pragma unroll
+            for (int s2 = 0; s2 < 4; ++s2) mr[r][s2] = KT == 6 ? 0 : smin[rr][s2];
+        }
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            const int tt = 16 * n + i;
+            const float dx = sdx[tt];
+            int bsp[4];
+#pragma unroll
+            for (int s2 = 0; s2 < 4; ++s2) bsp[s2] = KT == 6 ? 0 : sbs[tt][s2];
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                int msum = 0;
+                if (KT != 6)
+#pragma unroll
+                    for (int s2 = 0; s2 < 4; ++s2) msum += mr[r][s2] * bsp[s2];
+                acc[n][r] += dx * (dwr[r] * (float)isum[n][r] - dmr[r] * (float)msum);
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int n = 0; n < 4; ++n) {
+        const int t = t0 + 16 * n + i;
+        if (t >= T) continue;
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int row = r0 + 16 * w + 2 * r + hi;
+            if (row < N) y[(long long)t * ldy + row] = acc[n][r];
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+matmul_wmma_q4_K(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, const int *bs, float *y,
+                 long long ldy, int N, int K, int T) {
+    wmma_q8k<4>(W, row_bytes, q8, d8, bs, y, ldy, N, K, T);
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+matmul_wmma_q5_K(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, const int *bs, float *y,
+                 long long ldy, int N, int K, int T) {
+    wmma_q8k<5>(W, row_bytes, q8, d8, bs, y, ldy, N, K, T);
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+matmul_wmma_q6_K(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, const int *bs, float *y,
+                 long long ldy, int N, int K, int T) {
+    wmma_q8k<6>(W, row_bytes, q8, d8, bs, y, ldy, N, K, T);
+}
