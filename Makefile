@@ -118,7 +118,7 @@ $(CODIR)/%.co: $(SRCDIR)/%.hip
 	$(HIPCC) $(HIPFLAGS) -c $< -o $@
 
 # Kernels that quantize matvec inputs share the rounding rules in q8_device.h
-$(CODIR)/matvec_q.co $(CODIR)/gpu_ops.co $(CODIR)/attention.co: $(SRCDIR)/q8_device.h
+$(CODIR)/matvec_q.co $(CODIR)/gpu_ops.co $(CODIR)/attention.co $(CODIR)/deltanet.co: $(SRCDIR)/q8_device.h
 
 # Verify minimal test kernel
 verify_minimal.co: $(SRCDIR)/verify_minimal.hip

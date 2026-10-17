@@ -410,10 +410,11 @@ struct QwenModel {
         // g / sigmoid(beta) in place
         if (!check(deltanet_pre(s.qkv, rs.conv[l], L.ssm_conv1d, eng->ssm_d_conv, s.conv, NG, NV, s.alpha, s.beta,
                                 L.ssm_dt, L.ssm_a, s.alpha, s.beta, eps, T, 0), "deltanet_pre") ||
-            !check(deltanet_rule(rs.ssm[l], s.conv, s.alpha, s.beta, s.z, L.ssm_norm, s.lin, NG, NV, eps, T, 0),
-                   "deltanet_rule") ||
-            !produced(s.lin, eng->ssm_d_inner, T))
+            !check(deltanet_rule(rs.ssm[l], s.conv, s.alpha, s.beta, s.z, L.ssm_norm, s.lin, NG, NV, eps, T,
+                                 q8_for(eng->ssm_d_inner, T), 0),
+                   "deltanet_rule"))
             return false;
+        mark(s.lin, eng->ssm_d_inner, T, q8_for(eng->ssm_d_inner, T));
         return matvec(L.W_ssm_out, s.lin, s.proj, T, P_LIN);
     }
 

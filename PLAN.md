@@ -1218,11 +1218,12 @@ for the symptoms above.
 >
 > | Model | Generation | Prefill (561-token prompt) |
 > |---|---|---|
-> | Qwen3.5-4B | **62.6 tok/s** | **1,497 tok/s** (2,101 tokens: 1,423) |
-> | Qwen3.6-35B-A3B (MoE) | **57.1 tok/s** | **712 tok/s** (2,101 tokens: 739) |
+> | Qwen3.5-4B | **62.6 tok/s** | **1,597 tok/s** (612 tokens; 2,455 tokens: 1,494) |
+> | Qwen3.6-35B-A3B (MoE) | **57.1 tok/s** | **725 tok/s** (612 tokens; 2,455 tokens: 719) |
 >
-> 1. **Prefill (W1–W4 done).** Next is W5: DeltaNet prefill parallelism, then query-tiled flash
->    attention, then fuller expert tiles. See "TODO: prefill via WMMA" below.
+> 1. **Prefill (W1–W4 and W5.1 done).** Next is W5.2: query-tiled flash attention (`attn_partial` is
+>    17.5% of 4B prefill at 2,455 tokens, 306 ms), then fuller expert tiles. See "TODO: prefill via WMMA"
+>    below.
 > 2. **35B generation (16.5 ms GPU per token):**
 >    - BF16 LM head: 5.1 ms at ~200 GB/s (1 GB, the bandwidth floor is ~4.2 ms).
 >    - Expert matvecs: 3.3 ms at ~160 GB/s.
@@ -1388,12 +1389,22 @@ for the symptoms above.
 >     or block-pair loads.
 >   - Re-tune the micro-batch: bigger tiles want B = 128–256.
 >   - Expected: matmuls at ~20 TOPS → ~0.35 ms/token, ~2,500 tokens/s for the matmuls.
+> - **W5.1 — DONE ✅ (2026-10-17): DeltaNet prefill parallelism.** 4B prefill 1,499 → **1,597 tokens/s**
+>   (612 tokens), 1,380 → 1,494 (2,455 tokens); 35B 682 → 725. DeltaNet kernels at 2,455 tokens: 265 →
+>   118 ms.
+>   - `deltanet_rule`: grid (n_v, 8), block 128. 8 adjacent lanes share a state column, 16 rows each, and
+>     reduce the column's two dot products with shuffles: no barriers, 8× the workgroups. 210 → 62 ms.
+>     4 lanes per column measured the same; prefetching the next token's q/k/v was slower (352 µs vs 260).
+>   - `deltanet_norm`: the gated RMSNorm as its own kernel, two heads per workgroup; it also quantizes
+>     the output for ssm_out, which saves the separate `quantize_q8` launch.
+>   - `deltanet_conv` (T > 1): conv1d + SiLU + L2 norm for all tokens in parallel (the window is already
+>     in qkv), then `deltanet_conv_state` advances the conv state. 55 → 37 ms. Same arithmetic as
+>     `deltanet_pre` (still used for T = 1), so prefill stays bit-identical to token by token without WMMA.
+>   - Left: `deltanet_conv` (155 µs per 256 tokens, ~100 GB/s) and `deltanet_norm` (78 µs) could be
+>     faster; 3.4% of prefill together.
 > - **W5 (next), in order:**
->   1. **DeltaNet prefill parallelism.** The batched `deltanet_rule` has one workgroup per V head (32 in
->      total), each looping over the batch's tokens. The 128 state columns are independent: split each
->      head over 4–8 workgroups, and move the gated RMSNorm (which needs the whole head's output) into a
->      small follow-up kernel. 34% of 4B prefill at 2k tokens.
->   2. **Query-tiled flash attention for long prompts** (see below).
+>   2. **Query-tiled flash attention for long prompts** (see below). `attn_partial` is 306 ms of 1,744
+>      at 2,455 tokens on the 4B (avg 3.8 ms per call, 80 calls).
 >   3. **35B experts:** expert tiles average ~8 of 16 entries, so half of each WMMA tile is padding. Try
 >      micro-batches of 512 or 32-entry tiles.
 > - **W5. Then the rest of prefill becomes visible** (original text):
