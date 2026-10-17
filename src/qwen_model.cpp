@@ -14,6 +14,7 @@
 #include "inference.h"
 #include "inference_internal.h"
 #include "kv_cache.h"
+#include "deltanet.h"
 #include "qmatvec.h"
 #include "quant_types.h"
 #include "qwen_ops.h"
@@ -131,8 +132,9 @@ struct Scratch {
 };
 
 // Recurrent state of the Gated DeltaNet layers, persisted across tokens like the KV cache: per linear
-// layer a conv state [conv_dim][d_conv - 1] and a delta-rule state [dt_rank][d_state][d_state] (ggml's
-// transposed per-head layout). One sequence; zeroed when a sequence starts at pos 0.
+// layer a conv state [conv_dim][d_conv - 1] and a delta-rule state [dt_rank][d_state][d_state] (row-major
+// S per head, the layout of deltanet.hip). One sequence; zeroed when a sequence starts at pos 0. Only the
+// GPU touches it (the kernels, and hipMemsetAsync for the reset), so it is registered coarse-grained.
 struct RecurrentState {
     std::vector<float*> conv, ssm;   // indexed by layer; nullptr for full-attention layers
     ShmRegion mem;
@@ -151,11 +153,12 @@ struct RecurrentState {
             ptrs.push_back(&ssm[l]);
         }
         if (sizes.empty()) return true;
-        return mem.alloc("/dev/shm/qwen_recurrent_state.bin", sizes.data(), ptrs.data(), sizes.size());
+        return mem.alloc("/dev/shm/qwen_recurrent_state.bin", sizes.data(), ptrs.data(), sizes.size(),
+                         hipExtHostRegisterCoarseGrained);
     }
 
-    void reset() {
-        if (mem.base) memset(mem.base, 0, mem.total);
+    hipError_t reset() {
+        return mem.base ? hipMemsetAsync(mem.base, 0, mem.total, 0) : hipSuccess;
     }
 };
 
@@ -163,16 +166,16 @@ struct RecurrentState {
 // are timed by laps: lap(c) charges the time since the previous lap to c. A GPU section runs from its first
 // qmatvec launch to the hipDeviceSynchronize after it, so it includes launch overhead and the sync wait.
 enum ProfCat {
-    P_EMBED, P_ATTN_CPU, P_ATTN_CORE, P_ATTN_GPU, P_LIN_CPU, P_LIN_DELTA, P_LIN_GPU, P_FFN_CPU, P_FFN_GPU,
-    P_HEAD_CPU, P_HEAD_GPU, P_COUNT
+    P_EMBED, P_ATTN_CPU, P_ATTN_CORE, P_ATTN_GPU, P_LIN_CPU, P_LIN_GPU, P_FFN_CPU, P_FFN_GPU, P_HEAD_CPU,
+    P_HEAD_GPU, P_COUNT
 };
 static const char* const PROF_NAME[P_COUNT] = {
     "embedding (CPU)", "attention: norms, RoPE, KV write, gate (CPU)", "attention: softmax(QK)V (CPU)",
-    "attention: q/k/v/o matvecs (GPU)", "DeltaNet: norm, conv, L2, gates, gated norm (CPU)",
-    "DeltaNet: delta rule (CPU)", "DeltaNet: qkv/z/alpha/beta/out matvecs (GPU)", "FFN: norm, SwiGLU (CPU)",
+    "attention: q/k/v/o matvecs (GPU)", "DeltaNet: norm, residual (CPU)",
+    "DeltaNet: matvecs + conv/delta-rule kernels (GPU)", "FFN: norm, SwiGLU (CPU)",
     "FFN: gate/up/down matvecs (GPU)", "output norm + logits out (CPU)", "LM head matvec (GPU)",
 };
-static const bool PROF_GPU[P_COUNT] = {false, false, false, true, false, false, true, false, true, false, true};
+static const bool PROF_GPU[P_COUNT] = {false, false, false, true, false, true, false, true, false, true};
 
 struct Profile {
     double t[P_COUNT] = {};
@@ -202,6 +205,7 @@ struct QwenModel {
     ~QwenModel() {
         rs.mem.free();
         s.mem.free();
+        deltanet_free();
         qmatvec_free();
     }
 
@@ -210,6 +214,19 @@ struct QwenModel {
         if (qmatvec_init("matvec_q.co") != 0) {
             qwen_set_error("cannot load matvec_q.co (run from build/co)");
             return false;
+        }
+        bool has_linear = false;
+        for (const LayerWeights& L : eng->layers) has_linear |= L.kind == LAYER_LINEAR_ATTN;
+        if (has_linear) {
+            if (eng->ssm_d_state != DELTANET_HEAD_SIZE) {
+                qwen_set_error("ssm.state_size %d: the DeltaNet kernels are built for %d", eng->ssm_d_state,
+                               DELTANET_HEAD_SIZE);
+                return false;
+            }
+            if (deltanet_init("deltanet.co") != 0) {
+                qwen_set_error("cannot load deltanet.co (run from build/co)");
+                return false;
+            }
         }
         const int conv_dim = 2 * eng->ssm_n_group * eng->ssm_d_state + eng->ssm_d_inner;
         if (!s.alloc(eng->n_embd, eng->n_head, eng->n_head_kv, eng->head_dim, eng->n_ff, eng->vocab_size, conv_dim,
@@ -293,40 +310,21 @@ struct QwenModel {
     // Gated DeltaNet token mixer for one token; updates the layer's conv and delta-rule state and adds its
     // output to the residual. Follows llama.cpp's qwen35 build_layer_attn_linear.
     bool linear_attention(int l, const LayerWeights& L) {
-        const int E = eng->n_embd, DS = eng->ssm_d_state, NG = eng->ssm_n_group, NV = eng->ssm_dt_rank;
-        const int DI = eng->ssm_d_inner, KD = NG * DS, conv_dim = 2 * KD + DI;
+        const int E = eng->n_embd, NG = eng->ssm_n_group, NV = eng->ssm_dt_rank;
         const float eps = (float)eng->eps;
 
         qwen_rmsnorm(s.x, L.attn_norm, s.xn, E, eps);
         prof.lap(P_LIN_CPU);
         if (!matvec(L.W_qkv, s.xn, s.qkv, P_LIN_GPU) || !matvec(L.W_z, s.xn, s.z, P_LIN_GPU) ||
-            !matvec(L.W_alpha, s.xn, s.alpha, P_LIN_GPU) || !matvec(L.W_beta, s.xn, s.beta, P_LIN_GPU) || !sync())
+            !matvec(L.W_alpha, s.xn, s.alpha, P_LIN_GPU) || !matvec(L.W_beta, s.xn, s.beta, P_LIN_GPU))
             return false;
-        prof.lap(P_LIN_GPU);
 
-        // Causal conv1d over [q | k | v] channels, then SiLU; q and k heads get L2-normed
-        qwen_ssm_conv_step(rs.conv[l], s.qkv, L.ssm_conv1d, s.conv, conv_dim, eng->ssm_d_conv);
-        for (int i = 0; i < conv_dim; ++i) s.conv[i] = qwen_silu(s.conv[i]);
-        for (int h = 0; h < 2 * NG; ++h) qwen_l2norm(s.conv + (size_t)h * DS, s.conv + (size_t)h * DS, DS, eps);
-
-        // Per V head: decay gate g = softplus(alpha + dt_bias) * ssm_a (ssm_a = -exp(A_log)), beta = sigmoid
-        for (int h = 0; h < NV; ++h) {
-            s.alpha[h] = qwen_softplus(s.alpha[h] + L.ssm_dt[h]) * L.ssm_a[h];
-            s.beta[h] = qwen_sigmoid(s.beta[h]);
-        }
-        prof.lap(P_LIN_CPU);
-        qwen_gated_delta_step(rs.ssm[l], s.conv, s.conv + KD, s.conv + 2 * KD, s.alpha, s.beta, NV, NG, DS, s.lin);
-        prof.lap(P_LIN_DELTA);
-
-        // Gated RMSNorm per V head: norm(o) * ssm_norm * SiLU(z)
-        for (int h = 0; h < NV; ++h) {
-            float* o = s.lin + (size_t)h * DS;
-            const float* z = s.z + (size_t)h * DS;
-            qwen_rmsnorm(o, L.ssm_norm, o, DS, eps);
-            for (int i = 0; i < DS; ++i) o[i] *= qwen_silu(z[i]);
-        }
-
-        prof.lap(P_LIN_CPU);
+        // conv1d + SiLU + q/k L2 norm + gates, then the delta rule + gated norm, then ssm_out: all queued on
+        // the GPU behind the projections, one sync (deltanet.hip). alpha/beta become g/sigmoid(beta) in place.
+        hipError_t e = deltanet_pre(s.qkv, rs.conv[l], L.ssm_conv1d, eng->ssm_d_conv, s.conv, NG, NV, s.alpha, s.beta,
+                                    L.ssm_dt, L.ssm_a, s.alpha, s.beta, eps, 0);
+        if (e == hipSuccess) e = deltanet_rule(rs.ssm[l], s.conv, s.alpha, s.beta, s.z, L.ssm_norm, s.lin, NG, NV, eps, 0);
+        if (e != hipSuccess) { qwen_set_error("deltanet kernels, layer %d: %s", l, hipGetErrorString(e)); return false; }
         if (!matvec(L.W_ssm_out, s.lin, s.proj, P_LIN_GPU) || !sync()) return false;
         prof.lap(P_LIN_GPU);
         for (int i = 0; i < E; ++i) s.x[i] += s.proj[i];
@@ -365,7 +363,7 @@ struct QwenModel {
 
         // A sequence starting at position 0 starts from zero recurrent state (the KV cache needs no reset:
         // attention only reads positions 0..pos)
-        if (pos == 0) rs.reset();
+        if (pos == 0 && rs.reset() != hipSuccess) { qwen_set_error("recurrent state reset failed"); return -1; }
         prof.lap(P_EMBED);
 
         for (int l = 0; l < eng->n_layer; ++l) {

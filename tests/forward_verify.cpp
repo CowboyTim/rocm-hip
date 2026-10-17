@@ -22,6 +22,7 @@
 
 #include "inference.h"
 #include "inference_internal.h"
+#include "deltanet.h"
 #include "qmatvec.h"
 #include "quant_types.h"
 #include "qwen_model.h"
@@ -391,6 +392,58 @@ int main(int argc, char** argv) {
         snprintf(what, sizeof(what), "blk.%d ssm_norm (no gamma)", ll); report(what, snorm);
         snprintf(what, sizeof(what), "blk.%d gated norm (final_output)", ll); report(what, sfo);
         snprintf(what, sizeof(what), "blk.%d ssm_out (qmatvec)", ll); report(what, sout);
+
+        // The engine's GPU kernels (deltanet.hip) on the same reference inputs, state carried across
+        // tokens from the reference's initial state. The kernels keep S row-major, the transpose of ggml's.
+        if (DS != DELTANET_HEAD_SIZE || deltanet_init("deltanet.co") != 0) {
+            fprintf(stderr, "deltanet kernels unavailable\n");
+            return 1;
+        }
+        ShmBuf b_qkv, b_cs, b_out, b_al, b_be, b_z, b_st, b_lin;
+        if (!b_qkv.alloc("fwdv_dn_qkv.bin", CD) || !b_cs.alloc("fwdv_dn_cs.bin", (size_t)CD * (DC - 1)) ||
+            !b_out.alloc("fwdv_dn_out.bin", CD) || !b_al.alloc("fwdv_dn_al.bin", NV) || !b_be.alloc("fwdv_dn_be.bin", NV) ||
+            !b_z.alloc("fwdv_dn_z.bin", DI) || !b_st.alloc("fwdv_dn_st.bin", (size_t)NV * DS * DS) ||
+            !b_lin.alloc("fwdv_dn_lin.bin", DI)) {
+            fprintf(stderr, "alloc failed\n");
+            return 1;
+        }
+        memcpy(b_cs.p, cst.data(), cst.size() * sizeof(float));
+        for (int hh = 0; hh < NV; ++hh)
+            for (int i = 0; i < DS; ++i)
+                for (int j = 0; j < DS; ++j)
+                    b_st.p[((size_t)hh * DS + i) * DS + j] = st0[((size_t)hh * DS + j) * DS + i];
+        Stat gq, gk, gv, gg, gb, gfo, gst;
+        for (int t = 0; t < T; ++t) {
+            memcpy(b_qkv.p, &qkv[(size_t)t * CD], CD * sizeof(float));
+            memcpy(b_al.p, &alpha[(size_t)t * NV], NV * sizeof(float));
+            memcpy(b_be.p, &beta[(size_t)t * NV], NV * sizeof(float));
+            memcpy(b_z.p, &z[(size_t)t * DI], DI * sizeof(float));
+            hipError_t e = deltanet_pre(b_qkv.p, b_cs.p, L.ssm_conv1d, DC, b_out.p, NG, NV, b_al.p, b_be.p, L.ssm_dt,
+                                        L.ssm_a, b_al.p, b_be.p, eps, 0);
+            if (e == hipSuccess)
+                e = deltanet_rule(b_st.p, b_out.p, b_al.p, b_be.p, b_z.p, L.ssm_norm, b_lin.p, NG, NV, eps, 0);
+            if (e == hipSuccess) e = hipDeviceSynchronize();
+            if (e != hipSuccess) { fprintf(stderr, "deltanet kernels: %s\n", hipGetErrorString(e)); return 1; }
+            gq.add(b_out.p, &qn[(size_t)t * KD], KD);
+            gk.add(b_out.p + KD, &kn[(size_t)t * KD], KD);
+            gv.add(b_out.p + 2 * KD, &csilu[(size_t)t * CD + 2 * KD], DI);
+            gg.add(b_al.p, &gate[(size_t)t * NV], NV);
+            gb.add(b_be.p, &bsig[(size_t)t * NV], NV);
+            gfo.add(b_lin.p, &fo[(size_t)t * DI], DI);
+        }
+        std::vector<float> st_t((size_t)NV * DS * DS);
+        for (int hh = 0; hh < NV; ++hh)
+            for (int i = 0; i < DS; ++i)
+                for (int j = 0; j < DS; ++j)
+                    st_t[((size_t)hh * DS + j) * DS + i] = b_st.p[((size_t)hh * DS + i) * DS + j];
+        gst.add(st_t.data(), st1.data(), NV * DS * DS);
+        snprintf(what, sizeof(what), "blk.%d GPU conv + SiLU + L2: q", ll); report(what, gq);
+        snprintf(what, sizeof(what), "blk.%d GPU conv + SiLU + L2: k", ll); report(what, gk);
+        snprintf(what, sizeof(what), "blk.%d GPU conv + SiLU: v", ll); report(what, gv);
+        snprintf(what, sizeof(what), "blk.%d GPU decay gate", ll); report(what, gg);
+        snprintf(what, sizeof(what), "blk.%d GPU beta sigmoid", ll); report(what, gb);
+        snprintf(what, sizeof(what), "blk.%d GPU delta rule + gated norm", ll); report(what, gfo);
+        snprintf(what, sizeof(what), "blk.%d GPU delta rule final state", ll); report(what, gst);
     }
 
     // ---- first full-attention layer: projections, q/k norm, RoPE, attention, gate, output
@@ -541,6 +594,7 @@ int main(int argc, char** argv) {
                next_token);
     }
 
+    deltanet_free();
     qmatvec_free();
     inference_free_model(m);
     printf("%s (%d failed)\n", g_fail ? "FAIL" : "PASS", g_fail);

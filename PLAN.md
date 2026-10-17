@@ -1214,23 +1214,39 @@ for the symptoms above.
 > - Use the GPU as much as possible, and use the 16 Zen 5 cores (AVX-512) for what stays on the CPU.
 > - Judge each change by the bytes it moves and the syncs it adds, measured with `QWEN_PROFILE=1`.
 >
-> Now 22.5 tok/s generation (44.5 ms/token; was 4.8). Profile, per token:
-> - DeltaNet delta rule (CPU, 1 thread): 16.9 ms, 38%.
-> - FFN matvecs: 9.2 ms. DeltaNet matvecs: 5.7 ms. Attention matvecs: 1.7 ms. LM head: 3.3 ms.
->   Together they stream 2.8 GB at about 140 GB/s.
-> - Attention softmax(QK)V (CPU): 4.0 ms, growing with context.
-> - Other CPU ops: about 3.7 ms.
+> Now **39.5 tok/s** generation (25.3 ms/token). Profile, per token:
+> - Matvecs: FFN 9.4 ms, DeltaNet incl. its kernels 5.2 ms, attention 1.7 ms, LM head 3.3 ms. They
+>   stream 2.8 GB of weights at about 144 GB/s.
+> - Attention softmax(QK)V (CPU, 1 thread): 4.2 ms, 17%, growing with context.
+> - FFN SwiGLU and norms (CPU): 1.0 ms. Other CPU ops: about 0.6 ms.
+> - Syncs: FFN 2 per layer, attention 2 per layer, DeltaNet 1 per layer.
 >
-> 1. **Delta rule off the single core.** Either a GPU kernel (32 heads × 128×128 state, ~2 MB/layer, so
->    it is bandwidth-bound) or 16-thread AVX-512 on the CPU; measure both. The state is already a pinned
->    /dev/shm buffer. If it goes to the GPU, fold conv1d, L2 norm, gates and gated norm into the same
->    kernel(s), so the DeltaNet mixer needs one sync instead of two.
-> 2. **Attention core on the GPU** (or threaded), plus fewer syncs per layer: queue a layer's kernels
->    back to back and sync once per token where the dependencies allow.
-> 3. **Batched prefill:** a quantized matrix-matrix kernel that decodes each weight block once per batch.
->    Check it against the 5-token reference dump (itself a batched prefill) and against token-by-token
->    results.
+> 1. **Attention core on the GPU:** q/k norm, RoPE, KV write, softmax(QK)V and the gate, queued behind
+>    the q/k/v matvecs with `attn_output`, for one sync per attention layer, like DeltaNet. The KV cache
+>    must then be registered coarse-grained and written by the GPU only.
+> 2. **FFN and norms on the GPU:** SwiGLU, RMSNorms and residual adds as small kernels, so a whole layer,
+>    and then a whole token, needs a single sync. Then look at matvec efficiency: about 144 GB/s against
+>    LPDDR5X's ~256 GB/s peak.
+> 3. **Batched prefill:** a quantized matrix-matrix kernel that decodes each weight block once per batch,
+>    plus a multi-token DeltaNet kernel (sequential over tokens inside the kernel). Check it against the
+>    5-token reference dump (itself a batched prefill) and against token-by-token results.
 > 4. **Step 6 (35B-A3B):** router, top-8 of 256 experts, shared expert; `ref_dump acts` on the 35B.
+>
+> **DeltaNet mixer on the GPU — DONE ✅ (2026-10-17).** 22.5 → 39.5 tok/s.
+> - `src/deltanet.hip`, two kernels queued behind the qkv/z/alpha/beta matvecs and before `ssm_out`, one
+>   sync per DeltaNet layer (was two):
+>   - `deltanet_pre`: conv1d with state, SiLU, q/k L2 norm, gates.
+>   - `deltanet_rule`: delta rule plus gated RMSNorm. One workgroup per V head; thread j owns column j
+>     of S, stored row-major for coalescing (the transpose of ggml's layout), and the whole update for
+>     column j is thread-local.
+> - The whole DeltaNet section, matvecs included, takes 5.2 ms/token. Before, the matvecs alone took
+>   5.7 ms and the CPU work 19 ms, of which the single-threaded delta rule was 16.9 ms. The kernels cost
+>   under 0.5 ms/token, so a 16-thread CPU version (about 100 MB of state traffic per token) was not
+>   worth building.
+> - The recurrent state is GPU-owned: registered coarse-grained, and reset with `hipMemsetAsync`.
+> - `forward_verify` checks both kernels on reference inputs: q/k/v, gates, gated output and the final
+>   state are all within 2.3e-7. The end-to-end `l_out` check is unchanged (worst cos 0.995949), and
+>   greedy output is still identical to llama.cpp.
 >
 > **Speed + sampling — DONE ✅ (2026-10-17).**
 > - `QWEN_PROFILE=1` prints a per-section breakdown (`qwen_model_profile_print`).
