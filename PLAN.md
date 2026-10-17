@@ -1222,11 +1222,67 @@ for the symptoms above.
 >    - TYPE101 (ROCMFP4_FAST) has float matvecs only: give it int8 and batched kernels too. Its 17-byte
 >      blocks pair into 34 bytes (2-aligned), so the ROCmFP4 pair loads need 2-byte variants.
 >    - BF16 `output.weight` has float matvecs only.
-> 2. **Prefill speed:** the batched matmuls are compute-bound at ~600 tokens/s with v_dot4.
->    - RDNA3.5 WMMA (int8 16×16×16 tiles) is the next step up.
->    - The CPU embedding decode (2.6% of prefill) could move to the GPU.
+> 2. **Prefill speed: tiled WMMA GEMM** — see "TODO: prefill via WMMA" below.
 > 3. **Generation polish:** ROCmFP4 int8 bandwidth (192 vs 240 GB/s); a HIP graph per token (~0.6 ms of
 >    gaps).
+>
+> **TODO: prefill via WMMA (tiled int8 GEMM).** Goal: prefill ~600 → ~2,000+ tokens/s.
+>
+> **Why the current batched kernels stop at ~600 tokens/s.** Measured on gfx1151 (40 CUs at 2.9 GHz):
+> - Peak int8 throughput: `v_dot4_i32_i8` reaches **29 TOPS**, `v_wmma_i32_16x16x16_iu8` **55.5 TOPS**.
+> - A prefill token's matmuls are ~3.6 G MACs (the LM head runs once per batch, so it doesn't count).
+>   At 600 tokens/s that is **~4.3 TOPS: about 15% of the v_dot4 peak.** So the kernels are *not*
+>   compute-bound. (PLAN said they were; that was wrong.)
+> - The likely limit is data reuse. `matmul_q8_*` gives each wave one weight row and loops over a
+>   16-token tile, so a weight byte is reused 16×. But every activation byte is re-read from cache once
+>   per *weight row*: ~1 byte of cache traffic per MAC, ~2 TB/s at 600 tokens/s. There is also
+>   per-block scale math per (row, token).
+> - The fix is a real GEMM tiling, with each operand reused many times from LDS/registers. WMMA then does
+>   the inner products: 4,096 MACs per wave instruction instead of 4 per lane.
+>
+> **Plan:**
+>
+> - **W1. Facts first (half a day).**
+>   - Microbenchmarks for WMMA iu8 and f16: throughput, latency, and the gfx11 wave32 operand layout.
+>     A/B are 16×16 int8; each lane holds 16 bytes and the two half-waves replicate. C is 16×16 int32 in
+>     8 VGPRs: lane l holds column l % 16, rows 2i + l / 16.
+>   - An L2/LDS bandwidth probe, to confirm the activation re-read diagnosis on the current kernels
+>     (`rocprofv3` counters if available).
+>   - Keep `/tmp`-style scratch out of the repo; the benchmarks go in `tools/`.
+> - **W2. One type end to end: ROCmFP4 (Q4_0_ROCMFP4) × Q8_0.**
+>   - Workgroup tile: 64 weight rows × 64 tokens, 4 waves, each wave 16 rows × 64 tokens (4 WMMA
+>     accumulators, 32 VGPRs).
+>   - Per K-chunk of 256 values (8 blocks):
+>     - Decode 64 rows of FP4 nibbles to int8 into LDS once (`v_perm` codebook, as now), along with the
+>       64 × 16 half-block scales.
+>     - Copy the 64 tokens' Q8_0 bytes and scales into LDS.
+>     - Per 16-value step: one WMMA per 16×16 sub-tile gives an int32 dot over exactly one ROCmFP4
+>       half-block. Convert to float and accumulate `C += row_scale ⊗ token_scale · dot`
+>       (8 cvt + 8 FMA per lane per WMMA). Weight and activation scales are both per 16/32 values, so
+>       the scaling cannot be deferred past a block.
+>   - LDS ~34 KB per workgroup. Double-buffer the K-chunks so global loads overlap the WMMAs.
+>   - Verify against `matmul_q8_*` on real tensors. Integer dots are identical; float accumulation
+>     order differs, so the bound is 1e-5 relative to sum |w x|. The prefill-vs-token-by-token checks
+>     move from "bit-identical" to that bound for the WMMA path.
+>   - Benchmark with `matvec_bench batch T`.
+> - **W3. K-quants (Q4_K, Q5_K, Q6_K) × Q8_K.** Same tiling; the K-chunk is one 256-value super-block.
+>   - Sub-block scales are integers: keep int32 accumulators per super-block, with
+>     `C_int += sc[row][sub] · WMMA(...)` (an integer multiply of the C tile by a per-row vector).
+>   - Apply `d_row · d_tok` once per 256, and subtract the min / −32 offset terms through the Q8_K group
+>     sums (bsums) per (row, token), as now.
+>   - Q6_K's 210-byte blocks are 2-aligned: stage them with 2-byte loads.
+> - **W4. Dispatch and integration.**
+>   - `qmatvec_launch_q8_batch` picks WMMA for T ≥ 16 and keeps `matmul_q8_*` for small T and the tails.
+>   - ROCMFP4_FAST (the 35B's main type) gets the same kernel; its 17-byte blocks need 1-byte staging
+>     or block-pair loads.
+>   - Re-tune the micro-batch: bigger tiles want B = 128–256.
+>   - Expected: matmuls at ~20 TOPS → ~0.35 ms/token, ~2,500 tokens/s for the matmuls.
+> - **W5. Then the rest of prefill becomes visible:**
+>   - **Attention for long prompts is O(n²)** and recomputes K/V loads per query token. Needs a
+>     query-tiled flash attention (several tokens per workgroup share each K/V chunk), with FP16 WMMA
+>     for QKᵀ and PV.
+>   - **The CPU embedding row decode** (2.6% of prefill now) moves to the GPU.
+>   - **DeltaNet's per-token sequential loop:** fine at this scale; re-measure.
 >
 > **Batched prefill — DONE ✅ (2026-10-17).** ~50 → ~600 tokens/s.
 > - **Batched int8 matmuls:** `matmul_q8_<type>` decodes each lane's weight bytes once and applies them to
