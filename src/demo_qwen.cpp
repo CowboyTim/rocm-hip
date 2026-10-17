@@ -8,6 +8,7 @@
 #include "sampler.h"
 #include "tokenizer.h"
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <string>
 
@@ -83,6 +84,8 @@ int main(int argc, char** argv) {
 
     // Prefill; the last prompt token's logits give the first generated token
     qwen_model_profile_reset(model);
+    auto now = []() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    double t0 = now();
     for (int i = 0; i < n_tokens; ++i) {
         if (qwen_model_forward(model, tokens[i], i, nullptr) != 0) {
             fprintf(stderr, "Forward failed at token %d: %s\n", i, inference_get_last_error());
@@ -92,6 +95,7 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    const double t_prefill = now() - t0;
     if (profile) qwen_model_profile_print(model, "prefill");
     for (int i = 0; i < n_tokens; ++i) sampler_accept(smp, tokens[i]);
     int next = pick();
@@ -99,6 +103,8 @@ int main(int argc, char** argv) {
 
     // Generation; stops at n_gen tokens or EOS
     qwen_model_profile_reset(model);
+    t0 = now();
+    int n_fwd = 0;
     tokenizer_t* tok = inference_get_tokenizer(engine);
     const int eos = tokenizer_eos_id(tok);
     std::string text;
@@ -112,11 +118,16 @@ int main(int argc, char** argv) {
             fprintf(stderr, "Generation failed: %s\n", inference_get_last_error());
             break;
         }
+        ++n_fwd;
         sampler_accept(smp, next);
         next = pick();
     }
     sampler_free(smp);
+    const double t_gen = now() - t0;
     if (profile) qwen_model_profile_print(model, "generation");
+    printf("Timing%s: prefill %d tokens %.1f ms (%.2f tok/s), generation %d tokens %.1f ms (%.2f tok/s)\n",
+           profile ? " (profiled, extra syncs)" : "", n_tokens, 1e3 * t_prefill, n_tokens / t_prefill, n_fwd,
+           1e3 * t_gen, n_fwd > 0 ? n_fwd / t_gen : 0.0);
     printf("Prompt + generation: %s%s\n", prompt, text.c_str());
 
     inference_kv_cache_free(engine);

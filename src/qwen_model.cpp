@@ -1,9 +1,11 @@
-// qwen_model.cpp -- Qwen3.5 single-token forward pass (Phase 20 Step 3c).
+// qwen_model.cpp -- Qwen3.5 single-token forward pass (Phase 20).
 //
-// Every projection (attention Q/K/V/O, FFN gate/up/down, LM head) is one qmatvec_launch on the raw GGUF
-// blocks, read in place from the pinned file mapping. Activations live in one /dev/shm scratch buffer,
-// pinned once, so the GPU reads and writes them without copies. The small per-token vector ops (norms,
-// RoPE, single-query attention, SwiGLU) run on the CPU via qwen_ops for now.
+// Every projection (attention Q/K/V/O, DeltaNet, FFN gate/up/down, LM head) is one qmatvec_launch on the raw
+// GGUF blocks, read in place from the pinned file mapping. Activations live in one /dev/shm scratch buffer,
+// pinned once, so the GPU reads and writes them without copies. Everything after the embedding row decode
+// runs on the GPU: projections, the token mixers (attention.hip, deltanet.hip), norms, residual adds and
+// SwiGLU (gpu_ops.hip), queued back to back with one sync per token. qwen_ops holds the CPU reference
+// versions of these ops, which tests/forward_verify checks the kernels against.
 //
 // Both token mixers follow the llama.cpp qwen35 graph: gated full attention (gated Q, q/k RMSNorm, partial
 // NeoX RoPE, GQA, sigmoid output gate) and Gated DeltaNet (conv1d with state, L2-normed q/k, gated delta
@@ -16,9 +18,9 @@
 #include "kv_cache.h"
 #include "attention.h"
 #include "deltanet.h"
+#include "gpu_ops.h"
 #include "qmatvec.h"
 #include "quant_types.h"
-#include "qwen_ops.h"
 
 #include <hip/hip_runtime.h>
 
@@ -166,22 +168,22 @@ struct RecurrentState {
     }
 };
 
-// Wall-time breakdown of the forward pass (QWEN_PROFILE=1 prints it; see qwen_model_profile_print). Sections
-// are timed by laps: lap(c) charges the time since the previous lap to c. A GPU section runs from its first
-// qmatvec launch to the hipDeviceSynchronize after it, so it includes launch overhead and the sync wait.
-enum ProfCat {
-    P_EMBED, P_ATTN_CPU, P_ATTN_GPU, P_LIN_CPU, P_LIN_GPU, P_FFN_CPU, P_FFN_GPU, P_HEAD_CPU,
-    P_HEAD_GPU, P_COUNT
-};
+// Wall-time breakdown of the forward pass (QWEN_PROFILE=1; see qwen_model_profile_print). A token is one GPU
+// queue with a single sync, so section times only exist when profiling: then each section ends with a
+// hipDeviceSynchronize and lap(c) charges the time since the previous lap to c. Those extra syncs make a
+// profiled token a little slower than an unprofiled one.
+enum ProfCat { P_EMBED, P_ATTN, P_LIN, P_FFN, P_HEAD, P_COUNT };
 static const char* const PROF_NAME[P_COUNT] = {
-    "embedding (CPU)", "attention: norm, residual (CPU)",
-    "attention: matvecs + norm/RoPE/attention kernels (GPU)", "DeltaNet: norm, residual (CPU)",
-    "DeltaNet: matvecs + conv/delta-rule kernels (GPU)", "FFN: norm, SwiGLU (CPU)",
-    "FFN: gate/up/down matvecs (GPU)", "output norm + logits out (CPU)", "LM head matvec (GPU)",
+    "embedding row decode (CPU)",
+    "attention: matvecs + norm/RoPE/attention kernels",
+    "DeltaNet: matvecs + conv/delta-rule kernels",
+    "FFN: residual + norms, gate/up/down matvecs, SwiGLU",
+    "LM head matvec + logits out",
 };
-static const bool PROF_GPU[P_COUNT] = {false, false, true, false, true, false, true, false, true};
+static const bool PROF_GPU[P_COUNT] = {false, true, true, true, true};
 
 struct Profile {
+    bool on = getenv("QWEN_PROFILE") != nullptr;
     double t[P_COUNT] = {};
     double bytes[P_COUNT] = {};   // weight bytes streamed by the GPU sections
     double last = 0.0;
@@ -209,6 +211,7 @@ struct QwenModel {
     ~QwenModel() {
         rs.mem.free();
         s.mem.free();
+        gpu_ops_free();
         attention_free();
         deltanet_free();
         qmatvec_free();
@@ -216,8 +219,8 @@ struct QwenModel {
 
     bool init(inference_model* model) {
         eng = model;
-        if (qmatvec_init("matvec_q.co") != 0) {
-            qwen_set_error("cannot load matvec_q.co (run from build/co)");
+        if (qmatvec_init("matvec_q.co") != 0 || gpu_ops_init("gpu_ops.co") != 0) {
+            qwen_set_error("cannot load matvec_q.co / gpu_ops.co (run from build/co)");
             return false;
         }
         bool has_linear = false;
@@ -267,117 +270,109 @@ struct QwenModel {
         return true;
     }
 
-    bool sync() {
-        hipError_t e = hipDeviceSynchronize();
-        if (e != hipSuccess) { qwen_set_error("hipDeviceSynchronize: %s", hipGetErrorString(e)); return false; }
+    bool check(hipError_t e, const char* what) {
+        if (e != hipSuccess) qwen_set_error("%s: %s", what, hipGetErrorString(e));
+        return e == hipSuccess;
+    }
+
+    bool sync() { return check(hipDeviceSynchronize(), "hipDeviceSynchronize"); }
+
+    // End of a profiled section: only when profiling, sync so the GPU time lands in this section
+    bool section(ProfCat c) {
+        if (prof.on && !sync()) return false;
+        prof.lap(c);
         return true;
     }
 
-    // Gated full attention for one token at position pos; adds its output to the residual. q/k norm, RoPE,
-    // the KV cache write, attention over positions 0..pos and the output gate run as GPU kernels
-    // (attention.hip), queued between the q/k/v projections and attn_output: one sync.
+    // Gated full attention for one token at position pos, from the normed input s.xn; output in s.proj.
+    // q/k norm, RoPE, the KV cache write, attention over positions 0..pos and the output gate are GPU
+    // kernels (attention.hip).
     bool full_attention(const LayerWeights& L, int pos) {
-        const int E = eng->n_embd, HQ = eng->n_head, HKV = eng->n_head_kv;
-        const float eps = (float)eng->eps;
-
-        qwen_rmsnorm(s.x, L.attn_norm, s.xn, E, eps);
-        prof.lap(P_ATTN_CPU);
-        if (!matvec(L.Wq, s.xn, s.qfull, P_ATTN_GPU) || !matvec(L.Wk, s.xn, s.k, P_ATTN_GPU) ||
-            !matvec(L.Wv, s.xn, s.v, P_ATTN_GPU))
+        const int HQ = eng->n_head, HKV = eng->n_head_kv;
+        if (!matvec(L.Wq, s.xn, s.qfull, P_ATTN) || !matvec(L.Wk, s.xn, s.k, P_ATTN) || !matvec(L.Wv, s.xn, s.v, P_ATTN))
             return false;
         __half* K = kv_cache_k_row(eng->kvc, L.kv_slot, 0);
         __half* V = kv_cache_v_row(eng->kvc, L.kv_slot, 0);
         if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
-        const hipError_t e = attention_forward(s.qfull, s.k, s.v, L.q_norm, L.k_norm, K, V, HQ, HKV, eng->n_rot, pos,
-                                               eng->rope_freq_base, eps, s.q, s.part_ml, s.part_acc, s.attn, 0);
-        if (e != hipSuccess) { qwen_set_error("attention kernels, KV layer %d: %s", L.kv_slot, hipGetErrorString(e)); return false; }
-        if (!matvec(L.Wo, s.attn, s.proj, P_ATTN_GPU) || !sync()) return false;
-        prof.lap(P_ATTN_GPU);
-        for (int i = 0; i < E; ++i) s.x[i] += s.proj[i];
-        prof.lap(P_ATTN_CPU);
-        return true;
+        if (!check(attention_forward(s.qfull, s.k, s.v, L.q_norm, L.k_norm, K, V, HQ, HKV, eng->n_rot, pos,
+                                     eng->rope_freq_base, (float)eng->eps, s.q, s.part_ml, s.part_acc, s.attn, 0),
+                   "attention kernels"))
+            return false;
+        return matvec(L.Wo, s.attn, s.proj, P_ATTN);
     }
 
-    // Gated DeltaNet token mixer for one token; updates the layer's conv and delta-rule state and adds its
-    // output to the residual. Follows llama.cpp's qwen35 build_layer_attn_linear.
+    // Gated DeltaNet token mixer for one token, from s.xn; output in s.proj. Updates the layer's conv and
+    // delta-rule state. Follows llama.cpp's qwen35 build_layer_attn_linear (deltanet.hip).
     bool linear_attention(int l, const LayerWeights& L) {
-        const int E = eng->n_embd, NG = eng->ssm_n_group, NV = eng->ssm_dt_rank;
+        const int NG = eng->ssm_n_group, NV = eng->ssm_dt_rank;
         const float eps = (float)eng->eps;
-
-        qwen_rmsnorm(s.x, L.attn_norm, s.xn, E, eps);
-        prof.lap(P_LIN_CPU);
-        if (!matvec(L.W_qkv, s.xn, s.qkv, P_LIN_GPU) || !matvec(L.W_z, s.xn, s.z, P_LIN_GPU) ||
-            !matvec(L.W_alpha, s.xn, s.alpha, P_LIN_GPU) || !matvec(L.W_beta, s.xn, s.beta, P_LIN_GPU))
+        if (!matvec(L.W_qkv, s.xn, s.qkv, P_LIN) || !matvec(L.W_z, s.xn, s.z, P_LIN) ||
+            !matvec(L.W_alpha, s.xn, s.alpha, P_LIN) || !matvec(L.W_beta, s.xn, s.beta, P_LIN))
             return false;
-
-        // conv1d + SiLU + q/k L2 norm + gates, then the delta rule + gated norm, then ssm_out: all queued on
-        // the GPU behind the projections, one sync (deltanet.hip). alpha/beta become g/sigmoid(beta) in place.
-        hipError_t e = deltanet_pre(s.qkv, rs.conv[l], L.ssm_conv1d, eng->ssm_d_conv, s.conv, NG, NV, s.alpha, s.beta,
-                                    L.ssm_dt, L.ssm_a, s.alpha, s.beta, eps, 0);
-        if (e == hipSuccess) e = deltanet_rule(rs.ssm[l], s.conv, s.alpha, s.beta, s.z, L.ssm_norm, s.lin, NG, NV, eps, 0);
-        if (e != hipSuccess) { qwen_set_error("deltanet kernels, layer %d: %s", l, hipGetErrorString(e)); return false; }
-        if (!matvec(L.W_ssm_out, s.lin, s.proj, P_LIN_GPU) || !sync()) return false;
-        prof.lap(P_LIN_GPU);
-        for (int i = 0; i < E; ++i) s.x[i] += s.proj[i];
-        prof.lap(P_LIN_CPU);
-        return true;
+        // conv1d + SiLU + q/k L2 norm + gates, then the delta rule + gated norm; alpha/beta become
+        // g / sigmoid(beta) in place
+        if (!check(deltanet_pre(s.qkv, rs.conv[l], L.ssm_conv1d, eng->ssm_d_conv, s.conv, NG, NV, s.alpha, s.beta,
+                                L.ssm_dt, L.ssm_a, s.alpha, s.beta, eps, 0), "deltanet_pre") ||
+            !check(deltanet_rule(rs.ssm[l], s.conv, s.alpha, s.beta, s.z, L.ssm_norm, s.lin, NG, NV, eps, 0),
+                   "deltanet_rule"))
+            return false;
+        return matvec(L.W_ssm_out, s.lin, s.proj, P_LIN);
     }
 
-    // SwiGLU FFN; adds its output to the residual
-    bool ffn(const LayerWeights& L) {
+    // Residual add of the mixer output, the FFN's RMSNorm, SwiGLU FFN, then the residual add of its output
+    // fused with the next RMSNorm (next layer's attn_norm, or output_norm after the last layer)
+    bool ffn(const LayerWeights& L, const float* next_norm) {
         const int E = eng->n_embd, FF = eng->n_ff;
-        qwen_rmsnorm(s.x, L.ffn_norm, s.xn, E, (float)eng->eps);
-        prof.lap(P_FFN_CPU);
-        if (!matvec(L.W_gate, s.xn, s.ffg, P_FFN_GPU) || !matvec(L.W_up, s.xn, s.ffu, P_FFN_GPU) || !sync())
-            return false;
-        prof.lap(P_FFN_GPU);
-        for (int i = 0; i < FF; ++i) s.act[i] = qwen_silu(s.ffg[i]) * s.ffu[i];
-        prof.lap(P_FFN_CPU);
-        if (!matvec(L.W_down, s.act, s.proj, P_FFN_GPU) || !sync()) return false;
-        prof.lap(P_FFN_GPU);
-        for (int i = 0; i < E; ++i) s.x[i] += s.proj[i];
-        prof.lap(P_FFN_CPU);
-        return true;
+        const float eps = (float)eng->eps;
+        return check(gpu_add_rmsnorm(s.x, s.proj, L.ffn_norm, s.xn, E, eps, 0), "add_rmsnorm") &&
+               matvec(L.W_gate, s.xn, s.ffg, P_FFN) && matvec(L.W_up, s.xn, s.ffu, P_FFN) &&
+               check(gpu_swiglu(s.ffg, s.ffu, s.act, FF, 0), "swiglu") && matvec(L.W_down, s.act, s.proj, P_FFN) &&
+               check(gpu_add_rmsnorm(s.x, s.proj, next_norm, s.xn, E, eps, 0), "add_rmsnorm");
     }
 
+    // One token: the CPU decodes the embedding row into the residual stream, then the whole forward pass is
+    // one GPU queue with a single sync before the logits are read (more syncs when profiling or when a layer
+    // callback / QWEN_DEBUG wants the residual after each layer).
     int forward(int token_id, int pos, float* logits_out) {
         const int E = eng->n_embd;
+        const float eps = (float)eng->eps;
         if (token_id < 0 || token_id >= eng->vocab_size) { qwen_set_error("token %d out of range", token_id); return -1; }
         if (!eng->kvc || pos < 0 || pos >= kv_cache_n_ctx(eng->kvc)) { qwen_set_error("position %d out of range", pos); return -1; }
 
         prof.start();
-        // Embedding: decode one row of token_embd on the CPU
         if (qt_to_float(eng->token_embd.type, eng->token_embd.row(token_id), s.x, E) != 0) {
             qwen_set_error("cannot decode token_embd type %d", eng->token_embd.type);
             return -1;
         }
-
         // A sequence starting at position 0 starts from zero recurrent state (the KV cache needs no reset:
         // attention only reads positions 0..pos)
-        if (pos == 0 && rs.reset() != hipSuccess) { qwen_set_error("recurrent state reset failed"); return -1; }
+        if (pos == 0 && !check(rs.reset(), "recurrent state reset")) return -1;
+        if (!check(gpu_add_rmsnorm(s.x, nullptr, eng->layers[0].attn_norm, s.xn, E, eps, 0), "add_rmsnorm")) return -1;
         prof.lap(P_EMBED);
 
+        const bool per_layer = layer_cb || qwen_debug();
         for (int l = 0; l < eng->n_layer; ++l) {
-            prof.start();  // the debug trace and layer callback of the previous layer are not charged
             const LayerWeights& L = eng->layers[l];
-            const bool ok = L.kind == LAYER_FULL_ATTN ? full_attention(L, pos) : linear_attention(l, L);
-            if (!ok || !ffn(L)) return -1;
-            if (layer_cb) layer_cb(l, pos, s.x, E, layer_cb_user);
-            if (qwen_debug()) {
-                double ss = 0.0;
-                for (int i = 0; i < E; ++i) ss += (double)s.x[i] * s.x[i];
-                fprintf(stderr, "[qwen] pos %d blk %2d %-6s rms(x)=%.5g x[0..3]=%.5g %.5g %.5g %.5g\n", pos, l,
-                        L.kind == LAYER_FULL_ATTN ? "attn" : "linear", sqrt(ss / E), s.x[0], s.x[1], s.x[2], s.x[3]);
+            const bool attn = L.kind == LAYER_FULL_ATTN;
+            if (!(attn ? full_attention(L, pos) : linear_attention(l, L)) || !section(attn ? P_ATTN : P_LIN)) return -1;
+            const float* next_norm = l + 1 < eng->n_layer ? eng->layers[l + 1].attn_norm : eng->output_norm;
+            if (!ffn(L, next_norm) || !section(P_FFN)) return -1;
+            if (per_layer) {
+                if (!sync()) return -1;
+                if (layer_cb) layer_cb(l, pos, s.x, E, layer_cb_user);
+                if (qwen_debug()) {
+                    double ss = 0.0;
+                    for (int i = 0; i < E; ++i) ss += (double)s.x[i] * s.x[i];
+                    fprintf(stderr, "[qwen] pos %d blk %2d %-6s rms(x)=%.5g x[0..3]=%.5g %.5g %.5g %.5g\n", pos, l,
+                            attn ? "attn" : "linear", sqrt(ss / E), s.x[0], s.x[1], s.x[2], s.x[3]);
+                }
+                prof.start();  // the callback and debug trace are not charged
             }
         }
 
-        prof.start();  // the debug trace and layer callback above are not charged
-        qwen_rmsnorm(s.x, eng->output_norm, s.xn, E, (float)eng->eps);
-        prof.lap(P_HEAD_CPU);
-        if (!matvec(eng->output, s.xn, s.logits, P_HEAD_GPU) || !sync()) return -1;
-        prof.lap(P_HEAD_GPU);
+        if (!matvec(eng->output, s.xn, s.logits, P_HEAD) || !sync()) return -1;
         if (logits_out) memcpy(logits_out, s.logits, (size_t)eng->vocab_size * sizeof(float));
-        prof.lap(P_HEAD_CPU);
+        prof.lap(P_HEAD);
         prof.tokens++;
         return 0;
     }

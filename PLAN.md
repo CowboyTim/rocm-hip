@@ -1214,21 +1214,42 @@ for the symptoms above.
 > - Use the GPU as much as possible, and use the 16 Zen 5 cores (AVX-512) for what stays on the CPU.
 > - Judge each change by the bytes it moves and the syncs it adds, measured with `QWEN_PROFILE=1`.
 >
-> Now **49.4 tok/s** generation (20.2 ms/token). GPU sections are 95% of each token. Profile, per token:
-> - FFN matvecs: 9.4 ms. DeltaNet (matvecs + kernels): 5.1 ms. Attention (matvecs + kernels): 1.4 ms.
->   LM head: 3.2 ms. Weights stream at about 147 GB/s.
-> - CPU: FFN SwiGLU and norms 1.0 ms, everything else about 0.1 ms.
-> - Syncs: per layer, 2 in the FFN and 1 in the mixer.
+> Now **51.8 tok/s** generation (19.3 ms/token), with the whole forward pass on the GPU.
+> - Each token is one GPU queue and one sync; the CPU only decodes the embedding row (0.02 ms).
+> - It streams 2.8 GB of weights per token at about 146 GB/s. Profile:
+>   - FFN (incl. norms, SwiGLU): 9.5 ms.
+>   - DeltaNet: 5.1 ms.
+>   - LM head: 3.2 ms.
+>   - Attention: 1.4 ms.
+> - The ceiling is LPDDR5X bandwidth: at ~256 GB/s peak (~220 achievable) a token would take 11–13 ms,
+>   i.e. 75–90 tok/s.
 >
-> 1. **FFN and norms on the GPU, one sync per token:** SwiGLU, the RMSNorms and residual adds as small
->    kernels, plus the embedding row decode, so the whole token is one queue.
-> 2. **Matvec efficiency:** 147 GB/s averaged against LPDDR5X's ~256 GB/s peak. Q5_K/Q6_K and the
->    small-N matvecs are the ones below ~160 GB/s; also look at launch overhead (about 200 launches per
->    token).
-> 3. **Batched prefill:** a quantized matrix-matrix kernel that decodes each weight block once per batch,
->    plus a multi-token DeltaNet kernel (sequential over tokens inside the kernel) and multi-query
->    attention. Check it against the 5-token reference dump and against token-by-token results.
-> 4. **Step 6 (35B-A3B):** router, top-8 of 256 experts, shared expert; `ref_dump acts` on the 35B.
+> 1. **Matvec efficiency.** It is the whole remaining generation-speed budget.
+>    - Measure each kernel's achieved GB/s on cold weights (each tensor read once per token, nothing
+>      cached), by type and shape.
+>    - Q5_K/Q6_K (123–160 GB/s) and the DeltaNet section (123 GB/s; small-N alpha/beta matvecs) are the
+>      laggards; ROCMFP4 reaches ~200+.
+>    - Ideas:
+>      - More bytes in flight per wave (unroll blocks, wider loads).
+>      - Several rows per wave for small-K/large-N tensors.
+>      - Fusing matvecs that share an input: q/k/v, gate/up, qkv/z/alpha/beta.
+>      - Fewer launches: about 200 per token.
+> 2. **Batched prefill.** Prompt processing is still one token at a time (43 tok/s). Needs:
+>    - A quantized matrix-matrix kernel that decodes each weight block once per batch.
+>    - A multi-token DeltaNet kernel, sequential over tokens inside the kernel.
+>    - Multi-query attention.
+>    - Checks against the 5-token reference dump and against token-by-token results.
+> 3. **Step 6 (35B-A3B):** router, top-8 of 256 experts, shared expert; `ref_dump acts` on the 35B.
+>
+> **Whole forward pass on the GPU, one sync per token — DONE ✅ (2026-10-17).** 49.4 → 51.8 tok/s.
+> - `src/gpu_ops.hip` adds `add_rmsnorm` (the residual add fused with the next RMSNorm, one per layer
+>   boundary) and `swiglu`. Mixers now leave their output in `s.proj`, and the FFN does both residual
+>   adds.
+> - The syncs were cheaper than expected, so the gain is small; the point is that the CPU is now free.
+> - `QWEN_PROFILE=1` keeps per-section times by syncing at section boundaries (slightly slower). The demo
+>   always prints unprofiled prefill and generation tok/s.
+> - Greedy output is unchanged: the 32-token code prompt matches llama.cpp, and a 300-token run is
+>   byte-identical to the previous commit.
 >
 > **Attention on the GPU — DONE ✅ (2026-10-17).** 39.5 → 49.4 tok/s.
 > - `src/attention.hip`, three kernels queued between the q/k/v matvecs and `attn_output`, one sync:
