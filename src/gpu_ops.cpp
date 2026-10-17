@@ -5,7 +5,7 @@
 #include <stdio.h>
 
 static hipModule_t g_mod = nullptr;
-static hipFunction_t g_norm = nullptr, g_swiglu = nullptr, g_router = nullptr, g_combine = nullptr;
+static hipFunction_t g_norm = nullptr, g_swiglu = nullptr, g_router = nullptr, g_combine = nullptr, g_group = nullptr;
 
 int gpu_ops_init(const char* co_path) {
     if (g_mod) return 0;
@@ -17,7 +17,8 @@ int gpu_ops_init(const char* co_path) {
     if (hipModuleGetFunction(&g_norm, g_mod, "add_rmsnorm") != hipSuccess ||
         hipModuleGetFunction(&g_swiglu, g_mod, "swiglu") != hipSuccess ||
         hipModuleGetFunction(&g_router, g_mod, "moe_router") != hipSuccess ||
-        hipModuleGetFunction(&g_combine, g_mod, "moe_combine") != hipSuccess) {
+        hipModuleGetFunction(&g_combine, g_mod, "moe_combine") != hipSuccess ||
+        hipModuleGetFunction(&g_group, g_mod, "moe_group") != hipSuccess) {
         fprintf(stderr, "[gpu_ops] kernels missing in %s\n", co_path);
         gpu_ops_free();
         return -1;
@@ -28,7 +29,7 @@ int gpu_ops_init(const char* co_path) {
 void gpu_ops_free(void) {
     if (g_mod) (void)hipModuleUnload(g_mod);
     g_mod = nullptr;
-    g_norm = g_swiglu = g_router = g_combine = nullptr;
+    g_norm = g_swiglu = g_router = g_combine = g_group = nullptr;
 }
 
 hipError_t gpu_add_rmsnorm(const float* x_in, const float* add, float* x_out, const float* w, float* y, int n, int T,
@@ -65,4 +66,13 @@ hipError_t gpu_moe_combine(const float* down, const float* wts, const float* sha
     void* args[] = {(void*)&down, (void*)&wts, (void*)&shared, (void*)&sg, &out, &n_used, &n};
     return hipModuleLaunchKernel(g_combine, (unsigned)((n + 255) / 256), (unsigned)T, 1, 256, 1, 1, 0, stream, args,
                                  nullptr);
+}
+
+hipError_t gpu_moe_group(const int* ids, int T, int n_used, int n_expert, int tile, int* tok_rows, int* pair_rows,
+                         int* n_tiles, int* tile_e, int* tile_start, int* tile_n, hipStream_t stream) {
+    if (!g_group) return hipErrorInvalidDeviceFunction;
+    if (T <= 0 || n_used <= 0 || n_expert <= 0 || n_expert > 1024 || tile <= 0) return hipErrorInvalidValue;
+    void* args[] = {(void*)&ids, &T, &n_used, &n_expert, &tile, &tok_rows, &pair_rows, &n_tiles, &tile_e, &tile_start,
+                    &tile_n};
+    return hipModuleLaunchKernel(g_group, 1, 1, 1, 256, 1, 1, 0, stream, args, nullptr);
 }

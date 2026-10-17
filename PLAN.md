@@ -1216,24 +1216,37 @@ for the symptoms above.
 >
 > Now both target models run correctly on the GPU:
 >
-> | Model | Generation | Prefill |
+> | Model | Generation | Prefill (561-token prompt) |
 > |---|---|---|
-> | Qwen3.5-4B | **63.7 tok/s** | **~600 tok/s** |
-> | Qwen3.6-35B-A3B (MoE) | **~47 tok/s** | **~246 tok/s** |
+> | Qwen3.5-4B | **62.6 tok/s** | **667 tok/s** |
+> | Qwen3.6-35B-A3B (MoE) | **57.1 tok/s** | **515 tok/s** |
 >
-> 1. **35B speed (next):**
->    - **BF16 LM head:** `output.weight` is BF16, 1 GB read per token, 7.3 ms (34% of a token) at
->      140 GB/s through the generic float kernel (one value per lane). A vectorized BF16 kernel should
->      reach ~220 GB/s, ~-2.5 ms.
->    - **Small-K rows waste lanes:** the expert `down` projections have K = 512, i.e. 4
->      ROCMFP4_FAST block-quads per row, so 4 of 32 lanes work. Gate/up (K = 2048) use half the lanes.
->      Pack several rows per wave when a row has fewer than 32 lane-tasks. Expert matvecs run at ~80
->      GB/s now.
->    - **MoE prefill:** experts are matvec'd per (token, slot), with no weight reuse across tokens.
->      Group tokens by expert (sort by id) and run each expert's tokens as a batched matmul.
-> 2. **Prefill speed: tiled WMMA GEMM** — see "TODO: prefill via WMMA" below.
+> 1. **Prefill via WMMA (next)** — see "TODO: prefill via WMMA" below.
+> 2. **35B generation (16.5 ms GPU per token):**
+>    - BF16 LM head: 5.1 ms at ~200 GB/s (1 GB, the bandwidth floor is ~4.2 ms).
+>    - Expert matvecs: 3.3 ms at ~160 GB/s.
+>    - ROCMFP4_FAST matvecs: 2.9 ms.
+>    - The `moe_router` kernel: 0.43 ms. It does 8 serial block-argmax rounds per token; a single sort
+>      pass would be faster.
 > 3. **Generation polish:** ROCmFP4 int8 bandwidth (192 vs 240 GB/s); a HIP graph per token (~0.6 ms of
 >    gaps).
+>
+> **35B speed — DONE ✅ (2026-10-17).** Generation 47 → 57 tok/s, prefill 246 → 515 tok/s.
+> - **`matvec_bf16`:** 16-byte loads, activations rounded to BF16 as ggml does. The 1 GB LM head went
+>   from 140 to 205 GB/s, and now matches the reference from the raw input (1.6e-7 instead of 1.4e-3).
+> - **Lanes per row:** the int8 matvecs (plain and expert-indexed) take L ∈ {4, 8, 16, 32} lanes per
+>   row, so short rows share a wave. The experts' K = 512 down projections had 28 of 32 lanes idle.
+> - **`matvec_f32`** (the router, 84 MB per token): vectorized; it was 57 GB/s.
+> - **MoE prefill grouped by expert:**
+>   - `moe_group` sorts a batch's (token, slot) entries by expert and cuts them into tiles of 16.
+>   - `matmul_q8_id_<type>` runs each tile as a batched matmul: each expert's weights are decoded once
+>     per tile.
+>   - The batched bodies became device templates over a row map (`RowsLinear` / `RowsExpert`), shared
+>     by both kernel families.
+>   - Prefill micro-batches went from 64 to 256 tokens, which gives more tokens per expert; the 4B also
+>     improves, 600 → 667 tokens/s.
+> - All checks still pass. Prefill of 561 tokens stays **bit-identical** to token by token on both models,
+>   and 35B greedy output still matches llama-completion.
 >
 > **Step 6: Qwen3.6-35B-A3B (MoE) — DONE ✅ (2026-10-17).** It matches the reference and generates text
 > identical to llama.cpp.

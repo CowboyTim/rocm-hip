@@ -97,6 +97,16 @@ hipError_t qmatvec_launch_q8_id(int type, const void *W, size_t row_bytes, const
 hipError_t qmatvec_launch_id(int type, const void *W, size_t row_bytes, const int32_t *ids, int n_used, int x_per_slot,
                              const float *x, float *y, int N, int K, int T, hipStream_t stream);
 
+// MoE prefill: the experts' rows for a batch grouped by expert (gpu_moe_group). Tile k < *n_tiles covers up to
+// qmatvec_mm_tile() entries with expert tile_e[k]: entries tile_start[k] .. + tile_n[k] - 1 of in_rows (rows of
+// the quantized input q) / out_rows (rows of y, N values each). max_tiles bounds *n_tiles (grid size).
+int qmatvec_mm_tile(void);
+int qmatvec_q8_id_batch_supported(int type, int K);
+hipError_t qmatvec_launch_q8_id_batch(int type, const void *W, size_t row_bytes, const qmatvec_q8 *q, float *y, int N,
+                                      int K, int max_tiles, const int32_t *n_tiles, const int32_t *tile_e,
+                                      const int32_t *tile_start, const int32_t *tile_n, const int32_t *in_rows,
+                                      const int32_t *out_rows, hipStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

@@ -808,12 +808,35 @@ MATVEC_Q8_KERNELS(q6_K, mv_q6_K, 1)
 #define MM_ARGS const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, const int *bs, float *y, \
                 long long ldy, int N, int K, int T
 
+// Arguments of the kernel bodies below (device templates over a row map RM, see the kernels at the end)
+#define MM_BARGS const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, const int *bs, float *y, \
+                 long long ldy, int N, int K
+
+// Which input / output rows a workgroup's tile of up to MM_TB tokens covers, and where its weight rows are
+struct RowsLinear {  // prefill: tokens t0 .. t0 + nt - 1, rows t of the input and of y
+    long long t0;
+    int nt;
+    __device__ const uint8_t *row_ptr(const uint8_t *W, int row, long long rb, int) const { return W + (long long)row * rb; }
+    __device__ long long in(int j) const { return t0 + j; }
+    __device__ long long out(int j) const { return t0 + j; }
+};
+
+struct RowsExpert {  // MoE prefill: one expert's tile of (token, slot) entries, rows from lists
+    int e, nt;
+    const int *in_rows, *out_rows;
+    __device__ const uint8_t *row_ptr(const uint8_t *W, int row, long long rb, int N) const {
+        return W + ((long long)e * N + row) * rb;
+    }
+    __device__ long long in(int j) const { return in_rows[j]; }
+    __device__ long long out(int j) const { return out_rows[j]; }
+};
+
 #define MM_ROW_SETUP                                                                \
     const int lane = threadIdx.x & 31;                                              \
     const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);               \
     if (row >= N) return;                                                           \
-    const uint8_t *wr = W + (long long)row * row_bytes;                             \
-    const int t0 = blockIdx.y * MM_TB, nt = min(MM_TB, T - t0);                     \
+    const uint8_t *wr = rm.row_ptr(W, row, row_bytes, N);                           \
+    const int nt = rm.nt;                                                           \
     float acc[MM_TB];                                                               \
     _Pragma("unroll") for (int j = 0; j < MM_TB; ++j) acc[j] = 0.0f;
 
@@ -821,11 +844,11 @@ MATVEC_Q8_KERNELS(q6_K, mv_q6_K, 1)
     _Pragma("unroll") for (int j = 0; j < MM_TB; ++j) {                             \
         float a = acc[j];                                                           \
         for (int off = 16; off > 0; off >>= 1) a += __shfl_xor(a, off, 32);         \
-        if (lane == 0 && j < nt) y[(long long)(t0 + j) * ldy + row] = a;            \
+        if (lane == 0 && j < nt) y[rm.out(j) * ldy + row] = a;                      \
     }
 
-extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
-matmul_q8_q4_0_rocmfp4(MM_ARGS) {
+template <class RM>
+__device__ __forceinline__ void mmb_rocmfp4(MM_BARGS, const RM &rm) {
     (void)bs;
     MM_ROW_SETUP
     const int npairs = K / 64, nb = K / 32;
@@ -850,7 +873,7 @@ matmul_q8_q4_0_rocmfp4(MM_ARGS) {
         // Not unrolled: 16 copies of the body cost more in registers than the loop does (600 vs 466 tokens/s)
         for (int j = 0; j < MM_TB; ++j) {
             if (j >= nt) break;
-            const long long t = t0 + j;
+            const long long t = rm.in(j);
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
                 const int ib = 2 * p + h;
@@ -869,8 +892,8 @@ matmul_q8_q4_0_rocmfp4(MM_ARGS) {
     MM_STORE
 }
 
-extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
-matmul_q8_q6_K(MM_ARGS) {
+template <class RM>
+__device__ __forceinline__ void mmb_q6_K(MM_BARGS, const RM &rm) {
     MM_ROW_SETUP
     const int sub = lane >> 3, s = lane & 7;
     const int h = s >> 2, r = (s & 3) * 16, l = r & 31;
@@ -895,7 +918,7 @@ matmul_q8_q6_K(MM_ARGS) {
         // Not unrolled: 16 copies of the body cost more in registers than the loop does (600 vs 466 tokens/s)
         for (int j = 0; j < MM_TB; ++j) {
             if (j >= nt) break;
-            const long long t = t0 + j;
+            const long long t = rm.in(j);
             const int8_t *xb = q8 + t * K + (long long)ib * 256;
             const int *bst = bs + t * (K / 16) + ib * 16;
             int slo = 0, shi = 0;
@@ -911,8 +934,8 @@ matmul_q8_q6_K(MM_ARGS) {
     MM_STORE
 }
 
-template <bool Q5>
-__device__ void matmul_q8_kquant(MM_ARGS) {
+template <bool Q5, class RM>
+__device__ __forceinline__ void mmb_kquant(MM_BARGS, const RM &rm) {
     constexpr int BYTES = Q5 ? 176 : 144, QS = Q5 ? 48 : 16;
     MM_ROW_SETUP
     const int sub = lane >> 3, s = lane & 7;
@@ -941,7 +964,7 @@ __device__ void matmul_q8_kquant(MM_ARGS) {
         // Not unrolled: 16 copies of the body cost more in registers than the loop does (600 vs 466 tokens/s)
         for (int j = 0; j < MM_TB; ++j) {
             if (j >= nt) break;
-            const long long t = t0 + j;
+            const long long t = rm.in(j);
             const int8_t *xb = q8 + t * K + (long long)ib * 256 + 64 * c + l;
             const int *bst = bs + t * (K / 16) + ib * 16;
             int slo = 0, shi = 0;
@@ -959,18 +982,8 @@ __device__ void matmul_q8_kquant(MM_ARGS) {
     MM_STORE
 }
 
-extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
-matmul_q8_q4_K(MM_ARGS) {
-    matmul_q8_kquant<false>(W, row_bytes, q8, d8, bs, y, ldy, N, K, T);
-}
-
-extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
-matmul_q8_q5_K(MM_ARGS) {
-    matmul_q8_kquant<true>(W, row_bytes, q8, d8, bs, y, ldy, N, K, T);
-}
-
-extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
-matmul_q8_q4_0_rocmfp4_fast(MM_ARGS) {
+template <class RM>
+__device__ __forceinline__ void mmb_rocmfp4_fast(MM_BARGS, const RM &rm) {
     (void)bs;
     MM_ROW_SETUP
     const int nquad = K / 128, nb = K / 32;
@@ -989,7 +1002,7 @@ matmul_q8_q4_0_rocmfp4_fast(MM_ARGS) {
         // Not unrolled: see matmul_q8_q4_0_rocmfp4
         for (int jt = 0; jt < MM_TB; ++jt) {
             if (jt >= nt) break;
-            const long long t = t0 + jt;
+            const long long t = rm.in(jt);
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int ib = 4 * p + j;
@@ -1006,3 +1019,37 @@ matmul_q8_q4_0_rocmfp4_fast(MM_ARGS) {
     }
     MM_STORE
 }
+
+__device__ __forceinline__ void mmb_q4_K_lin(MM_BARGS, const RowsLinear &rm) { mmb_kquant<false>(W, row_bytes, q8, d8, bs, y, ldy, N, K, rm); }
+__device__ __forceinline__ void mmb_q5_K_lin(MM_BARGS, const RowsLinear &rm) { mmb_kquant<true>(W, row_bytes, q8, d8, bs, y, ldy, N, K, rm); }
+__device__ __forceinline__ void mmb_q4_K_exp(MM_BARGS, const RowsExpert &rm) { mmb_kquant<false>(W, row_bytes, q8, d8, bs, y, ldy, N, K, rm); }
+__device__ __forceinline__ void mmb_q5_K_exp(MM_BARGS, const RowsExpert &rm) { mmb_kquant<true>(W, row_bytes, q8, d8, bs, y, ldy, N, K, rm); }
+
+// matmul_q8_<type>: grid (ceil(N / ROWS_PER_BLOCK), ceil(T / MM_TB)) over T consecutive tokens.
+// matmul_q8_id_<type> (MoE prefill): grid (ceil(N / ROWS_PER_BLOCK), max_tiles). Tile k (k < *n_tiles) is up to
+// MM_TB (token, slot) entries that chose the same expert tile_e[k]: entries tile_start[k] .. + tile_n[k] - 1 of
+// the in_rows / out_rows lists (built by moe_group in gpu_ops.hip). W stacks all experts' N rows; y has N columns.
+// So each expert's weights are decoded once per tile of its tokens instead of once per token.
+#define MMID_ARGS                                                                                         \
+    const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, const int *bs, float *y, int N, int K, \
+        const int *n_tiles, const int *tile_e, const int *tile_start, const int *tile_n, const int *in_rows,          \
+        const int *out_rows
+
+#define MATMUL_Q8_KERNELS(name, BODY_LIN, BODY_EXP)                                                       \
+    extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matmul_q8_##name(MM_ARGS) {         \
+        const int t0 = blockIdx.y * MM_TB;                                                                \
+        const RowsLinear rm{t0, min(MM_TB, T - t0)};                                                      \
+        BODY_LIN(W, row_bytes, q8, d8, bs, y, ldy, N, K, rm);                                             \
+    }                                                                                                     \
+    extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matmul_q8_id_##name(MMID_ARGS) {    \
+        const int k = blockIdx.y;                                                                         \
+        if (k >= *n_tiles) return;                                                                        \
+        const RowsExpert rm{tile_e[k], tile_n[k], in_rows + tile_start[k], out_rows + tile_start[k]};     \
+        BODY_EXP(W, row_bytes, q8, d8, bs, y, N, N, K, rm);                                               \
+    }
+
+MATMUL_Q8_KERNELS(q4_0_rocmfp4, mmb_rocmfp4<RowsLinear>, mmb_rocmfp4<RowsExpert>)
+MATMUL_Q8_KERNELS(q4_0_rocmfp4_fast, mmb_rocmfp4_fast<RowsLinear>, mmb_rocmfp4_fast<RowsExpert>)
+MATMUL_Q8_KERNELS(q6_K, mmb_q6_K<RowsLinear>, mmb_q6_K<RowsExpert>)
+MATMUL_Q8_KERNELS(q4_K, mmb_q4_K_lin, mmb_q4_K_exp)
+MATMUL_Q8_KERNELS(q5_K, mmb_q5_K_lin, mmb_q5_K_exp)

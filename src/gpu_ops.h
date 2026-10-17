@@ -36,6 +36,15 @@ hipError_t gpu_moe_router(const float* logits, const float* x, const float* w_sh
 hipError_t gpu_moe_combine(const float* down, const float* wts, const float* shared, const float* sg, float* out,
                            int n_used, int n, int T, hipStream_t stream);
 
+// Group T tokens' selected experts (ids [T][n_used]) by expert for the expert-tiled matmuls: see moe_group in
+// gpu_ops.hip. tok_rows / pair_rows [T * n_used]; tile_e / tile_start / tile_n need gpu_moe_max_tiles entries.
+static inline int gpu_moe_max_tiles(int T, int n_used, int n_expert, int tile) {
+    const int n = T * n_used, bound = n_expert + n / tile;
+    return n < bound ? n : bound;
+}
+hipError_t gpu_moe_group(const int* ids, int T, int n_used, int n_expert, int tile, int* tok_rows, int* pair_rows,
+                         int* n_tiles, int* tile_e, int* tile_start, int* tile_n, hipStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

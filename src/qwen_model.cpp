@@ -132,6 +132,9 @@ struct Scratch {
     float* moe_act = nullptr;   // SiLU(gate) * up per expert [n_used * n_ff_exp]
     float* moe_down = nullptr;  // expert down projections [n_used * n_embd]
     float* sh_out = nullptr;    // shared expert output [n_embd]
+    // MoE prefill grouping (gpu_moe_group): entries sorted by expert, and tiles of them
+    int *g_tok = nullptr, *g_pair = nullptr, *g_ntiles = nullptr, *g_tile_e = nullptr, *g_tile_start = nullptr,
+        *g_tile_n = nullptr;
     // Attention partial results, per (token, head, 256-position chunk) up to n_ctx (attention.h)
     float* part_ml = nullptr;
     float* part_acc = nullptr;
@@ -156,18 +159,26 @@ struct Scratch {
                                 b * FF, b * FF, b * FF, (size_t)V,
                                 b * conv_dim, b * conv_dim, b * DI, b * NV, b * NV, b * DI,
                                 b * NE, b * NU, b * NU, b, b * NU * FE, b * NU * FE, b * NU * FE, b * NU * E, b * E,
+                                b * NU, b * NU, 1, b * NU, b * NU, b * NU,
                                 attention_part_ml_floats(HQ, n_ctx, rows), attention_part_acc_floats(HQ, n_ctx, rows),
                                 (qmatvec_q8_bytes(q8_max_k) + 3) / 4};
-        float* ids_f = nullptr;
+        float *ids_f = nullptr, *gt = nullptr, *gp = nullptr, *gn = nullptr, *ge = nullptr, *gs = nullptr, *gc = nullptr;
         float** const ptrs[] = {&x, &x_alt, &xn, &qfull, &q, &k, &v, &attn, &proj, &ffg, &ffu, &act, &logits,
                                 &qkv, &conv, &z, &alpha, &beta, &lin,
                                 &r_logits, &ids_f, &wts, &sg, &moe_g, &moe_u, &moe_act, &moe_down, &sh_out,
+                                &gt, &gp, &gn, &ge, &gs, &gc,
                                 &part_ml, &part_acc, &q8mem};
         static_assert(sizeof(sizes) / sizeof(sizes[0]) == sizeof(ptrs) / sizeof(ptrs[0]), "scratch table");
         if (!mem.alloc("/dev/shm/qwen_scratch.bin", sizes, ptrs, sizeof(sizes) / sizeof(sizes[0]),
                        hipExtHostRegisterCoarseGrained))
             return false;
         ids = (int*)ids_f;
+        g_tok = (int*)gt;
+        g_pair = (int*)gp;
+        g_ntiles = (int*)gn;
+        g_tile_e = (int*)ge;
+        g_tile_start = (int*)gs;
+        g_tile_n = (int*)gc;
         qmatvec_q8_bind(&q8, q8mem, q8_max_k);
         return true;
     }
@@ -287,11 +298,13 @@ struct QwenModel {
                 return false;
             }
         }
-        // Prefill micro-batch: up to 64 tokens, fewer when attention's per-token partial buffers (which grow with
-        // the context length) would exceed ~64 MB
+        // Prefill micro-batch: up to 256 tokens (bigger batches give each MoE expert more tokens per tile),
+        // fewer when attention's per-token partial buffers (which grow with the context length) would exceed
+        // ~64 MB
         const int n_ctx = kv_cache_n_ctx(eng->kvc);
         const size_t part_per_token = attention_part_acc_floats(eng->n_head, n_ctx, 1) * sizeof(float);
-        const int rows = (int)std::max<size_t>(1, std::min<size_t>(64, ((size_t)64 << 20) / std::max<size_t>(1, part_per_token)));
+        const size_t fit = ((size_t)64 << 20) / std::max<size_t>(1, part_per_token);
+        const int rows = (int)std::max<size_t>(1, std::min<size_t>(256, fit));
         if (!s.alloc(eng, n_ctx, rows)) {
             qwen_set_error("scratch allocation failed");
             return false;
@@ -405,15 +418,25 @@ struct QwenModel {
     }
 
     // Expert matvecs for T tokens with the experts in s.ids (n_used per token): int8 when s.q8 holds the input
-    // rows (T of them, or T * n_used with x_per_slot), else float. W stacks all experts' N rows.
-    bool matvec_id(const QuantWeight& W, const float* x, int x_per_slot, float* y, int N, int T, ProfCat c) {
+    // rows (T of them, or T * n_used with x_per_slot), else float. W stacks all experts' N rows. With `grouped`
+    // (a prefill batch after gpu_moe_group), the expert-tiled matmul: each expert's weights are decoded once
+    // per tile of up to 16 of its (token, slot) entries instead of once per entry.
+    bool matvec_id(const QuantWeight& W, const float* x, int x_per_slot, float* y, int N, int T, bool grouped,
+                   ProfCat c) {
         const int NU = eng->n_expert_used, K = W.K;
         prof.bytes[c] += (double)W.row_bytes * N * NU;
         const int rows_in = x_per_slot ? T * NU : T;
         const bool q8 = q8_src == x && q8_k == K && q8_t == rows_in && qmatvec_q8_supported(W.type, K);
-        const hipError_t e =
-            q8 ? qmatvec_launch_q8_id(W.type, W.data, W.row_bytes, s.ids, NU, x_per_slot, &s.q8, y, N, K, T, 0)
-               : qmatvec_launch_id(W.type, W.data, W.row_bytes, s.ids, NU, x_per_slot, x, y, N, K, T, 0);
+        hipError_t e;
+        if (q8 && grouped && qmatvec_q8_id_batch_supported(W.type, K))
+            e = qmatvec_launch_q8_id_batch(W.type, W.data, W.row_bytes, &s.q8, y, N, K,
+                                           gpu_moe_max_tiles(T, NU, eng->n_expert, qmatvec_mm_tile()), s.g_ntiles,
+                                           s.g_tile_e, s.g_tile_start, s.g_tile_n, x_per_slot ? s.g_pair : s.g_tok,
+                                           s.g_pair, 0);
+        else if (q8)
+            e = qmatvec_launch_q8_id(W.type, W.data, W.row_bytes, s.ids, NU, x_per_slot, &s.q8, y, N, K, T, 0);
+        else
+            e = qmatvec_launch_id(W.type, W.data, W.row_bytes, s.ids, NU, x_per_slot, x, y, N, K, T, 0);
         if (e != hipSuccess) {
             qwen_set_error("expert matvec type %d %dx%d (T %d): %s", W.type, N, K, T, hipGetErrorString(e));
             return false;
@@ -435,16 +458,21 @@ struct QwenModel {
         std::swap(s.x, s.x_alt);
         mark(s.xn, E, T, qe);
 
+        // A prefill batch groups its (token, slot) entries by expert for the expert-tiled matmuls
+        const bool grouped = T > 1;
         if (!matvec(L.W_router, s.xn, s.r_logits, T, P_FFN) ||
             !check(gpu_moe_router(s.r_logits, s.xn, L.shexp_gate, s.ids, s.wts, s.sg, NE, NU, E, T, 0), "moe_router") ||
-            !matvec_id(L.We_gate, s.xn, 0, s.moe_g, FE, T, P_FFN) || !matvec_id(L.We_up, s.xn, 0, s.moe_u, FE, T, P_FFN) ||
+            (grouped && !check(gpu_moe_group(s.ids, T, NU, NE, qmatvec_mm_tile(), s.g_tok, s.g_pair, s.g_ntiles,
+                                             s.g_tile_e, s.g_tile_start, s.g_tile_n, 0), "moe_group")) ||
+            !matvec_id(L.We_gate, s.xn, 0, s.moe_g, FE, T, grouped, P_FFN) ||
+            !matvec_id(L.We_up, s.xn, 0, s.moe_u, FE, T, grouped, P_FFN) ||
             !matvec(L.W_gate, s.xn, s.ffg, T, P_FFN) || !matvec(L.W_up, s.xn, s.ffu, T, P_FFN))
             return false;
 
         const qmatvec_q8* qx = q8_for(FE, T * NU);
         if (!check(gpu_swiglu(s.moe_g, s.moe_u, s.moe_act, T * NU * FE, qx, 0), "swiglu (experts)")) return false;
         mark(s.moe_act, FE, T * NU, qx);
-        if (!matvec_id(L.We_down, s.moe_act, 1, s.moe_down, E, T, P_FFN)) return false;
+        if (!matvec_id(L.We_down, s.moe_act, 1, s.moe_down, E, T, grouped, P_FFN)) return false;
 
         const qmatvec_q8* qs = q8_for(FS, T);
         if (!check(gpu_swiglu(s.ffg, s.ffu, s.act, T * FS, qs, 0), "swiglu (shared expert)")) return false;

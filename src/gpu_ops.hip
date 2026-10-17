@@ -170,3 +170,38 @@ moe_combine(const float* down, const float* wts, const float* shared, const floa
     for (int j = 1; j < n_used; ++j) acc += wts[t * n_used + j] * d[(size_t)j * n];
     out[(size_t)t * n + i] = acc + shared[(size_t)t * n + i] * sg[t];
 }
+
+// moe_group  grid 1, block 256: group a prefill batch's (token, slot) entries by expert, for the expert-tiled
+//            matmuls (matmul_q8_id_* in matvec_q.hip). Entries sorted by expert (stable): tok_rows[i] = token,
+//            pair_rows[i] = token * n_used + slot. Each expert's run is cut into tiles of up to `tile` entries:
+//            tile_e / tile_start / tile_n, *n_tiles of them. Serial in one thread: <= T * n_used + n_expert steps,
+//            deterministic.
+extern "C" __global__ void __launch_bounds__(256)
+moe_group(const int* ids, int T, int n_used, int n_expert, int tile, int* tok_rows, int* pair_rows, int* n_tiles,
+          int* tile_e, int* tile_start, int* tile_n) {
+    __shared__ int cnt[MOE_MAX_EXPERTS], off[MOE_MAX_EXPERTS];
+    for (int e = threadIdx.x; e < n_expert; e += 256) cnt[e] = 0;
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    const int n = T * n_used;
+    for (int i = 0; i < n; ++i) cnt[ids[i]]++;
+    int acc = 0;
+    for (int e = 0; e < n_expert; ++e) {
+        off[e] = acc;
+        acc += cnt[e];
+    }
+    int nt = 0;
+    for (int e = 0; e < n_expert; ++e)
+        for (int st = off[e]; st < off[e] + cnt[e]; st += tile) {
+            tile_e[nt] = e;
+            tile_start[nt] = st;
+            tile_n[nt] = min(tile, off[e] + cnt[e] - st);
+            ++nt;
+        }
+    *n_tiles = nt;
+    for (int i = 0; i < n; ++i) {
+        const int p = off[ids[i]]++;
+        tok_rows[p] = i / n_used;
+        pair_rows[p] = i;
+    }
+}

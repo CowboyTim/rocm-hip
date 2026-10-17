@@ -17,6 +17,7 @@ static hipFunction_t g_quant = nullptr;
 static hipFunction_t g_fn_mm[QMV_MAX_TYPE];  // batched int8 kernels, matmul_q8_<type>
 static hipFunction_t g_fn_q8_id[QMV_MAX_TYPE];  // expert-indexed int8 kernels, matvec_q8_id_<type>
 static hipFunction_t g_fn_id[QMV_MAX_TYPE];     // expert-indexed float kernels, matvec_id_<type>
+static hipFunction_t g_fn_mm_id[QMV_MAX_TYPE];  // expert-tiled batched int8 kernels, matmul_q8_id_<type>
 #define QMV_MM_TB 16  // tokens per tile, must match MM_TB in matvec_q.hip
 
 int qmatvec_init(const char *co_path) {
@@ -31,6 +32,7 @@ int qmatvec_init(const char *co_path) {
     memset(g_fn_mm, 0, sizeof(g_fn_mm));
     memset(g_fn_q8_id, 0, sizeof(g_fn_q8_id));
     memset(g_fn_id, 0, sizeof(g_fn_id));
+    memset(g_fn_mm_id, 0, sizeof(g_fn_mm_id));
     for (int t = 0; t < QMV_MAX_TYPE; ++t) {
         const qt_traits *tr = qt_get_traits(t);
         if (!tr) continue;
@@ -45,6 +47,8 @@ int qmatvec_init(const char *co_path) {
         if (hipModuleGetFunction(&g_fn_q8_id[t], g_mod, name) != hipSuccess) g_fn_q8_id[t] = nullptr;
         snprintf(name, sizeof(name), "matvec_id_%s", tr->name);
         if (hipModuleGetFunction(&g_fn_id[t], g_mod, name) != hipSuccess) g_fn_id[t] = nullptr;
+        snprintf(name, sizeof(name), "matmul_q8_id_%s", tr->name);
+        if (hipModuleGetFunction(&g_fn_mm_id[t], g_mod, name) != hipSuccess) g_fn_mm_id[t] = nullptr;
     }
     if (hipModuleGetFunction(&g_quant, g_mod, "quantize_q8") != hipSuccess) g_quant = nullptr;
     return 0;
@@ -58,6 +62,7 @@ void qmatvec_free(void) {
     memset(g_fn_mm, 0, sizeof(g_fn_mm));
     memset(g_fn_q8_id, 0, sizeof(g_fn_q8_id));
     memset(g_fn_id, 0, sizeof(g_fn_id));
+    memset(g_fn_mm_id, 0, sizeof(g_fn_mm_id));
     g_quant = nullptr;
 }
 
@@ -198,4 +203,29 @@ hipError_t qmatvec_launch_id(int type, const void *W, size_t row_bytes, const in
     const unsigned gx = (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);
     return hipModuleLaunchKernel(g_fn_id[type], gx, (unsigned)n_used, (unsigned)T, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0,
                                  stream, args, nullptr);
+}
+
+int qmatvec_mm_tile(void) { return QMV_MM_TB; }
+
+int qmatvec_q8_id_batch_supported(int type, int K) {
+    return qmatvec_q8_supported(type, K) && type >= 0 && type < QMV_MAX_TYPE && g_fn_mm_id[type] != nullptr;
+}
+
+hipError_t qmatvec_launch_q8_id_batch(int type, const void *W, size_t row_bytes, const qmatvec_q8 *q, float *y, int N,
+                                      int K, int max_tiles, const int32_t *n_tiles, const int32_t *tile_e,
+                                      const int32_t *tile_start, const int32_t *tile_n, const int32_t *in_rows,
+                                      const int32_t *out_rows, hipStream_t stream) {
+    if (!qmatvec_q8_id_batch_supported(type, K)) return hipErrorInvalidDeviceFunction;
+    if (max_tiles <= 0 || row_bytes != qt_row_size(type, K) || row_bytes % 4 != 0 || ((uintptr_t)W & 3) != 0)
+        return hipErrorInvalidValue;
+    const bool kq = type != QT_Q4_0_ROCMFP4 && type != QT_Q4_0_ROCMFP4_FAST;
+    const int8_t *q8 = kq ? q->qK : q->q0;
+    const float *d8 = kq ? q->dK : q->d0;
+    const int32_t *bs = q->bsK;
+    long long rb = (long long)row_bytes;
+    void *args[] = {(void *)&W, &rb, (void *)&q8, (void *)&d8, (void *)&bs, (void *)&y, &N, &K, (void *)&n_tiles,
+                    (void *)&tile_e, (void *)&tile_start, (void *)&tile_n, (void *)&in_rows, (void *)&out_rows};
+    const unsigned gx = (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);
+    return hipModuleLaunchKernel(g_fn_mm_id[type], gx, (unsigned)max_tiles, 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream,
+                                 args, nullptr);
 }
