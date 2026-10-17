@@ -1214,24 +1214,46 @@ for the symptoms above.
 > - Use the GPU as much as possible, and use the 16 Zen 5 cores (AVX-512) for what stays on the CPU.
 > - Judge each change by the bytes it moves and the syncs it adds, measured with `QWEN_PROFILE=1`.
 >
-> Now **61.9 tok/s** generation (16.2 ms/token). The whole forward pass is on the GPU, with int8 matvecs.
-> - The matvecs alone take 13.5 ms (`matvec_bench`: 209 GB/s against the 240 GB/s roofline).
-> - The other ~2.7 ms is small kernels and launch gaps: about 300 launches per token.
+> Now **63.1 tok/s** generation (15.8 ms/token). Prefill still runs one token at a time (~50 tok/s).
 >
-> 1. **Fewer launches:**
->    - Fuse `quantize_q8` into the kernels that produce matvec inputs: `add_rmsnorm`, `swiglu`, the
->      attention combine and the DeltaNet gated norm. That removes 4 launches per layer.
->    - Merge the N=32 alpha/beta matvecs (48 launches at ~14 GB/s) into one launch, or into `attn_qkv`'s.
->    - Then consider a HIP graph per token. Attention's per-position parameters (pos, chunk grid) would
->      need node updates.
->    - ROCmFP4 int8 is at 192 GB/s, below the K-quants (209–223). Try more bytes in flight per lane.
->    - Target: ~14 ms/token, ~70 tok/s.
-> 2. **Batched prefill.** Prompt processing is still one token at a time (43 tok/s). Needs:
+> Per-kernel GPU time (`rocprofv3 --kernel-trace --stats`), per forward:
+> - Matvecs: ~13.7 ms (90%).
+> - `deltanet_rule`: 0.5 ms (bandwidth-bound on the 4 MB/layer of state traffic).
+> - `add_rmsnorm`: ~0.2 ms.
+> - Everything else: under 0.3 ms.
+> - Gaps between kernels: ~0.6 ms.
+>
+> Remaining generation headroom is about 15–20%:
+> - ROCmFP4 int8 at 192 GB/s vs the 240 roofline.
+> - A HIP graph per token to close the gaps (attention's per-position arguments need node updates).
+>
+> Prompt processing is the bigger gap for real use: a 2,000-token prompt takes ~40 s.
+>
+> 1. **Batched prefill (next).** Needs:
 >    - A quantized matrix-matrix kernel that decodes each weight block once per batch.
 >    - A multi-token DeltaNet kernel, sequential over tokens inside the kernel.
 >    - Multi-query attention.
 >    - Checks against the 5-token reference dump and against token-by-token results.
-> 3. **Step 6 (35B-A3B):** router, top-8 of 256 experts, shared expert; `ref_dump acts` on the 35B.
+> 2. **Step 6 (35B-A3B):** router, top-8 of 256 experts, shared expert; `ref_dump acts` on the 35B.
+> 3. **Generation polish:** ROCmFP4 int8 bandwidth, a HIP graph per token.
+>
+> **Fewer launches and a parallel norm — DONE ✅ (2026-10-17).** 61.9 → 63.1 tok/s.
+> - **Fused quantization:** `quantize_q8`'s rounding rules now live in `src/q8_device.h`, shared by every
+>   kernel that produces a matvec input. `add_rmsnorm`, `swiglu` and `attn_combine` quantize their own
+>   output; only DeltaNet's output still needs a separate quantize launch (its workgroups are
+>   128-wide).
+> - **alpha/beta in one launch:** the int8 kernels take an optional second weight/output pair
+>   (`qmatvec_launch_q8_pair`).
+> - **Parallel `add_rmsnorm`:**
+>   - One workgroup per 256-value block. Each computes the (10 KB) sum of squares redundantly, then
+>     normalizes and quantizes its own block. It used to be one 1024-thread workgroup at ~9.5 µs per
+>     call, 65 calls per token.
+>   - The residual stream ping-pongs between `s.x` and `s.x_alt`, so no workgroup reads a value another
+>     already updated.
+> - Removing ~100 launches per token gained little (61.9 → 62.2); kernel-launch overhead was not the cost.
+>   The norm change brought the rest.
+> - End-to-end worst cos is 0.99937 (the summation order changed); short-prompt greedy output still
+>   matches llama.cpp.
 >
 > **int8 matvecs — DONE ✅ (2026-10-17).** 51.8 → 61.9 tok/s.
 > - `quantize_q8` turns each matvec input into both of ggml's activation formats in one launch, with

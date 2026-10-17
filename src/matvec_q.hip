@@ -13,6 +13,8 @@
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
+#include "q8_device.h"
+
 #define ROWS_PER_BLOCK 4
 
 __device__ __forceinline__ float fp16(const uint8_t *p) {
@@ -431,7 +433,9 @@ MATVEC_KERNEL(q4_0_rocmfp4_fast, BlkROCmFP4Fast)
 //                   (first one on ties), q = min(127, round-half-even(x * -127 / max)), plus the sum of
 //                   every 16 q values (bsums).
 //
-// Kernels: matvec_q8_<type>(W, row_bytes, q8, d, bsums, y, N, K), one wave per row as above.
+// Kernels: matvec_q8_<type>(W, W2, N1, row_bytes, q8, d, bsums, y, y2, N, K), one wave per row as above. Rows
+// 0..N1-1 come from W into y, rows N1..N-1 from W2 into y2 (same type and K): two small matvecs on the same
+// input in one launch (DeltaNet's alpha and beta). With one matrix, W2 = W, y2 = y, N1 = N.
 
 __device__ __forceinline__ int dot4(int a, int b, int c) { return __builtin_amdgcn_sudot4(true, a, true, b, c, false); }
 
@@ -441,48 +445,13 @@ __device__ __forceinline__ uint32_t ld32_a2(const uint8_t *p) {                 
     return (uint32_t)h[0] | ((uint32_t)h[1] << 16);
 }
 
-// grid K / 256, block 256: one Q8_K block and its eight Q8_0 blocks (one per wave)
+// grid K / 256, block 256: one Q8_K block and its eight Q8_0 blocks (see q8_device.h). Producers of matvec
+// inputs that can (add_rmsnorm, swiglu, attn_combine) quantize their own output instead.
 extern "C" __global__ void __launch_bounds__(256)
-quantize_q8(const float *x, int8_t *q0, float *d0, int8_t *qK, float *dK, int *bsK) {
-    __shared__ float s_a[8];
-    __shared__ int s_i[8];
-    const int t = threadIdx.x, lane = t & 31, w = t >> 5, b = blockIdx.x;
-    const int i = b * 256 + t;
-    const float v = x[i], a = fabsf(v);
-
-    // Q8_0 over the wave's 32 values
-    float am = a;
-    for (int off = 16; off > 0; off >>= 1) am = fmaxf(am, __shfl_xor(am, off, 32));
-    const float id0 = am != 0.0f ? 127.0f / am : 0.0f;
-    q0[i] = (int8_t)(int)rintf(v * id0);
-    if (lane == 0) d0[b * 8 + w] = __half2float(__float2half(am / 127.0f));
-
-    // Q8_K over the block's 256 values: largest |x|, lowest index on ties
-    float ba = a;
-    int bi = t;
-    for (int off = 16; off > 0; off >>= 1) {
-        const float oa = __shfl_xor(ba, off, 32);
-        const int oi = __shfl_xor(bi, off, 32);
-        if (oa > ba || (oa == ba && oi < bi)) { ba = oa; bi = oi; }
-    }
-    if (lane == 0) { s_a[w] = ba; s_i[w] = bi; }
-    __syncthreads();
-    float fa = s_a[0];
-    int fi = s_i[0];
-#pragma unroll
-    for (int k = 1; k < 8; ++k)
-        if (s_a[k] > fa || (s_a[k] == fa && s_i[k] < fi)) { fa = s_a[k]; fi = s_i[k]; }
-    int q = 0;
-    float iscale = 0.0f;
-    if (fa != 0.0f) {
-        iscale = -127.0f / x[b * 256 + fi];
-        q = min(127, (int)rintf(iscale * v));
-    }
-    qK[i] = (int8_t)q;
-    if (t == 0) dK[b] = fa != 0.0f ? 1.0f / iscale : 0.0f;
-    int s16 = q;
-    for (int off = 8; off > 0; off >>= 1) s16 += __shfl_xor(s16, off, 32);
-    if ((lane & 15) == 0) bsK[b * 16 + w * 2 + (lane >> 4)] = s16;
+quantize_q8(const float *x, Q8Out o) {
+    __shared__ Q8Shared sh;
+    const int t = threadIdx.x, b = blockIdx.x;
+    q8_block_value(x[b * 256 + t], true, b, t, sh, o);
 }
 
 // Four ROCmFP4 nibbles (one per byte, 0..15) -> four int8 codebook values {0,1,2,3,4,6,8,10} with sign bit 3,
@@ -509,14 +478,23 @@ __device__ __forceinline__ float rocmfp4_q8_block(const uint32_t qs[4], uint32_t
 }
 
 // ROCmFP4 x Q8_0: a lane takes a pair of 18-byte blocks (36 bytes, 4-aligned; the host requires K % 64 == 0)
+// Row `row` of the (W, y) / (W2, y2) pair: sets wr and yr; false past the last row
+#define Q8_ROW_SETUP                                                                \
+    const int lane = threadIdx.x & 31;                                              \
+    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);               \
+    if (row >= N) return;                                                           \
+    const bool second_mat = row >= N1;                                              \
+    const uint8_t *wr = (second_mat ? W2 : W) + (long long)(second_mat ? row - N1 : row) * row_bytes; \
+    float *yr = (second_mat ? y2 : y) + (second_mat ? row - N1 : row);
+
+#define Q8_ARGS                                                                                            \
+    const uint8_t *W, const uint8_t *W2, int N1, long long row_bytes, const int8_t *q8, const float *d8, \
+        const int *bs, float *y, float *y2, int N, int K
+
 extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
-matvec_q8_q4_0_rocmfp4(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, const int *bs,
-                       float *y, int N, int K) {
+matvec_q8_q4_0_rocmfp4(Q8_ARGS) {
     (void)bs;
-    const int lane = threadIdx.x & 31;
-    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
-    if (row >= N) return;
-    const uint8_t *wr = W + (long long)row * row_bytes;
+    Q8_ROW_SETUP
     const int npairs = K / 64;
     float acc = 0.0f;
     for (int p = lane; p < npairs; p += 32) {
@@ -532,7 +510,7 @@ matvec_q8_q4_0_rocmfp4(const uint8_t *W, long long row_bytes, const int8_t *q8, 
         acc += rocmfp4_q8_block(qb, (w[8] >> 16) & 0xFF, w[8] >> 24, q8 + (ib + 1) * 32, d8[ib + 1]);
     }
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
-    if (lane == 0) y[row] = acc;
+    if (lane == 0) *yr = acc;
 }
 
 // K-quant x Q8_K kernels: the wave works on 4 blocks at a time, 8 lanes per 256-value block, each lane on 16
@@ -546,12 +524,8 @@ matvec_q8_q4_0_rocmfp4(const uint8_t *W, long long row_bytes, const int8_t *q8, 
 // are 128h + (r >= 32 ? 32 : 0) + (r & 31) + 0..15 (low nibbles) and the same + 64 (high nibbles). The -32 offset
 // of every value is applied through the group sums: sum (q - 32) x = sum q x - 32 * sum x.
 extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
-matvec_q8_q6_K(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, const int *bs, float *y,
-               int N, int K) {
-    const int lane = threadIdx.x & 31;
-    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
-    if (row >= N) return;
-    const uint8_t *wr = W + (long long)row * row_bytes;
+matvec_q8_q6_K(Q8_ARGS) {
+    Q8_ROW_SETUP
     const int sub = lane >> 3, s = lane & 7;
     const int h = s >> 2, r = (s & 3) * 16, l = r & 31;
     const bool second = r >= 32;
@@ -579,20 +553,16 @@ matvec_q8_q6_K(const uint8_t *W, long long row_bytes, const int8_t *q8, const fl
         acc += fp16(b + 208) * d8[ib] * (float)isum;
     }
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
-    if (lane == 0) y[row] = acc;
+    if (lane == 0) *yr = acc;
 }
 
 // Q4_K / Q5_K: lane s (0..7) of its block takes qs bytes 16s..16s+15: chunk c = s / 2, offset l = (s & 1) * 16.
 // Low nibbles are values 64c + l + 0..15 (sub-block 2c), high nibbles 64c + 32 + l + 0..15 (sub-block 2c + 1);
 // Q5_K's fifth bits come from qh bytes l..l+15. Lane s also subtracts min s via the group sums.
 template <bool Q5>
-__device__ void matvec_q8_kquant(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8,
-                                 const int *bs, float *y, int N, int K) {
+__device__ void matvec_q8_kquant(Q8_ARGS) {
     constexpr int BYTES = Q5 ? 176 : 144, QS = Q5 ? 48 : 16;
-    const int lane = threadIdx.x & 31;
-    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
-    if (row >= N) return;
-    const uint8_t *wr = W + (long long)row * row_bytes;
+    Q8_ROW_SETUP
     const int sub = lane >> 3, s = lane & 7;
     const int c = s >> 1, l = (s & 1) * 16;
     const int nb = K / 256;
@@ -623,17 +593,15 @@ __device__ void matvec_q8_kquant(const uint8_t *W, long long row_bytes, const in
         acc += fp16(b) * dx * (float)isum - fp16(b + 2) * dx * (float)msum;
     }
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
-    if (lane == 0) y[row] = acc;
+    if (lane == 0) *yr = acc;
 }
 
 extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
-matvec_q8_q4_K(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, const int *bs, float *y,
-               int N, int K) {
-    matvec_q8_kquant<false>(W, row_bytes, q8, d8, bs, y, N, K);
+matvec_q8_q4_K(Q8_ARGS) {
+    matvec_q8_kquant<false>(W, W2, N1, row_bytes, q8, d8, bs, y, y2, N, K);
 }
 
 extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
-matvec_q8_q5_K(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, const int *bs, float *y,
-               int N, int K) {
-    matvec_q8_kquant<true>(W, row_bytes, q8, d8, bs, y, N, K);
+matvec_q8_q5_K(Q8_ARGS) {
+    matvec_q8_kquant<true>(W, W2, N1, row_bytes, q8, d8, bs, y, y2, N, K);
 }

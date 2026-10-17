@@ -9,6 +9,8 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include "qmatvec.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -32,10 +34,11 @@ static inline size_t attention_part_acc_floats(int n_q, int n_ctx) {
 //   qfull [n_q][2 * 256] (attn_q output, [Q | gate] per head), k, v [n_kv * 256] (attn_k / attn_v outputs),
 //   q_norm, k_norm [256]; K, V: the layer's cache (row p at p * kv_stride halves, kv_stride = n_kv * 256);
 //   q: scratch [n_q * 256]; part_ml / part_acc: scratch sized by the helpers above; out [n_q * 256] (gated).
+//   q8: if not NULL, out is also quantized into it for the int8 attn_output matvec.
 hipError_t attention_forward(const float* qfull, const float* k, const float* v, const float* q_norm,
                              const float* k_norm, __half* K, __half* V, int n_q, int n_kv, int n_rot, int pos,
                              float freq_base, float eps, float* q, float* part_ml, float* part_acc, float* out,
-                             hipStream_t stream);
+                             const qmatvec_q8* q8, hipStream_t stream);
 
 #ifdef __cplusplus
 }

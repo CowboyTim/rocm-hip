@@ -40,6 +40,28 @@ typedef struct qmatvec_q8 {
     int max_k;
 } qmatvec_q8;
 
+// The output pointers as kernels take them (Q8Out in q8_device.h): pass by value to kernels that quantize
+// their own output. All NULL when q is NULL (the kernel then skips quantizing).
+typedef struct qmatvec_q8_out {
+    int8_t *q0;
+    float *d0;
+    int8_t *qK;
+    float *dK;
+    int32_t *bsK;
+} qmatvec_q8_out;
+
+static inline qmatvec_q8_out qmatvec_q8_outputs(const qmatvec_q8 *q) {
+    qmatvec_q8_out o = {0, 0, 0, 0, 0};
+    if (q) {
+        o.q0 = q->q0;
+        o.d0 = q->d0;
+        o.qK = q->qK;
+        o.dK = q->dK;
+        o.bsK = q->bsK;
+    }
+    return o;
+}
+
 // Bytes of device-accessible memory a qmatvec_q8 for vectors of up to max_k values needs, and binding it
 // to such memory (16-byte aligned). max_k must be a multiple of 256.
 size_t qmatvec_q8_bytes(int max_k);
@@ -54,6 +76,10 @@ hipError_t qmatvec_quantize(const float *x, int K, const qmatvec_q8 *q, hipStrea
 // y = W x with x given by its quantized form q (from qmatvec_quantize of the same K)
 hipError_t qmatvec_launch_q8(int type, const void *W, size_t row_bytes, const qmatvec_q8 *q, float *y, int N, int K,
                              hipStream_t stream);
+
+// Two matvecs of the same type and K on the same input in one launch: y = W x (N rows), y2 = W2 x (N2 rows)
+hipError_t qmatvec_launch_q8_pair(int type, const void *W, int N, float *y, const void *W2, int N2, float *y2,
+                                  size_t row_bytes, const qmatvec_q8 *q, int K, hipStream_t stream);
 
 #ifdef __cplusplus
 }

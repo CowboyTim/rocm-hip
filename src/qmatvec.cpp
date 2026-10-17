@@ -92,21 +92,30 @@ int qmatvec_q8_supported(int type, int K) {
 hipError_t qmatvec_quantize(const float *x, int K, const qmatvec_q8 *q, hipStream_t stream) {
     if (!g_quant) return hipErrorInvalidDeviceFunction;
     if (K <= 0 || K % 256 != 0 || K > q->max_k) return hipErrorInvalidValue;
-    void *args[] = {(void *)&x, (void *)&q->q0, (void *)&q->d0, (void *)&q->qK, (void *)&q->dK, (void *)&q->bsK};
+    qmatvec_q8_out o = qmatvec_q8_outputs(q);
+    void *args[] = {(void *)&x, &o};
     return hipModuleLaunchKernel(g_quant, (unsigned)(K / 256), 1, 1, 256, 1, 1, 0, stream, args, nullptr);
 }
 
-hipError_t qmatvec_launch_q8(int type, const void *W, size_t row_bytes, const qmatvec_q8 *q, float *y, int N, int K,
-                             hipStream_t stream) {
+hipError_t qmatvec_launch_q8_pair(int type, const void *W, int N, float *y, const void *W2, int N2, float *y2,
+                                  size_t row_bytes, const qmatvec_q8 *q, int K, hipStream_t stream) {
     if (!qmatvec_q8_supported(type, K)) return hipErrorInvalidDeviceFunction;
-    if (row_bytes != qt_row_size(type, K) || row_bytes % 4 != 0 || ((uintptr_t)W & 3) != 0 || K > q->max_k)
+    if (row_bytes != qt_row_size(type, K) || row_bytes % 4 != 0 || ((uintptr_t)W & 3) != 0 || ((uintptr_t)W2 & 3) != 0 ||
+        K > q->max_k)
         return hipErrorInvalidValue;
     const bool kq = type != QT_Q4_0_ROCMFP4;  // K-quants read Q8_K, ROCmFP4 reads Q8_0
     const int8_t *q8 = kq ? q->qK : q->q0;
     const float *d8 = kq ? q->dK : q->d0;
     const int32_t *bs = q->bsK;
     long long rb = (long long)row_bytes;
-    void *args[] = {(void *)&W, &rb, (void *)&q8, (void *)&d8, (void *)&bs, (void *)&y, &N, &K};
-    const unsigned grid = (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);
+    int N1 = N, Nt = N + N2;
+    void *args[] = {(void *)&W, (void *)&W2, &N1, &rb, (void *)&q8, (void *)&d8, (void *)&bs, (void *)&y, (void *)&y2,
+                    &Nt, &K};
+    const unsigned grid = (unsigned)((Nt + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);
     return hipModuleLaunchKernel(g_fn_q8[type], grid, 1, 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream, args, nullptr);
+}
+
+hipError_t qmatvec_launch_q8(int type, const void *W, size_t row_bytes, const qmatvec_q8 *q, float *y, int N, int K,
+                             hipStream_t stream) {
+    return qmatvec_launch_q8_pair(type, W, N, y, W, 0, y, row_bytes, q, K, stream);
 }

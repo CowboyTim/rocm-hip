@@ -13,11 +13,14 @@
 //               and sum l of exp(score - m), then thread d accumulates sum_t exp(score_t - m) * V[t][d]
 //               (coalesced over d). Writes m, l and acc[HD] per (head, chunk).
 // attn_combine  grid n_q, block HD. Merges the chunks (rescaling each by exp(m_c - M)), divides by the total
-//               weight and applies the output gate sigmoid(gate) -> out.
+//               weight and applies the output gate sigmoid(gate) -> out. out feeds attn_output, so it is also
+//               quantized for the int8 matvec when o.qK != NULL (one head = one 256-value block).
 // Query head h reads KV head h / (n_q / n_kv), as ggml's broadcast does.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+
+#include "q8_device.h"
 
 #define HD 256
 #define CH HD
@@ -141,7 +144,8 @@ attn_partial(const float* q, const __half* K, const __half* V, int kv_stride, in
 }
 
 extern "C" __global__ void __launch_bounds__(HD)
-attn_combine(const float* part_ml, const float* part_acc, int n_chunks, const float* qfull, float* out) {
+attn_combine(const float* part_ml, const float* part_acc, int n_chunks, const float* qfull, float* out, Q8Out o) {
+    __shared__ Q8Shared sh;
     const int h = blockIdx.x, d = threadIdx.x;
     const float* ml = part_ml + (size_t)2 * h * n_chunks;
     float M = -INFINITY;
@@ -153,5 +157,7 @@ attn_combine(const float* part_ml, const float* part_acc, int n_chunks, const fl
         den += w * ml[2 * c + 1];
     }
     const float gate = qfull[(size_t)h * 2 * HD + HD + d];
-    out[h * HD + d] = num / den / (1.0f + __expf(-gate));
+    const float r = num / den / (1.0f + __expf(-gate));
+    out[h * HD + d] = r;
+    if (o.qK) q8_block_value(r, true, h, d, sh, o);  // uniform; HD == 256
 }

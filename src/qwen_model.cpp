@@ -100,6 +100,7 @@ struct ShmRegion {
 // Per-token activations
 struct Scratch {
     float* x = nullptr;       // residual stream [E]
+    float* x_alt = nullptr;   // the other residual buffer: add_rmsnorm writes x + add here, then they swap
     float* xn = nullptr;      // normed input to the projections [E]
     float* qfull = nullptr;   // attn_q output, [Q | gate] per head [2 * HQ * HD]
     float* q = nullptr;       // Q after norm + RoPE [HQ * HD]
@@ -130,13 +131,13 @@ struct Scratch {
 
     bool alloc(int E, int HQ, int HKV, int HD, int FF, int V, int conv_dim, int DI, int NV, int n_ctx) {
         q8_max_k = (std::max({E, HQ * HD, DI, FF}) + 255) / 256 * 256;
-        const size_t sizes[] = {(size_t)E, (size_t)E, (size_t)2 * HQ * HD, (size_t)HQ * HD,
+        const size_t sizes[] = {(size_t)E, (size_t)E, (size_t)E, (size_t)2 * HQ * HD, (size_t)HQ * HD,
                                 (size_t)HKV * HD, (size_t)HKV * HD, (size_t)HQ * HD, (size_t)E,
                                 (size_t)FF, (size_t)FF, (size_t)FF, (size_t)V,
                                 (size_t)conv_dim, (size_t)conv_dim, (size_t)DI, (size_t)NV, (size_t)NV, (size_t)DI,
                                 attention_part_ml_floats(HQ, n_ctx), attention_part_acc_floats(HQ, n_ctx),
                                 (qmatvec_q8_bytes(q8_max_k) + 3) / 4};
-        float** const ptrs[] = {&x, &xn, &qfull, &q, &k, &v, &attn, &proj, &ffg, &ffu, &act, &logits,
+        float** const ptrs[] = {&x, &x_alt, &xn, &qfull, &q, &k, &v, &attn, &proj, &ffg, &ffu, &act, &logits,
                                 &qkv, &conv, &z, &alpha, &beta, &lin, &part_ml, &part_acc, &q8mem};
         static_assert(sizeof(sizes) / sizeof(sizes[0]) == sizeof(ptrs) / sizeof(ptrs[0]), "scratch table");
         if (!mem.alloc("/dev/shm/qwen_scratch.bin", sizes, ptrs, sizeof(sizes) / sizeof(sizes[0]),
@@ -274,13 +275,20 @@ struct QwenModel {
         return true;
     }
 
-    // x[K] was just written by a kernel and feeds the next matvecs: quantize it once for the int8 kernels
-    bool produced(const float* x, int K) {
-        q8_src = nullptr;
-        if (!use_q8 || K % 256 != 0 || K > s.q8_max_k) return true;
-        if (!check(qmatvec_quantize(x, K, &s.q8, 0), "quantize_q8")) return false;
-        q8_src = x;
+    // The int8 buffer for a producer kernel to quantize its K-value output into, or NULL (float path)
+    const qmatvec_q8* q8_for(int K) const { return use_q8 && K % 256 == 0 && K <= s.q8_max_k ? &s.q8 : nullptr; }
+
+    // A producer kernel just wrote x[K], quantized into q (NULL: not quantized); the next matvecs read it
+    void mark(const float* x, int K, const qmatvec_q8* q) {
+        q8_src = q ? x : nullptr;
         q8_k = K;
+    }
+
+    // x[K] was written by a kernel that cannot quantize its output: quantize it in a separate launch
+    bool produced(const float* x, int K) {
+        const qmatvec_q8* q = q8_for(K);
+        if (q && !check(qmatvec_quantize(x, K, q, 0), "quantize_q8")) return false;
+        mark(x, K, q);
         return true;
     }
 
@@ -322,11 +330,12 @@ struct QwenModel {
         __half* K = kv_cache_k_row(eng->kvc, L.kv_slot, 0);
         __half* V = kv_cache_v_row(eng->kvc, L.kv_slot, 0);
         if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
+        const qmatvec_q8* q8 = q8_for(HQ * eng->head_dim);
         if (!check(attention_forward(s.qfull, s.k, s.v, L.q_norm, L.k_norm, K, V, HQ, HKV, eng->n_rot, pos,
-                                     eng->rope_freq_base, (float)eng->eps, s.q, s.part_ml, s.part_acc, s.attn, 0),
-                   "attention kernels") ||
-            !produced(s.attn, HQ * eng->head_dim))
+                                     eng->rope_freq_base, (float)eng->eps, s.q, s.part_ml, s.part_acc, s.attn, q8, 0),
+                   "attention kernels"))
             return false;
+        mark(s.attn, HQ * eng->head_dim, q8);
         return matvec(L.Wo, s.attn, s.proj, P_ATTN);
     }
 
@@ -335,9 +344,18 @@ struct QwenModel {
     bool linear_attention(int l, const LayerWeights& L) {
         const int NG = eng->ssm_n_group, NV = eng->ssm_dt_rank;
         const float eps = (float)eng->eps;
-        if (!matvec(L.W_qkv, s.xn, s.qkv, P_LIN) || !matvec(L.W_z, s.xn, s.z, P_LIN) ||
-            !matvec(L.W_alpha, s.xn, s.alpha, P_LIN) || !matvec(L.W_beta, s.xn, s.beta, P_LIN))
+        if (!matvec(L.W_qkv, s.xn, s.qkv, P_LIN) || !matvec(L.W_z, s.xn, s.z, P_LIN)) return false;
+        // alpha and beta: two N = 32 matvecs on the same input, one launch on the int8 path
+        const QuantWeight &A = L.W_alpha, &B = L.W_beta;
+        if (q8_src == s.xn && q8_k == A.K && A.type == B.type && A.K == B.K && A.row_bytes == B.row_bytes &&
+            qmatvec_q8_supported(A.type, A.K)) {
+            prof.bytes[P_LIN] += (double)A.row_bytes * (A.N + B.N);
+            if (!check(qmatvec_launch_q8_pair(A.type, A.data, A.N, s.alpha, B.data, B.N, s.beta, A.row_bytes, &s.q8,
+                                              A.K, 0), "alpha/beta matvec"))
+                return false;
+        } else if (!matvec(A, s.xn, s.alpha, P_LIN) || !matvec(B, s.xn, s.beta, P_LIN)) {
             return false;
+        }
         // conv1d + SiLU + q/k L2 norm + gates, then the delta rule + gated norm; alpha/beta become
         // g / sigmoid(beta) in place
         if (!check(deltanet_pre(s.qkv, rs.conv[l], L.ssm_conv1d, eng->ssm_d_conv, s.conv, NG, NV, s.alpha, s.beta,
@@ -354,11 +372,20 @@ struct QwenModel {
     bool ffn(const LayerWeights& L, const float* next_norm) {
         const int E = eng->n_embd, FF = eng->n_ff;
         const float eps = (float)eng->eps;
-        return check(gpu_add_rmsnorm(s.x, s.proj, L.ffn_norm, s.xn, E, eps, 0), "add_rmsnorm") && produced(s.xn, E) &&
-               matvec(L.W_gate, s.xn, s.ffg, P_FFN) && matvec(L.W_up, s.xn, s.ffu, P_FFN) &&
-               check(gpu_swiglu(s.ffg, s.ffu, s.act, FF, 0), "swiglu") && produced(s.act, FF) &&
-               matvec(L.W_down, s.act, s.proj, P_FFN) &&
-               check(gpu_add_rmsnorm(s.x, s.proj, next_norm, s.xn, E, eps, 0), "add_rmsnorm") && produced(s.xn, E);
+        const qmatvec_q8 *qe = q8_for(E), *qf = q8_for(FF);
+        if (!check(gpu_add_rmsnorm(s.x, s.proj, s.x_alt, L.ffn_norm, s.xn, E, eps, qe, 0), "add_rmsnorm")) return false;
+        std::swap(s.x, s.x_alt);
+        mark(s.xn, E, qe);
+        if (!matvec(L.W_gate, s.xn, s.ffg, P_FFN) || !matvec(L.W_up, s.xn, s.ffu, P_FFN) ||
+            !check(gpu_swiglu(s.ffg, s.ffu, s.act, FF, qf, 0), "swiglu"))
+            return false;
+        mark(s.act, FF, qf);
+        if (!matvec(L.W_down, s.act, s.proj, P_FFN) ||
+            !check(gpu_add_rmsnorm(s.x, s.proj, s.x_alt, next_norm, s.xn, E, eps, qe, 0), "add_rmsnorm"))
+            return false;
+        std::swap(s.x, s.x_alt);
+        mark(s.xn, E, qe);
+        return true;
     }
 
     // One token: the CPU decodes the embedding row into the residual stream, then the whole forward pass is
@@ -378,9 +405,10 @@ struct QwenModel {
         // A sequence starting at position 0 starts from zero recurrent state (the KV cache needs no reset:
         // attention only reads positions 0..pos)
         if (pos == 0 && !check(rs.reset(), "recurrent state reset")) return -1;
-        if (!check(gpu_add_rmsnorm(s.x, nullptr, eng->layers[0].attn_norm, s.xn, E, eps, 0), "add_rmsnorm") ||
-            !produced(s.xn, E))
+        if (!check(gpu_add_rmsnorm(s.x, nullptr, s.x, eng->layers[0].attn_norm, s.xn, E, eps, q8_for(E), 0),
+                   "add_rmsnorm"))
             return -1;
+        mark(s.xn, E, q8_for(E));
         prof.lap(P_EMBED);
 
         const bool per_layer = layer_cb || qwen_debug();

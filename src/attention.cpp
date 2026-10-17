@@ -34,7 +34,7 @@ void attention_free(void) {
 hipError_t attention_forward(const float* qfull, const float* k, const float* v, const float* q_norm,
                              const float* k_norm, __half* K, __half* V, int n_q, int n_kv, int n_rot, int pos,
                              float freq_base, float eps, float* q, float* part_ml, float* part_acc, float* out,
-                             hipStream_t stream) {
+                             const qmatvec_q8* q8, hipStream_t stream) {
     if (!g_prep) return hipErrorInvalidDeviceFunction;
     if (n_kv <= 0 || n_q % n_kv != 0 || n_rot > ATTN_HEAD_DIM || n_rot % 2 != 0 || pos < 0)
         return hipErrorInvalidValue;
@@ -56,6 +56,8 @@ hipError_t attention_forward(const float* qfull, const float* k, const float* v,
                               nullptr);
     if (e != hipSuccess) return e;
 
-    void* a_comb[] = {&part_ml, &part_acc, &n_chunks, (void*)&qfull, &out};
+    if (q8 && n_q * ATTN_HEAD_DIM > q8->max_k) return hipErrorInvalidValue;
+    qmatvec_q8_out o = qmatvec_q8_outputs(q8);
+    void* a_comb[] = {&part_ml, &part_acc, &n_chunks, (void*)&qfull, &out, &o};
     return hipModuleLaunchKernel(g_combine, (unsigned)n_q, 1, 1, ATTN_HEAD_DIM, 1, 1, 0, stream, a_comb, nullptr);
 }

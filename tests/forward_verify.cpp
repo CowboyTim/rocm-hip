@@ -588,7 +588,7 @@ int main(int argc, char** argv) {
             for (int d = 0; d < HD; ++d) ref_out[(size_t)h * HD + d] *= qwen_sigmoid(b_qf.p[(size_t)h * 2 * HD + HD + d]);
 
         hipError_t e = attention_forward(b_qf.p, b_k.p, b_v.p, L.q_norm, L.k_norm, K, Vc, HQ, HKV, m->n_rot, pos,
-                                         m->rope_freq_base, eps, b_q.p, b_ml.p, b_acc.p, b_out.p, 0);
+                                         m->rope_freq_base, eps, b_q.p, b_ml.p, b_acc.p, b_out.p, nullptr, 0);
         if (e == hipSuccess) e = hipDeviceSynchronize();
         if (e != hipSuccess) { fprintf(stderr, "attention kernels: %s\n", hipGetErrorString(e)); return 1; }
         Stat sq, skv, so;
