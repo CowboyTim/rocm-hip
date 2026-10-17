@@ -26,6 +26,35 @@ int qmatvec_supported(int type);
 hipError_t qmatvec_launch(int type, const void *W, size_t row_bytes, const float *x, float *y, int N, int K,
                           hipStream_t stream);
 
+// ---------------------------------------------------------------- int8 path
+// The activation vector is quantized once (qmatvec_quantize) into both formats ggml's CPU reference uses
+// (Q8_0 for ROCmFP4, Q8_K for K-quants), then int8 matvecs use v_dot4. See matvec_q.hip. Types and shapes
+// without an int8 kernel keep using qmatvec_launch on the float x.
+
+typedef struct qmatvec_q8 {
+    int8_t *q0;    // Q8_0 values [K]
+    float *d0;     // Q8_0 scales [K / 32] (FP16-rounded, as ggml stores them)
+    int8_t *qK;    // Q8_K values [K]
+    float *dK;     // Q8_K scales [K / 256]
+    int32_t *bsK;  // Q8_K sums of every 16 values [K / 16]
+    int max_k;
+} qmatvec_q8;
+
+// Bytes of device-accessible memory a qmatvec_q8 for vectors of up to max_k values needs, and binding it
+// to such memory (16-byte aligned). max_k must be a multiple of 256.
+size_t qmatvec_q8_bytes(int max_k);
+void qmatvec_q8_bind(qmatvec_q8 *q, void *mem, int max_k);
+
+// 1 if an int8 kernel handles this type at this K (and the activation can be quantized: K % 256 == 0)
+int qmatvec_q8_supported(int type, int K);
+
+// Quantize x[K] into q (both formats). K % 256 == 0, K <= q->max_k.
+hipError_t qmatvec_quantize(const float *x, int K, const qmatvec_q8 *q, hipStream_t stream);
+
+// y = W x with x given by its quantized form q (from qmatvec_quantize of the same K)
+hipError_t qmatvec_launch_q8(int type, const void *W, size_t row_bytes, const qmatvec_q8 *q, float *y, int N, int K,
+                             hipStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

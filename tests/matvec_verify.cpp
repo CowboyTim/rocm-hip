@@ -6,6 +6,10 @@
 // tensors: by default the first tensor of every type in the file. The reference decodes each row
 // with qt_to_float (bit-exact vs ggml, see dequant_verify) and accumulates in double.
 // Pass: |gpu - ref| <= 1e-5 * sum_k |w_k x_k| for every row. Run from build/co (loads matvec_q.co).
+//
+// Types with an int8 kernel are also run through qmatvec_quantize + qmatvec_launch_q8, against a reference
+// whose x is quantized on the CPU the way ggml does it (Q8_0 for ROCmFP4, Q8_K for K-quants) and decoded
+// back, so it checks the quantizer and the integer dot products together.
 
 #include "gguf_mmap.h"
 #include "qmatvec.h"
@@ -13,7 +17,9 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
+#include <hip/hip_fp16.h>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -44,6 +50,32 @@ struct ShmBuf {
         }
     }
 };
+
+// x quantized and decoded back as ggml's CPU reference does for this weight type's vec_dot_type:
+// Q8_0 (x86 SIMD quantize_row_q8_0) for ROCmFP4, Q8_K (quantize_row_q8_K_ref) for K-quants
+static void q8_roundtrip(int wtype, const float *x, float *out, int K) {
+    if (wtype != QT_Q4_0_ROCMFP4) {
+        for (int b = 0; b < K; b += 256) {
+            float amax = 0.0f, mx = 0.0f;
+            for (int j = 0; j < 256; ++j)
+                if (std::fabs(x[b + j]) > amax) { amax = std::fabs(x[b + j]); mx = x[b + j]; }
+            if (amax == 0.0f) { for (int j = 0; j < 256; ++j) out[b + j] = 0.0f; continue; }
+            const float iscale = -127.0f / mx, d = 1.0f / iscale;
+            for (int j = 0; j < 256; ++j) out[b + j] = d * (float)std::min(127, (int)nearbyintf(iscale * x[b + j]));
+        }
+    } else {
+        for (int b = 0; b < K; b += 32) {
+            float amax = 0.0f;
+            for (int j = 0; j < 32; ++j) amax = std::fmax(amax, std::fabs(x[b + j]));
+            const float id = amax != 0.0f ? 127.0f / amax : 0.0f;
+            const float dh = __half2float(__float2half(amax / 127.0f));
+            for (int j = 0; j < 32; ++j) out[b + j] = dh * nearbyintf(x[b + j] * id);
+        }
+    }
+}
+
+static ShmBuf g_q8mem;
+static qmatvec_q8 g_q8;
 
 static bool run_one(gguf_model_t *g, int64_t idx, ShmBuf &xb, ShmBuf &yb) {
     const char *name = gguf_tensor_name(g, idx);
@@ -98,7 +130,38 @@ static bool run_one(gguf_model_t *g, int64_t idx, ShmBuf &xb, ShmBuf &yb) {
     }
     printf("  [%s] %-32s %-18s %6d x %-6d worst rel err %.2e (row %d)%s\n", bad ? "FAIL" : "PASS", name, tr->name,
            N, K, worst, worst_n, bad ? " <-- rows over 1e-5" : "");
-    return bad == 0;
+    if (!qmatvec_q8_supported(type, K) || K > g_q8.max_k) return bad == 0;
+
+    // int8 path
+    memset(y, 0, (size_t)N * sizeof(float));
+    e = qmatvec_quantize(x, K, &g_q8, 0);
+    if (e == hipSuccess) e = qmatvec_launch_q8(type, W, rb, &g_q8, y, N, K, 0);
+    if (e == hipSuccess) e = hipDeviceSynchronize();
+    if (e != hipSuccess) {
+        printf("  [FAIL] %-32s int8 launch: %s\n", name, hipGetErrorString(e));
+        return false;
+    }
+    std::vector<float> xq((size_t)K);
+    q8_roundtrip(type, x, xq.data(), K);
+    double worst8 = 0.0;
+    int bad8 = 0, worst8_n = 0;
+    for (int n = 0; n < N; ++n) {
+        qt_to_float(type, W + (size_t)n * rb, row.data(), K);
+        double ref = 0.0, mag = 0.0;
+        for (int k = 0; k < K; ++k) {
+            ref += (double)row[k] * xq[k];
+            mag += std::fabs((double)row[k] * xq[k]);
+        }
+        const double rel = std::fabs(y[n] - ref) / (mag + 1e-30);
+        if (rel > worst8) {
+            worst8 = rel;
+            worst8_n = n;
+        }
+        if (rel > 1e-5) ++bad8;
+    }
+    printf("  [%s] %-32s %-18s int8 path (q8 x)   worst rel err %.2e (row %d)%s\n", bad8 ? "FAIL" : "PASS", name,
+           tr->name, worst8, worst8_n, bad8 ? " <-- rows over 1e-5" : "");
+    return bad == 0 && bad8 == 0;
 }
 
 int main(int argc, char **argv) {
@@ -138,6 +201,13 @@ int main(int argc, char **argv) {
             todo.push_back(i);
         }
     }
+
+    const int max_k = 1 << 16;
+    if (!g_q8mem.alloc("matvec_verify_q8.bin", qmatvec_q8_bytes(max_k))) {
+        fprintf(stderr, "cannot allocate /dev/shm buffers\n");
+        return 2;
+    }
+    qmatvec_q8_bind(&g_q8, g_q8mem.p, max_k);
 
     int fail = 0;
     for (int64_t i : todo) fail += !run_one(g, i, xb, yb);

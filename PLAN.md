@@ -1214,46 +1214,48 @@ for the symptoms above.
 > - Use the GPU as much as possible, and use the 16 Zen 5 cores (AVX-512) for what stays on the CPU.
 > - Judge each change by the bytes it moves and the syncs it adds, measured with `QWEN_PROFILE=1`.
 >
-> Now **51.8 tok/s** generation (19.3 ms/token), with the whole forward pass on the GPU.
-> - Each token is one GPU queue and one sync; the CPU only decodes the embedding row (0.02 ms).
-> - It streams 2.8 GB of weights per token at about 146 GB/s. Profile:
->   - FFN (incl. norms, SwiGLU): 9.5 ms.
->   - DeltaNet: 5.1 ms.
->   - LM head: 3.2 ms.
->   - Attention: 1.4 ms.
-> - The ceiling is LPDDR5X bandwidth: at ~256 GB/s peak (~220 achievable) a token would take 11–13 ms,
->   i.e. 75–90 tok/s.
+> Now **61.9 tok/s** generation (16.2 ms/token). The whole forward pass is on the GPU, with int8 matvecs.
+> - The matvecs alone take 13.5 ms (`matvec_bench`: 209 GB/s against the 240 GB/s roofline).
+> - The other ~2.7 ms is small kernels and launch gaps: about 300 launches per token.
 >
-> 1. **Matvec efficiency: int8 dot products.** This is the whole remaining generation-speed budget.
->    - Measured with `build/matvec_bench` (cold cache, each tensor read once per pass, as in a real token):
->      all matvecs of a token take 16.9 ms = **166.6 GB/s**. ROCMFP4 reaches 159, Q5_K 167, Q6_K 172.
->    - A plain streaming-read kernel through the same pinned GGUF mapping reaches **240 GB/s**. The gap
->      is 4.8 ms/token, so ~80 tok/s is the target.
->    - Tried on 2026-10-17, none of which helped (reverted, so don't repeat them):
->      - **LDS staging of each row** with 16- and 4-byte loads, then decoding from LDS: 130 GB/s with
->        4 KB per wave, 154 with 1 KB. The barriers serialize load and decode, and LDS cuts occupancy.
->      - **Rows per workgroup** 2/8/16 instead of 4: within ±2%.
->      - **Computing the ROCmFP4 codebook arithmetically** instead of a `__constant__` table:
->        126 GB/s, worse.
->    - Conclusion: the decoders are **ALU-bound**. Per weight value they extract a nibble, look it up,
->      convert int to float and do an FMA; it's not load-bound.
->    - **Next:** do what llama.cpp's GPU backends do.
->      - Quantize x to int8 once per matvec (Q8_1-style: 32-value blocks, FP32 scale plus sum).
->      - Decode weights to int8 and use the packed `v_dot4_i32_iu8` instruction (4 MACs per
->        instruction, available on gfx1151).
->      - Apply the block scales once per 32 values.
->      - Do it per type (ROCMFP4 / Q5_K / Q6_K first), each verified with `matvec_verify` against the
->        float path.
->    - Side effect: it matches ggml's CPU reference more closely, since ggml quantizes activations to
->      Q8 as well. That is the source of the ~130-token greedy drift, and `forward_verify`'s
->      Q8-emulated projections would become near-exact.
->    - Also: fuse the alpha/beta matvecs (24 × 2 launches of N=32 at ~11 GB/s; launch-bound, 0.2 ms).
+> 1. **Fewer launches:**
+>    - Fuse `quantize_q8` into the kernels that produce matvec inputs: `add_rmsnorm`, `swiglu`, the
+>      attention combine and the DeltaNet gated norm. That removes 4 launches per layer.
+>    - Merge the N=32 alpha/beta matvecs (48 launches at ~14 GB/s) into one launch, or into `attn_qkv`'s.
+>    - Then consider a HIP graph per token. Attention's per-position parameters (pos, chunk grid) would
+>      need node updates.
+>    - ROCmFP4 int8 is at 192 GB/s, below the K-quants (209–223). Try more bytes in flight per lane.
+>    - Target: ~14 ms/token, ~70 tok/s.
 > 2. **Batched prefill.** Prompt processing is still one token at a time (43 tok/s). Needs:
 >    - A quantized matrix-matrix kernel that decodes each weight block once per batch.
 >    - A multi-token DeltaNet kernel, sequential over tokens inside the kernel.
 >    - Multi-query attention.
 >    - Checks against the 5-token reference dump and against token-by-token results.
 > 3. **Step 6 (35B-A3B):** router, top-8 of 256 experts, shared expert; `ref_dump acts` on the 35B.
+>
+> **int8 matvecs — DONE ✅ (2026-10-17).** 51.8 → 61.9 tok/s.
+> - `quantize_q8` turns each matvec input into both of ggml's activation formats in one launch, with
+>   the reference's exact rounding:
+>   - Q8_0 (x86 SIMD rounding) for ROCmFP4.
+>   - Q8_K with group sums for the K-quants.
+> - `matvec_q8_<type>` decodes four weights into a packed dword and uses `v_dot4_i32_i8`, applying scales
+>   once per block. ROCmFP4's codebook is looked up four values at a time with `v_perm_b32`, through a
+>   positive and a negative table.
+> - K-quant kernels: 8 lanes per 256-value block, 4 blocks per wave iteration, 16 quant bytes per lane.
+>   The first version (whole wave on one block) was slower than float. Q6_K's −32 offset and Q4_K/Q5_K's
+>   mins go through the Q8_K group sums, as in ggml.
+> - Cold matvec bandwidth went from 166.6 to **209 GB/s**: Q6_K 223, Q5_K 209, ROCmFP4 192, the LM head
+>   231.
+> - The engine quantizes each matvec input once, right after the kernel that produces it
+>   (`QwenModel::produced`). `QWEN_MATVEC_FP32=1` forces the float kernels.
+> - **Closer to the reference:** each block's integer sum now equals ggml's.
+>   - `forward_verify` projections on the raw input agree to ≤ 6.4e-7; the float kernels were off by up
+>     to 2.3e-2.
+>   - End-to-end worst layer cos went from 0.99595 to 0.99896; layer 0 is within 1.65e-5.
+>   - The 300-token greedy run still departs from llama.cpp at the same token, so that near-tie comes
+>     from elsewhere (likely ggml's FP16 flash-attention accumulation).
+> - `matvec_verify` checks every int8 kernel against an exact CPU emulation of ggml's activation
+>   quantization (≤ 6e-8), on the 4B, every Qwen3-0.6B quant and the 35B.
 >
 > **Whole forward pass on the GPU, one sync per token — DONE ✅ (2026-10-17).** 49.4 → 51.8 tok/s.
 > - `src/gpu_ops.hip` adds `add_rmsnorm` (the residual add fused with the next RMSNorm, one per layer

@@ -1,6 +1,9 @@
 // matvec_bench -- cold-cache qmatvec bandwidth per tensor role (Phase 20 speed work). Run from build/co.
 //
-//   matvec_bench <model.gguf> [reps]
+//   matvec_bench <model.gguf> [reps] [f32]
+//
+// Uses the int8 kernels (qmatvec_launch_q8, activation quantized once per pass) wherever they exist; pass
+// "f32" to time the float kernels only.
 //
 // A generated token reads every weight tensor exactly once, so nothing is warm in the 32 MB Infinity
 // Cache. This runs one role (e.g. all 32 ffn_down) back to back across the layers, each tensor once per
@@ -40,11 +43,21 @@ int main(int argc, char** argv) {
         return 2;
     }
     const int reps = argc > 2 ? atoi(argv[2]) : 5;
+    const bool f32_only = argc > 3 && std::string(argv[3]) == "f32";
     inference_model* m = inference_load_model(argv[1]);
     if (!m || qmatvec_init("matvec_q.co") != 0) return 1;
     float* x = pinned(1 << 20);
     float* y = pinned(1 << 20);
     if (!x || !y) return 1;
+    const int max_k = 1 << 16;
+    void* qmem = nullptr;
+    {
+        const size_t qb = (qmatvec_q8_bytes(max_k) + 4095) & ~(size_t)4095;
+        qmem = mmap(nullptr, qb, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (qmem == MAP_FAILED || hipHostRegister(qmem, qb, hipExtHostRegisterCoarseGrained) != hipSuccess) return 1;
+    }
+    qmatvec_q8 q8;
+    qmatvec_q8_bind(&q8, qmem, max_k);
 
     struct Role { std::string name; std::vector<const QuantWeight*> w; };
     std::vector<Role> roles;
@@ -64,23 +77,29 @@ int main(int argc, char** argv) {
 
     std::map<std::string, std::pair<double, double>> by_type;  // type name -> (bytes, seconds) per pass
     double all_bytes = 0, all_t = 0;
-    printf("%-14s %-16s %5s %7s %6s %9s %9s %8s\n", "role", "type", "n", "N", "K", "MB/pass", "ms/pass", "GB/s");
+    printf("%-14s %-16s %5s %7s %6s %9s %9s %8s %s\n", "role", "type", "n", "N", "K", "MB/pass", "ms/pass", "GB/s",
+           "path");
     for (const Role& r : roles) {
         double bytes = 0;
         for (const QuantWeight* w : r.w) bytes += (double)w->row_bytes * w->N;
         double best = 1e9;
+        const bool q = !f32_only && qmatvec_q8_supported(r.w[0]->type, r.w[0]->K);
         for (int it = 0; it < reps + 1; ++it) {
             (void)hipDeviceSynchronize();
             const double t0 = now();
-            for (const QuantWeight* w : r.w)
-                if (qmatvec_launch(w->type, w->data, w->row_bytes, x, y, w->N, w->K, 0) != hipSuccess) return 1;
+            if (q && qmatvec_quantize(x, r.w[0]->K, &q8, 0) != hipSuccess) return 1;
+            for (const QuantWeight* w : r.w) {
+                const hipError_t e = q ? qmatvec_launch_q8(w->type, w->data, w->row_bytes, &q8, y, w->N, w->K, 0)
+                                       : qmatvec_launch(w->type, w->data, w->row_bytes, x, y, w->N, w->K, 0);
+                if (e != hipSuccess) return 1;
+            }
             (void)hipDeviceSynchronize();
             if (it > 0) best = std::min(best, now() - t0);  // pass 0 warms up code and TLB
         }
         const QuantWeight& w0 = *r.w[0];
         const char* tn = qt_get_traits(w0.type) ? qt_get_traits(w0.type)->name : "?";
-        printf("%-14s %-16s %5zu %7d %6d %9.1f %9.3f %8.1f\n", r.name.c_str(), tn, r.w.size(), w0.N, w0.K, bytes / 1e6,
-               best * 1e3, bytes / best / 1e9);
+        printf("%-14s %-16s %5zu %7d %6d %9.1f %9.3f %8.1f %s\n", r.name.c_str(), tn, r.w.size(), w0.N, w0.K,
+               bytes / 1e6, best * 1e3, bytes / best / 1e9, q ? "int8" : "f32");
         by_type[tn].first += bytes;
         by_type[tn].second += best;
         all_bytes += bytes;

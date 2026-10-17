@@ -178,20 +178,25 @@ static void report(const char* what, const Stat& s, double tol = 1e-4) {
     printf("  [%s] %-36s cos %.7f  max|d|/max|ref| %.2e\n", ok ? "PASS" : "FAIL", what, s.min_cos, s.max_rel);
 }
 
-// Projection: FP32 input (informational) and reference-quantized input (pass on max_rel)
+// Projection: FP32 input (informational), reference-quantized input on the float kernel, and the engine's
+// int8 kernel on the raw input (qmatvec_quantize + qmatvec_launch_q8, which quantizes like the reference).
+// The last two must match the reference to 1e-4.
 struct ProjStat {
-    Stat f32, emu;
+    Stat f32, emu, q8;
+    bool has_q8 = false;
 };
 
 static void report(const char* what, const ProjStat& s) {
-    const bool ok = s.emu.max_rel <= 1e-4;
+    const bool ok = s.emu.max_rel <= 1e-4 && (!s.has_q8 || s.q8.max_rel <= 1e-4);
     if (!ok) ++g_fail;
-    printf("  [%s] %-36s cos %.7f  max|d|/max|ref| %.2e   (FP32 input: cos %.7f, %.2e)\n", ok ? "PASS" : "FAIL",
-           what, s.emu.min_cos, s.emu.max_rel, s.f32.min_cos, s.f32.max_rel);
+    printf("  [%s] %-36s cos %.7f  max|d|/max|ref| %.2e", ok ? "PASS" : "FAIL", what, s.emu.min_cos, s.emu.max_rel);
+    if (s.has_q8) printf("   int8: %.2e", s.q8.max_rel);
+    printf("   (FP32 input: cos %.7f, %.2e)\n", s.f32.min_cos, s.f32.max_rel);
 }
 
 static float* g_x = nullptr;  // pinned input
 static float* g_y = nullptr;  // pinned output
+static qmatvec_q8 g_q8;       // quantized input for the int8 kernels
 
 static bool launch(const QuantWeight& W) {
     hipError_t e = qmatvec_launch(W.type, W.data, W.row_bytes, g_x, g_y, W.N, W.K, 0);
@@ -208,6 +213,14 @@ static bool proj(const QuantWeight& W, const float* x, const float* ref_out, Pro
     memcpy(g_x, x, (size_t)W.K * sizeof(float));
     if (!launch(W)) return false;
     st.f32.add(g_y, ref_out, W.N);
+    if (qmatvec_q8_supported(W.type, W.K) && W.K <= g_q8.max_k) {
+        hipError_t e = qmatvec_quantize(g_x, W.K, &g_q8, 0);
+        if (e == hipSuccess) e = qmatvec_launch_q8(W.type, W.data, W.row_bytes, &g_q8, g_y, W.N, W.K, 0);
+        if (e == hipSuccess) e = hipDeviceSynchronize();
+        if (e != hipSuccess) { fprintf(stderr, "int8 qmatvec type %d: %s\n", W.type, hipGetErrorString(e)); return false; }
+        st.q8.add(g_y, ref_out, W.N);
+        st.has_q8 = true;
+    }
     return true;
 }
 
@@ -249,6 +262,10 @@ int main(int argc, char** argv) {
     if (!xin.alloc("fwdv_x.bin", big) || !yout.alloc("fwdv_y.bin", big)) { fprintf(stderr, "alloc failed\n"); return 1; }
     g_x = xin.p;
     g_y = yout.p;
+    ShmBuf q8buf;
+    const int q8_max = (std::max(E, std::max(FF, HQ * HD)) + 255) / 256 * 256;
+    if (!q8buf.alloc("fwdv_q8.bin", (qmatvec_q8_bytes(q8_max) + 3) / 4)) { fprintf(stderr, "alloc failed\n"); return 1; }
+    qmatvec_q8_bind(&g_q8, q8buf.p, q8_max);
     float* y = g_y;
     std::vector<float> a, b, c, d;
 
