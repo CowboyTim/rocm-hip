@@ -1224,16 +1224,30 @@ for the symptoms above.
 > - The ceiling is LPDDR5X bandwidth: at ~256 GB/s peak (~220 achievable) a token would take 11–13 ms,
 >   i.e. 75–90 tok/s.
 >
-> 1. **Matvec efficiency.** It is the whole remaining generation-speed budget.
->    - Measure each kernel's achieved GB/s on cold weights (each tensor read once per token, nothing
->      cached), by type and shape.
->    - Q5_K/Q6_K (123–160 GB/s) and the DeltaNet section (123 GB/s; small-N alpha/beta matvecs) are the
->      laggards; ROCMFP4 reaches ~200+.
->    - Ideas:
->      - More bytes in flight per wave (unroll blocks, wider loads).
->      - Several rows per wave for small-K/large-N tensors.
->      - Fusing matvecs that share an input: q/k/v, gate/up, qkv/z/alpha/beta.
->      - Fewer launches: about 200 per token.
+> 1. **Matvec efficiency: int8 dot products.** This is the whole remaining generation-speed budget.
+>    - Measured with `build/matvec_bench` (cold cache, each tensor read once per pass, as in a real token):
+>      all matvecs of a token take 16.9 ms = **166.6 GB/s**. ROCMFP4 reaches 159, Q5_K 167, Q6_K 172.
+>    - A plain streaming-read kernel through the same pinned GGUF mapping reaches **240 GB/s**. The gap
+>      is 4.8 ms/token, so ~80 tok/s is the target.
+>    - Tried on 2026-10-17, none of which helped (reverted, so don't repeat them):
+>      - **LDS staging of each row** with 16- and 4-byte loads, then decoding from LDS: 130 GB/s with
+>        4 KB per wave, 154 with 1 KB. The barriers serialize load and decode, and LDS cuts occupancy.
+>      - **Rows per workgroup** 2/8/16 instead of 4: within ±2%.
+>      - **Computing the ROCmFP4 codebook arithmetically** instead of a `__constant__` table:
+>        126 GB/s, worse.
+>    - Conclusion: the decoders are **ALU-bound**. Per weight value they extract a nibble, look it up,
+>      convert int to float and do an FMA; it's not load-bound.
+>    - **Next:** do what llama.cpp's GPU backends do.
+>      - Quantize x to int8 once per matvec (Q8_1-style: 32-value blocks, FP32 scale plus sum).
+>      - Decode weights to int8 and use the packed `v_dot4_i32_iu8` instruction (4 MACs per
+>        instruction, available on gfx1151).
+>      - Apply the block scales once per 32 values.
+>      - Do it per type (ROCMFP4 / Q5_K / Q6_K first), each verified with `matvec_verify` against the
+>        float path.
+>    - Side effect: it matches ggml's CPU reference more closely, since ggml quantizes activations to
+>      Q8 as well. That is the source of the ~130-token greedy drift, and `forward_verify`'s
+>      Q8-emulated projections would become near-exact.
+>    - Also: fuse the alpha/beta matvecs (24 × 2 launches of N=32 at ~11 GB/s; launch-bound, 0.2 ms).
 > 2. **Batched prefill.** Prompt processing is still one token at a time (43 tok/s). Needs:
 >    - A quantized matrix-matrix kernel that decodes each weight block once per batch.
 >    - A multi-token DeltaNet kernel, sequential over tokens inside the kernel.
