@@ -47,7 +47,7 @@ struct LayerWeights {
     LayerKind kind = LAYER_FULL_ATTN;
     int kv_slot = -1;                                 // full attention: this layer's KV cache layer; else -1
     QuantWeight Wq, Wk, Wv, Wo;                       // full attention only; Wq rows are [Q | gate] per head
-    QuantWeight W_gate, W_up, W_down;                 // MLP (SwiGLU)
+    QuantWeight W_gate, W_up, W_down;                 // MLP (SwiGLU); the shared expert when moe
     const float* attn_norm = nullptr;                 // [n_embd] F32, pre-mixer RMSNorm gamma
     const float* ffn_norm = nullptr;                  // [n_embd] F32, post_attention_norm (pre-FFN)
     const float* q_norm = nullptr;                    // [head_dim] F32, full attention only
@@ -62,6 +62,13 @@ struct LayerWeights {
     const float* ssm_dt = nullptr;                    // [dt_rank] F32, ssm_dt.bias
     const float* ssm_a = nullptr;                     // [dt_rank] F32, -exp(A_log)
     const float* ssm_norm = nullptr;                  // [d_state] F32, per-head gated RMSNorm gamma
+
+    // Mixture of experts (qwen35moe, Phase 20 Step 6): replaces the dense FFN when moe
+    bool moe = false;
+    QuantWeight W_router;                             // ffn_gate_inp: F32 [n_expert x n_embd], router logits
+    QuantWeight We_gate, We_up;                       // ffn_{gate,up}_exps: [n_expert * n_ff_exp x n_embd]
+    QuantWeight We_down;                              // ffn_down_exps: [n_expert * n_embd x n_ff_exp]
+    const float* shexp_gate = nullptr;                // ffn_gate_inp_shexp: [n_embd] F32, shared-expert gate
 };
 
 // The complete inference_model struct - MUST match exactly between all TUs.
@@ -77,7 +84,11 @@ struct inference_model {
     int n_head = 0;                                     // attention heads
     int n_head_kv = 0;                                  // KV cache heads
     int head_dim = 0;                                   // per-head dimension (attention.key_length)
-    int n_ff = 0;                                       // FFN width (feed_forward_length)
+    int n_ff = 0;                                       // FFN width (feed_forward_length); 0 for MoE models
+    int n_expert = 0;                                   // MoE: experts per layer (expert_count)
+    int n_expert_used = 0;                              // MoE: experts per token (expert_used_count)
+    int n_ff_exp = 0;                                   // MoE: expert FFN width (expert_feed_forward_length)
+    int n_ff_shexp = 0;                                 // MoE: shared expert FFN width
     int n_rot = 0;                                      // rotary dims per head (rope.dimension_count)
     float rope_freq_base = 10000.0f;                    // rope.freq_base
     int vocab_size = 0;                                 // vocabulary size

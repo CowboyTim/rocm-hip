@@ -90,8 +90,10 @@ static bool bind_weight(gguf_model_t* gguf, const char* name, QuantWeight& w, bo
     const int64_t* ne = gguf_tensor_ne(gguf, idx);
     const int nd = gguf_tensor_dims(gguf, idx);
     if (!qt_get_traits(type)) { set_error("%s: unsupported tensor type %d", name, type); return false; }
-    if (!ne || nd < 1 || nd > 2) { set_error("%s: expected a 2-D tensor (n_dims=%d)", name, nd); return false; }
-    const int64_t K = ne[0], N = nd == 2 ? ne[1] : 1;
+    // A 3-D tensor (MoE experts, ne = {K, rows per expert, n_expert}) is bound as one matrix of all experts'
+    // rows: expert e is the row range [e * ne[1], (e + 1) * ne[1])
+    if (!ne || nd < 1 || nd > 3) { set_error("%s: expected a 2-D or 3-D tensor (n_dims=%d)", name, nd); return false; }
+    const int64_t K = ne[0], N = (nd >= 2 ? ne[1] : 1) * (nd == 3 ? ne[2] : 1);
     const size_t rb = qt_row_size(type, K);
     size_t bytes = 0;
     const void* p = gguf_get_tensor_ptr(gguf, name, &bytes);
@@ -209,12 +211,38 @@ static bool load_model_weights(inference_model* m) {
                 !check_shape("attn_output", i, L.Wo, E, HQ * HD)) return false;
         }
 
-        if (!bind_weight(m->gguf, nm(i, "ffn_gate.weight"), L.W_gate, true)) return false;
-        if (!bind_weight(m->gguf, nm(i, "ffn_up.weight"), L.W_up, true)) return false;
-        if (!bind_weight(m->gguf, nm(i, "ffn_down.weight"), L.W_down, true)) return false;
-        if (!check_shape("ffn_gate", i, L.W_gate, FF, E) ||
-            !check_shape("ffn_up", i, L.W_up, FF, E) ||
-            !check_shape("ffn_down", i, L.W_down, E, FF)) return false;
+        // FFN: MoE (router ffn_gate_inp + 3-D expert tensors + a sigmoid-gated shared expert) or dense SwiGLU
+        L.moe = find_tensor_index(m->gguf, nm(i, "ffn_gate_inp.weight")) >= 0;
+        if (L.moe) {
+            const int NE = m->n_expert, FE = m->n_ff_exp, FS = m->n_ff_shexp;
+            if (NE <= 0 || m->n_expert_used <= 0 || m->n_expert_used > NE || FE <= 0 || FS <= 0) {
+                set_error("blk.%d: bad MoE hparams (experts %d used %d ff_exp %d ff_shexp %d)", i, NE,
+                          m->n_expert_used, FE, FS);
+                return false;
+            }
+            if (!bind_weight(m->gguf, nm(i, "ffn_gate_inp.weight"), L.W_router, true)) return false;
+            if (!bind_weight(m->gguf, nm(i, "ffn_gate_exps.weight"), L.We_gate, true)) return false;
+            if (!bind_weight(m->gguf, nm(i, "ffn_up_exps.weight"), L.We_up, true)) return false;
+            if (!bind_weight(m->gguf, nm(i, "ffn_down_exps.weight"), L.We_down, true)) return false;
+            if (!bind_weight(m->gguf, nm(i, "ffn_gate_shexp.weight"), L.W_gate, true)) return false;
+            if (!bind_weight(m->gguf, nm(i, "ffn_up_shexp.weight"), L.W_up, true)) return false;
+            if (!bind_weight(m->gguf, nm(i, "ffn_down_shexp.weight"), L.W_down, true)) return false;
+            if (!bind_norm(m->gguf, nm(i, "ffn_gate_inp_shexp.weight"), E, L.shexp_gate, true)) return false;
+            if (!check_shape("ffn_gate_inp", i, L.W_router, NE, E) ||
+                !check_shape("ffn_gate_exps", i, L.We_gate, NE * FE, E) ||
+                !check_shape("ffn_up_exps", i, L.We_up, NE * FE, E) ||
+                !check_shape("ffn_down_exps", i, L.We_down, NE * E, FE) ||
+                !check_shape("ffn_gate_shexp", i, L.W_gate, FS, E) ||
+                !check_shape("ffn_up_shexp", i, L.W_up, FS, E) ||
+                !check_shape("ffn_down_shexp", i, L.W_down, E, FS)) return false;
+        } else {
+            if (!bind_weight(m->gguf, nm(i, "ffn_gate.weight"), L.W_gate, true)) return false;
+            if (!bind_weight(m->gguf, nm(i, "ffn_up.weight"), L.W_up, true)) return false;
+            if (!bind_weight(m->gguf, nm(i, "ffn_down.weight"), L.W_down, true)) return false;
+            if (!check_shape("ffn_gate", i, L.W_gate, FF, E) ||
+                !check_shape("ffn_up", i, L.W_up, FF, E) ||
+                !check_shape("ffn_down", i, L.W_down, E, FF)) return false;
+        }
     }
     return true;
 }
@@ -269,6 +297,10 @@ inference_model_t* inference_load_model(const char* gguf_path) {
     m->head_dim = (int)hd;
     m->vocab_size = (int)vs;
     m->n_ff = (int)gguf_arch_int(m->gguf, "feed_forward_length", 0);
+    m->n_expert = (int)gguf_arch_int(m->gguf, "expert_count", 0);
+    m->n_expert_used = (int)gguf_arch_int(m->gguf, "expert_used_count", 0);
+    m->n_ff_exp = (int)gguf_arch_int(m->gguf, "expert_feed_forward_length", 0);
+    m->n_ff_shexp = (int)gguf_arch_int(m->gguf, "expert_shared_feed_forward_length", 0);
     m->n_rot = (int)gguf_arch_int(m->gguf, "rope.dimension_count", hd);
     m->rope_freq_base = gguf_arch_float(m->gguf, "rope.freq_base", 10000.0f);
     m->eps = gguf_arch_float(m->gguf, "attention.layer_norm_rms_epsilon", 1e-6f);
