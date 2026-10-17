@@ -298,13 +298,14 @@ struct QwenModel {
                 return false;
             }
         }
-        // Prefill micro-batch: up to 256 tokens (bigger batches give each MoE expert more tokens per tile),
-        // fewer when attention's per-token partial buffers (which grow with the context length) would exceed
-        // ~64 MB
+        // Prefill micro-batch: up to 1024 tokens (bigger batches give each MoE expert more tokens per tile:
+        // 35B prefill 256 -> 1024 tokens was 845 -> 1,132 tokens/s), fewer if attention's partial buffers
+        // (at most ATTN_MAX_SPLITS slots per token, whatever n_ctx) would exceed ~256 MB
         const int n_ctx = kv_cache_n_ctx(eng->kvc);
-        const size_t part_per_token = attention_part_acc_floats(eng->n_head, n_ctx, 1) * sizeof(float);
-        const size_t fit = ((size_t)64 << 20) / std::max<size_t>(1, part_per_token);
-        const int rows = (int)std::max<size_t>(1, std::min<size_t>(256, fit));
+        const size_t part_per_token =  // ATTN_MAX_SPLITS slots
+            attention_part_acc_floats(eng->n_head, ATTN_CHUNK * ATTN_MAX_SPLITS, 1) * sizeof(float);
+        const size_t fit = ((size_t)256 << 20) / std::max<size_t>(1, part_per_token);
+        const int rows = (int)std::max<size_t>(1, std::min<size_t>(1024, fit));
         if (!s.alloc(eng, n_ctx, rows)) {
             qwen_set_error("scratch allocation failed");
             return false;

@@ -187,7 +187,8 @@ attn_combine(const float* part_ml, const float* part_acc, int n_chunks, int n_q,
 // attn_flash  grid (n_q / 4, ceil(T / FT), n_chunks), block 128 (4 waves). The same output as attn_partial
 //             (m, l, acc per (token, head, chunk), merged by attn_combine), for FT = 16 tokens and 4 query
 //             heads of one KV head at once, so each K/V chunk is read once per 64 query rows instead of once per
-//             row. Wave w takes head 4 * blockIdx.x + w; n_q / n_kv must be a multiple of 4 (the host checks).
+//             row. A chunk is `chunk` positions (a multiple of FB, chosen by the host so that a token has at
+//             most ATTN_MAX_SPLITS chunks). Wave w takes head 4 * blockIdx.x + w; n_q / n_kv must be a multiple of 4 (the host checks).
 //             Per block of FB = 16 positions: the K block and the transposed V block are staged in LDS (FP16,
 //             as cached), S = Q K^T (16 tokens x 16 positions, FP16 WMMA, FP32 accumulation; Q rounded to FP16
 //             as ggml's flash attention does), causal mask, online softmax per token row (running max m and sum
@@ -204,7 +205,7 @@ typedef float v8f __attribute__((ext_vector_type(8)));
 
 extern "C" __global__ void __launch_bounds__(128)
 attn_flash(const float* q, const __half* K, const __half* V, int kv_stride, int pos0, int T, int n_q, int n_kv_heads,
-           float scale, float* part_ml, float* part_acc) {
+           int chunk, float scale, float* part_ml, float* part_acc) {
     __shared__ __attribute__((aligned(16))) _Float16 sQ[4][FT][QP];
     __shared__ __attribute__((aligned(16))) _Float16 sK[FB][QP];
     __shared__ __attribute__((aligned(16))) _Float16 sVt[HD][FB];  // V block transposed: [dim][position]
@@ -213,7 +214,7 @@ attn_flash(const float* q, const __half* K, const __half* V, int kv_stride, int 
     const int h = blockIdx.x * 4 + w, g = blockIdx.x * 4 / (n_q / n_kv_heads);
     const int z0 = blockIdx.y * FT, c = blockIdx.z, n_chunks = gridDim.z;
     const int zmax = min(T, z0 + FT) - 1;                   // last token of the tile
-    const int npos = min(CH, pos0 + zmax + 1 - c * CH);     // chunk positions any token of the tile sees
+    const int npos = min(chunk, pos0 + zmax + 1 - c * chunk);  // chunk positions any token of the tile sees
     const int nb = npos > 0 ? (npos + FB - 1) / FB : 0;
 
     // This wave's Q rows (tokens z0 .. z0 + 15 of head h) to FP16; rows past T are zero
@@ -234,7 +235,7 @@ attn_flash(const float* q, const __half* K, const __half* V, int kv_stride, int 
 
 #pragma unroll 1
     for (int b = 0; b < nb; ++b) {
-        const int P0 = c * CH + b * FB;
+        const int P0 = c * chunk + b * FB;
         __syncthreads();  // the previous block's sK / sVt reads are done (and, the first time, sQ is written)
         // Stage the K and V blocks: 16 positions x 256 dims, 8 halves per uint4. Positions no token of the
         // tile sees are zeroed: they are masked, but 0 * (stale V) must stay 0.

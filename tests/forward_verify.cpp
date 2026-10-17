@@ -754,12 +754,13 @@ int main(int argc, char** argv) {
         snprintf(what, sizeof(what), "blk.%d attn_output (qmatvec)", la); report(what, so);
     }
 
-    // ---- GPU attention kernels vs the CPU reference ops at a long context (many 256-position chunks).
+    // ---- GPU attention kernels vs the CPU reference ops at a long context (10 256-position chunks: more than
+    // ATTN_MAX_SPLITS, so attn_flash splits the positions and attn_partial runs in token groups).
     // Random K/V history for positions 0..P-2; position P-1 goes through attn_prep (norm, RoPE, KV write)
     // from random projections, with the first attention layer's q/k norm weights.
     if (la >= 0) {
         const LayerWeights& L = m->layers[la];
-        const int P = 1500, DQ = HQ * HD, DKV = HKV * HD, pos = P - 1;
+        const int P = 2500, DQ = HQ * HD, DKV = HKV * HD, pos = P - 1;
         if (HD != ATTN_HEAD_DIM || attention_init("attention.co") != 0) { fprintf(stderr, "attention kernels unavailable\n"); return 1; }
         ShmBuf b_qf, b_k, b_v, b_q, b_ml, b_acc, b_out, b_K, b_V;
         if (!b_qf.alloc("fwdv_at_qf.bin", 2 * DQ) || !b_k.alloc("fwdv_at_k.bin", DKV) || !b_v.alloc("fwdv_at_v.bin", DKV) ||
@@ -810,7 +811,7 @@ int main(int argc, char** argv) {
         skv.add(kg.data(), kr.data(), DKV);
         so.add(b_out.p, ref_out.data(), DQ);
         char what[80];
-        // RoPE angles: GPU float pos * base^(-2i/n_rot) (as ggml), CPU reference double; at pos 1499 that
+        // RoPE angles: GPU float pos * base^(-2i/n_rot) (as ggml), CPU reference double; at pos 2499 that
         // differs by ~1e-4 rad, hence 1e-3 on the rotated values
         snprintf(what, sizeof(what), "GPU attn_prep Q norm + RoPE (pos %d)", pos); report(what, sq, 1e-3);
         snprintf(what, sizeof(what), "GPU attn_prep K row written to cache"); report(what, skv, 1e-3);
@@ -858,10 +859,27 @@ int main(int argc, char** argv) {
                         refb[(size_t)t * DQ + (size_t)h * HD + d] *=
                             qwen_sigmoid(c_qf.p[(size_t)t * 2 * DQ + (size_t)h * 2 * HD + HD + d]);
             }
+            // The output is also quantized in the same launches (attn_combine, per token group); compare that
+            // with quantizing it separately
+            ShmBuf qa, qb;
+            const int nq8 = TB * DQ;
+            qmatvec_q8 q8a, q8b;
+            if (!qa.alloc("fwdv_atb_q8a.bin", (qmatvec_q8_bytes(nq8) + 3) / 4) ||
+                !qb.alloc("fwdv_atb_q8b.bin", (qmatvec_q8_bytes(nq8) + 3) / 4)) {
+                fprintf(stderr, "alloc failed\n");
+                return 1;
+            }
+            qmatvec_q8_bind(&q8a, qa.p, nq8);
+            qmatvec_q8_bind(&q8b, qb.p, nq8);
             e = attention_forward(c_qf.p, c_k.p, c_v.p, L.q_norm, L.k_norm, K, Vc, HQ, HKV, m->n_rot, pos0, TB,
-                                  m->rope_freq_base, eps, c_q.p, c_ml.p, c_acc.p, c_out.p, nullptr, 0);
+                                  m->rope_freq_base, eps, c_q.p, c_ml.p, c_acc.p, c_out.p, &q8a, 0);
+            if (e == hipSuccess) e = qmatvec_quantize(c_out.p, nq8, &q8b, 0);
             if (e == hipSuccess) e = hipDeviceSynchronize();
             if (e != hipSuccess) { fprintf(stderr, "batched attention kernels: %s\n", hipGetErrorString(e)); return 1; }
+            const bool q8_same = memcmp(qa.p, qb.p, qmatvec_q8_bytes(nq8)) == 0;
+            if (!q8_same) ++g_fail;
+            printf("  [%s] GPU attention batched, %d tok: output quantized in the same launches %s\n",
+                   q8_same ? "PASS" : "FAIL", TB, q8_same ? "as qmatvec_quantize" : "DIFFERS from qmatvec_quantize");
             Stat sb;
             for (int t = 0; t < TB; ++t) sb.add(c_out.p + (size_t)t * DQ, &refb[(size_t)t * DQ], DQ);
             snprintf(what, sizeof(what), "GPU attention batched, %d tok at pos %d..%d", TB, pos0, P - 1);

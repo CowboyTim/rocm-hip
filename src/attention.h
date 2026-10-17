@@ -22,12 +22,24 @@ extern "C" {
 int attention_init(const char* co_path);
 void attention_free(void);
 
-// Partial-result buffer sizes, in floats, for T tokens and up to n_ctx positions
+// Partial results are kept per (token, head, slot); a slot is one range of positions. Up to ATTN_MAX_SPLITS
+// ranges per token in a batch (attn_flash), and a single token may need one 256-position chunk per slot
+// (attn_partial). Batches that use attn_partial run in token groups that fit, so the buffers do not grow
+// with n_ctx times T.
+#define ATTN_MAX_SPLITS 8
+
+static inline size_t attention_part_slots(int n_ctx, int T) {
+    const size_t c = (size_t)(n_ctx + ATTN_CHUNK - 1) / ATTN_CHUNK;
+    const size_t per_token = c < ATTN_MAX_SPLITS ? c : ATTN_MAX_SPLITS;
+    return c > (size_t)T * per_token ? c : (size_t)T * per_token;
+}
+
+// Partial-result buffer sizes, in floats, for batches of up to T tokens and up to n_ctx positions
 static inline size_t attention_part_ml_floats(int n_q, int n_ctx, int T) {
-    return (size_t)2 * T * n_q * ((n_ctx + ATTN_CHUNK - 1) / ATTN_CHUNK);
+    return 2 * attention_part_slots(n_ctx, T) * (size_t)n_q;
 }
 static inline size_t attention_part_acc_floats(int n_q, int n_ctx, int T) {
-    return (size_t)T * n_q * ((n_ctx + ATTN_CHUNK - 1) / ATTN_CHUNK) * ATTN_HEAD_DIM;
+    return attention_part_slots(n_ctx, T) * (size_t)n_q * ATTN_HEAD_DIM;
 }
 
 // T tokens at positions pos0 .. pos0 + T - 1; token t attends to positions 0 .. pos0 + t. Per token row t:

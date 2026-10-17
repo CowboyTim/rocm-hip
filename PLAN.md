@@ -1218,12 +1218,15 @@ for the symptoms above.
 >
 > | Model | Generation | Prefill (561-token prompt) |
 > |---|---|---|
-> | Qwen3.5-4B | **62.6 tok/s** | **1,627 tok/s** (612 tokens; 2,455 tokens: 1,715) |
-> | Qwen3.6-35B-A3B (MoE) | **57.1 tok/s** | **738 tok/s** (612 tokens; 2,455 tokens: 778) |
+> | Qwen3.5-4B | **62.6 tok/s** | **1,794 tok/s** (612 tokens; 2,455 tokens: 1,826) |
+> | Qwen3.6-35B-A3B (MoE) | **57.1 tok/s** | **1,137 tok/s** (612 tokens; 2,455 tokens: 1,193) |
 >
-> 1. **Prefill (W1–W4, W5.1 and W5.2 done).** Next is W5.3, fuller expert tiles for the 35B. 4B prefill
->    at 2,455 tokens is now 73% WMMA matmuls; `add_rmsnorm` (78 ms, 119 µs per call for 2560 × 256 values)
->    looks slow for what it does. See "TODO: prefill via WMMA" below.
+> 1. **Prefill (W1–W5 done).** What is left, by the 2,455-token profiles:
+>    - 35B: the expert matmuls (`matmul_wmma_id_*`) are still the largest part; with 1,024-token batches an
+>      expert averages ~32 entries. Measure its achieved bandwidth and TOPS against the roofline.
+>    - `deltanet_conv` (~100 GB/s) and the quantizing producers (`swiglu`, `add_rmsnorm_rows`) compute both
+>      Q8_0 and Q8_K although each consumer reads one.
+>    - The CPU embedding row decode.
 > 2. **35B generation (16.5 ms GPU per token):**
 >    - BF16 LM head: 5.1 ms at ~200 GB/s (1 GB, the bandwidth floor is ~4.2 ms).
 >    - Expert matvecs: 3.3 ms at ~160 GB/s.
@@ -1405,7 +1408,7 @@ for the symptoms above.
 > - **W5.2 — DONE ✅ (2026-10-17): query-tiled flash attention (`attn_flash`).** 4B prefill at 2,455
 >   tokens 1,494 → **1,715 tokens/s** (612 tokens: 1,597 → 1,627); 35B 719 → 778. Attention at 2,455
 >   tokens: 306 → 66 ms.
->   - Workgroup = 4 query heads of one KV head × 16 tokens × one 256-position chunk. Each 16-position
+>   - Workgroup = 4 query heads of one KV head × 16 tokens × one range of positions. Each 16-position
 >     K block and transposed V block is staged once in LDS for 64 query rows; S = QKᵀ and acc += PV are
 >     FP16 WMMAs with FP32 accumulation, with an online softmax per token row in between.
 >   - Writes the same (m, l, acc) partials as `attn_partial`, so `attn_combine` is shared. Used for
@@ -1413,9 +1416,22 @@ for the symptoms above.
 >   - 256 VGPRs, no spills. Q and P are rounded to FP16 (as ggml's flash attention does): 5.5e-4 of max
 >     vs the CPU reference (`forward_verify`, 40 tokens at positions 1460–1499).
 >   - `wmma_layout_verify` also pins the f16 → f32 WMMA layout; its FP32 sums are off by up to ~1 ulp.
-> - **W5 (next), in order:**
->   3. **35B experts:** expert tiles average ~8 of 16 entries, so half of each WMMA tile is padding. Try
->      micro-batches of 512 or 32-entry tiles.
+> - **W5.3 — DONE ✅ (2026-10-17): bigger prefill batches.** 35B prefill **738 → 1,137 tokens/s** (612
+>   tokens), 778 → 1,193 (2,455 tokens); 4B 1,627 → 1,794 and 1,715 → 1,826.
+>   - `matmul_f32`: the F32 MoE router ran as one `matvec_f32` launch per token and layer in prefill (98,200
+>     launches, 402 ms at 2,455 tokens). Now 8 tokens per wave, bit-identical. 35B 738 → 845.
+>   - Micro-batches of 1,024 tokens instead of 256: each expert gets ~32 entries instead of ~8, so its
+>     weights are streamed for full tiles. 35B 845 → 1,137 (512 tokens: 970).
+>   - Attention partial buffers no longer scale with n_ctx × T: `attn_flash` splits a token's positions
+>     into at most `ATTN_MAX_SPLITS` = 8 ranges of any multiple of 16, and `attn_partial` (small batches,
+>     or WMMA off) runs in token groups that fit. At 32k context the old rule would have cut batches to
+>     32 tokens. Scratch at 1,024 rows: ~0.5 GB on the 35B.
+>   - `add_rmsnorm_rows`: one workgroup per row for T > 1 (bit-identical), 78 → 52 ms.
+>   - Tests: `forward_verify`'s attention check uses 2,500 positions (10 chunks: splits and token groups)
+>     and checks the output quantized in the same launches; `generate_verify` also prefills in calls of
+>     200 tokens (batches at pos0 > 0).
+> - **W5 (remaining ideas):** 32-entry expert tiles (fewer tile launches per expert now that batches are
+>   bigger); see the NEXT STEP list above.
 > - **W5. Then the rest of prefill becomes visible** (original text):
 >   - **Attention for long prompts is O(n²)** and recomputes K/V loads per query token. Needs a
 >     query-tiled flash attention (several tokens per workgroup share each K/V chunk), with FP16 WMMA

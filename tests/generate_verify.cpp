@@ -91,19 +91,24 @@ int main(int argc, char** argv) {
               "inference_get_logits returns the last logits without another forward pass");
     }
 
-    // Long prompt: prefill (several micro-batches, crossing attention's 256-position chunks) must leave exactly
-    // the logits that feeding the same tokens one at a time does
+    // Long prompt: prefill (in one call, and in three calls of 200, 200 and the rest, so that batches start at
+    // pos0 > 0 inside attention's 256-position chunks whatever the micro-batch size) must leave exactly the
+    // logits that feeding the same tokens one at a time does
     {
         std::string text;
         for (int i = 0; i < 40; ++i) text += "The quick brown fox jumps over the lazy dog, again and again. ";
         int n = 0;
         int32_t* lt = inference_tokenize(m, text.c_str(), &n);
         const int V = inference_vocab_size(m);
-        std::vector<float> a(V), b(V);
+        std::vector<float> a(V), b(V), c(V);
         std::vector<int> ids(V);
         inference_reset(m);
         const int rc1 = inference_prefill(m, lt, n);
         inference_get_logits(m, ids.data(), a.data());
+        inference_reset(m);
+        int rc3 = 0;
+        for (int i0 = 0; i0 < n && rc3 == 0; i0 += 200) rc3 = inference_prefill(m, lt + i0, std::min(200, n - i0));
+        inference_get_logits(m, ids.data(), c.data());
         inference_reset(m);
         int nx = 0, rc2 = 0;
         for (int i = 0; i < n && rc2 == 0; ++i) rc2 = inference_decode_token(m, lt[i], &nx);
@@ -132,6 +137,18 @@ int main(int argc, char** argv) {
                  qwen_model_max_batch(inference_get_qwen_model(m)), d, cs, ta, tb,
                  exact ? " (WMMA off: must be identical)" : "");
         check(rc1 == 0 && rc2 == 0 && (exact ? d == 0.0 : ta == tb && cs >= 0.995), what);
+        double d3 = 0.0, dot3 = 0.0, nc = 0.0;
+        int tc = 0;
+        for (int i = 0; i < V; ++i) {
+            d3 = std::max(d3, (double)std::fabs(c[i] - b[i]));
+            dot3 += (double)c[i] * b[i];
+            nc += (double)c[i] * c[i];
+            if (c[i] > c[tc]) tc = i;
+        }
+        const double cs3 = dot3 / std::sqrt(nc * nb);
+        snprintf(what, sizeof(what), "prefill in calls of 200 tokens vs token by token: max |d| logits %.3g, cos %.7f, "
+                 "top-1 %d / %d", d3, cs3, tc, tb);
+        check(rc3 == 0 && (exact ? d3 == 0.0 : tc == tb && cs3 >= 0.995), what);
     }
 
     sampler_params p = sampler_default_params();  // temperature 0.8, top_k 40, top_p 0.95, min_p 0.05

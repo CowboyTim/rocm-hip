@@ -2,6 +2,8 @@
 
 #include "attention.h"
 
+#include <algorithm>
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,22 +58,53 @@ hipError_t attention_forward(const float* qfull, const float* k, const float* v,
                                          a_prep, nullptr);
     if (e != hipSuccess) return e;
 
-    int n_chunks = (n_last + ATTN_CHUNK - 1) / ATTN_CHUNK;
+    // Partial-result slots the caller's buffers hold (attention_part_slots with n_ctx >= n_last)
+    const int nc = (n_last + ATTN_CHUNK - 1) / ATTN_CHUNK;
+    const long long slots = std::max<long long>(nc, (long long)T * std::min(nc, ATTN_MAX_SPLITS));
     float scale = 1.0f / sqrtf((float)ATTN_HEAD_DIM);
     const float* qc = q;
-    if (T >= kFlashMinT && !g_flash_off && (n_q / n_kv) % 4 == 0) {
-        void* a_flash[] = {(void*)&qc, &K, &V, &kv_stride, &pos0, &T, &n_q, &n_kv, &scale, &part_ml, &part_acc};
-        e = hipModuleLaunchKernel(g_flash, (unsigned)(n_q / 4), (unsigned)((T + 15) / 16), (unsigned)n_chunks, 128, 1,
-                                  1, 0, stream, a_flash, nullptr);
-    } else {
-        void* a_part[] = {(void*)&qc, &K, &V, &kv_stride, &pos0, &n_q, &n_kv, &scale, &part_ml, &part_acc};
-        e = hipModuleLaunchKernel(g_partial, (unsigned)n_q, (unsigned)n_chunks, (unsigned)T, ATTN_HEAD_DIM, 1, 1, 0,
-                                  stream, a_part, nullptr);
-    }
-    if (e != hipSuccess) return e;
-
     qmatvec_q8_out o = qmatvec_q8_outputs(q8);
-    void* a_comb[] = {&part_ml, &part_acc, &n_chunks, &n_q, (void*)&qfull, &out, &o};
-    return hipModuleLaunchKernel(g_combine, (unsigned)n_q, (unsigned)T, 1, ATTN_HEAD_DIM, 1, 1, 0, stream, a_comb,
-                                 nullptr);
+
+    if (T >= kFlashMinT && !g_flash_off && (n_q / n_kv) % 4 == 0) {
+        // Up to ATTN_MAX_SPLITS ranges per token, each a multiple of 16 positions
+        int n_split = std::min(nc, ATTN_MAX_SPLITS);
+        int chunk = ((n_last + n_split - 1) / n_split + 15) / 16 * 16;
+        n_split = (n_last + chunk - 1) / chunk;
+        void* a_flash[] = {(void*)&qc, &K, &V, &kv_stride, &pos0, &T, &n_q, &n_kv, &chunk, &scale, &part_ml, &part_acc};
+        e = hipModuleLaunchKernel(g_flash, (unsigned)(n_q / 4), (unsigned)((T + 15) / 16), (unsigned)n_split, 128, 1,
+                                  1, 0, stream, a_flash, nullptr);
+        if (e != hipSuccess) return e;
+        void* a_comb[] = {&part_ml, &part_acc, &n_split, &n_q, (void*)&qfull, &out, &o};
+        return hipModuleLaunchKernel(g_combine, (unsigned)n_q, (unsigned)T, 1, ATTN_HEAD_DIM, 1, 1, 0, stream, a_comb,
+                                     nullptr);
+    }
+
+    // attn_partial: one 256-position chunk per slot, so the tokens run in groups of slots / nc
+    const int group = (int)std::max<long long>(1, slots / nc);
+    for (int z0 = 0; z0 < T; z0 += group) {
+        const int tg = std::min(group, T - z0), p0 = pos0 + z0;
+        const int n_chunks = (p0 + tg + ATTN_CHUNK - 1) / ATTN_CHUNK;
+        const float* qz = qc + (size_t)z0 * n_q * ATTN_HEAD_DIM;
+        const float* qfz = qfull + (size_t)z0 * 2 * n_q * ATTN_HEAD_DIM;
+        float* outz = out + (size_t)z0 * n_q * ATTN_HEAD_DIM;
+        qmatvec_q8_out oz = o;  // quantized blocks of tokens z0 ..: one 256-value block per head
+        if (oz.qK) {
+            const size_t blk = (size_t)z0 * n_q;
+            oz.q0 += blk * 256;
+            oz.qK += blk * 256;
+            oz.d0 += blk * 8;
+            oz.dK += blk;
+            oz.bsK += blk * 16;
+        }
+        void* a_part[] = {(void*)&qz, &K, &V, &kv_stride, (void*)&p0, &n_q, &n_kv, &scale, &part_ml, &part_acc};
+        e = hipModuleLaunchKernel(g_partial, (unsigned)n_q, (unsigned)n_chunks, (unsigned)tg, ATTN_HEAD_DIM, 1, 1, 0,
+                                  stream, a_part, nullptr);
+        if (e != hipSuccess) return e;
+        int nch = n_chunks;
+        void* a_comb[] = {&part_ml, &part_acc, &nch, &n_q, (void*)&qfz, &outz, &oz};
+        e = hipModuleLaunchKernel(g_combine, (unsigned)n_q, (unsigned)tg, 1, ATTN_HEAD_DIM, 1, 1, 0, stream, a_comb,
+                                  nullptr);
+        if (e != hipSuccess) return e;
+    }
+    return hipSuccess;
 }
