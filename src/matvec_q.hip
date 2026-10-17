@@ -1073,9 +1073,71 @@ typedef int v8i_t __attribute__((ext_vector_type(8)));
 #define WM_TILE 64
 #define WM_KC 128
 
-extern "C" __global__ void __launch_bounds__(128)
-matmul_wmma_q4_0_rocmfp4(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, float *y,
-                         long long ldy, int N, int K, int T) {
+// Weight staging policies for the Q8_0-activation WMMA kernel. Thread tid stages weight row tid / 2, blocks
+// wb = 2 * (tid & 1) and wb + 1 of the chunk's 4 blocks: load() reads them from global memory into registers
+// (so the next chunk's loads overlap this chunk's WMMAs), store() decodes them to int8 in LDS and writes the two
+// half-block scales of each block.
+struct WStageFP4 {  // Q4_0_ROCMFP4: 18-byte blocks (2-aligned), a UE4M3 scale per 16 values
+    uint32_t q[2][5];
+    __device__ void load(const uint8_t *W, long long rb, int row, bool ok, int b0, int wb) {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            if (ok) {
+                const uint8_t *b = W + (long long)row * rb + (long long)(b0 + wb + j) * 18;
+#pragma unroll
+                for (int k = 0; k < 4; ++k) q[j][k] = ld32_a2(b + 4 * k);
+                q[j][4] = *(const uint16_t *)(b + 16);
+            } else {
+#pragma unroll
+                for (int k = 0; k < 5; ++k) q[j][k] = 0;
+            }
+        }
+    }
+    __device__ void store(int8_t *srow, float *erow, int wb) const {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            uint32_t *dst = (uint32_t *)(srow + (wb + j) * 32);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                dst[k] = (uint32_t)rocmfp4_dec4(q[j][k] & 0x0F0F0F0Fu);
+                dst[4 + k] = (uint32_t)rocmfp4_dec4((q[j][k] >> 4) & 0x0F0F0F0Fu);
+            }
+            erow[(wb + j) * 2] = ue4m3_half((uint8_t)(q[j][4] & 0xFF));
+            erow[(wb + j) * 2 + 1] = ue4m3_half((uint8_t)(q[j][4] >> 8));
+        }
+    }
+};
+
+struct WStageFast {  // Q4_0_ROCMFP4_FAST: 17-byte blocks, one UE4M3 scale per 32 values. The chunk's 4 blocks
+                     // of a row are a 68-byte, 4-aligned quad: load it whole, extract bytes with v_alignbyte.
+    uint32_t w[18];
+    __device__ void load(const uint8_t *W, long long rb, int row, bool ok, int b0, int) {
+        const uint8_t *b = W + (long long)row * rb + (long long)b0 * 17;  // b0 % 4 == 0
+#pragma unroll
+        for (int k = 0; k < 17; ++k) w[k] = ok ? ld32(b + 4 * k) : 0;
+        w[17] = 0;
+    }
+    __device__ void store(int8_t *srow, float *erow, int wb) const {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int off = 17 * (wb + j);
+            uint32_t *dst = (uint32_t *)(srow + (wb + j) * 32);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint32_t qd = dword_at(w, off + 4 * k);
+                dst[k] = (uint32_t)rocmfp4_dec4(qd & 0x0F0F0F0Fu);
+                dst[4 + k] = (uint32_t)rocmfp4_dec4((qd >> 4) & 0x0F0F0F0Fu);
+            }
+            const float e = ue4m3_half((uint8_t)(dword_at(w, off + 16) & 0xFF));
+            erow[(wb + j) * 2] = e;
+            erow[(wb + j) * 2 + 1] = e;
+        }
+    }
+};
+
+template <class WS>
+__device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8,
+                                         float *y, long long ldy, int N, int K, int T) {
     // Rows padded by 16 bytes: the WMMA operand loads read 16 bytes from 16 consecutive rows, and an unpadded
     // 128-byte row stride would put them all in the same LDS banks
     __shared__ __attribute__((aligned(16))) int8_t sw[WM_TILE][WM_KC + 16];  // decoded weights
@@ -1092,27 +1154,14 @@ matmul_wmma_q4_0_rocmfp4(const uint8_t *W, long long row_bytes, const int8_t *q8
 #pragma unroll
         for (int r = 0; r < 8; ++r) acc[n][r] = 0.0f;
 
-    // Global data of one K chunk held in registers, so the next chunk's loads overlap this chunk's WMMAs:
-    // weights: blocks (row tid / 2, blocks 2 * (tid & 1) and + 1), 9 dwords each from 2-aligned 16-bit loads;
-    // activations: 4 uint4 = half (tid & 1) of token tid / 2's 128 bytes.
-    uint32_t gq[2][5];
+    // One K chunk's global data in registers: weights per the staging policy; activations: 4 uint4 = half
+    // (tid & 1) of token tid / 2's 128 bytes
+    WS ws;
     uint4 gx[4];
     const int wr_row = tid >> 1, wr_b = 2 * (tid & 1);
     const int xt0 = tid >> 1, xc = (tid & 1) * 64;
     auto load_chunk = [&](int k0) {
-        const int b0 = k0 / 32, row = r0 + wr_row;
-#pragma unroll
-        for (int j = 0; j < 2; ++j) {
-            if (row < N) {
-                const uint8_t *b = W + (long long)row * row_bytes + (long long)(b0 + wr_b + j) * 18;
-#pragma unroll
-                for (int k = 0; k < 4; ++k) gq[j][k] = ld32_a2(b + 4 * k);
-                gq[j][4] = *(const uint16_t *)(b + 16);
-            } else {
-#pragma unroll
-                for (int k = 0; k < 5; ++k) gq[j][k] = 0;
-            }
-        }
+        ws.load(W, row_bytes, r0 + wr_row, r0 + wr_row < N, k0 / 32, wr_b);
         const int t = t0 + xt0;
 #pragma unroll
         for (int c = 0; c < 4; ++c)
@@ -1120,17 +1169,7 @@ matmul_wmma_q4_0_rocmfp4(const uint8_t *W, long long row_bytes, const int8_t *q8
     };
     auto store_chunk = [&](int k0) {
         const int b0 = k0 / 32;
-#pragma unroll
-        for (int j = 0; j < 2; ++j) {
-            uint32_t *dst = (uint32_t *)&sw[wr_row][(wr_b + j) * 32];
-#pragma unroll
-            for (int k = 0; k < 4; ++k) {
-                dst[k] = (uint32_t)rocmfp4_dec4(gq[j][k] & 0x0F0F0F0Fu);
-                dst[4 + k] = (uint32_t)rocmfp4_dec4((gq[j][k] >> 4) & 0x0F0F0F0Fu);
-            }
-            sew[wr_row][(wr_b + j) * 2] = ue4m3_half((uint8_t)(gq[j][4] & 0xFF));
-            sew[wr_row][(wr_b + j) * 2 + 1] = ue4m3_half((uint8_t)(gq[j][4] >> 8));
-        }
+        ws.store(&sw[wr_row][0], &sew[wr_row][0], wr_b);
 #pragma unroll
         for (int c = 0; c < 4; ++c) *(uint4 *)&sx[xt0][xc + 16 * c] = gx[c];
         // token block scales: 64 tokens x 4 blocks, two per thread
@@ -1181,4 +1220,16 @@ matmul_wmma_q4_0_rocmfp4(const uint8_t *W, long long row_bytes, const int8_t *q8
             if (row < N) y[(long long)t * ldy + row] = acc[n][r];
         }
     }
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+matmul_wmma_q4_0_rocmfp4(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, float *y,
+                         long long ldy, int N, int K, int T) {
+    wmma_q80<WStageFP4>(W, row_bytes, q8, d8, y, ldy, N, K, T);
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+matmul_wmma_q4_0_rocmfp4_fast(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, float *y,
+                              long long ldy, int N, int K, int T) {
+    wmma_q80<WStageFast>(W, row_bytes, q8, d8, y, ldy, N, K, T);
 }
