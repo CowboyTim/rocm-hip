@@ -1,8 +1,11 @@
-// demo_qwen.cpp -- greedy generation with the Qwen3.5 forward pass.
-// Usage: ./qwen_demo <model.gguf> "prompt text" [n_gen]   (run from build/co)
+// demo_qwen.cpp -- text generation with the Qwen3.5 forward pass.
+// Usage: ./qwen_demo <model.gguf> "prompt text" [n_gen] [--temp T] [--top-k K] [--top-p P] [--min-p P]
+//                    [--repeat-penalty R] [--seed S]      (run from build/co)
+// Greedy by default (--temp 0). QWEN_PROFILE=1 prints the time breakdown.
 
 #include "qwen_model.h"
 #include "inference.h"
+#include "sampler.h"
 #include "tokenizer.h"
 #include <cstdio>
 #include <cstdlib>
@@ -10,13 +13,29 @@
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        printf("Usage: %s <model.gguf> \"prompt text\" [n_gen]\n", argv[0]);
+        printf("Usage: %s <model.gguf> \"prompt text\" [n_gen] [--temp T] [--top-k K] [--top-p P] [--min-p P] "
+               "[--repeat-penalty R] [--seed S]\n", argv[0]);
         return 1;
     }
 
     const char* model_path = argv[1];
     const char* prompt = argv[2];
-    const int n_gen = argc > 3 ? atoi(argv[3]) : 16;
+    int n_gen = 16;
+    sampler_params sp = sampler_default_params();
+    sp.temperature = 0.0f;  // greedy unless asked
+    for (int i = 3; i < argc; ++i) {
+        const std::string a = argv[i];
+        const char* v = i + 1 < argc ? argv[i + 1] : "0";
+        if (a == "--temp") { sp.temperature = (float)atof(v); ++i; }
+        else if (a == "--top-k") { sp.top_k = atoi(v); ++i; }
+        else if (a == "--top-p") { sp.top_p = (float)atof(v); ++i; }
+        else if (a == "--min-p") { sp.min_p = (float)atof(v); ++i; }
+        else if (a == "--repeat-penalty") { sp.repeat_penalty = (float)atof(v); ++i; }
+        else if (a == "--seed") { sp.seed = strtoull(v, nullptr, 10); ++i; }
+        else n_gen = atoi(argv[i]);
+    }
+    printf("Sampling: temp %g top_k %d top_p %g min_p %g repeat_penalty %g seed %llu\n", sp.temperature, sp.top_k,
+           sp.top_p, sp.min_p, sp.repeat_penalty, (unsigned long long)sp.seed);
 
     printf("Loading model: %s\n", model_path);
     inference_model_t* engine = inference_load_model(model_path);
@@ -56,15 +75,10 @@ int main(int argc, char** argv) {
     for (int i = 0; i < n_tokens; ++i) printf("%d ", tokens[i]);
     printf("\n");
 
-    // Greedy pick over the logits, read in place from the pinned scratch buffer
+    // Sample from the logits read in place from the pinned scratch buffer
     const int vocab_size = inference_vocab_size(engine);
-    auto argmax = [&]() {
-        const float* logits = qwen_model_logits(model);
-        int best = 0;
-        for (int v = 1; v < vocab_size; ++v)
-            if (logits[v] > logits[best]) best = v;
-        return best;
-    };
+    sampler_t* smp = sampler_create(&sp);
+    auto pick = [&]() { return sampler_sample(smp, qwen_model_logits(model), vocab_size); };
     const bool profile = getenv("QWEN_PROFILE") != nullptr;
 
     // Prefill; the last prompt token's logits give the first generated token
@@ -79,10 +93,11 @@ int main(int argc, char** argv) {
         }
     }
     if (profile) qwen_model_profile_print(model, "prefill");
-    int next = argmax();
+    for (int i = 0; i < n_tokens; ++i) sampler_accept(smp, tokens[i]);
+    int next = pick();
     inference_free_tokens(tokens, n_tokens);
 
-    // Greedy generation; stops at n_gen tokens or EOS
+    // Generation; stops at n_gen tokens or EOS
     qwen_model_profile_reset(model);
     tokenizer_t* tok = inference_get_tokenizer(engine);
     const int eos = tokenizer_eos_id(tok);
@@ -97,8 +112,10 @@ int main(int argc, char** argv) {
             fprintf(stderr, "Generation failed: %s\n", inference_get_last_error());
             break;
         }
-        next = argmax();
+        sampler_accept(smp, next);
+        next = pick();
     }
+    sampler_free(smp);
     if (profile) qwen_model_profile_print(model, "generation");
     printf("Prompt + generation: %s%s\n", prompt, text.c_str());
 

@@ -1206,19 +1206,52 @@ for the symptoms above.
 
 ### 20.3 Plan
 
-> **▶ NEXT STEP (as of 2026-10-16): Step 6 — the 35B-A3B (MoE).**
+> **▶ NEXT STEP (as of 2026-10-17): make the 4B fast, then batched prefill, then Step 6 (35B MoE).**
 >
-> The 4B now works from text to text. The tokenizer matches llama.cpp on a 21-prompt corpus, and
-> `qwen_demo` greedy output is identical to `llama-completion -no-cnv --temp 0` for 24 tokens of
-> "The capital of France is" (" Paris.\nA. True\nB. False\nAnswer: …") and 32 tokens of a Python prompt.
+> Agreed order (2026-10-17): usable 4B inference before the 35B. Ground rules for gfx1151 (UMA, 128 GB
+> shared by CPU/GPU/NPU):
+> - Never copy between CPU and GPU; both work on the same pinned pages.
+> - Use the GPU as much as possible, and use the 16 Zen 5 cores (AVX-512) for what stays on the CPU.
+> - Judge each change by the bytes it moves and the syncs it adds, measured with `QWEN_PROFILE=1`.
 >
-> 1. **Step 6 (35B-A3B):** TYPE101/BF16 already work in `qmatvec`, and the 35B's hparams load. Add the
->    MoE FFN: router, top-8 of 256 experts, and the shared expert. Bind the expert tensors in place, and
->    add a `forward_verify` section for one MoE layer plus the end-to-end `l_out` check. Reference: run
->    `ref_dump acts` on the 35B (into its own /dev/shm directory).
-> 2. **Then speed:** the DeltaNet and attention token mixers, norms and SwiGLU are CPU ops (`qwen_ops`).
->    Port them to kernels (the recurrent state is already a pinned /dev/shm buffer) and cut the
->    per-matvec syncs. Re-run `forward_verify` after each port.
+> Now 22.5 tok/s generation (44.5 ms/token; was 4.8). Profile, per token:
+> - DeltaNet delta rule (CPU, 1 thread): 16.9 ms, 38%.
+> - FFN matvecs: 9.2 ms. DeltaNet matvecs: 5.7 ms. Attention matvecs: 1.7 ms. LM head: 3.3 ms.
+>   Together they stream 2.8 GB at about 140 GB/s.
+> - Attention softmax(QK)V (CPU): 4.0 ms, growing with context.
+> - Other CPU ops: about 3.7 ms.
+>
+> 1. **Delta rule off the single core.** Either a GPU kernel (32 heads × 128×128 state, ~2 MB/layer, so
+>    it is bandwidth-bound) or 16-thread AVX-512 on the CPU; measure both. The state is already a pinned
+>    /dev/shm buffer. If it goes to the GPU, fold conv1d, L2 norm, gates and gated norm into the same
+>    kernel(s), so the DeltaNet mixer needs one sync instead of two.
+> 2. **Attention core on the GPU** (or threaded), plus fewer syncs per layer: queue a layer's kernels
+>    back to back and sync once per token where the dependencies allow.
+> 3. **Batched prefill:** a quantized matrix-matrix kernel that decodes each weight block once per batch.
+>    Check it against the 5-token reference dump (itself a batched prefill) and against token-by-token
+>    results.
+> 4. **Step 6 (35B-A3B):** router, top-8 of 256 experts, shared expert; `ref_dump acts` on the 35B.
+>
+> **Speed + sampling — DONE ✅ (2026-10-17).**
+> - `QWEN_PROFILE=1` prints a per-section breakdown (`qwen_model_profile_print`).
+> - The activation scratch is registered `hipExtHostRegisterCoarseGrained`: still zero-copy, but
+>   GPU-cacheable. Fine-grained `Mapped` made every matvec re-read x from DRAM; ffn_down took 4.2 ms.
+> - Q4_K/Q5_K/Q6_K matvecs are wave-cooperative (8 values per lane per block, coalesced): Q6_K went
+>   from 4.6 to 117+ GB/s, the LM head from 44 to 158 GB/s, Q5_K from 125 to 185 GB/s.
+> - `src/sampler.{h,cpp}`: llama.cpp's default chain (repeat penalty → top-k → top-p → min-p →
+>   temperature → seeded draw); temperature 0 is greedy. It reads the pinned logits in place, and the
+>   default chain costs 0.29 ms/token on the 248k vocabulary (heap top-k, bucketed top-p).
+> - Engine API fixed: the position is a per-model `n_past` (`inference_reset`, `inference_n_past`). The
+>   old code kept it in `static` counters that leaked across sequences, and `inference_get_logits` ran
+>   an extra forward pass on token 0. New `inference_generate_ex(…, sampler_params*)`; generation stops
+>   at EOS or a full context.
+> - `qwen_demo [n_gen] --temp --top-k --top-p --min-p --repeat-penalty --seed`.
+> - Tests:
+>   - `sampler_verify`: distributions and filters checked against exact expectations, plus speed.
+>   - `generate_verify`: greedy equals the manual decode loop and repeat calls are identical; seeded
+>     sampling is reproducible.
+>   - `inference_e2e_test` now rebuilds with `make all`. It was a stale binary from the old tokenizer,
+>     and its top-5 printout only looked at the first 5 vocab entries.
 >
 > **Tokenizer — DONE ✅ (2026-10-16).** `src/tokenizer.cpp` is rewritten as GPT-2 byte-level BPE following
 > llama.cpp's `llm_tokenizer_bpe`:

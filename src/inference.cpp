@@ -7,6 +7,7 @@
 #include "quant_types.h"
 #include "kv_cache.h"
 #include "tokenizer.h"
+#include "sampler.h"
 #include "qwen_model.h"
 #include <hip/hip_runtime.h>
 
@@ -25,10 +26,8 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <algorithm>
-#include <random>
 
 // Global RNG seed for reproducible sampling
-static std::atomic<uint32_t> g_rng_seed{0};
 
 // Thread-local error buffer
 static thread_local char g_last_error[1024] = {0};
@@ -367,6 +366,7 @@ int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
     m->kvc = kv_cache_create("/dev/shm/inference_kvc.bin", &cfg);
     if (!m->kvc) { set_error("kv_cache_create failed"); return -1; }
     m->n_ctx = n_ctx;
+    m->n_past = 0;
     // Create Qwen model for forward passes
     fprintf(stderr, "[KV_INIT] About to create qwen model\n"); fflush(stderr);
     m->qwen = qwen_model_create(m);
@@ -385,108 +385,45 @@ qwen_model_t* inference_get_qwen_model(inference_model_t* m) {
 }
 
 void inference_set_seed(inference_model_t* m, unsigned int seed) {
-    (void)m;
-    g_rng_seed.store(seed, std::memory_order_relaxed);
+    if (m) m->seed = seed;
+}
+
+void inference_reset(inference_model_t* m) {
+    if (m) m->n_past = 0;
+}
+
+int inference_n_past(const inference_model_t* m) {
+    return m ? m->n_past : 0;
+}
+
+// One forward pass for token at position n_past (the next position of the current sequence)
+static int forward_next(inference_model_t* m, int token_id) {
+    if (!m || !m->kvc || !m->qwen) { set_error("Invalid state (call inference_kv_cache_init first)"); return -1; }
+    if (m->n_past >= m->n_ctx) { set_error("context full (%d tokens)", m->n_ctx); return INFERENCE_ERR_CONTEXT_FULL; }
+    if (qwen_model_forward(m->qwen, token_id, m->n_past, nullptr) != 0) { set_error("qwen_model_forward failed"); return -1; }
+    ++m->n_past;
+    return 0;
 }
 
 int inference_decode_token(inference_model_t* m, int token_id, int* next_token_out) {
     clear_error();
-    if (!m || !m->kvc || !m->qwen || !next_token_out) { set_error("Invalid state"); return -1; }
-
-    // Need a position counter; store in model (simple static)
-    static thread_local int pos = 0;
-    float* logits = new float[m->vocab_size];
-    int rc = qwen_model_forward(m->qwen, token_id, pos, logits);
-    if (rc != 0) { delete[] logits; set_error("qwen_model_forward failed"); return -1; }
-
-    // Greedy sampling
+    if (!next_token_out) { set_error("Invalid args"); return -1; }
+    const int rc = forward_next(m, token_id);
+    if (rc != 0) return rc;
+    const float* logits = qwen_model_logits(m->qwen);
     int best = 0;
-    float best_val = logits[0];
-    for (int i = 1; i < m->vocab_size; ++i) {
-        if (logits[i] > best_val) { best_val = logits[i]; best = i; }
-    }
+    for (int i = 1; i < m->vocab_size; ++i)
+        if (logits[i] > logits[best]) best = i;
     *next_token_out = best;
-    ++pos;
-    delete[] logits;
     return 0;
 }
 
 int inference_get_logits(inference_model_t* m, int* vocab_ids, float* logits) {
     clear_error();
     if (!m || !m->qwen || !vocab_ids || !logits) { set_error("Invalid args"); return -1; }
-    // Fill vocab_ids with 0..vocab_size-1
+    if (m->n_past == 0) { set_error("no token decoded yet"); return -1; }
+    memcpy(logits, qwen_model_logits(m->qwen), (size_t)m->vocab_size * sizeof(float));
     for (int i = 0; i < m->vocab_size; ++i) vocab_ids[i] = i;
-    // Need a dummy token_id and position 0 for logits
-    static thread_local int pos = 0;
-    int rc = qwen_model_forward(m->qwen, 0, pos, logits);
-    if (rc == 0) {
-        for (int i = 0; i < m->vocab_size; ++i) vocab_ids[i] = i;
-    }
-    return rc;
-}
-
-// Sample from logits with temperature, top-k, top-p.
-// vocab_ids: array of vocab indices (size vocab_size)
-// logits: raw logits array (size vocab_size)
-// Returns sampled token ID, or -1 on error.
-int inference_sample_logits(inference_model_t* m, float temperature, int top_k, float top_p,
-                           int* vocab_ids, float* logits, int* out_token) {
-    clear_error();
-    if (!m || !vocab_ids || !logits || !out_token) { set_error("Invalid args"); return -1; }
-    int V = m->vocab_size;
-    // Copy logits to local vector for manipulation
-    std::vector<float> l(logits, logits + V);
-    // Temperature scaling
-    if (temperature > 0.0f) {
-        for (int i = 0; i < V; ++i) l[i] /= temperature;
-    }
-    // Softmax to get probabilities
-    float max_l = l[0];
-    for (int i = 1; i < V; ++i) if (l[i] > max_l) max_l = l[i];
-    float sum = 0.0f;
-    for (int i = 0; i < V; ++i) { l[i] = expf(l[i] - max_l); sum += l[i]; }
-    for (int i = 0; i < V; ++i) l[i] /= sum;
-
-    // Top-k
-    if (top_k > 0 && top_k < V) {
-        std::vector<std::pair<float,int>> idx;
-        idx.reserve(V);
-        for (int i = 0; i < V; ++i) idx.emplace_back(l[i], i);
-        std::nth_element(idx.begin(), idx.begin() + top_k, idx.end(),
-                         [](const auto& a, const auto& b){ return a.first > b.first; });
-        float cutoff = idx[top_k].first;
-        for (int i = 0; i < V; ++i) if (l[i] < cutoff) l[i] = 0.0f;
-        // renormalize
-        sum = 0.0f; for (int i = 0; i < V; ++i) sum += l[i];
-        if (sum > 0) for (int i = 0; i < V; ++i) l[i] /= sum;
-    }
-    // Top-p (nucleus)
-    if (top_p > 0.0f && top_p < 1.0f) {
-        std::vector<std::pair<float,int>> idx;
-        idx.reserve(V);
-        for (int i = 0; i < V; ++i) idx.emplace_back(l[i], i);
-        std::sort(idx.begin(), idx.end(),
-                  [](const auto& a, const auto& b){ return a.first > b.first; });
-        float cum = 0.0f;
-        int cutoff_idx = V;
-        for (int i = 0; i < V; ++i) {
-            cum += idx[i].first;
-            if (cum >= top_p) { cutoff_idx = i + 1; break; }
-        }
-        for (int i = cutoff_idx; i < V; ++i) l[idx[i].second] = 0.0f;
-        sum = 0.0f; for (int i = 0; i < V; ++i) sum += l[i];
-        if (sum > 0) for (int i = 0; i < V; ++i) l[i] /= sum;
-    }
-
-    // Sample from distribution
-    static thread_local std::mt19937 rng([](){
-        uint32_t seed = g_rng_seed.load(std::memory_order_relaxed);
-        if (seed != 0) return std::mt19937(seed);
-        return std::mt19937((unsigned)std::chrono::high_resolution_clock::now().time_since_epoch().count());
-    }());
-    std::discrete_distribution<int> dist(l.begin(), l.end());
-    int sampled = dist(rng);
-    *out_token = vocab_ids[sampled];
     return 0;
 }
 
@@ -562,50 +499,46 @@ int inference_forward_batch(inference_model_t* model,
     return INFERENCE_OK;
 }
 
-// Generation loop helper
-int inference_generate(inference_model_t* model,
-                       const int32_t* prompt_ids,
-                       int prompt_len,
-                       int max_new_tokens,
-                       float temperature,
-                       int top_k,
-                       float top_p,
-                       int32_t* out_ids,
-                       int* out_len) {
+int inference_generate_ex(inference_model_t* model, const int32_t* prompt_ids, int prompt_len, int max_new_tokens,
+                          const sampler_params* params, int32_t* out_ids, int* out_len) {
     clear_error();
     if (!model || !prompt_ids || !out_ids || !out_len || prompt_len <= 0 || max_new_tokens <= 0) {
         set_error("Invalid arguments");
         return INFERENCE_ERR_INVALID_ARG;
     }
-    // Prefill prompt
-    for (int i = 0; i < prompt_len; ++i) {
-        int next = 0;
-        int rc = inference_decode_token(model, prompt_ids[i], &next);
-        if (rc != 0) return rc;
+    *out_len = 0;
+    sampler_params prm = params ? *params : sampler_default_params();
+    sampler_t* smp = sampler_create(&prm);
+    const int eos = model->tokenizer ? tokenizer_eos_id(model->tokenizer) : -1;
+
+    // New sequence: prefill the prompt, then sample from the logits in place (no copy)
+    model->n_past = 0;
+    int rc = 0;
+    for (int i = 0; i < prompt_len && rc == 0; ++i) {
+        rc = forward_next(model, prompt_ids[i]);
+        sampler_accept(smp, prompt_ids[i]);
     }
-    // Generate new tokens
-    int generated = 0;
-    float* logits = new float[model->vocab_size];
-    int* vocab_ids = new int[model->vocab_size];
-    for (int i = 0; i < model->vocab_size; ++i) vocab_ids[i] = i;
-    for (int step = 0; step < max_new_tokens; ++step) {
-        int rc = inference_get_logits(model, vocab_ids, logits);
-        if (rc != 0) { delete[] logits; delete[] vocab_ids; return rc; }
-        int next = 0;
-        rc = inference_sample_logits(model, temperature, top_k, top_p, vocab_ids, logits, &next);
-        if (rc != 0) { delete[] logits; delete[] vocab_ids; return rc; }
-        out_ids[generated++] = next;
-        // feed next token back
-        rc = inference_decode_token(model, next, &next);
-        if (rc != 0) { delete[] logits; delete[] vocab_ids; return rc; }
-        if (next == tokenizer_eos_id(model->tokenizer)) break; // stop on EOS
+    for (int step = 0; step < max_new_tokens && rc == 0; ++step) {
+        const int next = sampler_sample(smp, qwen_model_logits(model->qwen), model->vocab_size);
+        if (next == eos) break;
+        out_ids[(*out_len)++] = next;
+        sampler_accept(smp, next);
+        if (step + 1 < max_new_tokens) rc = forward_next(model, next);
     }
-    *out_len = generated;
-    delete[] logits;
-    delete[] vocab_ids;
-    return INFERENCE_OK;
+    sampler_free(smp);
+    return rc == INFERENCE_ERR_CONTEXT_FULL ? INFERENCE_OK : rc;  // a full context just ends generation
 }
 
+int inference_generate(inference_model_t* model, const int32_t* prompt_ids, int prompt_len, int max_new_tokens,
+                       float temperature, int top_k, float top_p, int32_t* out_ids, int* out_len) {
+    sampler_params prm = sampler_default_params();
+    prm.temperature = temperature;
+    prm.top_k = top_k;
+    prm.top_p = top_p;
+    prm.min_p = 0.0f;
+    prm.seed = model ? model->seed : 0;
+    return inference_generate_ex(model, prompt_ids, prompt_len, max_new_tokens, &prm, out_ids, out_len);
+}
 
 tokenizer_t* inference_get_tokenizer(const inference_model_t* m) {
     if (!m) return nullptr;

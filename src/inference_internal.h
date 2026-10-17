@@ -109,6 +109,9 @@ struct inference_model {
     tokenizer_t* tokenizer = nullptr;                  // BPE tokenizer instance
     QwenModel* qwen = nullptr;                      // Qwen model handle (set during kv_init)
 
+    int n_past = 0;                                     // tokens decoded in the current sequence (next position)
+    uint64_t seed = 0;                                  // inference_generate sampler seed
+
     double eps = 1e-5;                                  // normalization epsilon
     int full_attention_interval = 0;                   // informational only; use LayerWeights::kind
 };

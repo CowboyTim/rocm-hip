@@ -71,6 +71,11 @@ ACTFP4_VERIFY    = $(BINDIR)/actfp4_verify
 TOKENIZER_VERIFY = $(BINDIR)/tokenizer_verify
 # GGUF tokenizer vs llama.cpp token ids (tests/data/*_tokenizer.tsv from tools/gen_tokenizer_ref.py)
 TOKENIZER_GGUF_VERIFY = $(BINDIR)/tokenizer_gguf_verify
+SAMPLER_VERIFY = $(BINDIR)/sampler_verify
+# Engine generation API on a real model; run from build/co
+GENERATE_VERIFY = $(BINDIR)/generate_verify
+# Older end-to-end smoke test with per-step top-5 logits; run from build/co
+E2E_TEST = $(BINDIR)/inference_e2e_test
 DEQUANT_VERIFY   = $(BINDIR)/dequant_verify
 MATVEC_VERIFY    = $(BINDIR)/matvec_verify
 # Phase 20 Step 3c: engine pieces vs the llama.cpp reference activations (ref_dump acts). Run from build/co.
@@ -93,7 +98,7 @@ QWEN_MODEL_LIB   = $(BUILDDIR)/libqwen.a
 QWEN_DEMO        = $(BINDIR)/qwen_demo
 
 # --- Build Rules ---
-all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(DEQUANT_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY)
+all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(GENERATE_VERIFY) $(E2E_TEST)
 
 $(WMMA_TARGET): $(WMMA_OBJ) $(WMMA_CO)
 	$(CLANG) $(WMMA_OBJ) $(LDFLAGS) -o $@
@@ -169,6 +174,9 @@ $(TOKENIZER_VERIFY): $(TESTSDIR)/tokenizer_verify.cpp $(SRCDIR)/tokenizer.cpp $(
 $(TOKENIZER_GGUF_VERIFY): $(TESTSDIR)/tokenizer_gguf_verify.cpp $(SRCDIR)/tokenizer.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/tokenizer.h $(SRCDIR)/unicode_flags.inc
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/tokenizer_gguf_verify.cpp $(SRCDIR)/tokenizer.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/quant_types.cpp $(LDFLAGS) -o $@
 
+$(SAMPLER_VERIFY): $(TESTSDIR)/sampler_verify.cpp $(SRCDIR)/sampler.cpp $(SRCDIR)/sampler.h
+	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/sampler_verify.cpp $(SRCDIR)/sampler.cpp -o $@
+
 # Phase 3 verify: full attention block chain; loads layernorm/gemm_act_fp4/rope_embedding/kv_cache_store/fp16_gemm/softmax_masked .co files
 $(ATTN_VERIFY): $(TESTSDIR)/attn_verify.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/kv_cache.h $(CODIR)/kv_cache_store.co $(CODIR)/gemm_act_fp4.co $(CODIR)/fp16_gemm.co $(CODIR)/layernorm.co $(CODIR)/rope_embedding.co $(CODIR)/softmax_masked.co
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/attn_verify.cpp $(SRCDIR)/kv_cache.cpp $(LDFLAGS) -o $@
@@ -186,13 +194,14 @@ $(QWEN_MODEL_CO): $(SRCDIR)/qwen_model.hip
 	$(HIPCC) $(HIPFLAGS) -c $< -o $@
 
 # Phase 4: Inference engine static library
-$(INFERENCE_LIB): $(SRCDIR)/inference.cpp $(SRCDIR)/inference.h $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/gguf_mmap.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/quant_types.h $(SRCDIR)/kv_cache.cpp $(SRCDIR)/kv_cache.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/tokenizer.h
+$(INFERENCE_LIB): $(SRCDIR)/inference.cpp $(SRCDIR)/inference.h $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/gguf_mmap.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/quant_types.h $(SRCDIR)/kv_cache.cpp $(SRCDIR)/kv_cache.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/tokenizer.h $(SRCDIR)/unicode_flags.inc $(SRCDIR)/sampler.cpp $(SRCDIR)/sampler.h $(SRCDIR)/qwen_model.h
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/inference.cpp -o $(OBJDIR)/inference.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/gguf_mmap.cpp -o $(OBJDIR)/gguf_mmap.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/quant_types.cpp -o $(OBJDIR)/quant_types.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/kv_cache.cpp -o $(OBJDIR)/kv_cache.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/tokenizer.cpp -o $(OBJDIR)/tokenizer.o
-	ar rcs $@ $(OBJDIR)/inference.o $(OBJDIR)/gguf_mmap.o $(OBJDIR)/quant_types.o $(OBJDIR)/kv_cache.o $(OBJDIR)/tokenizer.o
+	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/sampler.cpp -o $(OBJDIR)/sampler.o
+	ar rcs $@ $(OBJDIR)/inference.o $(OBJDIR)/gguf_mmap.o $(OBJDIR)/quant_types.o $(OBJDIR)/kv_cache.o $(OBJDIR)/tokenizer.o $(OBJDIR)/sampler.o
 
 # Phase 4: Inference engine shared library (versioned)
 INFERENCE_SO    = $(BUILDDIR)/libinference.so.1
@@ -226,12 +235,12 @@ install: $(INFERENCE_SO) $(INFERENCE_LIB) $(PKGCONFIG)
 	install -d $(DESTDIR)$(INSTALL_LIBDIR) $(DESTDIR)$(INSTALL_INCDIR) $(DESTDIR)$(INSTALL_PKGCONFIGDIR)
 	cp -f $(INFERENCE_SO_1) $(DESTDIR)$(INSTALL_LIBDIR)/
 	ln -sf libinference.so.1 $(DESTDIR)$(INSTALL_LIBDIR)/libinference.so
-	cp -f $(SRCDIR)/inference.h $(DESTDIR)$(INSTALL_INCDIR)/
+	cp -f $(SRCDIR)/inference.h $(SRCDIR)/sampler.h $(DESTDIR)$(INSTALL_INCDIR)/
 	cp -f $(PKGCONFIG) $(DESTDIR)$(INSTALL_PKGCONFIGDIR)/
 
 uninstall:
 	rm -f $(INSTALL_LIBDIR)/libinference.so $(INSTALL_LIBDIR)/libinference.so.1 $(INSTALL_LIBDIR)/libinference.so.1.0
-	rm -f $(INSTALL_INCDIR)/inference.h
+	rm -f $(INSTALL_INCDIR)/inference.h $(INSTALL_INCDIR)/sampler.h
 	rm -f $(INSTALL_PKGCONFIGDIR)/rocm-inference.pc
 
 # Phase 4: Qwen 3 model static library
@@ -251,15 +260,13 @@ $(QWEN_DEMO): $(SRCDIR)/demo_qwen.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR
 $(FORWARD_VERIFY): $(TESTSDIR)/forward_verify.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/matvec_q.co
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/forward_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
 
+$(GENERATE_VERIFY): $(TESTSDIR)/generate_verify.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/matvec_q.co
+	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/generate_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
+
 # End-to-end inference test (real model testing)
-E2E_TEST = $(BINDIR)/inference_e2e_test
-E2E_OBJ = $(OBJDIR)/inference_e2e_test.o
 
-$(E2E_TEST): $(E2E_OBJ) $(CODIR)/embedding_lookup.co copy_co_files
-	$(CLANG) $(CXXFLAGS) -I. $(QWEN_SRCS) $(SRCDIR)/inference.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/tokenizer.cpp $(E2E_OBJ) $(LDFLAGS) -o $@
-
-$(OBJDIR)/inference_e2e_test.o: $(SRCDIR)/inference_e2e_test.cpp
-	$(CLANG) $(CXXFLAGS) -I. -c $< -o $@
+$(E2E_TEST): $(SRCDIR)/inference_e2e_test.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/matvec_q.co
+	$(CLANG) $(CXXFLAGS) -I. $(SRCDIR)/inference_e2e_test.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
 
 # Build all demos and benchmark
 both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)

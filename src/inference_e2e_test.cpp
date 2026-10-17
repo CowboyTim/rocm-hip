@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#include <algorithm>
 #include <vector>
 #include "inference.h"
 #include "tokenizer.h"
@@ -112,17 +113,11 @@ int main(int argc, char** argv) {
         // Print top-5 tokens by logit value as diagnostic
         if (i == 0 || i == n_tokens - 1) {
             std::vector<std::pair<float,int>> top5;
-            for (int v = 0; v < vocab_size && (int)top5.size() < 5; ++v) {
-                top5.emplace_back(logits[v], v);
-            }
-            // Partial sort to find top 5
-            for (int j = 0; j < 5 && j < (int)top5.size(); ++j) {
-                int max_idx = j;
-                for (int k = j + 1; k < (int)top5.size(); ++k) {
-                    if (top5[k].first > top5[max_idx].first) max_idx = k;
-                }
-                std::swap(top5[j], top5[max_idx]);
-            }
+            top5.reserve(vocab_size);
+            for (int v = 0; v < vocab_size; ++v) top5.emplace_back(logits[v], v);
+            std::partial_sort(top5.begin(), top5.begin() + 5, top5.end(),
+                              [](const std::pair<float,int>& a, const std::pair<float,int>& b) { return a.first > b.first; });
+            top5.resize(5);
 
             printf("  Token %d logits (top-5): ", i);
             for (int j = 0; j < 5 && j < (int)top5.size(); ++j) {
