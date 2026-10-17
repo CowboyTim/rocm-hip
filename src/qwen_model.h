@@ -26,14 +26,24 @@ void qwen_model_free(qwen_model_t* model);
 // token_id: input token
 // pos: absolute position in sequence (for RoPE + KV cache indexing). Tokens of one sequence must come in
 //      order; pos 0 starts a new sequence and zeroes the DeltaNet recurrent state.
-// logits: output buffer [vocab_size] FP32 (pre-allocated by caller)
+// logits: output buffer [vocab_size] FP32 (pre-allocated by caller), or NULL to skip the copy and read them
+//         in place with qwen_model_logits()
 // Returns 0 on success, negative on error
 int qwen_model_forward(qwen_model_t* model, int token_id, int pos, float* logits);
+
+// Logits of the last qwen_model_forward, [vocab_size] FP32, in the pinned scratch buffer (no copy). Valid
+// until the next forward pass.
+const float* qwen_model_logits(qwen_model_t* model);
 
 // Called after each decoder layer with the residual stream x[n] (n = n_embd); for tests and tracing.
 // cb == NULL removes it.
 typedef void (*qwen_layer_cb)(int layer, int pos, const float* x, int n, void* user);
 void qwen_model_set_layer_callback(qwen_model_t* model, qwen_layer_cb cb, void* user);
+
+// Wall-time breakdown of the forward passes since the last reset (CPU ops, GPU matvecs, weight bandwidth),
+// printed to stderr under the given title
+void qwen_model_profile_reset(qwen_model_t* model);
+void qwen_model_profile_print(qwen_model_t* model, const char* title);
 
 // Batched forward pass for multiple sequences
 // tokens: array of token IDs, length batch_size

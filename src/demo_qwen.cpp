@@ -56,28 +56,34 @@ int main(int argc, char** argv) {
     for (int i = 0; i < n_tokens; ++i) printf("%d ", tokens[i]);
     printf("\n");
 
+    // Greedy pick over the logits, read in place from the pinned scratch buffer
+    const int vocab_size = inference_vocab_size(engine);
+    auto argmax = [&]() {
+        const float* logits = qwen_model_logits(model);
+        int best = 0;
+        for (int v = 1; v < vocab_size; ++v)
+            if (logits[v] > logits[best]) best = v;
+        return best;
+    };
+    const bool profile = getenv("QWEN_PROFILE") != nullptr;
+
     // Prefill; the last prompt token's logits give the first generated token
-    int vocab_size = inference_vocab_size(engine);
-    int next = 0;
+    qwen_model_profile_reset(model);
     for (int i = 0; i < n_tokens; ++i) {
-        float* logits = new float[vocab_size];
-        if (qwen_model_forward(model, tokens[i], i, logits) != 0) {
+        if (qwen_model_forward(model, tokens[i], i, nullptr) != 0) {
             fprintf(stderr, "Forward failed at token %d: %s\n", i, inference_get_last_error());
-            delete[] logits;
             inference_free_tokens(tokens, n_tokens);
             inference_kv_cache_free(engine);
             inference_free_model(engine);
             return 1;
         }
-        next = 0;
-        for (int v = 1; v < vocab_size; ++v) {
-            if (logits[v] > logits[next]) next = v;
-        }
-        delete[] logits;
     }
+    if (profile) qwen_model_profile_print(model, "prefill");
+    int next = argmax();
     inference_free_tokens(tokens, n_tokens);
 
     // Greedy generation; stops at n_gen tokens or EOS
+    qwen_model_profile_reset(model);
     tokenizer_t* tok = inference_get_tokenizer(engine);
     const int eos = tokenizer_eos_id(tok);
     std::string text;
@@ -87,18 +93,13 @@ int main(int argc, char** argv) {
         text += piece;
         printf("Generated token %d: %d '%s'\n", i, next, piece);
         if (next == eos || i + 1 == n_gen) break;
-        float* logits = new float[vocab_size];
-        if (qwen_model_forward(model, next, n_tokens + i, logits) != 0) {
+        if (qwen_model_forward(model, next, n_tokens + i, nullptr) != 0) {
             fprintf(stderr, "Generation failed: %s\n", inference_get_last_error());
-            delete[] logits;
             break;
         }
-        next = 0;
-        for (int v = 1; v < vocab_size; ++v) {
-            if (logits[v] > logits[next]) next = v;
-        }
-        delete[] logits;
+        next = argmax();
     }
+    if (profile) qwen_model_profile_print(model, "generation");
     printf("Prompt + generation: %s%s\n", prompt, text.c_str());
 
     inference_kv_cache_free(engine);

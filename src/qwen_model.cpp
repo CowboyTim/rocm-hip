@@ -20,6 +20,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -47,12 +48,20 @@ static bool qwen_debug() {
 }
 
 // One /dev/shm file, mmap(MAP_SHARED), hipHostRegister'ed once (project core pattern), carved into
-// 256-byte-aligned float arrays
+// 256-byte-aligned float arrays.
+//
+// Registration mode matters on the UMA APU, where both modes are zero-copy views of the same DRAM:
+// hipHostRegisterMapped is fine-grained (coherent at every access, so the GPU does not cache it), while
+// hipExtHostRegisterCoarseGrained lets the GPU cache it and makes it coherent at kernel boundaries and
+// syncs. Activations take coarse-grained: the GPU re-reads x once per output row, and every CPU/GPU
+// handoff already goes through a launch or hipDeviceSynchronize. That made the K = 9216 ffn_down matvec
+// 5x faster on gfx1151.
 struct ShmRegion {
     void* base = nullptr;
     size_t total = 0;
 
-    bool alloc(const char* path, const size_t* sizes, float** const* ptrs, size_t n) {
+    bool alloc(const char* path, const size_t* sizes, float** const* ptrs, size_t n,
+               unsigned flags = hipHostRegisterMapped) {
         std::vector<size_t> off(n);
         total = 0;
         for (size_t i = 0; i < n; ++i) {
@@ -66,7 +75,7 @@ struct ShmRegion {
         close(fd);
         unlink(path);
         if (p == MAP_FAILED) return false;
-        if (hipHostRegister(p, total, hipHostRegisterMapped) != hipSuccess) {
+        if (hipHostRegister(p, total, flags) != hipSuccess) {
             munmap(p, total);
             return false;
         }
@@ -116,7 +125,8 @@ struct Scratch {
         float** const ptrs[] = {&x, &xn, &qfull, &q, &gate, &k, &v, &attn, &proj, &ffg, &ffu, &act, &logits,
                                 &qkv, &conv, &z, &alpha, &beta, &lin};
         static_assert(sizeof(sizes) / sizeof(sizes[0]) == sizeof(ptrs) / sizeof(ptrs[0]), "scratch table");
-        return mem.alloc("/dev/shm/qwen_scratch.bin", sizes, ptrs, sizeof(sizes) / sizeof(sizes[0]));
+        return mem.alloc("/dev/shm/qwen_scratch.bin", sizes, ptrs, sizeof(sizes) / sizeof(sizes[0]),
+                         hipExtHostRegisterCoarseGrained);
     }
 };
 
@@ -149,8 +159,41 @@ struct RecurrentState {
     }
 };
 
+// Wall-time breakdown of the forward pass (QWEN_PROFILE=1 prints it; see qwen_model_profile_print). Sections
+// are timed by laps: lap(c) charges the time since the previous lap to c. A GPU section runs from its first
+// qmatvec launch to the hipDeviceSynchronize after it, so it includes launch overhead and the sync wait.
+enum ProfCat {
+    P_EMBED, P_ATTN_CPU, P_ATTN_CORE, P_ATTN_GPU, P_LIN_CPU, P_LIN_DELTA, P_LIN_GPU, P_FFN_CPU, P_FFN_GPU,
+    P_HEAD_CPU, P_HEAD_GPU, P_COUNT
+};
+static const char* const PROF_NAME[P_COUNT] = {
+    "embedding (CPU)", "attention: norms, RoPE, KV write, gate (CPU)", "attention: softmax(QK)V (CPU)",
+    "attention: q/k/v/o matvecs (GPU)", "DeltaNet: norm, conv, L2, gates, gated norm (CPU)",
+    "DeltaNet: delta rule (CPU)", "DeltaNet: qkv/z/alpha/beta/out matvecs (GPU)", "FFN: norm, SwiGLU (CPU)",
+    "FFN: gate/up/down matvecs (GPU)", "output norm + logits out (CPU)", "LM head matvec (GPU)",
+};
+static const bool PROF_GPU[P_COUNT] = {false, false, false, true, false, false, true, false, true, false, true};
+
+struct Profile {
+    double t[P_COUNT] = {};
+    double bytes[P_COUNT] = {};   // weight bytes streamed by the GPU sections
+    double last = 0.0;
+    int tokens = 0;
+
+    static double now() {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    void start() { last = now(); }
+    void lap(ProfCat c) {
+        const double t1 = now();
+        t[c] += t1 - last;
+        last = t1;
+    }
+};
+
 struct QwenModel {
     inference_model* eng = nullptr;
+    Profile prof;
     Scratch s;
     RecurrentState rs;
     qwen_layer_cb layer_cb = nullptr;
@@ -181,8 +224,9 @@ struct QwenModel {
         return true;
     }
 
-    // y = W x on the GPU. x and y must be in pinned memory (the scratch buffer).
-    bool matvec(const QuantWeight& W, const float* x, float* y) {
+    // y = W x on the GPU. x and y must be in pinned memory (the scratch buffer). c: profile section
+    bool matvec(const QuantWeight& W, const float* x, float* y, ProfCat c) {
+        prof.bytes[c] += (double)W.row_bytes * W.N;
         hipError_t e = qmatvec_launch(W.type, W.data, W.row_bytes, x, y, W.N, W.K, 0);
         if (e != hipSuccess) {
             qwen_set_error("qmatvec type %d %dx%d: %s", W.type, W.N, W.K, hipGetErrorString(e));
@@ -204,8 +248,11 @@ struct QwenModel {
         const float eps = (float)eng->eps;
 
         qwen_rmsnorm(s.x, L.attn_norm, s.xn, E, eps);
-        if (!matvec(L.Wq, s.xn, s.qfull) || !matvec(L.Wk, s.xn, s.k) || !matvec(L.Wv, s.xn, s.v) || !sync())
+        prof.lap(P_ATTN_CPU);
+        if (!matvec(L.Wq, s.xn, s.qfull, P_ATTN_GPU) || !matvec(L.Wk, s.xn, s.k, P_ATTN_GPU) ||
+            !matvec(L.Wv, s.xn, s.v, P_ATTN_GPU) || !sync())
             return false;
+        prof.lap(P_ATTN_GPU);
 
         // attn_q rows are [Q (HD) | gate (HD)] per head
         for (int h = 0; h < HQ; ++h) {
@@ -229,12 +276,17 @@ struct QwenModel {
             vrow[i] = __float2half(s.v[i]);
         }
 
+        prof.lap(P_ATTN_CPU);
         qwen_attention(s.q, kv_cache_k_row(eng->kvc, l, 0), kv_cache_v_row(eng->kvc, l, 0), DKV, pos + 1,
                        HQ, HKV, HD, 1.0f / sqrtf((float)HD), s.attn);
+        prof.lap(P_ATTN_CORE);
         for (int i = 0; i < HQ * HD; ++i) s.attn[i] *= qwen_sigmoid(s.gate[i]);
+        prof.lap(P_ATTN_CPU);
 
-        if (!matvec(L.Wo, s.attn, s.proj) || !sync()) return false;
+        if (!matvec(L.Wo, s.attn, s.proj, P_ATTN_GPU) || !sync()) return false;
+        prof.lap(P_ATTN_GPU);
         for (int i = 0; i < E; ++i) s.x[i] += s.proj[i];
+        prof.lap(P_ATTN_CPU);
         return true;
     }
 
@@ -246,9 +298,11 @@ struct QwenModel {
         const float eps = (float)eng->eps;
 
         qwen_rmsnorm(s.x, L.attn_norm, s.xn, E, eps);
-        if (!matvec(L.W_qkv, s.xn, s.qkv) || !matvec(L.W_z, s.xn, s.z) || !matvec(L.W_alpha, s.xn, s.alpha) ||
-            !matvec(L.W_beta, s.xn, s.beta) || !sync())
+        prof.lap(P_LIN_CPU);
+        if (!matvec(L.W_qkv, s.xn, s.qkv, P_LIN_GPU) || !matvec(L.W_z, s.xn, s.z, P_LIN_GPU) ||
+            !matvec(L.W_alpha, s.xn, s.alpha, P_LIN_GPU) || !matvec(L.W_beta, s.xn, s.beta, P_LIN_GPU) || !sync())
             return false;
+        prof.lap(P_LIN_GPU);
 
         // Causal conv1d over [q | k | v] channels, then SiLU; q and k heads get L2-normed
         qwen_ssm_conv_step(rs.conv[l], s.qkv, L.ssm_conv1d, s.conv, conv_dim, eng->ssm_d_conv);
@@ -260,7 +314,9 @@ struct QwenModel {
             s.alpha[h] = qwen_softplus(s.alpha[h] + L.ssm_dt[h]) * L.ssm_a[h];
             s.beta[h] = qwen_sigmoid(s.beta[h]);
         }
+        prof.lap(P_LIN_CPU);
         qwen_gated_delta_step(rs.ssm[l], s.conv, s.conv + KD, s.conv + 2 * KD, s.alpha, s.beta, NV, NG, DS, s.lin);
+        prof.lap(P_LIN_DELTA);
 
         // Gated RMSNorm per V head: norm(o) * ssm_norm * SiLU(z)
         for (int h = 0; h < NV; ++h) {
@@ -270,8 +326,11 @@ struct QwenModel {
             for (int i = 0; i < DS; ++i) o[i] *= qwen_silu(z[i]);
         }
 
-        if (!matvec(L.W_ssm_out, s.lin, s.proj) || !sync()) return false;
+        prof.lap(P_LIN_CPU);
+        if (!matvec(L.W_ssm_out, s.lin, s.proj, P_LIN_GPU) || !sync()) return false;
+        prof.lap(P_LIN_GPU);
         for (int i = 0; i < E; ++i) s.x[i] += s.proj[i];
+        prof.lap(P_LIN_CPU);
         return true;
     }
 
@@ -279,10 +338,16 @@ struct QwenModel {
     bool ffn(const LayerWeights& L) {
         const int E = eng->n_embd, FF = eng->n_ff;
         qwen_rmsnorm(s.x, L.ffn_norm, s.xn, E, (float)eng->eps);
-        if (!matvec(L.W_gate, s.xn, s.ffg) || !matvec(L.W_up, s.xn, s.ffu) || !sync()) return false;
+        prof.lap(P_FFN_CPU);
+        if (!matvec(L.W_gate, s.xn, s.ffg, P_FFN_GPU) || !matvec(L.W_up, s.xn, s.ffu, P_FFN_GPU) || !sync())
+            return false;
+        prof.lap(P_FFN_GPU);
         for (int i = 0; i < FF; ++i) s.act[i] = qwen_silu(s.ffg[i]) * s.ffu[i];
-        if (!matvec(L.W_down, s.act, s.proj) || !sync()) return false;
+        prof.lap(P_FFN_CPU);
+        if (!matvec(L.W_down, s.act, s.proj, P_FFN_GPU) || !sync()) return false;
+        prof.lap(P_FFN_GPU);
         for (int i = 0; i < E; ++i) s.x[i] += s.proj[i];
+        prof.lap(P_FFN_CPU);
         return true;
     }
 
@@ -291,6 +356,7 @@ struct QwenModel {
         if (token_id < 0 || token_id >= eng->vocab_size) { qwen_set_error("token %d out of range", token_id); return -1; }
         if (!eng->kvc || pos < 0 || pos >= kv_cache_n_ctx(eng->kvc)) { qwen_set_error("position %d out of range", pos); return -1; }
 
+        prof.start();
         // Embedding: decode one row of token_embd on the CPU
         if (qt_to_float(eng->token_embd.type, eng->token_embd.row(token_id), s.x, E) != 0) {
             qwen_set_error("cannot decode token_embd type %d", eng->token_embd.type);
@@ -300,8 +366,10 @@ struct QwenModel {
         // A sequence starting at position 0 starts from zero recurrent state (the KV cache needs no reset:
         // attention only reads positions 0..pos)
         if (pos == 0) rs.reset();
+        prof.lap(P_EMBED);
 
         for (int l = 0; l < eng->n_layer; ++l) {
+            prof.start();  // the debug trace and layer callback of the previous layer are not charged
             const LayerWeights& L = eng->layers[l];
             const bool ok = L.kind == LAYER_FULL_ATTN ? full_attention(l, L, pos) : linear_attention(l, L);
             if (!ok || !ffn(L)) return -1;
@@ -314,9 +382,14 @@ struct QwenModel {
             }
         }
 
+        prof.start();  // the debug trace and layer callback above are not charged
         qwen_rmsnorm(s.x, eng->output_norm, s.xn, E, (float)eng->eps);
-        if (!matvec(eng->output, s.xn, s.logits) || !sync()) return -1;
-        memcpy(logits_out, s.logits, (size_t)eng->vocab_size * sizeof(float));
+        prof.lap(P_HEAD_CPU);
+        if (!matvec(eng->output, s.xn, s.logits, P_HEAD_GPU) || !sync()) return -1;
+        prof.lap(P_HEAD_GPU);
+        if (logits_out) memcpy(logits_out, s.logits, (size_t)eng->vocab_size * sizeof(float));
+        prof.lap(P_HEAD_CPU);
+        prof.tokens++;
         return 0;
     }
 };
@@ -333,6 +406,39 @@ void qwen_model_free(qwen_model_t* model) {
     delete model;
 }
 
+const float* qwen_model_logits(qwen_model_t* model) {
+    return model ? model->s.logits : nullptr;
+}
+
+void qwen_model_profile_reset(qwen_model_t* model) {
+    if (model) model->prof = Profile();
+}
+
+void qwen_model_profile_print(qwen_model_t* model, const char* title) {
+    if (!model) return;
+    const Profile& p = model->prof;
+    const int n = p.tokens > 0 ? p.tokens : 1;
+    double total = 0.0, gpu = 0.0, bytes = 0.0;
+    for (int c = 0; c < P_COUNT; ++c) {
+        total += p.t[c];
+        if (PROF_GPU[c]) { gpu += p.t[c]; bytes += p.bytes[c]; }
+    }
+    fprintf(stderr, "[profile] %s: %d tokens, %.1f ms/token (%.2f tok/s); GPU sections %.0f%%, CPU %.0f%%\n",
+            title ? title : "forward", p.tokens, 1e3 * total / n, total > 0 ? n / total : 0.0,
+            total > 0 ? 100 * gpu / total : 0.0, total > 0 ? 100 * (total - gpu) / total : 0.0);
+    for (int c = 0; c < P_COUNT; ++c) {
+        if (p.t[c] == 0.0) continue;
+        fprintf(stderr, "[profile]   %-50s %8.2f ms/token %5.1f%%", PROF_NAME[c], 1e3 * p.t[c] / n,
+                total > 0 ? 100 * p.t[c] / total : 0.0);
+        if (PROF_GPU[c] && p.t[c] > 0)
+            fprintf(stderr, "  %7.1f MB/token %6.1f GB/s", p.bytes[c] / n / 1e6, p.bytes[c] / p.t[c] / 1e9);
+        fprintf(stderr, "\n");
+    }
+    if (gpu > 0)
+        fprintf(stderr, "[profile]   weights streamed: %.0f MB/token, %.1f GB/s averaged over the GPU sections\n",
+                bytes / n / 1e6, bytes / gpu / 1e9);
+}
+
 void qwen_model_set_layer_callback(qwen_model_t* model, qwen_layer_cb cb, void* user) {
     if (!model) return;
     model->layer_cb = cb;
@@ -340,7 +446,7 @@ void qwen_model_set_layer_callback(qwen_model_t* model, qwen_layer_cb cb, void* 
 }
 
 int qwen_model_forward(qwen_model_t* model, int token_id, int pos, float* logits) {
-    if (!model || !logits) return -1;
+    if (!model) return -1;
     return model->forward(token_id, pos, logits);
 }
 

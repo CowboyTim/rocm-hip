@@ -257,6 +257,75 @@ struct BlkQ6_K {
     }
 };
 
+// Wave-cooperative Q6_K: the 32 lanes decode one 256-value block together, 8 values each (Phase 20 speed
+// work). Lane l reads ql[l], ql[l + 32] and qh[l] of each 128-value half, plus x[l + {0, 32, 64, 96}],
+// so both the weight and the activation loads coalesce. One lane per block (BlkQ6_K) read 210-byte
+// blocks byte by byte at a 210-byte lane stride and reached 23 GB/s on ffn_down (K = 9216).
+struct BlkQ6_KCoop {
+    static constexpr int QK = 256, BYTES = 210;
+    __device__ static float lane_dot(const uint8_t *b, const float *x, int l) {
+        const int8_t *sc = (const int8_t *)(b + 192);
+        const int is = l / 16;
+        float s = 0.0f;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const uint8_t *ql = b + 64 * h, *qh = b + 128 + 32 * h;
+            const int8_t *scs = sc + 8 * h;
+            const float *xh = x + 128 * h;
+            const int q1 = ((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+            const int q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+            const int q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+            const int q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+            s += scs[is + 0] * q1 * xh[l] + scs[is + 2] * q2 * xh[l + 32] + scs[is + 4] * q3 * xh[l + 64] +
+                 scs[is + 6] * q4 * xh[l + 96];
+        }
+        return fp16(b + 208) * s;
+    }
+};
+
+// Wave-cooperative Q4_K / Q5_K, same scheme: per 64-value chunk j, lane l takes values 64j + l (low
+// nibble of q[32j + l]) and 64j + 32 + l (high nibble), plus Q5_K's high bits from qh[l].
+struct BlkQ4_KCoop {
+    static constexpr int QK = 256, BYTES = 144;
+    __device__ static float lane_dot(const uint8_t *b, const float *x, int l) {
+        const float d = fp16(b), min = fp16(b + 2);
+        const uint8_t *scales = b + 4, *q = b + 16;
+        float s = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            uint8_t sc1, m1, sc2, m2;
+            scale_min_k4(2 * j, scales, sc1, m1);
+            scale_min_k4(2 * j + 1, scales, sc2, m2);
+            const uint8_t v = q[32 * j + l];
+            s += (d * sc1 * (v & 0xF) - min * m1) * x[64 * j + l];
+            s += (d * sc2 * (v >> 4) - min * m2) * x[64 * j + 32 + l];
+        }
+        return s;
+    }
+};
+
+struct BlkQ5_KCoop {
+    static constexpr int QK = 256, BYTES = 176;
+    __device__ static float lane_dot(const uint8_t *b, const float *x, int l) {
+        const float d = fp16(b), min = fp16(b + 2);
+        const uint8_t *scales = b + 4, *qh = b + 16, *ql = b + 48;
+        const uint8_t h = qh[l];
+        float s = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            uint8_t sc1, m1, sc2, m2;
+            scale_min_k4(2 * j, scales, sc1, m1);
+            scale_min_k4(2 * j + 1, scales, sc2, m2);
+            const uint8_t v = ql[32 * j + l];
+            const int lo = (v & 0xF) + ((h >> (2 * j)) & 1 ? 16 : 0);
+            const int hi = (v >> 4) + ((h >> (2 * j + 1)) & 1 ? 16 : 0);
+            s += (d * sc1 * lo - min * m1) * x[64 * j + l];
+            s += (d * sc2 * hi - min * m2) * x[64 * j + 32 + l];
+        }
+        return s;
+    }
+};
+
 __constant__ int8_t k_rocmfp4_codebook[16] = {0, 1, 2, 3, 4, 6, 8, 10, 0, -1, -2, -3, -4, -6, -8, -10};
 
 __device__ __forceinline__ float ue4m3_half(uint8_t e) {
@@ -305,6 +374,27 @@ __device__ void matvec_impl(const uint8_t *W, long long row_bytes, const float *
     if (lane == 0) y[row] = acc;
 }
 
+// Wave-cooperative variant: every lane works on every block (B::lane_dot gives the lane's share)
+template <typename B>
+__device__ void matvec_coop_impl(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= N) return;
+    const uint8_t *wr = W + (long long)row * row_bytes;
+    const int nb = K / B::QK;
+    float acc = 0.0f;
+#pragma unroll 4
+    for (int ib = 0; ib < nb; ++ib) acc += B::lane_dot(wr + (long long)ib * B::BYTES, x + (long long)ib * B::QK, lane);
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
+    if (lane == 0) y[row] = acc;
+}
+
+#define MATVEC_COOP_KERNEL(name, B)                                                                       \
+    extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)                                     \
+        matvec_##name(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K) {    \
+        matvec_coop_impl<B>(W, row_bytes, x, y, N, K);                                                     \
+    }
+
 #define MATVEC_KERNEL(name, B)                                                                            \
     extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)                                     \
         matvec_##name(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K) {    \
@@ -321,8 +411,8 @@ MATVEC_KERNEL(q5_1, BlkQ5_1)
 MATVEC_KERNEL(q8_0, BlkQ8_0)
 MATVEC_KERNEL(q2_K, BlkQ2_K)
 MATVEC_KERNEL(q3_K, BlkQ3_K)
-MATVEC_KERNEL(q4_K, BlkQ4_K)
-MATVEC_KERNEL(q5_K, BlkQ5_K)
-MATVEC_KERNEL(q6_K, BlkQ6_K)
+MATVEC_COOP_KERNEL(q4_K, BlkQ4_KCoop)
+MATVEC_COOP_KERNEL(q5_K, BlkQ5_KCoop)
+MATVEC_COOP_KERNEL(q6_K, BlkQ6_KCoop)
 MATVEC_KERNEL(q4_0_rocmfp4, BlkROCmFP4)
 MATVEC_KERNEL(q4_0_rocmfp4_fast, BlkROCmFP4Fast)
