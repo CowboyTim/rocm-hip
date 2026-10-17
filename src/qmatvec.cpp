@@ -92,7 +92,9 @@ void qmatvec_q8_bind(qmatvec_q8 *q, void *mem, int max_k) {
 
 int qmatvec_q8_supported(int type, int K) {
     if (type < 0 || type >= QMV_MAX_TYPE || !g_fn_q8[type] || !g_quant || K % 256 != 0) return 0;
-    return type == QT_Q4_0_ROCMFP4 ? K % 64 == 0 : 1;  // ROCmFP4 lanes take 36-byte block pairs
+    if (type == QT_Q4_0_ROCMFP4) return K % 64 == 0;        // lanes take 36-byte block pairs
+    if (type == QT_Q4_0_ROCMFP4_FAST) return K % 128 == 0;  // lanes take 68-byte block quads
+    return 1;
 }
 
 hipError_t qmatvec_quantize(const float *x, int K, const qmatvec_q8 *q, hipStream_t stream) {
@@ -109,7 +111,7 @@ hipError_t qmatvec_launch_q8_pair(int type, const void *W, int N, float *y, cons
     if (row_bytes != qt_row_size(type, K) || row_bytes % 4 != 0 || ((uintptr_t)W & 3) != 0 || ((uintptr_t)W2 & 3) != 0 ||
         K > q->max_k)
         return hipErrorInvalidValue;
-    const bool kq = type != QT_Q4_0_ROCMFP4;  // K-quants read Q8_K, ROCmFP4 reads Q8_0
+    const bool kq = type != QT_Q4_0_ROCMFP4 && type != QT_Q4_0_ROCMFP4_FAST;  // K-quants read Q8_K, ROCmFP4 Q8_0
     const int8_t *q8 = kq ? q->qK : q->q0;
     const float *d8 = kq ? q->dK : q->d0;
     const int32_t *bs = q->bsK;
@@ -132,7 +134,7 @@ hipError_t qmatvec_launch_q8_batch(int type, const void *W, size_t row_bytes, co
     if (T <= 0 || row_bytes != qt_row_size(type, K) || row_bytes % 4 != 0 || ((uintptr_t)W & 3) != 0 ||
         (long long)T * K > q->max_k || ldy < N)
         return hipErrorInvalidValue;
-    const bool kq = type != QT_Q4_0_ROCMFP4;
+    const bool kq = type != QT_Q4_0_ROCMFP4 && type != QT_Q4_0_ROCMFP4_FAST;
     const int8_t *q8 = kq ? q->qK : q->q0;
     const float *d8 = kq ? q->dK : q->d0;
     const int32_t *bs = q->bsK;

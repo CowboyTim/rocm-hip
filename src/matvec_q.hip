@@ -513,6 +513,57 @@ matvec_q8_q4_0_rocmfp4(Q8_ARGS) {
     if (lane == 0) *yr = acc;
 }
 
+// ROCmFP4_FAST (17-byte blocks: 16 nibble bytes + one UE4M3 scale per 32 values) x Q8_0: a lane takes four
+// blocks (68 bytes, 4-aligned; the host requires K % 128 == 0) and extracts each block's 16 bytes from the
+// loaded dwords with v_alignbyte_b32. Same as ggml's rocmfp4_vec_dot_q4_0_fast_q8_0: d * (sumi0 + sumi1).
+__device__ __forceinline__ uint32_t dword_at(const uint32_t *w, int off) {  // off: compile-time after unrolling
+    return off % 4 == 0 ? w[off / 4] : __builtin_amdgcn_alignbyte(w[off / 4 + 1], w[off / 4], off % 4);
+}
+
+__device__ __forceinline__ void rocmfp4_fast_quad(const uint8_t *b, uint32_t qs[4][4], float e[4]) {
+    uint32_t w[18];
+#pragma unroll
+    for (int k = 0; k < 17; ++k) w[k] = ld32(b + 4 * k);
+    w[17] = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) qs[j][k] = dword_at(w, 17 * j + 4 * k);
+        e[j] = ue4m3_half((uint8_t)(dword_at(w, 17 * j + 16) & 0xFF));
+    }
+}
+
+__device__ __forceinline__ float rocmfp4_fast_q8_block(const uint32_t qs[4], float e, const int8_t *q8, float dx) {
+    const int *x8 = (const int *)q8;
+    int s0 = 0, s1 = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        s0 = dot4(rocmfp4_dec4(qs[k] & 0x0F0F0F0Fu), x8[k], s0);
+        s1 = dot4(rocmfp4_dec4((qs[k] >> 4) & 0x0F0F0F0Fu), x8[4 + k], s1);
+    }
+    return e * dx * (float)(s0 + s1);
+}
+
+extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
+matvec_q8_q4_0_rocmfp4_fast(Q8_ARGS) {
+    (void)bs;
+    Q8_ROW_SETUP
+    const int nquad = K / 128;
+    float acc = 0.0f;
+    for (int p = lane; p < nquad; p += 32) {
+        uint32_t qs[4][4];
+        float e[4];
+        rocmfp4_fast_quad(wr + (long long)p * 68, qs, e);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int ib = 4 * p + j;
+            acc += rocmfp4_fast_q8_block(qs[j], e[j], q8 + ib * 32, d8[ib]);
+        }
+    }
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
+    if (lane == 0) *yr = acc;
+}
+
 // K-quant x Q8_K kernels: the wave works on 4 blocks at a time, 8 lanes per 256-value block, each lane on 16
 // consecutive quant bytes (16 or 32 values that share one scale group per nibble half). One lane per block
 // sub-group also adds that block's min / offset correction through the Q8_K group sums. (A first version
@@ -780,4 +831,42 @@ matmul_q8_q4_K(MM_ARGS) {
 extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
 matmul_q8_q5_K(MM_ARGS) {
     matmul_q8_kquant<true>(W, row_bytes, q8, d8, bs, y, ldy, N, K, T);
+}
+
+extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
+matmul_q8_q4_0_rocmfp4_fast(MM_ARGS) {
+    (void)bs;
+    MM_ROW_SETUP
+    const int nquad = K / 128, nb = K / 32;
+    for (int p = lane; p < nquad; p += 32) {
+        uint32_t qs[4][4];
+        float e[4];
+        rocmfp4_fast_quad(wr + (long long)p * 68, qs, e);
+        int lo[4][4], hi[4][4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                lo[j][k] = rocmfp4_dec4(qs[j][k] & 0x0F0F0F0Fu);
+                hi[j][k] = rocmfp4_dec4((qs[j][k] >> 4) & 0x0F0F0F0Fu);
+            }
+        // Not unrolled: see matmul_q8_q4_0_rocmfp4
+        for (int jt = 0; jt < MM_TB; ++jt) {
+            if (jt >= nt) break;
+            const long long t = t0 + jt;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int ib = 4 * p + j;
+                const int *x8 = (const int *)(q8 + t * K + ib * 32);
+                int s0 = 0;
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    s0 = dot4(lo[j][k], x8[k], s0);
+                    s0 = dot4(hi[j][k], x8[4 + k], s0);
+                }
+                acc[jt] += e[j] * d8[t * nb + ib] * (float)s0;
+            }
+        }
+    }
+    MM_STORE
 }
