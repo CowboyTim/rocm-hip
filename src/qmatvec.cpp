@@ -15,6 +15,7 @@ static hipModule_t g_mod = nullptr;
 static hipFunction_t g_fn[QMV_MAX_TYPE];
 static hipFunction_t g_fn_q8[QMV_MAX_TYPE];  // int8 kernels, matvec_q8_<type>
 static hipFunction_t g_quant = nullptr;
+static hipFunction_t g_mm_f32 = nullptr;  // matmul_f32: batched F32
 static hipFunction_t g_fn_mm[QMV_MAX_TYPE];  // batched int8 kernels, matmul_q8_<type>
 static hipFunction_t g_fn_q8_id[QMV_MAX_TYPE];  // expert-indexed int8 kernels, matvec_q8_id_<type>
 static hipFunction_t g_fn_id[QMV_MAX_TYPE];     // expert-indexed float kernels, matvec_id_<type>
@@ -62,6 +63,7 @@ int qmatvec_init(const char *co_path) {
         if (hipModuleGetFunction(&g_fn_wmma_id[t], g_mod, name) != hipSuccess) g_fn_wmma_id[t] = nullptr;
     }
     if (hipModuleGetFunction(&g_quant, g_mod, "quantize_q8") != hipSuccess) g_quant = nullptr;
+    if (hipModuleGetFunction(&g_mm_f32, g_mod, "matmul_f32") != hipSuccess) g_mm_f32 = nullptr;
     g_use_wmma = getenv("QMATVEC_NO_WMMA") == nullptr;  // A/B switch
     if (const char *v = getenv("QMATVEC_WMMA_MIN_T")) g_wmma_min_t = atoi(v);  // tests: route small batches to WMMA
     return 0;
@@ -79,6 +81,7 @@ void qmatvec_free(void) {
     memset(g_fn_wmma, 0, sizeof(g_fn_wmma));
     memset(g_fn_wmma_id, 0, sizeof(g_fn_wmma_id));
     g_quant = nullptr;
+    g_mm_f32 = nullptr;
 }
 
 int qmatvec_supported(int type) {
@@ -94,6 +97,24 @@ hipError_t qmatvec_launch(int type, const void *W, size_t row_bytes, const float
     void *args[] = {(void *)&W, &rb, (void *)&x, (void *)&y, &N, &K};
     const unsigned grid = (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);
     return hipModuleLaunchKernel(g_fn[type], grid, 1, 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream, args, nullptr);
+}
+
+#define QMV_MF32_TT 8  // must match MF32_TT in matvec_q.hip
+
+hipError_t qmatvec_launch_batch(int type, const void *W, size_t row_bytes, const float *x, float *y, int N, int K,
+                                int T, hipStream_t stream) {
+    if (T > 1 && type == QT_F32 && g_mm_f32 && K % 4 == 0 && row_bytes == (size_t)K * 4 &&
+        (((uintptr_t)W | (uintptr_t)x) & 15) == 0) {
+        long long rb = (long long)row_bytes;
+        void *args[] = {(void *)&W, &rb, (void *)&x, (void *)&y, &N, &K, &T};
+        return hipModuleLaunchKernel(g_mm_f32, (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK),
+                                     (unsigned)((T + QMV_MF32_TT - 1) / QMV_MF32_TT), 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1,
+                                     0, stream, args, nullptr);
+    }
+    hipError_t e = hipSuccess;
+    for (int t = 0; t < T && e == hipSuccess; ++t)
+        e = qmatvec_launch(type, W, row_bytes, x + (size_t)t * K, y + (size_t)t * N, N, K, stream);
+    return e;
 }
 
 // ---------------------------------------------------------------- int8 path

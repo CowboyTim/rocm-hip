@@ -440,6 +440,40 @@ matvec_f32(const uint8_t *W, long long row_bytes, const float *x, float *y, int 
     if (lane == 0) y[row] = acc;
 }
 
+// F32 for MF32_TT tokens at a time (prefill: the MoE router ran one launch per token). grid (ceil(N /
+// ROWS_PER_BLOCK), ceil(T / MF32_TT)); each weight float4 is loaded once for the tile's tokens. Every token's sum
+// has matvec_f32's expression and order, so the results are bit-identical to it. The host guarantees
+// 16-byte-aligned rows and x, and K % 4 == 0.
+#define MF32_TT 8
+extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
+matmul_f32(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K, int T) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= N) return;
+    const int t0 = blockIdx.y * MF32_TT, nt = min(MF32_TT, T - t0);
+    const float4 *wr = (const float4 *)(W + (long long)row * row_bytes);
+    const float4 *xt = (const float4 *)(x + (size_t)t0 * K);
+    const int n4 = K / 4;
+    float acc[MF32_TT];
+#pragma unroll
+    for (int j = 0; j < MF32_TT; ++j) acc[j] = 0.0f;
+    for (int i = lane; i < n4; i += 32) {
+        const float4 w = wr[i];
+#pragma unroll
+        for (int j = 0; j < MF32_TT; ++j)
+            if (j < nt) {
+                const float4 v = xt[(size_t)j * n4 + i];
+                acc[j] += w.x * v.x + w.y * v.y + w.z * v.z + w.w * v.w;
+            }
+    }
+#pragma unroll
+    for (int j = 0; j < MF32_TT; ++j) {
+        float a = acc[j];
+        for (int off = 16; off > 0; off >>= 1) a += __shfl_xor(a, off, 32);
+        if (lane == 0 && j < nt) y[(size_t)(t0 + j) * N + row] = a;
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
 matvec_bf16(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K) {
     const int lane = threadIdx.x & 31;

@@ -339,16 +339,14 @@ struct QwenModel {
 
     // Y[t] = W X[t] for T rows on the GPU (X, Y in pinned memory, rows of W.K / W.N values). c: profile
     // section. Uses the int8 kernels when there is one for the type and s.q8 holds these rows; otherwise the
-    // float kernel, one launch per row.
+    // float kernels (one batched launch for F32, else one launch per row).
     bool matvec(const QuantWeight& W, const float* x, float* y, int T, ProfCat c) {
         prof.bytes[c] += (double)W.row_bytes * W.N;
         const bool q8 = q8_src == x && q8_k == W.K && q8_t == T && qmatvec_q8_supported(W.type, W.K);
         hipError_t e = hipSuccess;
         if (q8 && T == 1) e = qmatvec_launch_q8(W.type, W.data, W.row_bytes, &s.q8, y, W.N, W.K, 0);
         else if (q8) e = qmatvec_launch_q8_batch(W.type, W.data, W.row_bytes, &s.q8, y, W.N, W.N, W.K, T, 0);
-        else
-            for (int t = 0; t < T && e == hipSuccess; ++t)
-                e = qmatvec_launch(W.type, W.data, W.row_bytes, x + (size_t)t * W.K, y + (size_t)t * W.N, W.N, W.K, 0);
+        else e = qmatvec_launch_batch(W.type, W.data, W.row_bytes, x, y, W.N, W.K, T, 0);
         if (e != hipSuccess) {
             qwen_set_error("qmatvec type %d %dx%d (T %d): %s", W.type, W.N, W.K, T, hipGetErrorString(e));
             return false;

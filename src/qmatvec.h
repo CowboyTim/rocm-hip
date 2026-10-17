@@ -26,6 +26,11 @@ int qmatvec_supported(int type);
 hipError_t qmatvec_launch(int type, const void *W, size_t row_bytes, const float *x, float *y, int N, int K,
                           hipStream_t stream);
 
+// The same for T rows of x [K] -> y [N]: one batched launch for F32 (bit-identical to qmatvec_launch per row),
+// otherwise one qmatvec_launch per row.
+hipError_t qmatvec_launch_batch(int type, const void *W, size_t row_bytes, const float *x, float *y, int N, int K,
+                                int T, hipStream_t stream);
+
 // ---------------------------------------------------------------- int8 path
 // The activation vector is quantized once (qmatvec_quantize) into both formats ggml's CPU reference uses
 // (Q8_0 for ROCmFP4, Q8_K for K-quants), then int8 matvecs use v_dot4. See matvec_q.hip. Types and shapes
