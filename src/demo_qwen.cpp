@@ -72,9 +72,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    printf("Prompt tokens (%d): ", n_tokens);
-    for (int i = 0; i < n_tokens; ++i) printf("%d ", tokens[i]);
-    printf("\n");
+    printf("Prompt tokens (%d): ", n_tokens);  // the first 32 for long prompts
+    for (int i = 0; i < n_tokens && i < 32; ++i) printf("%d ", tokens[i]);
+    printf("%s\n", n_tokens > 32 ? "..." : "");
 
     // Sample from the logits read in place from the pinned scratch buffer
     const int vocab_size = inference_vocab_size(engine);

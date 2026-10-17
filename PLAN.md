@@ -1218,12 +1218,11 @@ for the symptoms above.
 >
 > | Model | Generation | Prefill (561-token prompt) |
 > |---|---|---|
-> | Qwen3.5-4B | **62.6 tok/s** | **1,497 tok/s** |
-> | Qwen3.6-35B-A3B (MoE) | **57.1 tok/s** | **581 tok/s** |
+> | Qwen3.5-4B | **62.6 tok/s** | **1,497 tok/s** (2,101 tokens: 1,423) |
+> | Qwen3.6-35B-A3B (MoE) | **57.1 tok/s** | **712 tok/s** (2,101 tokens: 739) |
 >
-> 1. **Prefill via WMMA (in progress: W1–W3 done).** Next, W4 for the 35B: WMMA on the expert tiles
->    (`matmul_q8_id_*` → a 16- or 32-token-wide WMMA tile per expert group). Then W5: long-prompt
->    attention. See "TODO: prefill via WMMA" below.
+> 1. **Prefill (W1–W4 done).** Next is W5: DeltaNet prefill parallelism, then query-tiled flash
+>    attention, then fuller expert tiles. See "TODO: prefill via WMMA" below.
 > 2. **35B generation (16.5 ms GPU per token):**
 >    - BF16 LM head: 5.1 ms at ~200 GB/s (1 GB, the bandwidth floor is ~4.2 ms).
 >    - Expert matvecs: 3.3 ms at ~160 GB/s.
@@ -1372,13 +1371,32 @@ for the symptoms above.
 >   - Apply `d_row · d_tok` once per 256, and subtract the min / −32 offset terms through the Q8_K group
 >     sums (bsums) per (row, token), as now.
 >   - Q6_K's 210-byte blocks are 2-aligned: stage them with 2-byte loads.
+> - **W4 — DONE ✅ (2026-10-17): WMMA on the MoE expert tiles.** 35B prefill 581 → **712 tokens/s**
+>   (561 tokens).
+>   - `wmma_q80` is a template over the token-tile width (4 × 16 tokens dense, 1 × 16 per expert tile) and
+>     a row map (`WRowsLinear` / `WRowsExpert`). `matmul_wmma_id_<type>` runs `moe_group`'s tiles: 64
+>     expert rows × 16 entries, 80 VGPRs, no spills.
+>   - `forward_verify` checks the grouped prefill path directly on the reference's own expert choice:
+>     ≤ 7.8e-7 with WMMA, identical to the per-token expert kernels without it.
+>   - **Profile at 2,101 tokens:**
+>     - 4B at 1,423 tokens/s: FFN 42%, DeltaNet 34%, attention 21% (O(n²), growing).
+>     - 35B at 739 tokens/s: experts 67%, DeltaNet 20%, attention 11%.
+>   - Original W4 text:
 > - **W4. Dispatch and integration.**
 >   - `qmatvec_launch_q8_batch` picks WMMA for T ≥ 16 and keeps `matmul_q8_*` for small T and the tails.
 >   - ROCMFP4_FAST (the 35B's main type) gets the same kernel; its 17-byte blocks need 1-byte staging
 >     or block-pair loads.
 >   - Re-tune the micro-batch: bigger tiles want B = 128–256.
 >   - Expected: matmuls at ~20 TOPS → ~0.35 ms/token, ~2,500 tokens/s for the matmuls.
-> - **W5. Then the rest of prefill becomes visible:**
+> - **W5 (next), in order:**
+>   1. **DeltaNet prefill parallelism.** The batched `deltanet_rule` has one workgroup per V head (32 in
+>      total), each looping over the batch's tokens. The 128 state columns are independent: split each
+>      head over 4–8 workgroups, and move the gated RMSNorm (which needs the whole head's output) into a
+>      small follow-up kernel. 34% of 4B prefill at 2k tokens.
+>   2. **Query-tiled flash attention for long prompts** (see below).
+>   3. **35B experts:** expert tiles average ~8 of 16 entries, so half of each WMMA tile is padding. Try
+>      micro-batches of 512 or 32-entry tiles.
+> - **W5. Then the rest of prefill becomes visible** (original text):
 >   - **Attention for long prompts is O(n²)** and recomputes K/V loads per query token. Needs a
 >     query-tiled flash attention (several tokens per workgroup share each K/V chunk), with FP16 WMMA
 >     for QKᵀ and PV.
