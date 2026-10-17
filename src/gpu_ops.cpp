@@ -29,13 +29,15 @@ void gpu_ops_free(void) {
     g_norm = g_swiglu = nullptr;
 }
 
-hipError_t gpu_add_rmsnorm(const float* x_in, const float* add, float* x_out, const float* w, float* y, int n,
+hipError_t gpu_add_rmsnorm(const float* x_in, const float* add, float* x_out, const float* w, float* y, int n, int T,
                            float eps, const qmatvec_q8* q8, hipStream_t stream) {
     if (!g_norm) return hipErrorInvalidDeviceFunction;
-    if ((q8 && (n % 256 != 0 || n > q8->max_k)) || (add && x_out == x_in)) return hipErrorInvalidValue;
+    if (T <= 0 || (q8 && (n % 256 != 0 || (long long)n * T > q8->max_k)) || (add && x_out == x_in))
+        return hipErrorInvalidValue;
     qmatvec_q8_out o = qmatvec_q8_outputs(q8);
     void* args[] = {(void*)&x_in, (void*)&add, &x_out, (void*)&w, &y, &n, &eps, &o};
-    return hipModuleLaunchKernel(g_norm, (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1, 0, stream, args, nullptr);
+    return hipModuleLaunchKernel(g_norm, (unsigned)((n + 255) / 256), (unsigned)T, 1, 256, 1, 1, 0, stream, args,
+                                 nullptr);
 }
 
 hipError_t gpu_swiglu(const float* g, const float* u, float* out, int n, const qmatvec_q8* q8, hipStream_t stream) {

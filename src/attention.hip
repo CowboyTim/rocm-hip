@@ -4,15 +4,20 @@
 // as the CPU reference in qwen_ops.cpp (qwen_rmsnorm, qwen_rope_neox, qwen_attention), which follows
 // llama.cpp's qwen35 graph. HD = head_dim = 256 (the host checks it).
 //
-// attn_prep     grid n_q + n_kv, block HD. Workgroup h < n_q: Q head h (first half of attn_q's [Q | gate]
+// All three take T tokens at positions pos0 .. pos0 + T - 1 (prefill; T = 1 when generating) through the
+// last grid dimension; token z attends to positions 0 .. pos0 + z (causal). Per-token rows: qfull
+// [2 * n_q * HD], k / v [n_kv * HD], q / out [n_q * HD].
+//
+// attn_prep     grid (n_q + n_kv, T), block HD. Workgroup h < n_q: Q head h (first half of attn_q's [Q | gate]
 //               head), RMSNorm with q_norm, NeoX RoPE over the first n_rot dims -> q. Workgroup n_q + g:
 //               K head g, RMSNorm with k_norm, RoPE -> FP16 into the K cache row of this position, and V
 //               head g -> FP16 into the V cache row. The CPU never touches the KV cache.
-// attn_partial  grid (n_q, n_chunks), block HD (= CH positions per chunk). Flash-decoding: thread t scores
+// attn_partial  grid (n_q, n_chunks, T), block HD (= CH positions per chunk), n_chunks for the last token;
+//               chunks past a token's last position contribute nothing (m = -inf, l = 0, acc = 0). Flash-decoding: thread t scores
 //               position chunk * CH + t against q (q . K / sqrt(HD)), the workgroup takes the chunk's max m
 //               and sum l of exp(score - m), then thread d accumulates sum_t exp(score_t - m) * V[t][d]
 //               (coalesced over d). Writes m, l and acc[HD] per (head, chunk).
-// attn_combine  grid n_q, block HD. Merges the chunks (rescaling each by exp(m_c - M)), divides by the total
+// attn_combine  grid (n_q, T), block HD. Merges the chunks (rescaling each by exp(m_c - M)), divides by the total
 //               weight and applies the output gate sigmoid(gate) -> out. out feeds attn_output, so it is also
 //               quantized for the int8 matvec when o.qK != NULL (one head = one 256-value block).
 // Query head h reads KV head h / (n_q / n_kv), as ggml's broadcast does.
@@ -83,8 +88,14 @@ __device__ float norm_rope(float x, const float* w, int n_rot, int pos, float fr
 
 extern "C" __global__ void __launch_bounds__(HD)
 attn_prep(const float* qfull, const float* k, const float* v, const float* q_norm, const float* k_norm, float* q_out,
-          __half* k_row, __half* v_row, int n_q, int n_rot, int pos, float freq_base, float eps) {
-    const int b = blockIdx.x, d = threadIdx.x;
+          __half* K, __half* V, int kv_stride, int n_q, int n_kv, int n_rot, int pos0, float freq_base, float eps) {
+    const int b = blockIdx.x, d = threadIdx.x, z = blockIdx.y, pos = pos0 + z;
+    qfull += (size_t)z * 2 * n_q * HD;
+    q_out += (size_t)z * n_q * HD;
+    k += (size_t)z * n_kv * HD;
+    v += (size_t)z * n_kv * HD;
+    __half* k_row = K + (size_t)pos * kv_stride;
+    __half* v_row = V + (size_t)pos * kv_stride;
     if (b < n_q) {
         const float x = qfull[(size_t)b * 2 * HD + d];
         q_out[b * HD + d] = norm_rope(x, q_norm, n_rot, pos, freq_base, eps);
@@ -97,10 +108,14 @@ attn_prep(const float* qfull, const float* k, const float* v, const float* q_nor
 }
 
 extern "C" __global__ void __launch_bounds__(HD)
-attn_partial(const float* q, const __half* K, const __half* V, int kv_stride, int n_kv, int n_q, int n_kv_heads,
+attn_partial(const float* q, const __half* K, const __half* V, int kv_stride, int pos0, int n_q, int n_kv_heads,
              float scale, float* part_ml, float* part_acc) {
     __shared__ float sq[HD], sw[CH];
-    const int h = blockIdx.x, c = blockIdx.y, t = threadIdx.x, n_chunks = gridDim.y;
+    const int h = blockIdx.x, c = blockIdx.y, t = threadIdx.x, n_chunks = gridDim.y, z = blockIdx.z;
+    const int n_kv = pos0 + z + 1;
+    q += (size_t)z * n_q * HD;
+    part_ml += (size_t)2 * z * n_q * n_chunks;
+    part_acc += (size_t)z * n_q * n_chunks * HD;
     const int g = h / (n_q / n_kv_heads);
     sq[t] = q[h * HD + t];
     __syncthreads();
@@ -130,7 +145,7 @@ attn_partial(const float* q, const __half* K, const __half* V, int kv_stride, in
     __syncthreads();
 
     // acc[d] over this chunk's positions (thread per dim)
-    const int p0 = c * CH, np = min(CH, n_kv - p0);
+    const int p0 = c * CH, np = max(0, min(CH, n_kv - p0));
     const __half* vb = V + (size_t)p0 * kv_stride + (size_t)g * HD + t;
     float acc = 0.0f;
     for (int i = 0; i < np; ++i) acc += sw[i] * __half2float(vb[(size_t)i * kv_stride]);
@@ -144,9 +159,14 @@ attn_partial(const float* q, const __half* K, const __half* V, int kv_stride, in
 }
 
 extern "C" __global__ void __launch_bounds__(HD)
-attn_combine(const float* part_ml, const float* part_acc, int n_chunks, const float* qfull, float* out, Q8Out o) {
+attn_combine(const float* part_ml, const float* part_acc, int n_chunks, int n_q, const float* qfull, float* out,
+             Q8Out o) {
     __shared__ Q8Shared sh;
-    const int h = blockIdx.x, d = threadIdx.x;
+    const int h = blockIdx.x, d = threadIdx.x, z = blockIdx.y;
+    part_ml += (size_t)2 * z * n_q * n_chunks;
+    part_acc += (size_t)z * n_q * n_chunks * HD;
+    qfull += (size_t)z * 2 * n_q * HD;
+    out += (size_t)z * n_q * HD;
     const float* ml = part_ml + (size_t)2 * h * n_chunks;
     float M = -INFINITY;
     for (int c = 0; c < n_chunks; ++c) M = fmaxf(M, ml[2 * c]);
@@ -159,5 +179,5 @@ attn_combine(const float* part_ml, const float* part_acc, int n_chunks, const fl
     const float gate = qfull[(size_t)h * 2 * HD + HD + d];
     const float r = num / den / (1.0f + __expf(-gate));
     out[h * HD + d] = r;
-    if (o.qK) q8_block_value(r, true, h, d, sh, o);  // uniform; HD == 256
+    if (o.qK) q8_block_value(r, true, z * n_q + h, d, sh, o);  // uniform; HD == 256: one head = one block
 }

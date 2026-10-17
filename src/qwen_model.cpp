@@ -135,7 +135,7 @@ struct Scratch {
                                 (size_t)HKV * HD, (size_t)HKV * HD, (size_t)HQ * HD, (size_t)E,
                                 (size_t)FF, (size_t)FF, (size_t)FF, (size_t)V,
                                 (size_t)conv_dim, (size_t)conv_dim, (size_t)DI, (size_t)NV, (size_t)NV, (size_t)DI,
-                                attention_part_ml_floats(HQ, n_ctx), attention_part_acc_floats(HQ, n_ctx),
+                                attention_part_ml_floats(HQ, n_ctx, 1), attention_part_acc_floats(HQ, n_ctx, 1),
                                 (qmatvec_q8_bytes(q8_max_k) + 3) / 4};
         float** const ptrs[] = {&x, &x_alt, &xn, &qfull, &q, &k, &v, &attn, &proj, &ffg, &ffu, &act, &logits,
                                 &qkv, &conv, &z, &alpha, &beta, &lin, &part_ml, &part_acc, &q8mem};
@@ -331,7 +331,7 @@ struct QwenModel {
         __half* V = kv_cache_v_row(eng->kvc, L.kv_slot, 0);
         if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
         const qmatvec_q8* q8 = q8_for(HQ * eng->head_dim);
-        if (!check(attention_forward(s.qfull, s.k, s.v, L.q_norm, L.k_norm, K, V, HQ, HKV, eng->n_rot, pos,
+        if (!check(attention_forward(s.qfull, s.k, s.v, L.q_norm, L.k_norm, K, V, HQ, HKV, eng->n_rot, pos, 1,
                                      eng->rope_freq_base, (float)eng->eps, s.q, s.part_ml, s.part_acc, s.attn, q8, 0),
                    "attention kernels"))
             return false;
@@ -359,8 +359,8 @@ struct QwenModel {
         // conv1d + SiLU + q/k L2 norm + gates, then the delta rule + gated norm; alpha/beta become
         // g / sigmoid(beta) in place
         if (!check(deltanet_pre(s.qkv, rs.conv[l], L.ssm_conv1d, eng->ssm_d_conv, s.conv, NG, NV, s.alpha, s.beta,
-                                L.ssm_dt, L.ssm_a, s.alpha, s.beta, eps, 0), "deltanet_pre") ||
-            !check(deltanet_rule(rs.ssm[l], s.conv, s.alpha, s.beta, s.z, L.ssm_norm, s.lin, NG, NV, eps, 0),
+                                L.ssm_dt, L.ssm_a, s.alpha, s.beta, eps, 1, 0), "deltanet_pre") ||
+            !check(deltanet_rule(rs.ssm[l], s.conv, s.alpha, s.beta, s.z, L.ssm_norm, s.lin, NG, NV, eps, 1, 0),
                    "deltanet_rule") ||
             !produced(s.lin, eng->ssm_d_inner))
             return false;
@@ -373,7 +373,7 @@ struct QwenModel {
         const int E = eng->n_embd, FF = eng->n_ff;
         const float eps = (float)eng->eps;
         const qmatvec_q8 *qe = q8_for(E), *qf = q8_for(FF);
-        if (!check(gpu_add_rmsnorm(s.x, s.proj, s.x_alt, L.ffn_norm, s.xn, E, eps, qe, 0), "add_rmsnorm")) return false;
+        if (!check(gpu_add_rmsnorm(s.x, s.proj, s.x_alt, L.ffn_norm, s.xn, E, 1, eps, qe, 0), "add_rmsnorm")) return false;
         std::swap(s.x, s.x_alt);
         mark(s.xn, E, qe);
         if (!matvec(L.W_gate, s.xn, s.ffg, P_FFN) || !matvec(L.W_up, s.xn, s.ffu, P_FFN) ||
@@ -381,7 +381,7 @@ struct QwenModel {
             return false;
         mark(s.act, FF, qf);
         if (!matvec(L.W_down, s.act, s.proj, P_FFN) ||
-            !check(gpu_add_rmsnorm(s.x, s.proj, s.x_alt, next_norm, s.xn, E, eps, qe, 0), "add_rmsnorm"))
+            !check(gpu_add_rmsnorm(s.x, s.proj, s.x_alt, next_norm, s.xn, E, 1, eps, qe, 0), "add_rmsnorm"))
             return false;
         std::swap(s.x, s.x_alt);
         mark(s.xn, E, qe);
@@ -405,7 +405,7 @@ struct QwenModel {
         // A sequence starting at position 0 starts from zero recurrent state (the KV cache needs no reset:
         // attention only reads positions 0..pos)
         if (pos == 0 && !check(rs.reset(), "recurrent state reset")) return -1;
-        if (!check(gpu_add_rmsnorm(s.x, nullptr, s.x, eng->layers[0].attn_norm, s.xn, E, eps, q8_for(E), 0),
+        if (!check(gpu_add_rmsnorm(s.x, nullptr, s.x, eng->layers[0].attn_norm, s.xn, E, 1, eps, q8_for(E), 0),
                    "add_rmsnorm"))
             return -1;
         mark(s.xn, E, q8_for(E));

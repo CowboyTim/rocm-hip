@@ -31,19 +31,20 @@ void deltanet_free(void) {
 
 hipError_t deltanet_pre(const float* qkv, float* conv_state, const float* conv_w, int d_conv, float* conv_out,
                         int n_k, int n_v, const float* alpha, const float* beta_in, const float* dt_bias,
-                        const float* ssm_a, float* g_out, float* beta_out, float eps, hipStream_t stream) {
+                        const float* ssm_a, float* g_out, float* beta_out, float eps, int T, hipStream_t stream) {
     if (!g_pre) return hipErrorInvalidDeviceFunction;
-    if (d_conv < 2 || d_conv > 8 || n_v > DELTANET_HEAD_SIZE) return hipErrorInvalidValue;
+    if (d_conv < 2 || d_conv > 8 || T <= 0) return hipErrorInvalidValue;
     int n_qk = 2 * n_k;
     void* args[] = {(void*)&qkv, &conv_state, (void*)&conv_w, &d_conv, &conv_out, &n_qk, (void*)&alpha,
-                    (void*)&beta_in, (void*)&dt_bias, (void*)&ssm_a, &g_out, &beta_out, &n_v, &eps};
+                    (void*)&beta_in, (void*)&dt_bias, (void*)&ssm_a, &g_out, &beta_out, &n_v, &eps, &T};
     return hipModuleLaunchKernel(g_pre, (unsigned)(2 * n_k + n_v), 1, 1, DELTANET_HEAD_SIZE, 1, 1, 0, stream, args,
                                  nullptr);
 }
 
 hipError_t deltanet_rule(float* state, const float* conv_out, const float* g, const float* beta, const float* z,
-                         const float* norm_w, float* out, int n_k, int n_v, float eps, hipStream_t stream) {
+                         const float* norm_w, float* out, int n_k, int n_v, float eps, int T, hipStream_t stream) {
     if (!g_rule) return hipErrorInvalidDeviceFunction;
-    void* args[] = {&state, (void*)&conv_out, (void*)&g, (void*)&beta, (void*)&z, (void*)&norm_w, &out, &n_k, &eps};
+    if (T <= 0) return hipErrorInvalidValue;
+    void* args[] = {&state, (void*)&conv_out, (void*)&g, (void*)&beta, (void*)&z, (void*)&norm_w, &out, &n_k, &eps, &T};
     return hipModuleLaunchKernel(g_rule, (unsigned)n_v, 1, 1, DELTANET_HEAD_SIZE, 1, 1, 0, stream, args, nullptr);
 }

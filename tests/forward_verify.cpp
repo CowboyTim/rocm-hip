@@ -437,9 +437,9 @@ int main(int argc, char** argv) {
             memcpy(b_be.p, &beta[(size_t)t * NV], NV * sizeof(float));
             memcpy(b_z.p, &z[(size_t)t * DI], DI * sizeof(float));
             hipError_t e = deltanet_pre(b_qkv.p, b_cs.p, L.ssm_conv1d, DC, b_out.p, NG, NV, b_al.p, b_be.p, L.ssm_dt,
-                                        L.ssm_a, b_al.p, b_be.p, eps, 0);
+                                        L.ssm_a, b_al.p, b_be.p, eps, 1, 0);
             if (e == hipSuccess)
-                e = deltanet_rule(b_st.p, b_out.p, b_al.p, b_be.p, b_z.p, L.ssm_norm, b_lin.p, NG, NV, eps, 0);
+                e = deltanet_rule(b_st.p, b_out.p, b_al.p, b_be.p, b_z.p, L.ssm_norm, b_lin.p, NG, NV, eps, 1, 0);
             if (e == hipSuccess) e = hipDeviceSynchronize();
             if (e != hipSuccess) { fprintf(stderr, "deltanet kernels: %s\n", hipGetErrorString(e)); return 1; }
             gq.add(b_out.p, &qn[(size_t)t * KD], KD);
@@ -462,6 +462,45 @@ int main(int argc, char** argv) {
         snprintf(what, sizeof(what), "blk.%d GPU beta sigmoid", ll); report(what, gb);
         snprintf(what, sizeof(what), "blk.%d GPU delta rule + gated norm", ll); report(what, gfo);
         snprintf(what, sizeof(what), "blk.%d GPU delta rule final state", ll); report(what, gst);
+
+        // The same kernels on all T tokens in one call (prefill), from the reference's initial state
+        {
+            ShmBuf c_qkv, c_out, c_al, c_be, c_z, c_lin;
+            if (!c_qkv.alloc("fwdv_dnb_qkv.bin", (size_t)T * CD) || !c_out.alloc("fwdv_dnb_out.bin", (size_t)T * CD) ||
+                !c_al.alloc("fwdv_dnb_al.bin", (size_t)T * NV) || !c_be.alloc("fwdv_dnb_be.bin", (size_t)T * NV) ||
+                !c_z.alloc("fwdv_dnb_z.bin", (size_t)T * DI) || !c_lin.alloc("fwdv_dnb_lin.bin", (size_t)T * DI)) {
+                fprintf(stderr, "alloc failed\n");
+                return 1;
+            }
+            memcpy(b_cs.p, cst.data(), cst.size() * sizeof(float));
+            for (int hh = 0; hh < NV; ++hh)
+                for (int i = 0; i < DS; ++i)
+                    for (int j = 0; j < DS; ++j)
+                        b_st.p[((size_t)hh * DS + i) * DS + j] = st0[((size_t)hh * DS + j) * DS + i];
+            memcpy(c_qkv.p, qkv.data(), (size_t)T * CD * sizeof(float));
+            memcpy(c_al.p, alpha.data(), (size_t)T * NV * sizeof(float));
+            memcpy(c_be.p, beta.data(), (size_t)T * NV * sizeof(float));
+            memcpy(c_z.p, z.data(), (size_t)T * DI * sizeof(float));
+            hipError_t e = deltanet_pre(c_qkv.p, b_cs.p, L.ssm_conv1d, DC, c_out.p, NG, NV, c_al.p, c_be.p, L.ssm_dt,
+                                        L.ssm_a, c_al.p, c_be.p, eps, T, 0);
+            if (e == hipSuccess)
+                e = deltanet_rule(b_st.p, c_out.p, c_al.p, c_be.p, c_z.p, L.ssm_norm, c_lin.p, NG, NV, eps, T, 0);
+            if (e == hipSuccess) e = hipDeviceSynchronize();
+            if (e != hipSuccess) { fprintf(stderr, "batched deltanet kernels: %s\n", hipGetErrorString(e)); return 1; }
+            Stat bq, bfo, bst;
+            for (int t = 0; t < T; ++t) {
+                bq.add(c_out.p + (size_t)t * CD, &qn[(size_t)t * KD], KD);
+                bfo.add(c_lin.p + (size_t)t * DI, &fo[(size_t)t * DI], DI);
+            }
+            for (int hh = 0; hh < NV; ++hh)
+                for (int i = 0; i < DS; ++i)
+                    for (int j = 0; j < DS; ++j)
+                        st_t[((size_t)hh * DS + j) * DS + i] = b_st.p[((size_t)hh * DS + i) * DS + j];
+            bst.add(st_t.data(), st1.data(), NV * DS * DS);
+            snprintf(what, sizeof(what), "blk.%d GPU batched (%d tok) conv+L2: q", ll, T); report(what, bq);
+            snprintf(what, sizeof(what), "blk.%d GPU batched (%d tok) output", ll, T); report(what, bfo);
+            snprintf(what, sizeof(what), "blk.%d GPU batched (%d tok) state", ll, T); report(what, bst);
+        }
     }
 
     // ---- first full-attention layer: projections, q/k norm, RoPE, attention, gate, output
@@ -554,8 +593,8 @@ int main(int argc, char** argv) {
         if (HD != ATTN_HEAD_DIM || attention_init("attention.co") != 0) { fprintf(stderr, "attention kernels unavailable\n"); return 1; }
         ShmBuf b_qf, b_k, b_v, b_q, b_ml, b_acc, b_out, b_K, b_V;
         if (!b_qf.alloc("fwdv_at_qf.bin", 2 * DQ) || !b_k.alloc("fwdv_at_k.bin", DKV) || !b_v.alloc("fwdv_at_v.bin", DKV) ||
-            !b_q.alloc("fwdv_at_q.bin", DQ) || !b_ml.alloc("fwdv_at_ml.bin", attention_part_ml_floats(HQ, P)) ||
-            !b_acc.alloc("fwdv_at_acc.bin", attention_part_acc_floats(HQ, P)) || !b_out.alloc("fwdv_at_out.bin", DQ) ||
+            !b_q.alloc("fwdv_at_q.bin", DQ) || !b_ml.alloc("fwdv_at_ml.bin", attention_part_ml_floats(HQ, P, 1)) ||
+            !b_acc.alloc("fwdv_at_acc.bin", attention_part_acc_floats(HQ, P, 1)) || !b_out.alloc("fwdv_at_out.bin", DQ) ||
             !b_K.alloc("fwdv_at_K.bin", (size_t)P * DKV / 2 + 1) || !b_V.alloc("fwdv_at_V.bin", (size_t)P * DKV / 2 + 1)) {
             fprintf(stderr, "alloc failed\n");
             return 1;
@@ -587,7 +626,7 @@ int main(int argc, char** argv) {
         for (int h = 0; h < HQ; ++h)
             for (int d = 0; d < HD; ++d) ref_out[(size_t)h * HD + d] *= qwen_sigmoid(b_qf.p[(size_t)h * 2 * HD + HD + d]);
 
-        hipError_t e = attention_forward(b_qf.p, b_k.p, b_v.p, L.q_norm, L.k_norm, K, Vc, HQ, HKV, m->n_rot, pos,
+        hipError_t e = attention_forward(b_qf.p, b_k.p, b_v.p, L.q_norm, L.k_norm, K, Vc, HQ, HKV, m->n_rot, pos, 1,
                                          m->rope_freq_base, eps, b_q.p, b_ml.p, b_acc.p, b_out.p, nullptr, 0);
         if (e == hipSuccess) e = hipDeviceSynchronize();
         if (e != hipSuccess) { fprintf(stderr, "attention kernels: %s\n", hipGetErrorString(e)); return 1; }
@@ -607,6 +646,56 @@ int main(int argc, char** argv) {
         snprintf(what, sizeof(what), "GPU attn_prep K row written to cache"); report(what, skv, 1e-3);
         snprintf(what, sizeof(what), "GPU attention, %d positions (%d chunks), gated", P, (P + ATTN_CHUNK - 1) / ATTN_CHUNK);
         report(what, so, 2e-3);
+
+        // Batched: TB tokens at positions pos0 .. P - 1 in one call (prefill). Each token's projections are
+        // random; the reference runs the CPU ops token by token, causally (token t sees positions <= pos0 + t).
+        {
+            const int TB = 8, pos0 = P - TB;
+            ShmBuf c_qf, c_k, c_v, c_q, c_ml, c_acc, c_out;
+            if (!c_qf.alloc("fwdv_atb_qf.bin", (size_t)TB * 2 * DQ) || !c_k.alloc("fwdv_atb_k.bin", (size_t)TB * DKV) ||
+                !c_v.alloc("fwdv_atb_v.bin", (size_t)TB * DKV) || !c_q.alloc("fwdv_atb_q.bin", (size_t)TB * DQ) ||
+                !c_ml.alloc("fwdv_atb_ml.bin", attention_part_ml_floats(HQ, P, TB)) ||
+                !c_acc.alloc("fwdv_atb_acc.bin", attention_part_acc_floats(HQ, P, TB)) ||
+                !c_out.alloc("fwdv_atb_out.bin", (size_t)TB * DQ)) {
+                fprintf(stderr, "alloc failed\n");
+                return 1;
+            }
+            for (size_t i = 0; i < (size_t)TB * 2 * DQ; ++i) c_qf.p[i] = 3.0f * rnd();
+            for (size_t i = 0; i < (size_t)TB * DKV; ++i) { c_k.p[i] = 3.0f * rnd(); c_v.p[i] = rnd(); }
+            // reference K/V rows for the batch positions, then attention per token
+            for (int t = 0; t < TB; ++t) {
+                std::vector<float> kt(DKV);
+                for (int g = 0; g < HKV; ++g) {
+                    qwen_rmsnorm(&c_k.p[(size_t)t * DKV + (size_t)g * HD], L.k_norm, &kt[(size_t)g * HD], HD, eps);
+                    qwen_rope_neox(&kt[(size_t)g * HD], m->n_rot, pos0 + t, m->rope_freq_base);
+                }
+                for (int i = 0; i < DKV; ++i) {
+                    Kr[(size_t)(pos0 + t) * DKV + i] = __float2half(kt[i]);
+                    Vr[(size_t)(pos0 + t) * DKV + i] = __float2half(c_v.p[(size_t)t * DKV + i]);
+                }
+            }
+            std::vector<float> refb((size_t)TB * DQ), qt(DQ);
+            for (int t = 0; t < TB; ++t) {
+                for (int h = 0; h < HQ; ++h) {
+                    qwen_rmsnorm(&c_qf.p[(size_t)t * 2 * DQ + (size_t)h * 2 * HD], L.q_norm, &qt[(size_t)h * HD], HD, eps);
+                    qwen_rope_neox(&qt[(size_t)h * HD], m->n_rot, pos0 + t, m->rope_freq_base);
+                }
+                qwen_attention(qt.data(), Kr.data(), Vr.data(), DKV, pos0 + t + 1, HQ, HKV, HD, 1.0f / sqrtf((float)HD),
+                               &refb[(size_t)t * DQ]);
+                for (int h = 0; h < HQ; ++h)
+                    for (int d = 0; d < HD; ++d)
+                        refb[(size_t)t * DQ + (size_t)h * HD + d] *=
+                            qwen_sigmoid(c_qf.p[(size_t)t * 2 * DQ + (size_t)h * 2 * HD + HD + d]);
+            }
+            e = attention_forward(c_qf.p, c_k.p, c_v.p, L.q_norm, L.k_norm, K, Vc, HQ, HKV, m->n_rot, pos0, TB,
+                                  m->rope_freq_base, eps, c_q.p, c_ml.p, c_acc.p, c_out.p, nullptr, 0);
+            if (e == hipSuccess) e = hipDeviceSynchronize();
+            if (e != hipSuccess) { fprintf(stderr, "batched attention kernels: %s\n", hipGetErrorString(e)); return 1; }
+            Stat sb;
+            for (int t = 0; t < TB; ++t) sb.add(c_out.p + (size_t)t * DQ, &refb[(size_t)t * DQ], DQ);
+            snprintf(what, sizeof(what), "GPU attention batched, %d tok at pos %d..%d", TB, pos0, P - 1);
+            report(what, sb, 2e-3);
+        }
         attention_free();
     }
 

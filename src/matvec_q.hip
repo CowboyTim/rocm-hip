@@ -660,7 +660,7 @@ matmul_q8_q4_0_rocmfp4(MM_ARGS) {
                 lo[h][k] = rocmfp4_dec4(qs[h][k] & 0x0F0F0F0Fu);
                 hi[h][k] = rocmfp4_dec4((qs[h][k] >> 4) & 0x0F0F0F0Fu);
             }
-#pragma unroll
+        // Not unrolled: 16 copies of the body cost more in registers than the loop does (600 vs 466 tokens/s)
         for (int j = 0; j < MM_TB; ++j) {
             if (j >= nt) break;
             const long long t = t0 + j;
@@ -705,7 +705,7 @@ matmul_q8_q6_K(MM_ARGS) {
         }
         const int sclo = sc[g_lo], schi = sc[g_hi], sc_a = sc[2 * s], sc_b = sc[2 * s + 1];
         const float dw = fp16(b + 208);
-#pragma unroll
+        // Not unrolled: 16 copies of the body cost more in registers than the loop does (600 vs 466 tokens/s)
         for (int j = 0; j < MM_TB; ++j) {
             if (j >= nt) break;
             const long long t = t0 + j;
@@ -751,7 +751,7 @@ __device__ void matmul_q8_kquant(MM_ARGS) {
         scale_min_k4(2 * c + 1, b + 4, sc2, m2);
         scale_min_k4(s, b + 4, sm, mm);
         const float dw = fp16(b), dmin = fp16(b + 2);
-#pragma unroll
+        // Not unrolled: 16 copies of the body cost more in registers than the loop does (600 vs 466 tokens/s)
         for (int j = 0; j < MM_TB; ++j) {
             if (j >= nt) break;
             const long long t = t0 + j;

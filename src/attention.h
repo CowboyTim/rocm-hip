@@ -22,21 +22,21 @@ extern "C" {
 int attention_init(const char* co_path);
 void attention_free(void);
 
-// Partial-result buffer sizes, in floats, for up to n_ctx positions
-static inline size_t attention_part_ml_floats(int n_q, int n_ctx) {
-    return (size_t)2 * n_q * ((n_ctx + ATTN_CHUNK - 1) / ATTN_CHUNK);
+// Partial-result buffer sizes, in floats, for T tokens and up to n_ctx positions
+static inline size_t attention_part_ml_floats(int n_q, int n_ctx, int T) {
+    return (size_t)2 * T * n_q * ((n_ctx + ATTN_CHUNK - 1) / ATTN_CHUNK);
 }
-static inline size_t attention_part_acc_floats(int n_q, int n_ctx) {
-    return (size_t)n_q * ((n_ctx + ATTN_CHUNK - 1) / ATTN_CHUNK) * ATTN_HEAD_DIM;
+static inline size_t attention_part_acc_floats(int n_q, int n_ctx, int T) {
+    return (size_t)T * n_q * ((n_ctx + ATTN_CHUNK - 1) / ATTN_CHUNK) * ATTN_HEAD_DIM;
 }
 
-// One token at position pos (attends to positions 0..pos):
+// T tokens at positions pos0 .. pos0 + T - 1; token t attends to positions 0 .. pos0 + t. Per token row t:
 //   qfull [n_q][2 * 256] (attn_q output, [Q | gate] per head), k, v [n_kv * 256] (attn_k / attn_v outputs),
-//   q_norm, k_norm [256]; K, V: the layer's cache (row p at p * kv_stride halves, kv_stride = n_kv * 256);
-//   q: scratch [n_q * 256]; part_ml / part_acc: scratch sized by the helpers above; out [n_q * 256] (gated).
-//   q8: if not NULL, out is also quantized into it for the int8 attn_output matvec.
+//   q: scratch [n_q * 256], out [n_q * 256] (gated). q_norm, k_norm [256]; K, V: the layer's cache (row p at
+//   p * kv_stride halves, kv_stride = n_kv * 256); part_ml / part_acc: scratch sized by the helpers above.
+//   q8: if not NULL, out is also quantized into it (flattened [T * n_q * 256]) for the int8 attn_output matmul.
 hipError_t attention_forward(const float* qfull, const float* k, const float* v, const float* q_norm,
-                             const float* k_norm, __half* K, __half* V, int n_q, int n_kv, int n_rot, int pos,
+                             const float* k_norm, __half* K, __half* V, int n_q, int n_kv, int n_rot, int pos0, int T,
                              float freq_base, float eps, float* q, float* part_ml, float* part_acc, float* out,
                              const qmatvec_q8* q8, hipStream_t stream);
 

@@ -40,71 +40,92 @@ __device__ float block_sum(float v) {
     return s;
 }
 
+// Both kernels take T consecutive tokens (prefill; T = 1 when generating) and loop over them in order: the
+// recurrence is sequential, but the conv history and each state column stay in registers for the whole batch,
+// so the state is read and written once per batch instead of once per token. Per-token rows: qkv / conv_out
+// [conv_dim], alpha / beta / g [n_v], z / out [n_v * DS].
+
 extern "C" __global__ void __launch_bounds__(DS)
 deltanet_pre(const float* qkv, float* conv_state, const float* conv_w, int d_conv, float* conv_out, int n_qk,
              const float* alpha, const float* beta_in, const float* dt_bias, const float* ssm_a, float* g_out,
-             float* beta_out, int n_v, float eps) {
+             float* beta_out, int n_v, float eps, int T) {
+    const int conv_dim = gridDim.x * DS;
     const int c = blockIdx.x * DS + threadIdx.x;
     const int ns = d_conv - 1;
     float* st = conv_state + (size_t)c * ns;
     const float* w = conv_w + (size_t)c * d_conv;
-    const float x = qkv[c];
-    float hist[MAX_DCONV];
-    float s = 0.0f;
-    for (int i = 0; i < ns; ++i) {
-        hist[i] = st[i];
-        s += hist[i] * w[i];
-    }
-    s += x * w[ns];
-    for (int i = 0; i + 1 < ns; ++i) st[i] = hist[i + 1];
-    st[ns - 1] = x;
+    float hist[MAX_DCONV], wc[MAX_DCONV];
+    for (int i = 0; i < ns; ++i) hist[i] = st[i];
+    for (int i = 0; i < d_conv; ++i) wc[i] = w[i];
 
-    float y = silu(s);
-    if ((int)blockIdx.x < n_qk) {  // uniform per workgroup
-        const float sum = block_sum(y * y);
-        y *= 1.0f / fmaxf(sqrtf(sum), eps);
-    }
-    conv_out[c] = y;
+    for (int t = 0; t < T; ++t) {
+        const float x = qkv[(size_t)t * conv_dim + c];
+        float s = 0.0f;
+        for (int i = 0; i < ns; ++i) s += hist[i] * wc[i];
+        s += x * wc[ns];
+        for (int i = 0; i + 1 < ns; ++i) hist[i] = hist[i + 1];
+        hist[ns - 1] = x;
 
-    if (blockIdx.x == 0 && (int)threadIdx.x < n_v) {
-        const int h = threadIdx.x;
-        const float a = alpha[h] + dt_bias[h];
-        const float sp = a > 20.0f ? a : logf(1.0f + expf(a));
-        g_out[h] = sp * ssm_a[h];
-        beta_out[h] = 1.0f / (1.0f + expf(-beta_in[h]));
+        float y = silu(s);
+        if ((int)blockIdx.x < n_qk) {  // uniform per workgroup
+            const float sum = block_sum(y * y);
+            y *= 1.0f / fmaxf(sqrtf(sum), eps);
+        }
+        conv_out[(size_t)t * conv_dim + c] = y;
     }
+    for (int i = 0; i < ns; ++i) st[i] = hist[i];
+
+    if (blockIdx.x == 0)
+        for (int k = threadIdx.x; k < T * n_v; k += DS) {
+            const int h = k % n_v;
+            const float a = alpha[k] + dt_bias[h];
+            const float sp = a > 20.0f ? a : logf(1.0f + expf(a));
+            g_out[k] = sp * ssm_a[h];
+            beta_out[k] = 1.0f / (1.0f + expf(-beta_in[k]));
+        }
 }
 
 extern "C" __global__ void __launch_bounds__(DS)
 deltanet_rule(float* state, const float* conv_out, const float* g, const float* beta, const float* z,
-              const float* norm_w, float* out, int n_k, float eps) {
+              const float* norm_w, float* out, int n_k, float eps, int T) {
     __shared__ float sq[DS], sk[DS];
-    const int h = blockIdx.x, j = threadIdx.x, hk = h % n_k;
-    sq[j] = conv_out[hk * DS + j];
-    sk[j] = conv_out[n_k * DS + hk * DS + j];
-    const float v = conv_out[2 * n_k * DS + h * DS + j];
-    __syncthreads();
-
+    const int h = blockIdx.x, j = threadIdx.x, hk = h % n_k, n_v = gridDim.x;
+    const int conv_dim = 2 * n_k * DS + n_v * DS;
     float* S = state + (size_t)h * DS * DS;
-    const float decay = expf(g[h]);
     float col[DS];
-    float kv = 0.0f;
 #pragma unroll
-    for (int i = 0; i < DS; ++i) {
-        col[i] = S[i * DS + j] * decay;
-        kv += col[i] * sk[i];
-    }
-    const float delta = (v - kv) * beta[h];
-    float o = 0.0f;
-#pragma unroll
-    for (int i = 0; i < DS; ++i) {
-        const float sij = col[i] + sk[i] * delta;
-        S[i * DS + j] = sij;
-        o += sij * sq[i];
-    }
-    o *= 1.0f / sqrtf((float)DS);
+    for (int i = 0; i < DS; ++i) col[i] = S[i * DS + j];
+    const float nw = norm_w[j];
 
-    const float ss = block_sum(o * o);
-    const float inv = rsqrtf(ss / DS + eps);
-    out[h * DS + j] = o * inv * norm_w[j] * silu(z[h * DS + j]);
+    for (int t = 0; t < T; ++t) {
+        const float* co = conv_out + (size_t)t * conv_dim;
+        __syncthreads();  // the previous token's reads of sq / sk are done
+        sq[j] = co[hk * DS + j];
+        sk[j] = co[n_k * DS + hk * DS + j];
+        const float v = co[2 * n_k * DS + h * DS + j];
+        __syncthreads();
+
+        const float decay = expf(g[t * n_v + h]);
+        float kv = 0.0f;
+#pragma unroll
+        for (int i = 0; i < DS; ++i) {
+            col[i] *= decay;
+            kv += col[i] * sk[i];
+        }
+        const float delta = (v - kv) * beta[t * n_v + h];
+        float o = 0.0f;
+#pragma unroll
+        for (int i = 0; i < DS; ++i) {
+            col[i] += sk[i] * delta;
+            o += col[i] * sq[i];
+        }
+        o *= 1.0f / sqrtf((float)DS);
+
+        const float ss = block_sum(o * o);
+        const float inv = rsqrtf(ss / DS + eps);
+        const size_t r = (size_t)t * n_v * DS + h * DS + j;
+        out[r] = o * inv * nw * silu(z[r]);
+    }
+#pragma unroll
+    for (int i = 0; i < DS; ++i) S[i * DS + j] = col[i];
 }

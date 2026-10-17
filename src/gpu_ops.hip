@@ -13,7 +13,8 @@
 
 #include "q8_device.h"
 
-// add_rmsnorm: grid ceil(n / 256), block 256. Every workgroup computes the full sum of squares itself (n is
+// add_rmsnorm: grid (ceil(n / 256), T), block 256; blockIdx.y is the token (rows of n values, quantized as
+// one flattened [T * n] vector). Every workgroup computes the full sum of squares itself (n is
 // small, ~10 KB, and the redundant reads hit the cache), then normalizes and quantizes only its own 256-value
 // block: the whole GPU works on it instead of one workgroup (that took ~9.5 us, 65 times per token). The
 // residual is written to x_out, not back to x_in, so workgroups never read a value another one has already
@@ -23,6 +24,11 @@ extern "C" __global__ void __launch_bounds__(256)
 add_rmsnorm(const float* x_in, const float* add, float* x_out, const float* w, float* y, int n, float eps, Q8Out o) {
     __shared__ float part[8];
     __shared__ Q8Shared sh;
+    const long long row = (long long)blockIdx.y * n;
+    x_in += row;
+    x_out += row;
+    y += row;
+    if (add) add += row;
     const int t = threadIdx.x, i = blockIdx.x * 256 + t;
     float ss = 0.0f;
     for (int k = t; k < n; k += 256) {
@@ -45,7 +51,7 @@ add_rmsnorm(const float* x_in, const float* add, float* x_out, const float* w, f
         v = v * inv * (w ? w[i] : 1.0f);
         y[i] = v;
     }
-    if (o.qK) q8_block_value(v, active, blockIdx.x, t, sh, o);  // uniform; n % 256 == 0 when set
+    if (o.qK) q8_block_value(v, active, blockIdx.y * (n / 256) + blockIdx.x, t, sh, o);  // uniform; n % 256 == 0
 }
 
 extern "C" __global__ void __launch_bounds__(256)
