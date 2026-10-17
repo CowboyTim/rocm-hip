@@ -1214,17 +1214,52 @@ for the symptoms above.
 > - Use the GPU as much as possible, and use the 16 Zen 5 cores (AVX-512) for what stays on the CPU.
 > - Judge each change by the bytes it moves and the syncs it adds, measured with `QWEN_PROFILE=1`.
 >
-> Now **63.7 tok/s** generation and **~600 tok/s prefill** (a 2,101-token prompt in 3.5 s; it took ~42 s
-> token by token).
+> Now both target models run correctly on the GPU:
 >
-> 1. **Step 6 (35B-A3B, next):** router, top-8 of 256 experts, shared expert; `ref_dump acts` on the 35B
->    (into its own /dev/shm directory).
->    - TYPE101 (ROCMFP4_FAST) has float matvecs only: give it int8 and batched kernels too. Its 17-byte
->      blocks pair into 34 bytes (2-aligned), so the ROCmFP4 pair loads need 2-byte variants.
->    - BF16 `output.weight` has float matvecs only.
+> | Model | Generation | Prefill |
+> |---|---|---|
+> | Qwen3.5-4B | **63.7 tok/s** | **~600 tok/s** |
+> | Qwen3.6-35B-A3B (MoE) | **~47 tok/s** | **~246 tok/s** |
+>
+> 1. **35B speed (next):**
+>    - **BF16 LM head:** `output.weight` is BF16, 1 GB read per token, 7.3 ms (34% of a token) at
+>      140 GB/s through the generic float kernel (one value per lane). A vectorized BF16 kernel should
+>      reach ~220 GB/s, ~-2.5 ms.
+>    - **Small-K rows waste lanes:** the expert `down` projections have K = 512, i.e. 4
+>      ROCMFP4_FAST block-quads per row, so 4 of 32 lanes work. Gate/up (K = 2048) use half the lanes.
+>      Pack several rows per wave when a row has fewer than 32 lane-tasks. Expert matvecs run at ~80
+>      GB/s now.
+>    - **MoE prefill:** experts are matvec'd per (token, slot), with no weight reuse across tokens.
+>      Group tokens by expert (sort by id) and run each expert's tokens as a batched matmul.
 > 2. **Prefill speed: tiled WMMA GEMM** — see "TODO: prefill via WMMA" below.
 > 3. **Generation polish:** ROCmFP4 int8 bandwidth (192 vs 240 GB/s); a HIP graph per token (~0.6 ms of
 >    gaps).
+>
+> **Step 6: Qwen3.6-35B-A3B (MoE) — DONE ✅ (2026-10-17).** It matches the reference and generates text
+> identical to llama.cpp.
+> - **Loader:** MoE hparams; F32 router; 3-D expert tensors bound as one matrix of all experts' rows; the
+>   shared expert and its F32 gate vector.
+> - **ROCMFP4_FAST int8 and batched kernels:** 68-byte block quads, bytes extracted with
+>   `v_alignbyte_b32`.
+> - **MoE FFN entirely on the GPU, no CPU round trip:**
+>   - `moe_router`: softmax, top-8 in descending order, renormalized by max(sum, 6.1e-5), plus the
+>     shared-expert sigmoid gate.
+>   - Expert-indexed matvecs (`matvec_q8_id_*`, float `matvec_id_*`) read the selected ids from GPU
+>     memory, on a (row block, slot, token) grid.
+>   - `moe_combine`: weighted sum in slot order plus the gated shared expert.
+>   - The int8 kernel bodies became device functions shared by the plain and the expert-indexed
+>     kernels.
+> - **Reference:** `/dev/shm/ref_qwen36_35b` (`ref_dump acts`; 2,665 tensors, 395 MB, 2.3 s).
+> - **`forward_verify` on the 35B, all PASS:**
+>   - Router: the same top-8 experts as the reference for all 5 tokens; weights and the shared gate to
+>     ~1e-7.
+>   - Expert gate/up/down (int8, by id) ≤ 3.9e-7; shared expert ≤ 3.4e-7; combine 8.5e-8.
+>   - DeltaNet, attention and the BF16 LM head pass as well.
+>   - End to end: worst cos 0.9975 over 40 layers, next token " Paris". Prefill is bit-identical to
+>     token by token.
+>   - The 4B is unchanged.
+> - **Greedy:** 32 tokens on "The capital of France is" and on the Python prompt are **identical to
+>   llama-completion**.
 >
 > **TODO: prefill via WMMA (tiled int8 GEMM).** Goal: prefill ~600 → ~2,000+ tokens/s.
 >

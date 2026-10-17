@@ -419,6 +419,51 @@ MATVEC_COOP_KERNEL(q6_K, BlkQ6_KCoop)
 MATVEC_KERNEL(q4_0_rocmfp4, BlkROCmFP4)
 MATVEC_KERNEL(q4_0_rocmfp4_fast, BlkROCmFP4Fast)
 
+// Float expert-indexed (MoE) kernels, for types without an int8 kernel (and QWEN_MATVEC_FP32): same grid and
+// ids / x_per_slot convention as matvec_q8_id_<type> below, on the FP32 input rows.
+template <typename B, bool COOP>
+__device__ void matvec_id_impl(const uint8_t *W, long long row_bytes, const int *ids, int n_used, int x_per_slot,
+                               const float *x, float *y, int N, int K) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= N) return;
+    const int slot = blockIdx.y, t = blockIdx.z, e = ids[t * n_used + slot];
+    const uint8_t *wr = W + ((long long)e * N + row) * row_bytes;
+    const float *xr = x + (x_per_slot ? (long long)t * n_used + slot : t) * K;
+    const int nb = K / B::QK;
+    float acc = 0.0f;
+    if constexpr (COOP) {
+        for (int ib = 0; ib < nb; ++ib) acc += B::lane_dot(wr + (long long)ib * B::BYTES, xr + (long long)ib * B::QK, lane);
+    } else {
+        for (int ib = lane; ib < nb; ib += 32) acc += B::dot(wr + (long long)ib * B::BYTES, xr + (long long)ib * B::QK);
+    }
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
+    if (lane == 0) y[((long long)t * n_used + slot) * N + row] = acc;
+}
+
+#define MATVEC_ID_KERNEL(name, B, COOP)                                                                   \
+    extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)                                     \
+        matvec_id_##name(const uint8_t *W, long long row_bytes, const int *ids, int n_used, int x_per_slot, \
+                         const float *x, float *y, int N, int K) {                                        \
+        matvec_id_impl<B, COOP>(W, row_bytes, ids, n_used, x_per_slot, x, y, N, K);                        \
+    }
+
+MATVEC_ID_KERNEL(f32, BlkF32, false)
+MATVEC_ID_KERNEL(f16, BlkF16, false)
+MATVEC_ID_KERNEL(bf16, BlkBF16, false)
+MATVEC_ID_KERNEL(q4_0, BlkQ4_0, false)
+MATVEC_ID_KERNEL(q4_1, BlkQ4_1, false)
+MATVEC_ID_KERNEL(q5_0, BlkQ5_0, false)
+MATVEC_ID_KERNEL(q5_1, BlkQ5_1, false)
+MATVEC_ID_KERNEL(q8_0, BlkQ8_0, false)
+MATVEC_ID_KERNEL(q2_K, BlkQ2_K, false)
+MATVEC_ID_KERNEL(q3_K, BlkQ3_K, false)
+MATVEC_ID_KERNEL(q4_K, BlkQ4_KCoop, true)
+MATVEC_ID_KERNEL(q5_K, BlkQ5_KCoop, true)
+MATVEC_ID_KERNEL(q6_K, BlkQ6_KCoop, true)
+MATVEC_ID_KERNEL(q4_0_rocmfp4, BlkROCmFP4, false)
+MATVEC_ID_KERNEL(q4_0_rocmfp4_fast, BlkROCmFP4Fast, false)
+
 // ================================================================ int8 path (Phase 20 speed work)
 //
 // The float kernels above are ALU-bound (~166 GB/s against a 240 GB/s streaming roofline): every weight
@@ -491,10 +536,8 @@ __device__ __forceinline__ float rocmfp4_q8_block(const uint32_t qs[4], uint32_t
         const int *bs, float *y, float *y2, int N, int K
 
 // ROCmFP4 x Q8_0: a lane takes a pair of 18-byte blocks (36 bytes, 4-aligned; the host requires K % 64 == 0)
-extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
-matvec_q8_q4_0_rocmfp4(Q8_ARGS) {
+__device__ __forceinline__ float mv_rocmfp4(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K, int lane) {
     (void)bs;
-    Q8_ROW_SETUP
     const int npairs = K / 64;
     float acc = 0.0f;
     for (int p = lane; p < npairs; p += 32) {
@@ -509,8 +552,7 @@ matvec_q8_q4_0_rocmfp4(Q8_ARGS) {
         acc += rocmfp4_q8_block(qa, w[4] & 0xFF, (w[4] >> 8) & 0xFF, q8 + ib * 32, d8[ib]);
         acc += rocmfp4_q8_block(qb, (w[8] >> 16) & 0xFF, w[8] >> 24, q8 + (ib + 1) * 32, d8[ib + 1]);
     }
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
-    if (lane == 0) *yr = acc;
+    return acc;
 }
 
 // ROCmFP4_FAST (17-byte blocks: 16 nibble bytes + one UE4M3 scale per 32 values) x Q8_0: a lane takes four
@@ -544,10 +586,8 @@ __device__ __forceinline__ float rocmfp4_fast_q8_block(const uint32_t qs[4], flo
     return e * dx * (float)(s0 + s1);
 }
 
-extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
-matvec_q8_q4_0_rocmfp4_fast(Q8_ARGS) {
+__device__ __forceinline__ float mv_rocmfp4_fast(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K, int lane) {
     (void)bs;
-    Q8_ROW_SETUP
     const int nquad = K / 128;
     float acc = 0.0f;
     for (int p = lane; p < nquad; p += 32) {
@@ -560,8 +600,7 @@ matvec_q8_q4_0_rocmfp4_fast(Q8_ARGS) {
             acc += rocmfp4_fast_q8_block(qs[j], e[j], q8 + ib * 32, d8[ib]);
         }
     }
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
-    if (lane == 0) *yr = acc;
+    return acc;
 }
 
 // K-quant x Q8_K kernels: the wave works on 4 blocks at a time, 8 lanes per 256-value block, each lane on 16
@@ -574,9 +613,7 @@ matvec_q8_q4_0_rocmfp4_fast(Q8_ARGS) {
 // Q6_K: lane s (0..7) of its block takes ql bytes 16s..16s+15: half h = s / 4, offset r = (s & 3) * 16. Values
 // are 128h + (r >= 32 ? 32 : 0) + (r & 31) + 0..15 (low nibbles) and the same + 64 (high nibbles). The -32 offset
 // of every value is applied through the group sums: sum (q - 32) x = sum q x - 32 * sum x.
-extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
-matvec_q8_q6_K(Q8_ARGS) {
-    Q8_ROW_SETUP
+__device__ __forceinline__ float mv_q6_K(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K, int lane) {
     const int sub = lane >> 3, s = lane & 7;
     const int h = s >> 2, r = (s & 3) * 16, l = r & 31;
     const bool second = r >= 32;
@@ -603,17 +640,15 @@ matvec_q8_q6_K(Q8_ARGS) {
         isum -= 32 * (sc[2 * s] * bs[ib * 16 + 2 * s] + sc[2 * s + 1] * bs[ib * 16 + 2 * s + 1]);
         acc += fp16(b + 208) * d8[ib] * (float)isum;
     }
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
-    if (lane == 0) *yr = acc;
+    return acc;
 }
 
 // Q4_K / Q5_K: lane s (0..7) of its block takes qs bytes 16s..16s+15: chunk c = s / 2, offset l = (s & 1) * 16.
 // Low nibbles are values 64c + l + 0..15 (sub-block 2c), high nibbles 64c + 32 + l + 0..15 (sub-block 2c + 1);
 // Q5_K's fifth bits come from qh bytes l..l+15. Lane s also subtracts min s via the group sums.
 template <bool Q5>
-__device__ void matvec_q8_kquant(Q8_ARGS) {
+__device__ __forceinline__ float mv_kquant(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K, int lane) {
     constexpr int BYTES = Q5 ? 176 : 144, QS = Q5 ? 48 : 16;
-    Q8_ROW_SETUP
     const int sub = lane >> 3, s = lane & 7;
     const int c = s >> 1, l = (s & 1) * 16;
     const int nb = K / 256;
@@ -643,19 +678,54 @@ __device__ void matvec_q8_kquant(Q8_ARGS) {
         const float dx = d8[ib];
         acc += fp16(b) * dx * (float)isum - fp16(b + 2) * dx * (float)msum;
     }
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
-    if (lane == 0) *yr = acc;
+    return acc;
 }
 
-extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
-matvec_q8_q4_K(Q8_ARGS) {
-    matvec_q8_kquant<false>(W, W2, N1, row_bytes, q8, d8, bs, y, y2, N, K);
+
+__device__ __forceinline__ float mv_q4_K(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
+                                         int lane) {
+    return mv_kquant<false>(wr, q8, d8, bs, K, lane);
 }
 
-extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
-matvec_q8_q5_K(Q8_ARGS) {
-    matvec_q8_kquant<true>(W, W2, N1, row_bytes, q8, d8, bs, y, y2, N, K);
+__device__ __forceinline__ float mv_q5_K(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
+                                         int lane) {
+    return mv_kquant<true>(wr, q8, d8, bs, K, lane);
 }
+
+// Expert-indexed (MoE) variant: grid (ceil(N / ROWS_PER_BLOCK), n_used, T). Slot j of token t uses expert
+// e = ids[t * n_used + j], i.e. rows e * N .. e * N + N - 1 of W (all experts' rows stacked), and writes row
+// t * n_used + j of y. Its input is row t of the quantized activations (x_per_slot = 0: every expert of a token
+// reads the token's vector) or row t * n_used + j (x_per_slot = 1: each expert reads its own, e.g. the
+// SwiGLU output going into ffn_down). The selected experts never leave the GPU.
+#define Q8ID_ARGS                                                                                       \
+    const uint8_t *W, long long row_bytes, const int *ids, int n_used, int x_per_slot, const int8_t *q8, \
+        const float *d8, const int *bs, float *y, int N, int K
+
+#define MATVEC_Q8_KERNELS(name, FN, KQ)                                                                  \
+    extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matvec_q8_##name(Q8_ARGS) {        \
+        Q8_ROW_SETUP                                                                                     \
+        float acc = FN(wr, q8, d8, bs, K, lane);                                                         \
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);                          \
+        if (lane == 0) *yr = acc;                                                                        \
+    }                                                                                                    \
+    extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matvec_q8_id_##name(Q8ID_ARGS) {   \
+        const int lane = threadIdx.x & 31;                                                               \
+        const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);                                \
+        if (row >= N) return;                                                                            \
+        const int slot = blockIdx.y, t = blockIdx.z, e = ids[t * n_used + slot];                         \
+        const uint8_t *wr = W + ((long long)e * N + row) * row_bytes;                                    \
+        const long long in_row = x_per_slot ? (long long)t * n_used + slot : t;                          \
+        float acc = FN(wr, q8 + in_row * K, d8 + in_row * (K / ((KQ) ? 256 : 32)), bs + in_row * (K / 16), \
+                       K, lane);                                                                         \
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);                          \
+        if (lane == 0) y[((long long)t * n_used + slot) * N + row] = acc;                                \
+    }
+
+MATVEC_Q8_KERNELS(q4_0_rocmfp4, mv_rocmfp4, 0)
+MATVEC_Q8_KERNELS(q4_0_rocmfp4_fast, mv_rocmfp4_fast, 0)
+MATVEC_Q8_KERNELS(q4_K, mv_q4_K, 1)
+MATVEC_Q8_KERNELS(q5_K, mv_q5_K, 1)
+MATVEC_Q8_KERNELS(q6_K, mv_q6_K, 1)
 
 // ================================================================ batched int8 matmul (prefill)
 //

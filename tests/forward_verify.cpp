@@ -24,6 +24,7 @@
 #include "inference_internal.h"
 #include "attention.h"
 #include "deltanet.h"
+#include "gpu_ops.h"
 #include "qmatvec.h"
 #include "quant_types.h"
 #include "qwen_model.h"
@@ -143,6 +144,13 @@ static void ref_act_roundtrip(int wtype, const float* x, float* out, int K) {
             const float dh = __half2float(__float2half(d));
             for (int j = 0; j < 32; ++j) out[b + j] = dh * nearbyintf(x[b + j] * id);
         }
+    } else if (wtype == QT_BF16) {  // ggml_fp32_to_bf16: round to nearest even
+        for (int i = 0; i < K; ++i) {
+            uint32_t u;
+            memcpy(&u, &x[i], 4);
+            u = (u + (0x7fff + ((u >> 16) & 1))) & 0xffff0000u;
+            memcpy(&out[i], &u, 4);
+        }
     } else {
         memcpy(out, x, (size_t)K * sizeof(float));
     }
@@ -249,7 +257,7 @@ int main(int argc, char** argv) {
 
     inference_model* m = inference_load_model(argv[1]);
     if (!m) { fprintf(stderr, "load failed: %s\n", inference_get_last_error()); return 1; }
-    if (qmatvec_init("matvec_q.co") != 0) return 1;
+    if (qmatvec_init("matvec_q.co") != 0 || gpu_ops_init("gpu_ops.co") != 0) return 1;
 
     const int E = m->n_embd, HD = m->head_dim, HQ = m->n_head, HKV = m->n_head_kv, FF = m->n_ff;
     const int V = m->vocab_size;
@@ -263,7 +271,8 @@ int main(int argc, char** argv) {
     g_x = xin.p;
     g_y = yout.p;
     ShmBuf q8buf;
-    const int q8_max = (std::max(E, std::max(FF, HQ * HD)) + 255) / 256 * 256;
+    const int q8_max = std::max((std::max(E, std::max(FF, HQ * HD)) + 255) / 256 * 256,
+                                T * std::max(m->n_expert_used * m->n_ff_exp, E));
     if (!q8buf.alloc("fwdv_q8.bin", (qmatvec_q8_bytes(q8_max) + 3) / 4)) { fprintf(stderr, "alloc failed\n"); return 1; }
     qmatvec_q8_bind(&g_q8, q8buf.p, q8_max);
     float* y = g_y;
@@ -299,23 +308,143 @@ int main(int argc, char** argv) {
         }
         report("blk.0 post_attention_norm", spn);
 
-        std::vector<float> g, u, sw, out;
-        if (!ref("ffn_gate-0", nullptr, g) || !ref("ffn_up-0", nullptr, u) || !ref("ffn_swiglu-0", nullptr, sw) ||
-            !ref("ffn_out-0", nullptr, out))
-            return 1;
-        std::vector<float> act(FF);
-        for (int t = 0; t < T; ++t) {
-            if (!proj(L.W_gate, &b[(size_t)t * E], &g[(size_t)t * FF], sg)) return 1;
-            if (!proj(L.W_up, &b[(size_t)t * E], &u[(size_t)t * FF], su)) return 1;
-            for (int i = 0; i < FF; ++i) act[i] = qwen_silu(g[(size_t)t * FF + i]) * u[(size_t)t * FF + i];
-            ssw.add(act.data(), &sw[(size_t)t * FF], FF);
-            if (!proj(L.W_down, &sw[(size_t)t * FF], &out[(size_t)t * E], sd)) return 1;
+        if (!L.moe) {
+            std::vector<float> g, u, sw, out;
+            if (!ref("ffn_gate-0", nullptr, g) || !ref("ffn_up-0", nullptr, u) || !ref("ffn_swiglu-0", nullptr, sw) ||
+                !ref("ffn_out-0", nullptr, out))
+                return 1;
+            std::vector<float> act(FF);
+            for (int t = 0; t < T; ++t) {
+                if (!proj(L.W_gate, &b[(size_t)t * E], &g[(size_t)t * FF], sg)) return 1;
+                if (!proj(L.W_up, &b[(size_t)t * E], &u[(size_t)t * FF], su)) return 1;
+                for (int i = 0; i < FF; ++i) act[i] = qwen_silu(g[(size_t)t * FF + i]) * u[(size_t)t * FF + i];
+                ssw.add(act.data(), &sw[(size_t)t * FF], FF);
+                if (!proj(L.W_down, &sw[(size_t)t * FF], &out[(size_t)t * E], sd)) return 1;
+            }
+            printf("  (blk.0 types: ffn_gate %d, ffn_up %d, ffn_down %d)\n", L.W_gate.type, L.W_up.type, L.W_down.type);
+            report("blk.0 ffn_gate (qmatvec)", sg);
+            report("blk.0 ffn_up (qmatvec)", su);
+            report("blk.0 SwiGLU", ssw);
+            report("blk.0 ffn_down (qmatvec)", sd);
+        } else {
+            // Mixture of experts: router, expert selection and weights, the selected experts' projections (the
+            // engine's expert-indexed int8 kernels, fed the reference's own expert choice so slots line up),
+            // the shared expert, and the weighted combine. Every piece starts from reference inputs.
+            const int NE = m->n_expert, NU = m->n_expert_used, FE = m->n_ff_exp, FS = m->n_ff_shexp;
+            std::vector<float> lg, pr, wn, mg, mu, msw, md, shg, shu, shsw, shd, sgs, fo;
+            if (!ref("ffn_moe_logits-0", "MUL_MAT", lg) || !ref("ffn_moe_probs-0", "SOFT_MAX", pr) ||
+                !ref("ffn_moe_weights_norm-0", "DIV", wn) || !ref("ffn_moe_gate-0", nullptr, mg) ||
+                !ref("ffn_moe_up-0", nullptr, mu) || !ref("ffn_moe_swiglu-0", nullptr, msw) ||
+                !ref("ffn_moe_down-0", nullptr, md) || !ref("ffn_gate-0", "MUL_MAT", shg) ||
+                !ref("ffn_up-0", "MUL_MAT", shu) || !ref("ffn_swiglu-0", nullptr, shsw) ||
+                !ref("ffn_shexp-0", nullptr, shd) || !ref("shared_expert_gate_sigmoid-0", nullptr, sgs) ||
+                !ref("ffn_out-0", nullptr, fo))
+                return 1;
+
+            ProjStat srl, ssg, ssu, ssd;
+            for (int t = 0; t < T; ++t)
+                if (!proj(L.W_router, &b[(size_t)t * E], &lg[(size_t)t * NE], srl)) return 1;
+
+            // Reference expert choice: the NU largest probabilities, descending (ties: lowest index)
+            std::vector<int> rids((size_t)T * NU);
+            for (int t = 0; t < T; ++t) {
+                std::vector<int> idx(NE);
+                for (int e = 0; e < NE; ++e) idx[e] = e;
+                const float* pt = &pr[(size_t)t * NE];
+                std::stable_sort(idx.begin(), idx.end(), [&](int i, int j) { return pt[i] > pt[j]; });
+                for (int j = 0; j < NU; ++j) rids[(size_t)t * NU + j] = idx[j];
+            }
+
+            ShmBuf b_lg, b_x, b_ids, b_w, b_sg, b_d, b_sh, b_out;
+            if (!b_lg.alloc("fwdv_moe_lg.bin", (size_t)T * NE) || !b_x.alloc("fwdv_moe_x.bin", (size_t)T * E) ||
+                !b_ids.alloc("fwdv_moe_ids.bin", (size_t)T * NU) || !b_w.alloc("fwdv_moe_w.bin", (size_t)T * NU) ||
+                !b_sg.alloc("fwdv_moe_sg.bin", T) || !b_d.alloc("fwdv_moe_d.bin", (size_t)T * NU * E) ||
+                !b_sh.alloc("fwdv_moe_sh.bin", (size_t)T * E) || !b_out.alloc("fwdv_moe_out.bin", (size_t)T * E)) {
+                fprintf(stderr, "alloc failed\n");
+                return 1;
+            }
+            int* gids = (int*)b_ids.p;
+            memcpy(b_lg.p, lg.data(), (size_t)T * NE * sizeof(float));
+            memcpy(b_x.p, b.data(), (size_t)T * E * sizeof(float));
+            hipError_t e = gpu_moe_router(b_lg.p, b_x.p, L.shexp_gate, gids, b_w.p, b_sg.p, NE, NU, E, T, 0);
+            if (e == hipSuccess) e = hipDeviceSynchronize();
+            if (e != hipSuccess) { fprintf(stderr, "moe_router: %s\n", hipGetErrorString(e)); return 1; }
+            int id_bad = 0;
+            for (int i = 0; i < T * NU; ++i) id_bad += gids[i] != rids[i];
+            Stat sw8, ssgs;
+            sw8.add(b_w.p, wn.data(), T * NU);
+            ssgs.add(b_sg.p, sgs.data(), T);
+
+            // Expert projections with the reference's expert choice
+            memcpy(gids, rids.data(), rids.size() * sizeof(int));
+            Stat seg, seu, sesw, sed, scomb;
+            const QuantWeight* W3[2] = {&L.We_gate, &L.We_up};
+            const std::vector<float>* R3[2] = {&mg, &mu};
+            Stat* S3[2] = {&seg, &seu};
+            for (int k = 0; k < 2; ++k) {
+                memcpy(g_x, b.data(), (size_t)T * E * sizeof(float));
+                e = qmatvec_quantize(g_x, T * E, &g_q8, 0);
+                if (e == hipSuccess)
+                    e = qmatvec_launch_q8_id(W3[k]->type, W3[k]->data, W3[k]->row_bytes, gids, NU, 0, &g_q8, g_y, FE, E, T, 0);
+                if (e == hipSuccess) e = hipDeviceSynchronize();
+                if (e != hipSuccess) { fprintf(stderr, "expert matvec: %s\n", hipGetErrorString(e)); return 1; }
+                for (int r = 0; r < T * NU; ++r) S3[k]->add(g_y + (size_t)r * FE, &(*R3[k])[(size_t)r * FE], FE);
+            }
+            std::vector<float> act((size_t)FE);
+            for (int r = 0; r < T * NU; ++r) {
+                for (int i = 0; i < FE; ++i) act[i] = qwen_silu(mg[(size_t)r * FE + i]) * mu[(size_t)r * FE + i];
+                sesw.add(act.data(), &msw[(size_t)r * FE], FE);
+            }
+            memcpy(g_x, msw.data(), (size_t)T * NU * FE * sizeof(float));
+            e = qmatvec_quantize(g_x, T * NU * FE, &g_q8, 0);
+            if (e == hipSuccess)
+                e = qmatvec_launch_q8_id(L.We_down.type, L.We_down.data, L.We_down.row_bytes, gids, NU, 1, &g_q8, g_y, E,
+                                         FE, T, 0);
+            if (e == hipSuccess) e = hipDeviceSynchronize();
+            if (e != hipSuccess) { fprintf(stderr, "expert down: %s\n", hipGetErrorString(e)); return 1; }
+            for (int r = 0; r < T * NU; ++r) sed.add(g_y + (size_t)r * E, &md[(size_t)r * E], E);
+
+            // Shared expert
+            std::vector<float> sact((size_t)FS);
+            Stat sssw;
+            for (int t = 0; t < T; ++t) {
+                if (!proj(L.W_gate, &b[(size_t)t * E], &shg[(size_t)t * FS], ssg) ||
+                    !proj(L.W_up, &b[(size_t)t * E], &shu[(size_t)t * FS], ssu))
+                    return 1;
+                for (int i = 0; i < FS; ++i) sact[i] = qwen_silu(shg[(size_t)t * FS + i]) * shu[(size_t)t * FS + i];
+                sssw.add(sact.data(), &shsw[(size_t)t * FS], FS);
+                if (!proj(L.W_down, &shsw[(size_t)t * FS], &shd[(size_t)t * E], ssd)) return 1;
+            }
+
+            // Combine on the reference expert outputs, weights, shared output and gate
+            memcpy(b_d.p, md.data(), (size_t)T * NU * E * sizeof(float));
+            memcpy(b_w.p, wn.data(), (size_t)T * NU * sizeof(float));
+            memcpy(b_sh.p, shd.data(), (size_t)T * E * sizeof(float));
+            memcpy(b_sg.p, sgs.data(), (size_t)T * sizeof(float));
+            e = gpu_moe_combine(b_d.p, b_w.p, b_sh.p, b_sg.p, b_out.p, NU, E, T, 0);
+            if (e == hipSuccess) e = hipDeviceSynchronize();
+            if (e != hipSuccess) { fprintf(stderr, "moe_combine: %s\n", hipGetErrorString(e)); return 1; }
+            scomb.add(b_out.p, fo.data(), T * E);
+
+            printf("  (blk.0 types: router %d, experts gate %d up %d down %d, shared %d/%d/%d)\n", L.W_router.type,
+                   L.We_gate.type, L.We_up.type, L.We_down.type, L.W_gate.type, L.W_up.type, L.W_down.type);
+            report("blk.0 router logits (F32)", srl);
+            const bool ids_ok = id_bad == 0;
+            if (!ids_ok) ++g_fail;
+            printf("  [%s] blk.0 router: top-%d experts for %d tokens   %d of %d differ from the reference\n",
+                   ids_ok ? "PASS" : "FAIL", NU, T, id_bad, T * NU);
+            report("blk.0 router: renormalized weights", sw8);
+            report("blk.0 router: shared-expert gate", ssgs);
+            report("blk.0 experts gate (int8, by id)", seg);
+            report("blk.0 experts up (int8, by id)", seu);
+            report("blk.0 experts SwiGLU", sesw);
+            report("blk.0 experts down (int8, by id)", sed);
+            report("blk.0 shared expert gate (qmatvec)", ssg);
+            report("blk.0 shared expert up (qmatvec)", ssu);
+            report("blk.0 shared expert SwiGLU", sssw);
+            report("blk.0 shared expert down (qmatvec)", ssd);
+            report("blk.0 MoE combine (ffn_out)", scomb);
         }
-        printf("  (blk.0 types: ffn_gate %d, ffn_up %d, ffn_down %d)\n", L.W_gate.type, L.W_up.type, L.W_down.type);
-        report("blk.0 ffn_gate (qmatvec)", sg);
-        report("blk.0 ffn_up (qmatvec)", su);
-        report("blk.0 SwiGLU", ssw);
-        report("blk.0 ffn_down (qmatvec)", sd);
     }
 
     // ---- first Gated DeltaNet layer: projections, conv1d with state, L2 norm, gates, delta rule, gated norm

@@ -87,6 +87,16 @@ hipError_t qmatvec_launch_q8_pair(int type, const void *W, int N, float *y, cons
 hipError_t qmatvec_launch_q8_batch(int type, const void *W, size_t row_bytes, const qmatvec_q8 *q, float *y,
                                    long long ldy, int N, int K, int T, hipStream_t stream);
 
+// Mixture-of-experts matvecs, with the expert choice read from GPU memory (no CPU round trip). W stacks every
+// expert's N rows (expert e = rows e * N .. e * N + N - 1). For token t and slot j < n_used, expert
+// e = ids[t * n_used + j] multiplies input row t (x_per_slot = 0) or row t * n_used + j (x_per_slot = 1) into
+// row t * n_used + j of y (N values each). The int8 version reads the inputs from q (quantized as one flattened
+// vector of all input rows); the float version reads x.
+hipError_t qmatvec_launch_q8_id(int type, const void *W, size_t row_bytes, const int32_t *ids, int n_used,
+                                int x_per_slot, const qmatvec_q8 *q, float *y, int N, int K, int T, hipStream_t stream);
+hipError_t qmatvec_launch_id(int type, const void *W, size_t row_bytes, const int32_t *ids, int n_used, int x_per_slot,
+                             const float *x, float *y, int N, int K, int T, hipStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif
