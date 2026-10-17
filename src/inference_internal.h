@@ -45,6 +45,7 @@ enum LayerKind : int8_t {
 
 struct LayerWeights {
     LayerKind kind = LAYER_FULL_ATTN;
+    int kv_slot = -1;                                 // full attention: this layer's KV cache layer; else -1
     QuantWeight Wq, Wk, Wv, Wo;                       // full attention only; Wq rows are [Q | gate] per head
     QuantWeight W_gate, W_up, W_down;                 // MLP (SwiGLU)
     const float* attn_norm = nullptr;                 // [n_embd] F32, pre-mixer RMSNorm gamma
@@ -114,6 +115,7 @@ struct inference_model {
 
     double eps = 1e-5;                                  // normalization epsilon
     int full_attention_interval = 0;                   // informational only; use LayerWeights::kind
+    int n_kv_layers = 0;                                // full-attention layers, i.e. KV cache layers
 };
 
 #endif // INFERENCE_INTERNAL_H

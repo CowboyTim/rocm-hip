@@ -22,6 +22,7 @@
 
 #include "inference.h"
 #include "inference_internal.h"
+#include "attention.h"
 #include "deltanet.h"
 #include "qmatvec.h"
 #include "quant_types.h"
@@ -525,6 +526,71 @@ int main(int argc, char** argv) {
         snprintf(what, sizeof(what), "blk.%d gate split + sigmoid", la); report(what, sgs);
         snprintf(what, sizeof(what), "blk.%d gated output", la); report(what, sg);
         snprintf(what, sizeof(what), "blk.%d attn_output (qmatvec)", la); report(what, so);
+    }
+
+    // ---- GPU attention kernels vs the CPU reference ops at a long context (many 256-position chunks).
+    // Random K/V history for positions 0..P-2; position P-1 goes through attn_prep (norm, RoPE, KV write)
+    // from random projections, with the first attention layer's q/k norm weights.
+    if (la >= 0) {
+        const LayerWeights& L = m->layers[la];
+        const int P = 1500, DQ = HQ * HD, DKV = HKV * HD, pos = P - 1;
+        if (HD != ATTN_HEAD_DIM || attention_init("attention.co") != 0) { fprintf(stderr, "attention kernels unavailable\n"); return 1; }
+        ShmBuf b_qf, b_k, b_v, b_q, b_ml, b_acc, b_out, b_K, b_V;
+        if (!b_qf.alloc("fwdv_at_qf.bin", 2 * DQ) || !b_k.alloc("fwdv_at_k.bin", DKV) || !b_v.alloc("fwdv_at_v.bin", DKV) ||
+            !b_q.alloc("fwdv_at_q.bin", DQ) || !b_ml.alloc("fwdv_at_ml.bin", attention_part_ml_floats(HQ, P)) ||
+            !b_acc.alloc("fwdv_at_acc.bin", attention_part_acc_floats(HQ, P)) || !b_out.alloc("fwdv_at_out.bin", DQ) ||
+            !b_K.alloc("fwdv_at_K.bin", (size_t)P * DKV / 2 + 1) || !b_V.alloc("fwdv_at_V.bin", (size_t)P * DKV / 2 + 1)) {
+            fprintf(stderr, "alloc failed\n");
+            return 1;
+        }
+        __half* K = (__half*)b_K.p;
+        __half* Vc = (__half*)b_V.p;
+        uint32_t rng = 12345;
+        auto rnd = [&]() { rng = rng * 1664525u + 1013904223u; return ((rng >> 8) * (1.0f / 16777216.0f)) * 2.0f - 1.0f; };
+        for (size_t i = 0; i < (size_t)(P - 1) * DKV; ++i) { K[i] = __float2half(rnd()); Vc[i] = __float2half(rnd()); }
+        for (int i = 0; i < 2 * DQ; ++i) b_qf.p[i] = 3.0f * rnd();
+        for (int i = 0; i < DKV; ++i) { b_k.p[i] = 3.0f * rnd(); b_v.p[i] = rnd(); }
+
+        // CPU reference first (the kernel writes row pos of K/V itself)
+        std::vector<float> q(DQ), kk(DKV), ref_out(DQ);
+        std::vector<__half> Kr(K, K + (size_t)P * DKV), Vr(Vc, Vc + (size_t)P * DKV);
+        for (int h = 0; h < HQ; ++h) {
+            qwen_rmsnorm(&b_qf.p[(size_t)h * 2 * HD], L.q_norm, &q[(size_t)h * HD], HD, eps);
+            qwen_rope_neox(&q[(size_t)h * HD], m->n_rot, pos, m->rope_freq_base);
+        }
+        for (int g = 0; g < HKV; ++g) {
+            qwen_rmsnorm(&b_k.p[(size_t)g * HD], L.k_norm, &kk[(size_t)g * HD], HD, eps);
+            qwen_rope_neox(&kk[(size_t)g * HD], m->n_rot, pos, m->rope_freq_base);
+        }
+        for (int i = 0; i < DKV; ++i) {
+            Kr[(size_t)pos * DKV + i] = __float2half(kk[i]);
+            Vr[(size_t)pos * DKV + i] = __float2half(b_v.p[i]);
+        }
+        qwen_attention(q.data(), Kr.data(), Vr.data(), DKV, P, HQ, HKV, HD, 1.0f / sqrtf((float)HD), ref_out.data());
+        for (int h = 0; h < HQ; ++h)
+            for (int d = 0; d < HD; ++d) ref_out[(size_t)h * HD + d] *= qwen_sigmoid(b_qf.p[(size_t)h * 2 * HD + HD + d]);
+
+        hipError_t e = attention_forward(b_qf.p, b_k.p, b_v.p, L.q_norm, L.k_norm, K, Vc, HQ, HKV, m->n_rot, pos,
+                                         m->rope_freq_base, eps, b_q.p, b_ml.p, b_acc.p, b_out.p, 0);
+        if (e == hipSuccess) e = hipDeviceSynchronize();
+        if (e != hipSuccess) { fprintf(stderr, "attention kernels: %s\n", hipGetErrorString(e)); return 1; }
+        Stat sq, skv, so;
+        sq.add(b_q.p, q.data(), DQ);
+        std::vector<float> kg(DKV), kr(DKV);
+        for (int i = 0; i < DKV; ++i) {
+            kg[i] = __half2float(K[(size_t)pos * DKV + i]);
+            kr[i] = __half2float(Kr[(size_t)pos * DKV + i]);
+        }
+        skv.add(kg.data(), kr.data(), DKV);
+        so.add(b_out.p, ref_out.data(), DQ);
+        char what[80];
+        // RoPE angles: GPU float pos * base^(-2i/n_rot) (as ggml), CPU reference double; at pos 1499 that
+        // differs by ~1e-4 rad, hence 1e-3 on the rotated values
+        snprintf(what, sizeof(what), "GPU attn_prep Q norm + RoPE (pos %d)", pos); report(what, sq, 1e-3);
+        snprintf(what, sizeof(what), "GPU attn_prep K row written to cache"); report(what, skv, 1e-3);
+        snprintf(what, sizeof(what), "GPU attention, %d positions (%d chunks), gated", P, (P + ATTN_CHUNK - 1) / ATTN_CHUNK);
+        report(what, so, 2e-3);
+        attention_free();
     }
 
     // ---- output norm + LM head on the last token

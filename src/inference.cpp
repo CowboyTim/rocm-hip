@@ -168,6 +168,7 @@ static bool load_model_weights(inference_model* m) {
             return false;
         }
         L.kind = linear ? LAYER_LINEAR_ATTN : LAYER_FULL_ATTN;
+        if (full) L.kv_slot = m->n_kv_layers++;  // only attention layers get KV cache space
 
         if (!bind_norm(m->gguf, nm(i, "attn_norm.weight"), E, L.attn_norm, true)) return false;
         if (!bind_norm(m->gguf, nm(i, "post_attention_norm.weight"), E, L.ffn_norm, true)) return false;
@@ -362,7 +363,9 @@ void inference_free_tokens(int32_t* tokens, int len) {
 int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
     clear_error();
     if (!m) { set_error("NULL model"); return -1; }
-    kv_cache_config_t cfg{(int)m->n_layer, n_ctx, m->n_embd, m->head_dim, m->n_head, m->n_head_kv};
+    // One KV layer per full-attention layer (LayerWeights::kv_slot); DeltaNet layers keep recurrent state instead
+    kv_cache_config_t cfg{m->n_kv_layers > 0 ? m->n_kv_layers : 1, n_ctx, m->n_embd, m->head_dim, m->n_head,
+                          m->n_head_kv};
     m->kvc = kv_cache_create("/dev/shm/inference_kvc.bin", &cfg);
     if (!m->kvc) { set_error("kv_cache_create failed"); return -1; }
     m->n_ctx = n_ctx;

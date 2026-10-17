@@ -1214,23 +1214,37 @@ for the symptoms above.
 > - Use the GPU as much as possible, and use the 16 Zen 5 cores (AVX-512) for what stays on the CPU.
 > - Judge each change by the bytes it moves and the syncs it adds, measured with `QWEN_PROFILE=1`.
 >
-> Now **39.5 tok/s** generation (25.3 ms/token). Profile, per token:
-> - Matvecs: FFN 9.4 ms, DeltaNet incl. its kernels 5.2 ms, attention 1.7 ms, LM head 3.3 ms. They
->   stream 2.8 GB of weights at about 144 GB/s.
-> - Attention softmax(QK)V (CPU, 1 thread): 4.2 ms, 17%, growing with context.
-> - FFN SwiGLU and norms (CPU): 1.0 ms. Other CPU ops: about 0.6 ms.
-> - Syncs: FFN 2 per layer, attention 2 per layer, DeltaNet 1 per layer.
+> Now **49.4 tok/s** generation (20.2 ms/token). GPU sections are 95% of each token. Profile, per token:
+> - FFN matvecs: 9.4 ms. DeltaNet (matvecs + kernels): 5.1 ms. Attention (matvecs + kernels): 1.4 ms.
+>   LM head: 3.2 ms. Weights stream at about 147 GB/s.
+> - CPU: FFN SwiGLU and norms 1.0 ms, everything else about 0.1 ms.
+> - Syncs: per layer, 2 in the FFN and 1 in the mixer.
 >
-> 1. **Attention core on the GPU:** q/k norm, RoPE, KV write, softmax(QK)V and the gate, queued behind
->    the q/k/v matvecs with `attn_output`, for one sync per attention layer, like DeltaNet. The KV cache
->    must then be registered coarse-grained and written by the GPU only.
-> 2. **FFN and norms on the GPU:** SwiGLU, RMSNorms and residual adds as small kernels, so a whole layer,
->    and then a whole token, needs a single sync. Then look at matvec efficiency: about 144 GB/s against
->    LPDDR5X's ~256 GB/s peak.
+> 1. **FFN and norms on the GPU, one sync per token:** SwiGLU, the RMSNorms and residual adds as small
+>    kernels, plus the embedding row decode, so the whole token is one queue.
+> 2. **Matvec efficiency:** 147 GB/s averaged against LPDDR5X's ~256 GB/s peak. Q5_K/Q6_K and the
+>    small-N matvecs are the ones below ~160 GB/s; also look at launch overhead (about 200 launches per
+>    token).
 > 3. **Batched prefill:** a quantized matrix-matrix kernel that decodes each weight block once per batch,
->    plus a multi-token DeltaNet kernel (sequential over tokens inside the kernel). Check it against the
->    5-token reference dump (itself a batched prefill) and against token-by-token results.
+>    plus a multi-token DeltaNet kernel (sequential over tokens inside the kernel) and multi-query
+>    attention. Check it against the 5-token reference dump and against token-by-token results.
 > 4. **Step 6 (35B-A3B):** router, top-8 of 256 experts, shared expert; `ref_dump acts` on the 35B.
+>
+> **Attention on the GPU — DONE ✅ (2026-10-17).** 39.5 → 49.4 tok/s.
+> - `src/attention.hip`, three kernels queued between the q/k/v matvecs and `attn_output`, one sync:
+>   - `attn_prep`: q/k RMSNorm, NeoX RoPE, K/V written as FP16 straight into the cache row.
+>   - `attn_partial`: flash-decoding over 256-position chunks; one workgroup per (head, chunk),
+>     scores thread-per-position, V sum thread-per-dimension.
+>   - `attn_combine`: merges the chunks and applies the sigmoid gate.
+> - The attention section went from 1.7 ms of matvecs plus 4.7 ms of CPU to 1.4 ms total.
+> - The KV cache now holds only the 8 attention layers (`LayerWeights::kv_slot`), not all 32: 4× less
+>   memory, 128 MB at 4k context. It is registered coarse-grained and written only by the GPU.
+> - `forward_verify` adds a 1500-position, 6-chunk check against the CPU reference ops (output within
+>   2.3e-5). The end-to-end `l_out` check is unchanged.
+> - **Long greedy runs:** a 300-token greedy run gives byte-identical output with the old CPU attention
+>   path. It matches llama-completion for about 130 tokens ("The history of the Roman Empire"), then a
+>   near-tie flips. That is expected drift: ggml quantizes matmul activations to Q8, we keep FP32.
+>   Short prompts (24 and 32 tokens) still match exactly.
 >
 > **DeltaNet mixer on the GPU — DONE ✅ (2026-10-17).** 22.5 → 39.5 tok/s.
 > - `src/deltanet.hip`, two kernels queued behind the qkv/z/alpha/beta matvecs and before `ssm_out`, one

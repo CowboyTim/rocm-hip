@@ -39,9 +39,9 @@ __half* row_raw(inference_kv_cache_t* c, bool is_v, int layer, int pos) {
     // DEBUG: check why we might return NULL
     static int call_count = 0;
     call_count++;
-    
+
     if (!c || !c->base) {
-        fprintf(stderr, "[KV_CACHE] row_raw #%d FAIL: c=%p base=%p (is_v=%d)\n", 
+        fprintf(stderr, "[KV_CACHE] row_raw #%d FAIL: c=%p base=%p (is_v=%d)\n",
                 call_count, (void*)c, (void*)c ? c->base : nullptr, is_v); fflush(stderr);
         return nullptr;
     }
@@ -90,7 +90,8 @@ inference_kv_cache_t *kv_cache_create(const char *shm_path, const kv_cache_confi
     c->base = mmap(NULL, c->total_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, c->fd, 0);
     if (c->base == MAP_FAILED) { perror("kv_cache: mmap"); close(c->fd); delete c; return nullptr; }
 
-    hipError_t st = hipHostRegister(c->base, c->total_bytes, hipHostRegisterDefault);
+    // Coarse-grained: GPU-cacheable, coherent with the CPU at kernel boundaries and syncs. Still zero-copy.
+    hipError_t st = hipHostRegister(c->base, c->total_bytes, hipExtHostRegisterCoarseGrained);
     if (st != hipSuccess) {
         fprintf(stderr, "kv_cache: hipHostRegister failed: %s\n", hipGetErrorString(st));
         munmap(c->base, c->total_bytes); close(c->fd); delete c; return nullptr;

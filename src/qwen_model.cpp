@@ -14,6 +14,7 @@
 #include "inference.h"
 #include "inference_internal.h"
 #include "kv_cache.h"
+#include "attention.h"
 #include "deltanet.h"
 #include "qmatvec.h"
 #include "quant_types.h"
@@ -99,7 +100,6 @@ struct Scratch {
     float* xn = nullptr;      // normed input to the projections [E]
     float* qfull = nullptr;   // attn_q output, [Q | gate] per head [2 * HQ * HD]
     float* q = nullptr;       // Q after norm + RoPE [HQ * HD]
-    float* gate = nullptr;    // attention output gate [HQ * HD]
     float* k = nullptr;       // [HKV * HD]
     float* v = nullptr;       // [HKV * HD]
     float* attn = nullptr;    // gated attention output, input to attn_output [HQ * HD]
@@ -115,16 +115,20 @@ struct Scratch {
     float* alpha = nullptr;   // ssm_alpha output, then the decay gate [dt_rank]
     float* beta = nullptr;    // ssm_beta output, then sigmoid [dt_rank]
     float* lin = nullptr;     // delta-rule output, then gated-normed: input to ssm_out [d_inner]
+    // Attention partial results, per (head, 256-position chunk) up to n_ctx (attention.h)
+    float* part_ml = nullptr;
+    float* part_acc = nullptr;
 
     ShmRegion mem;
 
-    bool alloc(int E, int HQ, int HKV, int HD, int FF, int V, int conv_dim, int DI, int NV) {
-        const size_t sizes[] = {(size_t)E, (size_t)E, (size_t)2 * HQ * HD, (size_t)HQ * HD, (size_t)HQ * HD,
+    bool alloc(int E, int HQ, int HKV, int HD, int FF, int V, int conv_dim, int DI, int NV, int n_ctx) {
+        const size_t sizes[] = {(size_t)E, (size_t)E, (size_t)2 * HQ * HD, (size_t)HQ * HD,
                                 (size_t)HKV * HD, (size_t)HKV * HD, (size_t)HQ * HD, (size_t)E,
                                 (size_t)FF, (size_t)FF, (size_t)FF, (size_t)V,
-                                (size_t)conv_dim, (size_t)conv_dim, (size_t)DI, (size_t)NV, (size_t)NV, (size_t)DI};
-        float** const ptrs[] = {&x, &xn, &qfull, &q, &gate, &k, &v, &attn, &proj, &ffg, &ffu, &act, &logits,
-                                &qkv, &conv, &z, &alpha, &beta, &lin};
+                                (size_t)conv_dim, (size_t)conv_dim, (size_t)DI, (size_t)NV, (size_t)NV, (size_t)DI,
+                                attention_part_ml_floats(HQ, n_ctx), attention_part_acc_floats(HQ, n_ctx)};
+        float** const ptrs[] = {&x, &xn, &qfull, &q, &k, &v, &attn, &proj, &ffg, &ffu, &act, &logits,
+                                &qkv, &conv, &z, &alpha, &beta, &lin, &part_ml, &part_acc};
         static_assert(sizeof(sizes) / sizeof(sizes[0]) == sizeof(ptrs) / sizeof(ptrs[0]), "scratch table");
         return mem.alloc("/dev/shm/qwen_scratch.bin", sizes, ptrs, sizeof(sizes) / sizeof(sizes[0]),
                          hipExtHostRegisterCoarseGrained);
@@ -166,16 +170,16 @@ struct RecurrentState {
 // are timed by laps: lap(c) charges the time since the previous lap to c. A GPU section runs from its first
 // qmatvec launch to the hipDeviceSynchronize after it, so it includes launch overhead and the sync wait.
 enum ProfCat {
-    P_EMBED, P_ATTN_CPU, P_ATTN_CORE, P_ATTN_GPU, P_LIN_CPU, P_LIN_GPU, P_FFN_CPU, P_FFN_GPU, P_HEAD_CPU,
+    P_EMBED, P_ATTN_CPU, P_ATTN_GPU, P_LIN_CPU, P_LIN_GPU, P_FFN_CPU, P_FFN_GPU, P_HEAD_CPU,
     P_HEAD_GPU, P_COUNT
 };
 static const char* const PROF_NAME[P_COUNT] = {
-    "embedding (CPU)", "attention: norms, RoPE, KV write, gate (CPU)", "attention: softmax(QK)V (CPU)",
-    "attention: q/k/v/o matvecs (GPU)", "DeltaNet: norm, residual (CPU)",
+    "embedding (CPU)", "attention: norm, residual (CPU)",
+    "attention: matvecs + norm/RoPE/attention kernels (GPU)", "DeltaNet: norm, residual (CPU)",
     "DeltaNet: matvecs + conv/delta-rule kernels (GPU)", "FFN: norm, SwiGLU (CPU)",
     "FFN: gate/up/down matvecs (GPU)", "output norm + logits out (CPU)", "LM head matvec (GPU)",
 };
-static const bool PROF_GPU[P_COUNT] = {false, false, false, true, false, true, false, true, false, true};
+static const bool PROF_GPU[P_COUNT] = {false, false, true, false, true, false, true, false, true};
 
 struct Profile {
     double t[P_COUNT] = {};
@@ -205,6 +209,7 @@ struct QwenModel {
     ~QwenModel() {
         rs.mem.free();
         s.mem.free();
+        attention_free();
         deltanet_free();
         qmatvec_free();
     }
@@ -229,8 +234,18 @@ struct QwenModel {
             }
         }
         const int conv_dim = 2 * eng->ssm_n_group * eng->ssm_d_state + eng->ssm_d_inner;
+        if (eng->n_kv_layers > 0) {
+            if (eng->head_dim != ATTN_HEAD_DIM) {
+                qwen_set_error("head_dim %d: the attention kernels are built for %d", eng->head_dim, ATTN_HEAD_DIM);
+                return false;
+            }
+            if (attention_init("attention.co") != 0) {
+                qwen_set_error("cannot load attention.co (run from build/co)");
+                return false;
+            }
+        }
         if (!s.alloc(eng->n_embd, eng->n_head, eng->n_head_kv, eng->head_dim, eng->n_ff, eng->vocab_size, conv_dim,
-                     eng->ssm_d_inner, eng->ssm_dt_rank)) {
+                     eng->ssm_d_inner, eng->ssm_dt_rank, kv_cache_n_ctx(eng->kvc))) {
             qwen_set_error("scratch allocation failed");
             return false;
         }
@@ -258,48 +273,24 @@ struct QwenModel {
         return true;
     }
 
-    // Gated full attention for one token at position pos; adds its output to the residual
-    bool full_attention(int l, const LayerWeights& L, int pos) {
-        const int E = eng->n_embd, HD = eng->head_dim, HQ = eng->n_head, HKV = eng->n_head_kv;
-        const int DKV = HKV * HD;
+    // Gated full attention for one token at position pos; adds its output to the residual. q/k norm, RoPE,
+    // the KV cache write, attention over positions 0..pos and the output gate run as GPU kernels
+    // (attention.hip), queued between the q/k/v projections and attn_output: one sync.
+    bool full_attention(const LayerWeights& L, int pos) {
+        const int E = eng->n_embd, HQ = eng->n_head, HKV = eng->n_head_kv;
         const float eps = (float)eng->eps;
 
         qwen_rmsnorm(s.x, L.attn_norm, s.xn, E, eps);
         prof.lap(P_ATTN_CPU);
         if (!matvec(L.Wq, s.xn, s.qfull, P_ATTN_GPU) || !matvec(L.Wk, s.xn, s.k, P_ATTN_GPU) ||
-            !matvec(L.Wv, s.xn, s.v, P_ATTN_GPU) || !sync())
+            !matvec(L.Wv, s.xn, s.v, P_ATTN_GPU))
             return false;
-        prof.lap(P_ATTN_GPU);
-
-        // attn_q rows are [Q (HD) | gate (HD)] per head
-        for (int h = 0; h < HQ; ++h) {
-            float* q = s.q + (size_t)h * HD;
-            memcpy(q, s.qfull + (size_t)h * 2 * HD, HD * sizeof(float));
-            memcpy(s.gate + (size_t)h * HD, s.qfull + (size_t)h * 2 * HD + HD, HD * sizeof(float));
-            qwen_rmsnorm(q, L.q_norm, q, HD, eps);
-            qwen_rope_neox(q, eng->n_rot, pos, eng->rope_freq_base);
-        }
-        for (int g = 0; g < HKV; ++g) {
-            float* k = s.k + (size_t)g * HD;
-            qwen_rmsnorm(k, L.k_norm, k, HD, eps);
-            qwen_rope_neox(k, eng->n_rot, pos, eng->rope_freq_base);
-        }
-
-        __half* krow = kv_cache_k_row(eng->kvc, l, pos);
-        __half* vrow = kv_cache_v_row(eng->kvc, l, pos);
-        if (!krow || !vrow) { qwen_set_error("KV cache row %d of layer %d out of range", pos, l); return false; }
-        for (int i = 0; i < DKV; ++i) {
-            krow[i] = __float2half(s.k[i]);
-            vrow[i] = __float2half(s.v[i]);
-        }
-
-        prof.lap(P_ATTN_CPU);
-        qwen_attention(s.q, kv_cache_k_row(eng->kvc, l, 0), kv_cache_v_row(eng->kvc, l, 0), DKV, pos + 1,
-                       HQ, HKV, HD, 1.0f / sqrtf((float)HD), s.attn);
-        prof.lap(P_ATTN_CORE);
-        for (int i = 0; i < HQ * HD; ++i) s.attn[i] *= qwen_sigmoid(s.gate[i]);
-        prof.lap(P_ATTN_CPU);
-
+        __half* K = kv_cache_k_row(eng->kvc, L.kv_slot, 0);
+        __half* V = kv_cache_v_row(eng->kvc, L.kv_slot, 0);
+        if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
+        const hipError_t e = attention_forward(s.qfull, s.k, s.v, L.q_norm, L.k_norm, K, V, HQ, HKV, eng->n_rot, pos,
+                                               eng->rope_freq_base, eps, s.q, s.part_ml, s.part_acc, s.attn, 0);
+        if (e != hipSuccess) { qwen_set_error("attention kernels, KV layer %d: %s", L.kv_slot, hipGetErrorString(e)); return false; }
         if (!matvec(L.Wo, s.attn, s.proj, P_ATTN_GPU) || !sync()) return false;
         prof.lap(P_ATTN_GPU);
         for (int i = 0; i < E; ++i) s.x[i] += s.proj[i];
@@ -369,7 +360,7 @@ struct QwenModel {
         for (int l = 0; l < eng->n_layer; ++l) {
             prof.start();  // the debug trace and layer callback of the previous layer are not charged
             const LayerWeights& L = eng->layers[l];
-            const bool ok = L.kind == LAYER_FULL_ATTN ? full_attention(l, L, pos) : linear_attention(l, L);
+            const bool ok = L.kind == LAYER_FULL_ATTN ? full_attention(L, pos) : linear_attention(l, L);
             if (!ok || !ffn(L)) return -1;
             if (layer_cb) layer_cb(l, pos, s.x, E, layer_cb_user);
             if (qwen_debug()) {
