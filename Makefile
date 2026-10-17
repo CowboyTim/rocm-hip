@@ -76,6 +76,8 @@ SAMPLER_VERIFY = $(BINDIR)/sampler_verify
 GENERATE_VERIFY = $(BINDIR)/generate_verify
 # Older end-to-end smoke test with per-step top-5 logits; run from build/co
 E2E_TEST = $(BINDIR)/inference_e2e_test
+# WMMA operand layout on the hardware (Phase 20 W1); self-contained
+WMMA_LAYOUT_VERIFY = $(BINDIR)/wmma_layout_verify
 # Cold-cache matvec bandwidth per tensor role; run from build/co
 MATVEC_BENCH = $(BINDIR)/matvec_bench
 DEQUANT_VERIFY   = $(BINDIR)/dequant_verify
@@ -100,7 +102,7 @@ QWEN_MODEL_LIB   = $(BUILDDIR)/libqwen.a
 QWEN_DEMO        = $(BINDIR)/qwen_demo
 
 # --- Build Rules ---
-all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(GENERATE_VERIFY) $(E2E_TEST) $(MATVEC_BENCH)
+all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(GENERATE_VERIFY) $(E2E_TEST) $(MATVEC_BENCH) $(WMMA_LAYOUT_VERIFY)
 
 $(WMMA_TARGET): $(WMMA_OBJ) $(WMMA_CO)
 	$(CLANG) $(WMMA_OBJ) $(LDFLAGS) -o $@
@@ -278,6 +280,9 @@ $(E2E_TEST): $(SRCDIR)/inference_e2e_test.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
 
 $(MATVEC_BENCH): tools/matvec_bench.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/matvec_q.co
 	$(CLANG) $(CXXFLAGS) -I. tools/matvec_bench.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
+
+$(WMMA_LAYOUT_VERIFY): $(TESTSDIR)/wmma_layout_verify.hip
+	$(HIPCC) -O3 --offload-arch=$(ARCH) -mno-wavefrontsize64 $< -o $@
 
 # Build all demos and benchmark
 both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)

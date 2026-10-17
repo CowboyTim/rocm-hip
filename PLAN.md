@@ -1290,6 +1290,18 @@ for the symptoms above.
 >
 > **Plan:**
 >
+> - **W1 — DONE ✅ (2026-10-17).**
+>   - `tests/wmma_layout_verify` (built by `make all`) confirms the wave32 iu8 layout on the hardware:
+>     A row i / B column i in lanes i and i + 16 (16 int8 K-values each), C column l % 16, row
+>     2r + l / 16.
+>   - rocprofv3 GL1C counters on the batched kernels at T = 64: L1→L2 reads are 4–6× the weight bytes
+>     (each 16-token tile re-reads the weights from L2). But L2 runs at only ~130 GB/s and L1 requests
+>     at a few hundred GB/s, far below the caches' limits. So the current kernels are bound by
+>     instruction issue and latency (per-token decode and scale math around 4-wide dot4s), not by cache
+>     bandwidth.
+>   - The tiled WMMA kernel addresses both: weights decoded once per 64 tokens, 4,096 MACs per
+>     instruction.
+>   - Original W1 text:
 > - **W1. Facts first (half a day).**
 >   - Microbenchmarks for WMMA iu8 and f16: throughput, latency, and the gfx11 wave32 operand layout.
 >     A/B are 16×16 int8; each lane holds 16 bytes and the two half-waves replicate. C is 16×16 int32 in
