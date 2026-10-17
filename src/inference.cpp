@@ -408,6 +408,15 @@ static int forward_next(inference_model_t* m, int token_id) {
     return 0;
 }
 
+int inference_prefill(inference_model_t* m, const int32_t* tokens, int n) {
+    clear_error();
+    if (!m || !m->kvc || !m->qwen || !tokens || n <= 0) { set_error("Invalid state or arguments"); return -1; }
+    if (m->n_past + n > m->n_ctx) { set_error("context full (%d + %d > %d tokens)", m->n_past, n, m->n_ctx); return INFERENCE_ERR_CONTEXT_FULL; }
+    if (qwen_model_prefill(m->qwen, (const int*)tokens, n, m->n_past, nullptr) != 0) { set_error("qwen_model_prefill failed"); return -1; }
+    m->n_past += n;
+    return 0;
+}
+
 int inference_decode_token(inference_model_t* m, int token_id, int* next_token_out) {
     clear_error();
     if (!next_token_out) { set_error("Invalid args"); return -1; }
@@ -514,13 +523,10 @@ int inference_generate_ex(inference_model_t* model, const int32_t* prompt_ids, i
     sampler_t* smp = sampler_create(&prm);
     const int eos = model->tokenizer ? tokenizer_eos_id(model->tokenizer) : -1;
 
-    // New sequence: prefill the prompt, then sample from the logits in place (no copy)
+    // New sequence: prefill the prompt in batches, then sample from the logits in place (no copy)
     model->n_past = 0;
-    int rc = 0;
-    for (int i = 0; i < prompt_len && rc == 0; ++i) {
-        rc = forward_next(model, prompt_ids[i]);
-        sampler_accept(smp, prompt_ids[i]);
-    }
+    int rc = inference_prefill(model, prompt_ids, prompt_len);
+    for (int i = 0; i < prompt_len; ++i) sampler_accept(smp, prompt_ids[i]);
     for (int step = 0; step < max_new_tokens && rc == 0; ++step) {
         const int next = sampler_sample(smp, qwen_model_logits(model->qwen), model->vocab_size);
         if (next == eos) break;

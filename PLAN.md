@@ -1214,28 +1214,43 @@ for the symptoms above.
 > - Use the GPU as much as possible, and use the 16 Zen 5 cores (AVX-512) for what stays on the CPU.
 > - Judge each change by the bytes it moves and the syncs it adds, measured with `QWEN_PROFILE=1`.
 >
-> Now **63.1 tok/s** generation (15.8 ms/token). Prefill still runs one token at a time (~50 tok/s).
+> Now **63.7 tok/s** generation and **~600 tok/s prefill** (a 2,101-token prompt in 3.5 s; it took ~42 s
+> token by token).
 >
-> Per-kernel GPU time (`rocprofv3 --kernel-trace --stats`), per forward:
-> - Matvecs: ~13.7 ms (90%).
-> - `deltanet_rule`: 0.5 ms (bandwidth-bound on the 4 MB/layer of state traffic).
-> - `add_rmsnorm`: ~0.2 ms.
-> - Everything else: under 0.3 ms.
-> - Gaps between kernels: ~0.6 ms.
+> 1. **Step 6 (35B-A3B, next):** router, top-8 of 256 experts, shared expert; `ref_dump acts` on the 35B
+>    (into its own /dev/shm directory).
+>    - TYPE101 (ROCMFP4_FAST) has float matvecs only: give it int8 and batched kernels too. Its 17-byte
+>      blocks pair into 34 bytes (2-aligned), so the ROCmFP4 pair loads need 2-byte variants.
+>    - BF16 `output.weight` has float matvecs only.
+> 2. **Prefill speed:** the batched matmuls are compute-bound at ~600 tokens/s with v_dot4.
+>    - RDNA3.5 WMMA (int8 16×16×16 tiles) is the next step up.
+>    - The CPU embedding decode (2.6% of prefill) could move to the GPU.
+> 3. **Generation polish:** ROCmFP4 int8 bandwidth (192 vs 240 GB/s); a HIP graph per token (~0.6 ms of
+>    gaps).
 >
-> Remaining generation headroom is about 15–20%:
-> - ROCmFP4 int8 at 192 GB/s vs the 240 roofline.
-> - A HIP graph per token to close the gaps (attention's per-position arguments need node updates).
->
-> Prompt processing is the bigger gap for real use: a 2,000-token prompt takes ~40 s.
->
-> 1. **Batched prefill (next).** Needs:
->    - A quantized matrix-matrix kernel that decodes each weight block once per batch.
->    - A multi-token DeltaNet kernel, sequential over tokens inside the kernel.
->    - Multi-query attention.
->    - Checks against the 5-token reference dump and against token-by-token results.
-> 2. **Step 6 (35B-A3B):** router, top-8 of 256 experts, shared expert; `ref_dump acts` on the 35B.
-> 3. **Generation polish:** ROCmFP4 int8 bandwidth, a HIP graph per token.
+> **Batched prefill — DONE ✅ (2026-10-17).** ~50 → ~600 tokens/s.
+> - **Batched int8 matmuls:** `matmul_q8_<type>` decodes each lane's weight bytes once and applies them to
+>   a 16-token tile. The T inputs are quantized as one flattened vector. Bit-identical to the single-token
+>   kernels; ~600 tokens/s for a token's matmuls at T = 64 (8-token tiles: 513, 32: 630 but worse at
+>   T = 16).
+> - **Token dimension everywhere:**
+>   - `add_rmsnorm` has a token grid dimension.
+>   - Attention adds a token grid dimension (causal per token; chunks past a token's last position
+>     contribute exactly 0).
+>   - The DeltaNet kernels loop over the batch in order, with conv history and state columns in
+>     registers, so state is read and written once per batch.
+> - **Engine:** `QwenModel::forward(tokens, T, pos0)`. Single-token decoding is T = 1.
+>   - `qwen_model_prefill` runs micro-batches of up to 64 tokens, fewer for long contexts so attention's
+>     partial buffers stay under ~64 MB.
+>   - The LM head runs for the last token only.
+>   - `inference_prefill` and `inference_generate_ex` use it, and so does `qwen_demo`.
+> - **Verification:**
+>   - `forward_verify`: the 5 reference tokens in one prefill call are **bit-identical** to
+>     token-by-token (every layer's residual and the logits). Batched DeltaNet and 8-token causal
+>     attention are checked against the reference / CPU ops.
+>   - `generate_verify`: a 561-token prefill (9 micro-batches, 3 attention chunks) leaves bit-identical
+>     logits to token-by-token.
+>   - `matvec_verify` checks the batched kernels against the single-token ones.
 >
 > **Fewer launches and a parallel norm — DONE ✅ (2026-10-17).** 61.9 → 63.1 tok/s.
 > - **Fused quantization:** `quantize_q8`'s rounding rules now live in `src/q8_device.h`, shared by every

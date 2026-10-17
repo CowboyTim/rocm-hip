@@ -86,14 +86,12 @@ int main(int argc, char** argv) {
     qwen_model_profile_reset(model);
     auto now = []() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
     double t0 = now();
-    for (int i = 0; i < n_tokens; ++i) {
-        if (qwen_model_forward(model, tokens[i], i, nullptr) != 0) {
-            fprintf(stderr, "Forward failed at token %d: %s\n", i, inference_get_last_error());
-            inference_free_tokens(tokens, n_tokens);
-            inference_kv_cache_free(engine);
-            inference_free_model(engine);
-            return 1;
-        }
+    if (qwen_model_prefill(model, (const int*)tokens, n_tokens, 0, nullptr) != 0) {
+        fprintf(stderr, "Prefill failed: %s\n", inference_get_last_error());
+        inference_free_tokens(tokens, n_tokens);
+        inference_kv_cache_free(engine);
+        inference_free_model(engine);
+        return 1;
     }
     const double t_prefill = now() - t0;
     if (profile) qwen_model_profile_print(model, "prefill");

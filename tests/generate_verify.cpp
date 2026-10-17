@@ -13,7 +13,10 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <string>
 #include <vector>
 
 static int g_fail = 0;
@@ -42,7 +45,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     inference_model_t* m = inference_load_model(argv[1]);
-    if (!m || inference_kv_cache_init(m, 256) != 0) {
+    if (!m || inference_kv_cache_init(m, 1024) != 0) {
         fprintf(stderr, "load failed: %s\n", inference_get_last_error());
         return 1;
     }
@@ -85,6 +88,32 @@ int main(int argc, char** argv) {
             if (a[i] > a[best]) best = i;
         check(a == b && best == next && memcmp(a.data(), qwen_model_logits(inference_get_qwen_model(m)), V * 4) == 0,
               "inference_get_logits returns the last logits without another forward pass");
+    }
+
+    // Long prompt: prefill (several micro-batches, crossing attention's 256-position chunks) must leave exactly
+    // the logits that feeding the same tokens one at a time does
+    {
+        std::string text;
+        for (int i = 0; i < 40; ++i) text += "The quick brown fox jumps over the lazy dog, again and again. ";
+        int n = 0;
+        int32_t* lt = inference_tokenize(m, text.c_str(), &n);
+        const int V = inference_vocab_size(m);
+        std::vector<float> a(V), b(V);
+        std::vector<int> ids(V);
+        inference_reset(m);
+        const int rc1 = inference_prefill(m, lt, n);
+        inference_get_logits(m, ids.data(), a.data());
+        inference_reset(m);
+        int nx = 0, rc2 = 0;
+        for (int i = 0; i < n && rc2 == 0; ++i) rc2 = inference_decode_token(m, lt[i], &nx);
+        inference_get_logits(m, ids.data(), b.data());
+        inference_free_tokens(lt, n);
+        double d = 0.0;
+        for (int i = 0; i < V; ++i) d = std::max(d, (double)std::fabs(a[i] - b[i]));
+        char what[128];
+        snprintf(what, sizeof(what), "prefill of %d tokens == token by token (max |d| logits %.3g, batch %d)", n, d,
+                 qwen_model_max_batch(inference_get_qwen_model(m)));
+        check(rc1 == 0 && rc2 == 0 && d == 0.0, what);
     }
 
     sampler_params p = sampler_default_params();  // temperature 0.8, top_k 40, top_p 0.95, min_p 0.05

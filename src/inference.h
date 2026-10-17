@@ -66,6 +66,11 @@ void inference_set_seed(inference_model_t* model, unsigned int seed);
 void inference_reset(inference_model_t* model);
 int inference_n_past(const inference_model_t* model);
 
+// Prefill: n tokens of the current sequence at positions n_past .. n_past + n - 1, in batches (much faster
+// than n inference_decode_token calls, same results). Afterwards the logits are those of the last token.
+// Returns 0 on success, INFERENCE_ERR_CONTEXT_FULL if they don't fit, negative on error.
+int inference_prefill(inference_model_t* model, const int32_t* tokens, int n);
+
 // Single-token decode step: runs one forward pass for token_id at position n_past, appends it to the
 // KV cache and recurrent state, and returns the greedy next token. Use inference_get_logits (or
 // qwen_model_logits) to sample differently.

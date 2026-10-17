@@ -98,7 +98,10 @@ struct ShmRegion {
 };
 
 // Per-token activations
+// Per-forward activations for up to B tokens (one micro-batch of a prefill; B = 1 row is used when
+// generating). Each array holds B rows of the per-token size given in brackets.
 struct Scratch {
+    int B = 0;                // tokens per forward (rows)
     float* x = nullptr;       // residual stream [E]
     float* x_alt = nullptr;   // the other residual buffer: add_rmsnorm writes x + add here, then they swap
     float* xn = nullptr;      // normed input to the projections [E]
@@ -111,7 +114,7 @@ struct Scratch {
     float* ffg = nullptr;     // ffn_gate output [FF]
     float* ffu = nullptr;     // ffn_up output [FF]
     float* act = nullptr;     // SiLU(gate) * up, input to ffn_down [FF]
-    float* logits = nullptr;  // [vocab]
+    float* logits = nullptr;  // [vocab], one row: only the last token's logits are computed
     // Gated DeltaNet
     float* qkv = nullptr;     // attn_qkv output [conv_dim]
     float* conv = nullptr;    // SiLU(conv1d(qkv)) = [q | k | v] [conv_dim]
@@ -119,23 +122,26 @@ struct Scratch {
     float* alpha = nullptr;   // ssm_alpha output, then the decay gate [dt_rank]
     float* beta = nullptr;    // ssm_beta output, then sigmoid [dt_rank]
     float* lin = nullptr;     // delta-rule output, then gated-normed: input to ssm_out [d_inner]
-    // Attention partial results, per (head, 256-position chunk) up to n_ctx (attention.h)
+    // Attention partial results, per (token, head, 256-position chunk) up to n_ctx (attention.h)
     float* part_ml = nullptr;
     float* part_acc = nullptr;
-    // Quantized copy of the current matvec input for the int8 kernels (qmatvec.h), up to q8_max_k values
+    // Quantized copy of the current matmul input for the int8 kernels (qmatvec.h): B rows of up to the
+    // largest per-token K, as one flattened vector of q8_max_k values
     float* q8mem = nullptr;
     qmatvec_q8 q8;
     int q8_max_k = 0;
 
     ShmRegion mem;
 
-    bool alloc(int E, int HQ, int HKV, int HD, int FF, int V, int conv_dim, int DI, int NV, int n_ctx) {
-        q8_max_k = (std::max({E, HQ * HD, DI, FF}) + 255) / 256 * 256;
-        const size_t sizes[] = {(size_t)E, (size_t)E, (size_t)E, (size_t)2 * HQ * HD, (size_t)HQ * HD,
-                                (size_t)HKV * HD, (size_t)HKV * HD, (size_t)HQ * HD, (size_t)E,
-                                (size_t)FF, (size_t)FF, (size_t)FF, (size_t)V,
-                                (size_t)conv_dim, (size_t)conv_dim, (size_t)DI, (size_t)NV, (size_t)NV, (size_t)DI,
-                                attention_part_ml_floats(HQ, n_ctx, 1), attention_part_acc_floats(HQ, n_ctx, 1),
+    bool alloc(int E, int HQ, int HKV, int HD, int FF, int V, int conv_dim, int DI, int NV, int n_ctx, int rows) {
+        B = rows;
+        const size_t b = (size_t)rows;
+        q8_max_k = (std::max({E, HQ * HD, DI, FF}) + 255) / 256 * 256 * rows;
+        const size_t sizes[] = {b * E, b * E, b * E, b * 2 * HQ * HD, b * HQ * HD,
+                                b * HKV * HD, b * HKV * HD, b * HQ * HD, b * E,
+                                b * FF, b * FF, b * FF, (size_t)V,
+                                b * conv_dim, b * conv_dim, b * DI, b * NV, b * NV, b * DI,
+                                attention_part_ml_floats(HQ, n_ctx, rows), attention_part_acc_floats(HQ, n_ctx, rows),
                                 (qmatvec_q8_bytes(q8_max_k) + 3) / 4};
         float** const ptrs[] = {&x, &x_alt, &xn, &qfull, &q, &k, &v, &attn, &proj, &ffg, &ffu, &act, &logits,
                                 &qkv, &conv, &z, &alpha, &beta, &lin, &part_ml, &part_acc, &q8mem};
@@ -222,7 +228,7 @@ struct QwenModel {
     // QWEN_MATVEC_FP32=1 keeps every matvec on the float kernels (A/B and debugging).
     bool use_q8 = getenv("QWEN_MATVEC_FP32") == nullptr;
     const float* q8_src = nullptr;
-    int q8_k = 0;
+    int q8_k = 0, q8_t = 0;
 
     ~QwenModel() {
         rs.mem.free();
@@ -263,8 +269,13 @@ struct QwenModel {
                 return false;
             }
         }
+        // Prefill micro-batch: up to 64 tokens, fewer when attention's per-token partial buffers (which grow with
+        // the context length) would exceed ~64 MB
+        const int n_ctx = kv_cache_n_ctx(eng->kvc);
+        const size_t part_per_token = attention_part_acc_floats(eng->n_head, n_ctx, 1) * sizeof(float);
+        const int rows = (int)std::max<size_t>(1, std::min<size_t>(64, ((size_t)64 << 20) / std::max<size_t>(1, part_per_token)));
         if (!s.alloc(eng->n_embd, eng->n_head, eng->n_head_kv, eng->head_dim, eng->n_ff, eng->vocab_size, conv_dim,
-                     eng->ssm_d_inner, eng->ssm_dt_rank, kv_cache_n_ctx(eng->kvc))) {
+                     eng->ssm_d_inner, eng->ssm_dt_rank, n_ctx, rows)) {
             qwen_set_error("scratch allocation failed");
             return false;
         }
@@ -275,32 +286,41 @@ struct QwenModel {
         return true;
     }
 
-    // The int8 buffer for a producer kernel to quantize its K-value output into, or NULL (float path)
-    const qmatvec_q8* q8_for(int K) const { return use_q8 && K % 256 == 0 && K <= s.q8_max_k ? &s.q8 : nullptr; }
-
-    // A producer kernel just wrote x[K], quantized into q (NULL: not quantized); the next matvecs read it
-    void mark(const float* x, int K, const qmatvec_q8* q) {
-        q8_src = q ? x : nullptr;
-        q8_k = K;
+    // The int8 buffer for a producer kernel to quantize its T rows of K values into, or NULL (float path)
+    const qmatvec_q8* q8_for(int K, int T) const {
+        return use_q8 && K % 256 == 0 && (long long)K * T <= s.q8_max_k ? &s.q8 : nullptr;
     }
 
-    // x[K] was written by a kernel that cannot quantize its output: quantize it in a separate launch
-    bool produced(const float* x, int K) {
-        const qmatvec_q8* q = q8_for(K);
-        if (q && !check(qmatvec_quantize(x, K, q, 0), "quantize_q8")) return false;
-        mark(x, K, q);
+    // A producer kernel just wrote T rows of x[K], quantized into q (NULL: not quantized); the next matmuls
+    // read it
+    void mark(const float* x, int K, int T, const qmatvec_q8* q) {
+        q8_src = q ? x : nullptr;
+        q8_k = K;
+        q8_t = T;
+    }
+
+    // T rows of x[K] were written by a kernel that cannot quantize its output: quantize them in a separate launch
+    bool produced(const float* x, int K, int T) {
+        const qmatvec_q8* q = q8_for(K, T);
+        if (q && !check(qmatvec_quantize(x, K * T, q, 0), "quantize_q8")) return false;
+        mark(x, K, T, q);
         return true;
     }
 
-    // y = W x on the GPU. x and y must be in pinned memory (the scratch buffer). c: profile section. Uses the
-    // int8 kernel when there is one and s.q8 holds this x; otherwise the float kernel.
-    bool matvec(const QuantWeight& W, const float* x, float* y, ProfCat c) {
+    // Y[t] = W X[t] for T rows on the GPU (X, Y in pinned memory, rows of W.K / W.N values). c: profile
+    // section. Uses the int8 kernels when there is one for the type and s.q8 holds these rows; otherwise the
+    // float kernel, one launch per row.
+    bool matvec(const QuantWeight& W, const float* x, float* y, int T, ProfCat c) {
         prof.bytes[c] += (double)W.row_bytes * W.N;
-        const bool q8 = q8_src == x && q8_k == W.K && qmatvec_q8_supported(W.type, W.K);
-        hipError_t e = q8 ? qmatvec_launch_q8(W.type, W.data, W.row_bytes, &s.q8, y, W.N, W.K, 0)
-                          : qmatvec_launch(W.type, W.data, W.row_bytes, x, y, W.N, W.K, 0);
+        const bool q8 = q8_src == x && q8_k == W.K && q8_t == T && qmatvec_q8_supported(W.type, W.K);
+        hipError_t e = hipSuccess;
+        if (q8 && T == 1) e = qmatvec_launch_q8(W.type, W.data, W.row_bytes, &s.q8, y, W.N, W.K, 0);
+        else if (q8) e = qmatvec_launch_q8_batch(W.type, W.data, W.row_bytes, &s.q8, y, W.N, W.N, W.K, T, 0);
+        else
+            for (int t = 0; t < T && e == hipSuccess; ++t)
+                e = qmatvec_launch(W.type, W.data, W.row_bytes, x + (size_t)t * W.K, y + (size_t)t * W.N, W.N, W.K, 0);
         if (e != hipSuccess) {
-            qwen_set_error("qmatvec type %d %dx%d: %s", W.type, W.N, W.K, hipGetErrorString(e));
+            qwen_set_error("qmatvec type %d %dx%d (T %d): %s", W.type, W.N, W.K, T, hipGetErrorString(e));
             return false;
         }
         return true;
@@ -320,121 +340,163 @@ struct QwenModel {
         return true;
     }
 
-    // Gated full attention for one token at position pos, from the normed input s.xn; output in s.proj.
-    // q/k norm, RoPE, the KV cache write, attention over positions 0..pos and the output gate are GPU
-    // kernels (attention.hip).
-    bool full_attention(const LayerWeights& L, int pos) {
-        const int HQ = eng->n_head, HKV = eng->n_head_kv;
-        if (!matvec(L.Wq, s.xn, s.qfull, P_ATTN) || !matvec(L.Wk, s.xn, s.k, P_ATTN) || !matvec(L.Wv, s.xn, s.v, P_ATTN))
+    // Gated full attention for T tokens at positions pos0 .., from the normed input s.xn; output in s.proj.
+    // q/k norm, RoPE, the KV cache write, causal attention and the output gate are GPU kernels (attention.hip).
+    bool full_attention(const LayerWeights& L, int pos0, int T) {
+        const int HQ = eng->n_head, HKV = eng->n_head_kv, DQ = HQ * eng->head_dim;
+        if (!matvec(L.Wq, s.xn, s.qfull, T, P_ATTN) || !matvec(L.Wk, s.xn, s.k, T, P_ATTN) ||
+            !matvec(L.Wv, s.xn, s.v, T, P_ATTN))
             return false;
         __half* K = kv_cache_k_row(eng->kvc, L.kv_slot, 0);
         __half* V = kv_cache_v_row(eng->kvc, L.kv_slot, 0);
         if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
-        const qmatvec_q8* q8 = q8_for(HQ * eng->head_dim);
-        if (!check(attention_forward(s.qfull, s.k, s.v, L.q_norm, L.k_norm, K, V, HQ, HKV, eng->n_rot, pos, 1,
+        const qmatvec_q8* q8 = q8_for(DQ, T);
+        if (!check(attention_forward(s.qfull, s.k, s.v, L.q_norm, L.k_norm, K, V, HQ, HKV, eng->n_rot, pos0, T,
                                      eng->rope_freq_base, (float)eng->eps, s.q, s.part_ml, s.part_acc, s.attn, q8, 0),
                    "attention kernels"))
             return false;
-        mark(s.attn, HQ * eng->head_dim, q8);
-        return matvec(L.Wo, s.attn, s.proj, P_ATTN);
+        mark(s.attn, DQ, T, q8);
+        return matvec(L.Wo, s.attn, s.proj, T, P_ATTN);
     }
 
-    // Gated DeltaNet token mixer for one token, from s.xn; output in s.proj. Updates the layer's conv and
+    // Gated DeltaNet token mixer for T tokens, from s.xn; output in s.proj. Updates the layer's conv and
     // delta-rule state. Follows llama.cpp's qwen35 build_layer_attn_linear (deltanet.hip).
-    bool linear_attention(int l, const LayerWeights& L) {
+    bool linear_attention(int l, const LayerWeights& L, int T) {
         const int NG = eng->ssm_n_group, NV = eng->ssm_dt_rank;
         const float eps = (float)eng->eps;
-        if (!matvec(L.W_qkv, s.xn, s.qkv, P_LIN) || !matvec(L.W_z, s.xn, s.z, P_LIN)) return false;
-        // alpha and beta: two N = 32 matvecs on the same input, one launch on the int8 path
+        if (!matvec(L.W_qkv, s.xn, s.qkv, T, P_LIN) || !matvec(L.W_z, s.xn, s.z, T, P_LIN)) return false;
+        // alpha and beta: two N = 32 matvecs on the same input, one launch on the single-token int8 path
         const QuantWeight &A = L.W_alpha, &B = L.W_beta;
-        if (q8_src == s.xn && q8_k == A.K && A.type == B.type && A.K == B.K && A.row_bytes == B.row_bytes &&
-            qmatvec_q8_supported(A.type, A.K)) {
+        if (T == 1 && q8_src == s.xn && q8_k == A.K && q8_t == 1 && A.type == B.type && A.K == B.K &&
+            A.row_bytes == B.row_bytes && qmatvec_q8_supported(A.type, A.K)) {
             prof.bytes[P_LIN] += (double)A.row_bytes * (A.N + B.N);
             if (!check(qmatvec_launch_q8_pair(A.type, A.data, A.N, s.alpha, B.data, B.N, s.beta, A.row_bytes, &s.q8,
                                               A.K, 0), "alpha/beta matvec"))
                 return false;
-        } else if (!matvec(A, s.xn, s.alpha, P_LIN) || !matvec(B, s.xn, s.beta, P_LIN)) {
+        } else if (!matvec(A, s.xn, s.alpha, T, P_LIN) || !matvec(B, s.xn, s.beta, T, P_LIN)) {
             return false;
         }
         // conv1d + SiLU + q/k L2 norm + gates, then the delta rule + gated norm; alpha/beta become
         // g / sigmoid(beta) in place
         if (!check(deltanet_pre(s.qkv, rs.conv[l], L.ssm_conv1d, eng->ssm_d_conv, s.conv, NG, NV, s.alpha, s.beta,
-                                L.ssm_dt, L.ssm_a, s.alpha, s.beta, eps, 1, 0), "deltanet_pre") ||
-            !check(deltanet_rule(rs.ssm[l], s.conv, s.alpha, s.beta, s.z, L.ssm_norm, s.lin, NG, NV, eps, 1, 0),
+                                L.ssm_dt, L.ssm_a, s.alpha, s.beta, eps, T, 0), "deltanet_pre") ||
+            !check(deltanet_rule(rs.ssm[l], s.conv, s.alpha, s.beta, s.z, L.ssm_norm, s.lin, NG, NV, eps, T, 0),
                    "deltanet_rule") ||
-            !produced(s.lin, eng->ssm_d_inner))
+            !produced(s.lin, eng->ssm_d_inner, T))
             return false;
-        return matvec(L.W_ssm_out, s.lin, s.proj, P_LIN);
+        return matvec(L.W_ssm_out, s.lin, s.proj, T, P_LIN);
     }
 
     // Residual add of the mixer output, the FFN's RMSNorm, SwiGLU FFN, then the residual add of its output
     // fused with the next RMSNorm (next layer's attn_norm, or output_norm after the last layer)
-    bool ffn(const LayerWeights& L, const float* next_norm) {
+    bool ffn(const LayerWeights& L, const float* next_norm, int T) {
         const int E = eng->n_embd, FF = eng->n_ff;
         const float eps = (float)eng->eps;
-        const qmatvec_q8 *qe = q8_for(E), *qf = q8_for(FF);
-        if (!check(gpu_add_rmsnorm(s.x, s.proj, s.x_alt, L.ffn_norm, s.xn, E, 1, eps, qe, 0), "add_rmsnorm")) return false;
-        std::swap(s.x, s.x_alt);
-        mark(s.xn, E, qe);
-        if (!matvec(L.W_gate, s.xn, s.ffg, P_FFN) || !matvec(L.W_up, s.xn, s.ffu, P_FFN) ||
-            !check(gpu_swiglu(s.ffg, s.ffu, s.act, FF, qf, 0), "swiglu"))
-            return false;
-        mark(s.act, FF, qf);
-        if (!matvec(L.W_down, s.act, s.proj, P_FFN) ||
-            !check(gpu_add_rmsnorm(s.x, s.proj, s.x_alt, next_norm, s.xn, E, 1, eps, qe, 0), "add_rmsnorm"))
+        const qmatvec_q8 *qe = q8_for(E, T), *qf = q8_for(FF, T);
+        if (!check(gpu_add_rmsnorm(s.x, s.proj, s.x_alt, L.ffn_norm, s.xn, E, T, eps, qe, 0), "add_rmsnorm"))
             return false;
         std::swap(s.x, s.x_alt);
-        mark(s.xn, E, qe);
+        mark(s.xn, E, T, qe);
+        if (!matvec(L.W_gate, s.xn, s.ffg, T, P_FFN) || !matvec(L.W_up, s.xn, s.ffu, T, P_FFN) ||
+            !check(gpu_swiglu(s.ffg, s.ffu, s.act, FF * T, qf, 0), "swiglu"))
+            return false;
+        mark(s.act, FF, T, qf);
+        if (!matvec(L.W_down, s.act, s.proj, T, P_FFN) ||
+            !check(gpu_add_rmsnorm(s.x, s.proj, s.x_alt, next_norm, s.xn, E, T, eps, qe, 0), "add_rmsnorm"))
+            return false;
+        std::swap(s.x, s.x_alt);
+        mark(s.xn, E, T, qe);
         return true;
     }
 
-    // One token: the CPU decodes the embedding row into the residual stream, then the whole forward pass is
-    // one GPU queue with a single sync before the logits are read (more syncs when profiling or when a layer
-    // callback / QWEN_DEBUG wants the residual after each layer).
-    int forward(int token_id, int pos, float* logits_out) {
+    // T consecutive tokens at positions pos0 .. pos0 + T - 1 (T <= s.B): the CPU decodes their embedding rows into
+    // the residual stream, then the whole forward pass is one GPU queue with a single sync before the last
+    // token's logits are read (more syncs when profiling or when a layer callback / QWEN_DEBUG wants the residual
+    // after each layer). Every kernel computes each token exactly as it would one at a time, so a prefill gives
+    // the same results as feeding the tokens one by one.
+    int forward(const int* tokens, int T, int pos0, float* logits_out) {
         const int E = eng->n_embd;
         const float eps = (float)eng->eps;
-        if (token_id < 0 || token_id >= eng->vocab_size) { qwen_set_error("token %d out of range", token_id); return -1; }
-        if (!eng->kvc || pos < 0 || pos >= kv_cache_n_ctx(eng->kvc)) { qwen_set_error("position %d out of range", pos); return -1; }
-
-        prof.start();
-        if (qt_to_float(eng->token_embd.type, eng->token_embd.row(token_id), s.x, E) != 0) {
-            qwen_set_error("cannot decode token_embd type %d", eng->token_embd.type);
+        if (T <= 0 || T > s.B) { qwen_set_error("batch of %d tokens (max %d)", T, s.B); return -1; }
+        if (!eng->kvc || pos0 < 0 || pos0 + T > kv_cache_n_ctx(eng->kvc)) {
+            qwen_set_error("positions %d..%d out of range", pos0, pos0 + T - 1);
             return -1;
         }
+
+        prof.start();
+        for (int t = 0; t < T; ++t) {
+            if (tokens[t] < 0 || tokens[t] >= eng->vocab_size) { qwen_set_error("token %d out of range", tokens[t]); return -1; }
+            if (qt_to_float(eng->token_embd.type, eng->token_embd.row(tokens[t]), s.x + (size_t)t * E, E) != 0) {
+                qwen_set_error("cannot decode token_embd type %d", eng->token_embd.type);
+                return -1;
+            }
+        }
         // A sequence starting at position 0 starts from zero recurrent state (the KV cache needs no reset:
-        // attention only reads positions 0..pos)
-        if (pos == 0 && !check(rs.reset(), "recurrent state reset")) return -1;
-        if (!check(gpu_add_rmsnorm(s.x, nullptr, s.x, eng->layers[0].attn_norm, s.xn, E, 1, eps, q8_for(E), 0),
+        // attention only reads positions up to its own)
+        if (pos0 == 0 && !check(rs.reset(), "recurrent state reset")) return -1;
+        if (!check(gpu_add_rmsnorm(s.x, nullptr, s.x, eng->layers[0].attn_norm, s.xn, E, T, eps, q8_for(E, T), 0),
                    "add_rmsnorm"))
             return -1;
-        mark(s.xn, E, q8_for(E));
+        mark(s.xn, E, T, q8_for(E, T));
         prof.lap(P_EMBED);
 
         const bool per_layer = layer_cb || qwen_debug();
         for (int l = 0; l < eng->n_layer; ++l) {
             const LayerWeights& L = eng->layers[l];
             const bool attn = L.kind == LAYER_FULL_ATTN;
-            if (!(attn ? full_attention(L, pos) : linear_attention(l, L)) || !section(attn ? P_ATTN : P_LIN)) return -1;
+            if (!(attn ? full_attention(L, pos0, T) : linear_attention(l, L, T)) || !section(attn ? P_ATTN : P_LIN))
+                return -1;
             const float* next_norm = l + 1 < eng->n_layer ? eng->layers[l + 1].attn_norm : eng->output_norm;
-            if (!ffn(L, next_norm) || !section(P_FFN)) return -1;
+            if (!ffn(L, next_norm, T) || !section(P_FFN)) return -1;
             if (per_layer) {
                 if (!sync()) return -1;
-                if (layer_cb) layer_cb(l, pos, s.x, E, layer_cb_user);
-                if (qwen_debug()) {
-                    double ss = 0.0;
-                    for (int i = 0; i < E; ++i) ss += (double)s.x[i] * s.x[i];
-                    fprintf(stderr, "[qwen] pos %d blk %2d %-6s rms(x)=%.5g x[0..3]=%.5g %.5g %.5g %.5g\n", pos, l,
-                            attn ? "attn" : "linear", sqrt(ss / E), s.x[0], s.x[1], s.x[2], s.x[3]);
+                for (int t = 0; t < T; ++t) {
+                    const float* xt = s.x + (size_t)t * E;
+                    if (layer_cb) layer_cb(l, pos0 + t, xt, E, layer_cb_user);
+                    if (qwen_debug()) {
+                        double ss = 0.0;
+                        for (int i = 0; i < E; ++i) ss += (double)xt[i] * xt[i];
+                        fprintf(stderr, "[qwen] pos %d blk %2d %-6s rms(x)=%.5g x[0..3]=%.5g %.5g %.5g %.5g\n", pos0 + t,
+                                l, attn ? "attn" : "linear", sqrt(ss / E), xt[0], xt[1], xt[2], xt[3]);
+                    }
                 }
                 prof.start();  // the callback and debug trace are not charged
             }
         }
 
-        if (!matvec(eng->output, s.xn, s.logits, P_HEAD) || !sync()) return -1;
+        // LM head on the last token only: its row of s.xn, and its row of the quantized buffer
+        const float* xl = s.xn + (size_t)(T - 1) * E;
+        qmatvec_q8 last = s.q8;
+        if (q8_src == s.xn) {
+            const size_t r = (size_t)(T - 1) * E;
+            last.q0 += r;
+            last.qK += r;
+            last.d0 += r / 32;
+            last.dK += r / 256;
+            last.bsK += r / 16;
+            last.max_k = E;
+        }
+        const QuantWeight& H = eng->output;
+        prof.bytes[P_HEAD] += (double)H.row_bytes * H.N;
+        const hipError_t e = q8_src == s.xn && qmatvec_q8_supported(H.type, E)
+                                 ? qmatvec_launch_q8(H.type, H.data, H.row_bytes, &last, s.logits, H.N, E, 0)
+                                 : qmatvec_launch(H.type, H.data, H.row_bytes, xl, s.logits, H.N, E, 0);
+        if (!check(e, "LM head") || !sync()) return -1;
         if (logits_out) memcpy(logits_out, s.logits, (size_t)eng->vocab_size * sizeof(float));
         prof.lap(P_HEAD);
-        prof.tokens++;
+        prof.tokens += T;
+        return 0;
+    }
+
+    // A whole prompt (or any n tokens of the sequence) from position pos0, in micro-batches of s.B tokens.
+    // Leaves the logits of the last token in s.logits (and logits_out, if given).
+    int prefill(const int* tokens, int n, int pos0, float* logits_out) {
+        if (n <= 0) { qwen_set_error("empty prefill"); return -1; }
+        for (int done = 0; done < n;) {
+            const int T = std::min(s.B, n - done);
+            if (forward(tokens + done, T, pos0 + done, done + T == n ? logits_out : nullptr) != 0) return -1;
+            done += T;
+        }
         return 0;
     }
 };
@@ -492,7 +554,16 @@ void qwen_model_set_layer_callback(qwen_model_t* model, qwen_layer_cb cb, void* 
 
 int qwen_model_forward(qwen_model_t* model, int token_id, int pos, float* logits) {
     if (!model) return -1;
-    return model->forward(token_id, pos, logits);
+    return model->forward(&token_id, 1, pos, logits);
+}
+
+int qwen_model_prefill(qwen_model_t* model, const int* tokens, int n, int pos0, float* logits) {
+    if (!model || !tokens) return -1;
+    return model->prefill(tokens, n, pos0, logits);
+}
+
+int qwen_model_max_batch(const qwen_model_t* model) {
+    return model ? model->s.B : 0;
 }
 
 // The old batched path assumed dense full-attention layers and the repacked FP4 weights. It is removed

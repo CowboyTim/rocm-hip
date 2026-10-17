@@ -764,6 +764,27 @@ int main(int argc, char** argv) {
         if (!tok_ok) ++g_fail;
         printf("  [%s] engine next token after the prompt: %d (reference %d)\n", tok_ok ? "PASS" : "FAIL", best,
                next_token);
+
+        // Prefill: the same tokens in one qwen_model_prefill call. Every kernel computes each token exactly as
+        // the one-at-a-time path does, so the residuals and logits must be identical, not just close.
+        Ctx pctx;
+        pctx.T = T;
+        pctx.l_out.resize((size_t)m->n_layer * T * E);
+        qwen_model_set_layer_callback(qm, [](int l, int pos, const float* x, int n, void* u) {
+            Ctx* c = (Ctx*)u;
+            memcpy(&c->l_out[((size_t)l * c->T + pos) * n], x, (size_t)n * sizeof(float));
+        }, &pctx);
+        std::vector<float> plogits(V);
+        if (qwen_model_prefill(qm, tokens.data(), T, 0, plogits.data()) != 0) { fprintf(stderr, "prefill failed\n"); return 1; }
+        qwen_model_set_layer_callback(qm, nullptr, nullptr);
+        double dmax = 0.0;
+        for (size_t i = 0; i < ctx.l_out.size(); ++i) dmax = std::max(dmax, (double)std::fabs(pctx.l_out[i] - ctx.l_out[i]));
+        double lmax = 0.0;
+        for (int i = 0; i < V; ++i) lmax = std::max(lmax, (double)std::fabs(plogits[i] - logits[i]));
+        const bool pok = dmax == 0.0 && lmax == 0.0;
+        if (!pok) ++g_fail;
+        printf("  [%s] prefill (%d tokens, one call, max batch %d) vs token by token: max |d| l_out %.3g, logits %.3g\n",
+               pok ? "PASS" : "FAIL", T, qwen_model_max_batch(qm), dmax, lmax);
     }
 
     deltanet_free();

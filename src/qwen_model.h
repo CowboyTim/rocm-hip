@@ -31,7 +31,16 @@ void qwen_model_free(qwen_model_t* model);
 // Returns 0 on success, negative on error
 int qwen_model_forward(qwen_model_t* model, int token_id, int pos, float* logits);
 
-// Logits of the last qwen_model_forward, [vocab_size] FP32, in the pinned scratch buffer (no copy). Valid
+// Prefill: n tokens of the sequence at positions pos0 .. pos0 + n - 1 (pos0 = 0 starts a new sequence),
+// processed in micro-batches of qwen_model_max_batch tokens: each weight block is read once per 16-token tile
+// instead of once per token. Same results as n qwen_model_forward calls. logits (optional, [vocab_size]) gets
+// the last token's logits; qwen_model_logits() has them too. Returns 0 on success.
+int qwen_model_prefill(qwen_model_t* model, const int* tokens, int n, int pos0, float* logits);
+
+// Tokens per prefill micro-batch (scratch rows)
+int qwen_model_max_batch(const qwen_model_t* model);
+
+// Logits of the last qwen_model_forward / qwen_model_prefill, [vocab_size] FP32, in the pinned scratch buffer (no copy). Valid
 // until the next forward pass.
 const float* qwen_model_logits(qwen_model_t* model);
 
