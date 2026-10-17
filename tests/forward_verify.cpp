@@ -819,8 +819,9 @@ int main(int argc, char** argv) {
 
         // Batched: TB tokens at positions pos0 .. P - 1 in one call (prefill). Each token's projections are
         // random; the reference runs the CPU ops token by token, causally (token t sees positions <= pos0 + t).
-        {
-            const int TB = 8, pos0 = P - TB;
+        // TB = 8 runs attn_partial; TB = 40 runs attn_flash (FP16 WMMA), with a partial last token tile.
+        for (const int TB : {8, 40}) {
+            const int pos0 = P - TB;
             ShmBuf c_qf, c_k, c_v, c_q, c_ml, c_acc, c_out;
             if (!c_qf.alloc("fwdv_atb_qf.bin", (size_t)TB * 2 * DQ) || !c_k.alloc("fwdv_atb_k.bin", (size_t)TB * DKV) ||
                 !c_v.alloc("fwdv_atb_v.bin", (size_t)TB * DKV) || !c_q.alloc("fwdv_atb_q.bin", (size_t)TB * DQ) ||

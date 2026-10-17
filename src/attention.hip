@@ -181,3 +181,129 @@ attn_combine(const float* part_ml, const float* part_acc, int n_chunks, int n_q,
     out[h * HD + d] = r;
     if (o.qK) q8_block_value(r, true, z * n_q + h, d, sh, o);  // uniform; HD == 256: one head = one block
 }
+
+// ---------------------------------------------------------------- prefill: query-tiled flash attention
+//
+// attn_flash  grid (n_q / 4, ceil(T / FT), n_chunks), block 128 (4 waves). The same output as attn_partial
+//             (m, l, acc per (token, head, chunk), merged by attn_combine), for FT = 16 tokens and 4 query
+//             heads of one KV head at once, so each K/V chunk is read once per 64 query rows instead of once per
+//             row. Wave w takes head 4 * blockIdx.x + w; n_q / n_kv must be a multiple of 4 (the host checks).
+//             Per block of FB = 16 positions: the K block and the transposed V block are staged in LDS (FP16,
+//             as cached), S = Q K^T (16 tokens x 16 positions, FP16 WMMA, FP32 accumulation; Q rounded to FP16
+//             as ggml's flash attention does), causal mask, online softmax per token row (running max m and sum
+//             l; the row's previous acc is rescaled by exp(m_old - m_new)), then acc += P V with P in FP16.
+//             Operand layouts as tests/wmma_layout_verify: A row i / B column i in lanes i and i + 16; C
+//             column lane % 16, element r = row 2 r + lane / 16.
+
+typedef _Float16 v16h __attribute__((ext_vector_type(16)));
+typedef float v8f __attribute__((ext_vector_type(8)));
+
+#define FT 16          // query tokens per tile
+#define FB 16          // positions per block
+#define QP (HD + 8)    // padded LDS row of Q / K (halves)
+
+extern "C" __global__ void __launch_bounds__(128)
+attn_flash(const float* q, const __half* K, const __half* V, int kv_stride, int pos0, int T, int n_q, int n_kv_heads,
+           float scale, float* part_ml, float* part_acc) {
+    __shared__ __attribute__((aligned(16))) _Float16 sQ[4][FT][QP];
+    __shared__ __attribute__((aligned(16))) _Float16 sK[FB][QP];
+    __shared__ __attribute__((aligned(16))) _Float16 sVt[HD][FB];  // V block transposed: [dim][position]
+    __shared__ __attribute__((aligned(16))) _Float16 sP[4][FT][FB];
+    const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31, i = lane & 15, hi = lane >> 4;
+    const int h = blockIdx.x * 4 + w, g = blockIdx.x * 4 / (n_q / n_kv_heads);
+    const int z0 = blockIdx.y * FT, c = blockIdx.z, n_chunks = gridDim.z;
+    const int zmax = min(T, z0 + FT) - 1;                   // last token of the tile
+    const int npos = min(CH, pos0 + zmax + 1 - c * CH);     // chunk positions any token of the tile sees
+    const int nb = npos > 0 ? (npos + FB - 1) / FB : 0;
+
+    // This wave's Q rows (tokens z0 .. z0 + 15 of head h) to FP16; rows past T are zero
+    for (int idx = lane; idx < FT * HD / 4; idx += 32) {
+        const int rr = idx / (HD / 4), d = 4 * (idx % (HD / 4));
+        float4 x = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (z0 + rr < T) x = *(const float4*)(q + ((size_t)(z0 + rr) * n_q + h) * HD + d);
+        sQ[w][rr][d] = (_Float16)x.x, sQ[w][rr][d + 1] = (_Float16)x.y;
+        sQ[w][rr][d + 2] = (_Float16)x.z, sQ[w][rr][d + 3] = (_Float16)x.w;
+    }
+
+    float m[8], l[8];
+    v8f acc[HD / 16];
+#pragma unroll
+    for (int r = 0; r < 8; ++r) m[r] = -INFINITY, l[r] = 0.0f;
+#pragma unroll
+    for (int dt = 0; dt < HD / 16; ++dt) acc[dt] = (v8f){};
+
+#pragma unroll 1
+    for (int b = 0; b < nb; ++b) {
+        const int P0 = c * CH + b * FB;
+        __syncthreads();  // the previous block's sK / sVt reads are done (and, the first time, sQ is written)
+        // Stage the K and V blocks: 16 positions x 256 dims, 8 halves per uint4. Positions no token of the
+        // tile sees are zeroed: they are masked, but 0 * (stale V) must stay 0.
+#pragma unroll
+        for (int k = 0; k < FB * HD / 8 / 128; ++k) {
+            const int idx = tid + 128 * k, p = idx / (HD / 8), d = 8 * (idx % (HD / 8));
+            uint4 ku = make_uint4(0, 0, 0, 0), vu = ku;
+            if (P0 + p <= pos0 + zmax) {
+                const size_t off = (size_t)(P0 + p) * kv_stride + (size_t)g * HD + d;
+                ku = *(const uint4*)(K + off);
+                vu = *(const uint4*)(V + off);
+            }
+            *(uint4*)&sK[p][d] = ku;
+            const _Float16* vh = (const _Float16*)&vu;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) sVt[d + e][p] = vh[e];
+        }
+        __syncthreads();
+
+        // S = Q K^T for this wave's 16 tokens x 16 positions
+        v8f s = {};
+#pragma unroll
+        for (int kk = 0; kk < HD / 16; ++kk) {
+            const v16h a = *(const v16h*)&sQ[w][i][kk * 16];
+            const v16h bk = *(const v16h*)&sK[i][kk * 16];
+            s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bk, s);
+        }
+
+        // Online softmax; this lane holds position P0 + i of token rows 2 r + hi
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int z = z0 + 2 * r + hi;
+            const float sv = P0 + i <= pos0 + z ? s[r] * scale : -INFINITY;
+            float mx = sv;
+#pragma unroll
+            for (int off = 1; off < 16; off <<= 1) mx = fmaxf(mx, __shfl_xor(mx, off, 32));
+            const float mn = fmaxf(m[r], mx);
+            const float alpha = mn == -INFINITY ? 1.0f : __expf(m[r] - mn);
+            const float p = sv == -INFINITY ? 0.0f : __expf(sv - mn);
+            float ps = p;
+#pragma unroll
+            for (int off = 1; off < 16; off <<= 1) ps += __shfl_xor(ps, off, 32);
+            l[r] = l[r] * alpha + ps;
+            m[r] = mn;
+#pragma unroll
+            for (int dt = 0; dt < HD / 16; ++dt) acc[dt][r] *= alpha;
+            sP[w][2 * r + hi][i] = (_Float16)p;
+        }
+        __syncthreads();  // sP rows are read by other lanes
+
+        // acc += P V
+        const v16h a = *(const v16h*)&sP[w][i][0];
+#pragma unroll
+        for (int dt = 0; dt < HD / 16; ++dt) {
+            const v16h bv = *(const v16h*)&sVt[dt * 16 + i][0];
+            acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bv, acc[dt]);
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const int z = z0 + 2 * r + hi;
+        if (z >= T) continue;
+        const size_t pc = ((size_t)z * n_q + h) * n_chunks + c;
+        if (i == 0) {
+            part_ml[2 * pc] = m[r];
+            part_ml[2 * pc + 1] = l[r];
+        }
+#pragma unroll
+        for (int dt = 0; dt < HD / 16; ++dt) part_acc[pc * HD + dt * 16 + i] = acc[dt][r];
+    }
+}

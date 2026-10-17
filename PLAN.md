@@ -1218,12 +1218,12 @@ for the symptoms above.
 >
 > | Model | Generation | Prefill (561-token prompt) |
 > |---|---|---|
-> | Qwen3.5-4B | **62.6 tok/s** | **1,597 tok/s** (612 tokens; 2,455 tokens: 1,494) |
-> | Qwen3.6-35B-A3B (MoE) | **57.1 tok/s** | **725 tok/s** (612 tokens; 2,455 tokens: 719) |
+> | Qwen3.5-4B | **62.6 tok/s** | **1,627 tok/s** (612 tokens; 2,455 tokens: 1,715) |
+> | Qwen3.6-35B-A3B (MoE) | **57.1 tok/s** | **738 tok/s** (612 tokens; 2,455 tokens: 778) |
 >
-> 1. **Prefill (W1–W4 and W5.1 done).** Next is W5.2: query-tiled flash attention (`attn_partial` is
->    17.5% of 4B prefill at 2,455 tokens, 306 ms), then fuller expert tiles. See "TODO: prefill via WMMA"
->    below.
+> 1. **Prefill (W1–W4, W5.1 and W5.2 done).** Next is W5.3, fuller expert tiles for the 35B. 4B prefill
+>    at 2,455 tokens is now 73% WMMA matmuls; `add_rmsnorm` (78 ms, 119 µs per call for 2560 × 256 values)
+>    looks slow for what it does. See "TODO: prefill via WMMA" below.
 > 2. **35B generation (16.5 ms GPU per token):**
 >    - BF16 LM head: 5.1 ms at ~200 GB/s (1 GB, the bandwidth floor is ~4.2 ms).
 >    - Expert matvecs: 3.3 ms at ~160 GB/s.
@@ -1402,9 +1402,18 @@ for the symptoms above.
 >     `deltanet_pre` (still used for T = 1), so prefill stays bit-identical to token by token without WMMA.
 >   - Left: `deltanet_conv` (155 µs per 256 tokens, ~100 GB/s) and `deltanet_norm` (78 µs) could be
 >     faster; 3.4% of prefill together.
+> - **W5.2 — DONE ✅ (2026-10-17): query-tiled flash attention (`attn_flash`).** 4B prefill at 2,455
+>   tokens 1,494 → **1,715 tokens/s** (612 tokens: 1,597 → 1,627); 35B 719 → 778. Attention at 2,455
+>   tokens: 306 → 66 ms.
+>   - Workgroup = 4 query heads of one KV head × 16 tokens × one 256-position chunk. Each 16-position
+>     K block and transposed V block is staged once in LDS for 64 query rows; S = QKᵀ and acc += PV are
+>     FP16 WMMAs with FP32 accumulation, with an online softmax per token row in between.
+>   - Writes the same (m, l, acc) partials as `attn_partial`, so `attn_combine` is shared. Used for
+>     T ≥ 16 when n_q / n_kv is a multiple of 4 (both models); `QMATVEC_NO_WMMA` turns it off too.
+>   - 256 VGPRs, no spills. Q and P are rounded to FP16 (as ggml's flash attention does): 5.5e-4 of max
+>     vs the CPU reference (`forward_verify`, 40 tokens at positions 1460–1499).
+>   - `wmma_layout_verify` also pins the f16 → f32 WMMA layout; its FP32 sums are off by up to ~1 ulp.
 > - **W5 (next), in order:**
->   2. **Query-tiled flash attention for long prompts** (see below). `attn_partial` is 306 ms of 1,744
->      at 2,455 tokens on the 4B (avg 3.8 ms per call, 80 calls).
 >   3. **35B experts:** expert tiles average ~8 of 16 entries, so half of each WMMA tile is padding. Try
 >      micro-batches of 512 or 32-entry tiles.
 > - **W5. Then the rest of prefill becomes visible** (original text):

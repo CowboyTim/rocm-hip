@@ -4,9 +4,15 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 static hipModule_t g_mod = nullptr;
-static hipFunction_t g_prep = nullptr, g_partial = nullptr, g_combine = nullptr;
+static hipFunction_t g_prep = nullptr, g_partial = nullptr, g_combine = nullptr, g_flash = nullptr;
+
+// attn_flash takes batches of at least this many tokens. QMATVEC_NO_WMMA (qmatvec.h) also turns it off, so
+// that prefill can be compared bit for bit with token by token.
+static const int kFlashMinT = 16;
+static bool g_flash_off = false;
 
 int attention_init(const char* co_path) {
     if (g_mod) return 0;
@@ -17,18 +23,20 @@ int attention_init(const char* co_path) {
     }
     if (hipModuleGetFunction(&g_prep, g_mod, "attn_prep") != hipSuccess ||
         hipModuleGetFunction(&g_partial, g_mod, "attn_partial") != hipSuccess ||
-        hipModuleGetFunction(&g_combine, g_mod, "attn_combine") != hipSuccess) {
+        hipModuleGetFunction(&g_combine, g_mod, "attn_combine") != hipSuccess ||
+        hipModuleGetFunction(&g_flash, g_mod, "attn_flash") != hipSuccess) {
         fprintf(stderr, "[attention] kernels missing in %s\n", co_path);
         attention_free();
         return -1;
     }
+    g_flash_off = getenv("QMATVEC_NO_WMMA") != nullptr;
     return 0;
 }
 
 void attention_free(void) {
     if (g_mod) (void)hipModuleUnload(g_mod);
     g_mod = nullptr;
-    g_prep = g_partial = g_combine = nullptr;
+    g_prep = g_partial = g_combine = g_flash = nullptr;
 }
 
 hipError_t attention_forward(const float* qfull, const float* k, const float* v, const float* q_norm,
@@ -51,9 +59,15 @@ hipError_t attention_forward(const float* qfull, const float* k, const float* v,
     int n_chunks = (n_last + ATTN_CHUNK - 1) / ATTN_CHUNK;
     float scale = 1.0f / sqrtf((float)ATTN_HEAD_DIM);
     const float* qc = q;
-    void* a_part[] = {(void*)&qc, &K, &V, &kv_stride, &pos0, &n_q, &n_kv, &scale, &part_ml, &part_acc};
-    e = hipModuleLaunchKernel(g_partial, (unsigned)n_q, (unsigned)n_chunks, (unsigned)T, ATTN_HEAD_DIM, 1, 1, 0, stream,
-                              a_part, nullptr);
+    if (T >= kFlashMinT && !g_flash_off && (n_q / n_kv) % 4 == 0) {
+        void* a_flash[] = {(void*)&qc, &K, &V, &kv_stride, &pos0, &T, &n_q, &n_kv, &scale, &part_ml, &part_acc};
+        e = hipModuleLaunchKernel(g_flash, (unsigned)(n_q / 4), (unsigned)((T + 15) / 16), (unsigned)n_chunks, 128, 1,
+                                  1, 0, stream, a_flash, nullptr);
+    } else {
+        void* a_part[] = {(void*)&qc, &K, &V, &kv_stride, &pos0, &n_q, &n_kv, &scale, &part_ml, &part_acc};
+        e = hipModuleLaunchKernel(g_partial, (unsigned)n_q, (unsigned)n_chunks, (unsigned)T, ATTN_HEAD_DIM, 1, 1, 0,
+                                  stream, a_part, nullptr);
+    }
     if (e != hipSuccess) return e;
 
     qmatvec_q8_out o = qmatvec_q8_outputs(q8);
