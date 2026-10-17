@@ -81,6 +81,12 @@ hipError_t qmatvec_launch_q8(int type, const void *W, size_t row_bytes, const qm
 hipError_t qmatvec_launch_q8_pair(int type, const void *W, int N, float *y, const void *W2, int N2, float *y2,
                                   size_t row_bytes, const qmatvec_q8 *q, int K, hipStream_t stream);
 
+// Batched: Y[t] = W X[t] for T tokens (prefill). q holds the T inputs quantized as one flattened [T * K]
+// vector (qmatvec_quantize(X, T * K, q)); row t of the result goes to y + t * ldy. Same support as
+// qmatvec_q8_supported; each weight block is decoded once per tile of 16 tokens.
+hipError_t qmatvec_launch_q8_batch(int type, const void *W, size_t row_bytes, const qmatvec_q8 *q, float *y,
+                                   long long ldy, int N, int K, int T, hipStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

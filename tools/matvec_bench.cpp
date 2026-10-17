@@ -1,9 +1,10 @@
 // matvec_bench -- cold-cache qmatvec bandwidth per tensor role (Phase 20 speed work). Run from build/co.
 //
-//   matvec_bench <model.gguf> [reps] [f32]
+//   matvec_bench <model.gguf> [reps] [f32 | batch T]
 //
 // Uses the int8 kernels (qmatvec_launch_q8, activation quantized once per pass) wherever they exist; pass
-// "f32" to time the float kernels only.
+// "f32" to time the float kernels only, or "batch T" to time the batched prefill kernels on T tokens
+// (reported per token).
 //
 // A generated token reads every weight tensor exactly once, so nothing is warm in the 32 MB Infinity
 // Cache. This runs one role (e.g. all 32 ffn_down) back to back across the layers, each tensor once per
@@ -44,12 +45,13 @@ int main(int argc, char** argv) {
     }
     const int reps = argc > 2 ? atoi(argv[2]) : 5;
     const bool f32_only = argc > 3 && std::string(argv[3]) == "f32";
+    const int T = argc > 4 && std::string(argv[3]) == "batch" ? atoi(argv[4]) : 1;
     inference_model* m = inference_load_model(argv[1]);
     if (!m || qmatvec_init("matvec_q.co") != 0) return 1;
-    float* x = pinned(1 << 20);
-    float* y = pinned(1 << 20);
+    float* x = pinned((size_t)T << 16);
+    float* y = pinned(std::max((size_t)1 << 20, (size_t)T * 300000));
     if (!x || !y) return 1;
-    const int max_k = 1 << 16;
+    const int max_k = (1 << 16) * T;
     void* qmem = nullptr;
     {
         const size_t qb = (qmatvec_q8_bytes(max_k) + 4095) & ~(size_t)4095;
@@ -87,10 +89,12 @@ int main(int argc, char** argv) {
         for (int it = 0; it < reps + 1; ++it) {
             (void)hipDeviceSynchronize();
             const double t0 = now();
-            if (q && qmatvec_quantize(x, r.w[0]->K, &q8, 0) != hipSuccess) return 1;
+            if (q && qmatvec_quantize(x, T * r.w[0]->K, &q8, 0) != hipSuccess) return 1;
             for (const QuantWeight* w : r.w) {
-                const hipError_t e = q ? qmatvec_launch_q8(w->type, w->data, w->row_bytes, &q8, y, w->N, w->K, 0)
-                                       : qmatvec_launch(w->type, w->data, w->row_bytes, x, y, w->N, w->K, 0);
+                const hipError_t e =
+                    !q ? qmatvec_launch(w->type, w->data, w->row_bytes, x, y, w->N, w->K, 0)
+                    : T > 1 ? qmatvec_launch_q8_batch(w->type, w->data, w->row_bytes, &q8, y, w->N, w->N, w->K, T, 0)
+                            : qmatvec_launch_q8(w->type, w->data, w->row_bytes, &q8, y, w->N, w->K, 0);
                 if (e != hipSuccess) return 1;
             }
             (void)hipDeviceSynchronize();
@@ -111,6 +115,9 @@ int main(int argc, char** argv) {
                kv.second.first / kv.second.second / 1e9);
     printf("all matvecs of a token: %.1f MB in %.3f ms = %.1f GB/s\n", all_bytes / 1e6, all_t * 1e3,
            all_bytes / all_t / 1e9);
+    if (T > 1)
+        printf("batch of %d tokens: %.3f ms per token = %.1f tokens/s for the matmuls alone\n", T, all_t * 1e3 / T,
+               T / all_t);
     qmatvec_free();
     inference_free_model(m);
     return 0;

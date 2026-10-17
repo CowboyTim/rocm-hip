@@ -161,7 +161,42 @@ static bool run_one(gguf_model_t *g, int64_t idx, ShmBuf &xb, ShmBuf &yb) {
     }
     printf("  [%s] %-32s %-18s int8 path (q8 x)   worst rel err %.2e (row %d)%s\n", bad8 ? "FAIL" : "PASS", name,
            tr->name, worst8, worst8_n, bad8 ? " <-- rows over 1e-5" : "");
-    return bad == 0 && bad8 == 0;
+
+    // Batched (prefill) kernel on T = 11 tokens (a full tile of 8 plus a partial one): every token row must
+    // equal the single-token int8 matvec on that token
+    const int T = 11;
+    if ((size_t)T * K * sizeof(float) > xb.n || (size_t)T * N * sizeof(float) > yb.n || T * K > g_q8.max_k) {
+        printf("  [SKIP] %-32s batched check exceeds test buffers\n", name);
+        return bad == 0 && bad8 == 0;
+    }
+    std::vector<float> xs((size_t)T * K), single((size_t)T * N);
+    uint32_t s2 = 777u;
+    for (size_t i = 0; i < xs.size(); ++i) {
+        s2 = s2 * 1664525u + 1013904223u;
+        xs[i] = ((int)(s2 >> 9) - (1 << 22)) / (float)(1 << 22);
+    }
+    for (int t = 0; t < T; ++t) {
+        memcpy(x, &xs[(size_t)t * K], (size_t)K * sizeof(float));
+        e = qmatvec_quantize(x, K, &g_q8, 0);
+        if (e == hipSuccess) e = qmatvec_launch_q8(type, W, rb, &g_q8, y, N, K, 0);
+        if (e == hipSuccess) e = hipDeviceSynchronize();
+        if (e != hipSuccess) { printf("  [FAIL] %-32s int8 launch: %s\n", name, hipGetErrorString(e)); return false; }
+        memcpy(&single[(size_t)t * N], y, (size_t)N * sizeof(float));
+    }
+    memcpy(x, xs.data(), xs.size() * sizeof(float));
+    e = qmatvec_quantize(x, T * K, &g_q8, 0);
+    if (e == hipSuccess) e = qmatvec_launch_q8_batch(type, W, rb, &g_q8, y, N, N, K, T, 0);
+    if (e == hipSuccess) e = hipDeviceSynchronize();
+    if (e != hipSuccess) { printf("  [FAIL] %-32s batched launch: %s\n", name, hipGetErrorString(e)); return false; }
+    double worstb = 0.0;
+    for (size_t i = 0; i < single.size(); ++i) {
+        const double d = std::fabs((double)y[i] - single[i]) / (std::fabs((double)single[i]) + 1e-3);
+        worstb = std::max(worstb, d);
+    }
+    const bool okb = worstb <= 1e-5;
+    printf("  [%s] %-32s %-18s batched, %d tokens  worst rel diff vs single %.2e\n", okb ? "PASS" : "FAIL", name,
+           tr->name, T, worstb);
+    return bad == 0 && bad8 == 0 && okb;
 }
 
 int main(int argc, char **argv) {

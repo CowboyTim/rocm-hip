@@ -477,7 +477,6 @@ __device__ __forceinline__ float rocmfp4_q8_block(const uint32_t qs[4], uint32_t
     return ue4m3_half((uint8_t)e0) * dx * (float)s0 + ue4m3_half((uint8_t)e1) * dx * (float)s1;
 }
 
-// ROCmFP4 x Q8_0: a lane takes a pair of 18-byte blocks (36 bytes, 4-aligned; the host requires K % 64 == 0)
 // Row `row` of the (W, y) / (W2, y2) pair: sets wr and yr; false past the last row
 #define Q8_ROW_SETUP                                                                \
     const int lane = threadIdx.x & 31;                                              \
@@ -491,6 +490,7 @@ __device__ __forceinline__ float rocmfp4_q8_block(const uint32_t qs[4], uint32_t
     const uint8_t *W, const uint8_t *W2, int N1, long long row_bytes, const int8_t *q8, const float *d8, \
         const int *bs, float *y, float *y2, int N, int K
 
+// ROCmFP4 x Q8_0: a lane takes a pair of 18-byte blocks (36 bytes, 4-aligned; the host requires K % 64 == 0)
 extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
 matvec_q8_q4_0_rocmfp4(Q8_ARGS) {
     (void)bs;
@@ -604,4 +604,180 @@ matvec_q8_q4_K(Q8_ARGS) {
 extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
 matvec_q8_q5_K(Q8_ARGS) {
     matvec_q8_kquant<true>(W, W2, N1, row_bytes, q8, d8, bs, y, y2, N, K);
+}
+
+// ================================================================ batched int8 matmul (prefill)
+//
+// Y[t][n] = sum_k W[n][k] X[t][k] for T tokens: the same decoders and lane layouts as the matvec_q8 kernels,
+// but each lane decodes its weight bytes once and applies them to a tile of MM_TB tokens, so a weight block is
+// read once per tile instead of once per token. The activations of the T tokens are quantized as one
+// flattened [T * K] vector (qmatvec_quantize), which is the same thing block by block since K % 256 == 0.
+// grid (ceil(N / ROWS_PER_BLOCK), ceil(T / MM_TB)), block 32 * ROWS_PER_BLOCK; y row t at y + t * ldy.
+//
+// Kernels: matmul_q8_<type>(W, row_bytes, q8, d8, bs, y, ldy, N, K, T)
+
+#define MM_TB 16
+
+#define MM_ARGS const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, const int *bs, float *y, \
+                long long ldy, int N, int K, int T
+
+#define MM_ROW_SETUP                                                                \
+    const int lane = threadIdx.x & 31;                                              \
+    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);               \
+    if (row >= N) return;                                                           \
+    const uint8_t *wr = W + (long long)row * row_bytes;                             \
+    const int t0 = blockIdx.y * MM_TB, nt = min(MM_TB, T - t0);                     \
+    float acc[MM_TB];                                                               \
+    _Pragma("unroll") for (int j = 0; j < MM_TB; ++j) acc[j] = 0.0f;
+
+#define MM_STORE                                                                    \
+    _Pragma("unroll") for (int j = 0; j < MM_TB; ++j) {                             \
+        float a = acc[j];                                                           \
+        for (int off = 16; off > 0; off >>= 1) a += __shfl_xor(a, off, 32);         \
+        if (lane == 0 && j < nt) y[(long long)(t0 + j) * ldy + row] = a;            \
+    }
+
+extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
+matmul_q8_q4_0_rocmfp4(MM_ARGS) {
+    (void)bs;
+    MM_ROW_SETUP
+    const int npairs = K / 64, nb = K / 32;
+    for (int p = lane; p < npairs; p += 32) {
+        const uint8_t *b = wr + (long long)p * 36;
+        uint32_t w[9];
+#pragma unroll
+        for (int k = 0; k < 9; ++k) w[k] = ld32(b + 4 * k);
+        const uint32_t qs[2][4] = {{w[0], w[1], w[2], w[3]},
+                                   {(w[4] >> 16) | (w[5] << 16), (w[5] >> 16) | (w[6] << 16),
+                                    (w[6] >> 16) | (w[7] << 16), (w[7] >> 16) | (w[8] << 16)}};
+        const float e[2][2] = {{ue4m3_half((uint8_t)(w[4] & 0xFF)), ue4m3_half((uint8_t)((w[4] >> 8) & 0xFF))},
+                               {ue4m3_half((uint8_t)((w[8] >> 16) & 0xFF)), ue4m3_half((uint8_t)(w[8] >> 24))}};
+        int lo[2][4], hi[2][4];
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                lo[h][k] = rocmfp4_dec4(qs[h][k] & 0x0F0F0F0Fu);
+                hi[h][k] = rocmfp4_dec4((qs[h][k] >> 4) & 0x0F0F0F0Fu);
+            }
+#pragma unroll
+        for (int j = 0; j < MM_TB; ++j) {
+            if (j >= nt) break;
+            const long long t = t0 + j;
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int ib = 2 * p + h;
+                const int *x8 = (const int *)(q8 + t * K + ib * 32);
+                int s0 = 0, s1 = 0;
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    s0 = dot4(lo[h][k], x8[k], s0);
+                    s1 = dot4(hi[h][k], x8[4 + k], s1);
+                }
+                const float dx = d8[t * nb + ib];
+                acc[j] += e[h][0] * dx * (float)s0 + e[h][1] * dx * (float)s1;
+            }
+        }
+    }
+    MM_STORE
+}
+
+extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
+matmul_q8_q6_K(MM_ARGS) {
+    MM_ROW_SETUP
+    const int sub = lane >> 3, s = lane & 7;
+    const int h = s >> 2, r = (s & 3) * 16, l = r & 31;
+    const bool second = r >= 32;
+    const int sh_lo = second ? 2 : 0;
+    const int v_lo = 128 * h + (second ? 32 : 0) + l, v_hi = v_lo + 64;
+    const int g_lo = 8 * h + l / 16 + (second ? 2 : 0), g_hi = g_lo + 4;
+    const int nb = K / 256;
+    for (int ib = sub; ib < nb; ib += KQ_BLOCKS_PER_ITER) {
+        const uint8_t *b = wr + (long long)ib * 210;  // 2-aligned
+        const int8_t *sc = (const int8_t *)(b + 192);
+        int vlo[4], vhi[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t ql = ld32_a2(b + 64 * h + r + 4 * k);
+            const uint32_t qh = ld32_a2(b + 128 + 32 * h + l + 4 * k);
+            vlo[k] = (int)((ql & 0x0F0F0F0Fu) | (((qh >> sh_lo) & 0x03030303u) << 4));
+            vhi[k] = (int)(((ql >> 4) & 0x0F0F0F0Fu) | (((qh >> (sh_lo + 4)) & 0x03030303u) << 4));
+        }
+        const int sclo = sc[g_lo], schi = sc[g_hi], sc_a = sc[2 * s], sc_b = sc[2 * s + 1];
+        const float dw = fp16(b + 208);
+#pragma unroll
+        for (int j = 0; j < MM_TB; ++j) {
+            if (j >= nt) break;
+            const long long t = t0 + j;
+            const int8_t *xb = q8 + t * K + (long long)ib * 256;
+            const int *bst = bs + t * (K / 16) + ib * 16;
+            int slo = 0, shi = 0;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                slo = dot4(vlo[k], *(const int *)(xb + v_lo + 4 * k), slo);
+                shi = dot4(vhi[k], *(const int *)(xb + v_hi + 4 * k), shi);
+            }
+            const int isum = sclo * slo + schi * shi - 32 * (sc_a * bst[2 * s] + sc_b * bst[2 * s + 1]);
+            acc[j] += dw * d8[t * nb + ib] * (float)isum;
+        }
+    }
+    MM_STORE
+}
+
+template <bool Q5>
+__device__ void matmul_q8_kquant(MM_ARGS) {
+    constexpr int BYTES = Q5 ? 176 : 144, QS = Q5 ? 48 : 16;
+    MM_ROW_SETUP
+    const int sub = lane >> 3, s = lane & 7;
+    const int c = s >> 1, l = (s & 1) * 16;
+    const int nb = K / 256;
+    for (int ib = sub; ib < nb; ib += KQ_BLOCKS_PER_ITER) {
+        const uint8_t *b = wr + (long long)ib * BYTES;
+        int lo[4], hi[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t q = ld32(b + QS + 32 * c + l + 4 * k);
+            uint32_t a = q & 0x0F0F0F0Fu, h4 = (q >> 4) & 0x0F0F0F0Fu;
+            if (Q5) {
+                const uint32_t qh = ld32(b + 16 + l + 4 * k);
+                a |= ((qh >> (2 * c)) & 0x01010101u) << 4;
+                h4 |= ((qh >> (2 * c + 1)) & 0x01010101u) << 4;
+            }
+            lo[k] = (int)a;
+            hi[k] = (int)h4;
+        }
+        uint8_t sc1, m1, sc2, m2, sm, mm;
+        scale_min_k4(2 * c, b + 4, sc1, m1);
+        scale_min_k4(2 * c + 1, b + 4, sc2, m2);
+        scale_min_k4(s, b + 4, sm, mm);
+        const float dw = fp16(b), dmin = fp16(b + 2);
+#pragma unroll
+        for (int j = 0; j < MM_TB; ++j) {
+            if (j >= nt) break;
+            const long long t = t0 + j;
+            const int8_t *xb = q8 + t * K + (long long)ib * 256 + 64 * c + l;
+            const int *bst = bs + t * (K / 16) + ib * 16;
+            int slo = 0, shi = 0;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                slo = dot4(lo[k], *(const int *)(xb + 4 * k), slo);
+                shi = dot4(hi[k], *(const int *)(xb + 32 + 4 * k), shi);
+            }
+            const int isum = sc1 * slo + sc2 * shi;
+            const int msum = mm * (bst[2 * s] + bst[2 * s + 1]);
+            const float dx = d8[t * nb + ib];
+            acc[j] += dw * dx * (float)isum - dmin * dx * (float)msum;
+        }
+    }
+    MM_STORE
+}
+
+extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
+matmul_q8_q4_K(MM_ARGS) {
+    matmul_q8_kquant<false>(W, row_bytes, q8, d8, bs, y, ldy, N, K, T);
+}
+
+extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
+matmul_q8_q5_K(MM_ARGS) {
+    matmul_q8_kquant<true>(W, row_bytes, q8, d8, bs, y, ldy, N, K, T);
 }
