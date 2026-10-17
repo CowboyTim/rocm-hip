@@ -54,6 +54,50 @@ add_rmsnorm(const float* x_in, const float* add, float* x_out, const float* w, f
     if (o.qK) q8_block_value(v, active, blockIdx.y * (n / 256) + blockIdx.x, t, sh, o);  // uniform; n % 256 == 0
 }
 
+// add_rmsnorm_rows: the same for many rows (prefill): grid T, block 256, one workgroup per row, which it reads
+// once (add_rmsnorm's workgroups each re-read the whole row for the sum of squares). n % 256 == 0 and
+// n <= 256 * NORM_MAXV. Thread t holds values t + 256 j and sums them in add_rmsnorm's order, so the
+// results are bit-identical.
+#define NORM_MAXV 16
+extern "C" __global__ void __launch_bounds__(256)
+add_rmsnorm_rows(const float* x_in, const float* add, float* x_out, const float* w, float* y, int n, float eps,
+                 Q8Out o) {
+    __shared__ float part[8];
+    __shared__ Q8Shared sh;
+    const long long row = (long long)blockIdx.x * n;
+    x_in += row;
+    x_out += row;
+    y += row;
+    if (add) add += row;
+    const int t = threadIdx.x, nb = n / 256;
+    float x[NORM_MAXV];
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < NORM_MAXV; ++j)
+        if (j < nb) {
+            const int k = t + 256 * j;
+            x[j] = add ? x_in[k] + add[k] : x_in[k];
+            ss += x[j] * x[j];
+        }
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor(ss, off, 32);
+    if ((t & 31) == 0) part[t >> 5] = ss;
+    __syncthreads();
+    float tot = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) tot += part[k];
+    const float inv = rsqrtf(tot / n + eps);
+
+#pragma unroll
+    for (int j = 0; j < NORM_MAXV; ++j)
+        if (j < nb) {  // uniform
+            const int k = t + 256 * j;
+            if (add) x_out[k] = x[j];
+            const float v = x[j] * inv * (w ? w[k] : 1.0f);
+            y[k] = v;
+            if (o.qK) q8_block_value(v, true, blockIdx.x * nb + j, t, sh, o);
+        }
+}
+
 extern "C" __global__ void __launch_bounds__(256)
 swiglu(const float* g, const float* u, float* out, int n, Q8Out o) {
     __shared__ Q8Shared sh;

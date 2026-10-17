@@ -5,6 +5,7 @@
 #include <stdio.h>
 
 static hipModule_t g_mod = nullptr;
+static hipFunction_t g_norm_rows = nullptr;
 static hipFunction_t g_norm = nullptr, g_swiglu = nullptr, g_router = nullptr, g_combine = nullptr, g_group = nullptr;
 
 int gpu_ops_init(const char* co_path) {
@@ -15,6 +16,7 @@ int gpu_ops_init(const char* co_path) {
         return -1;
     }
     if (hipModuleGetFunction(&g_norm, g_mod, "add_rmsnorm") != hipSuccess ||
+        hipModuleGetFunction(&g_norm_rows, g_mod, "add_rmsnorm_rows") != hipSuccess ||
         hipModuleGetFunction(&g_swiglu, g_mod, "swiglu") != hipSuccess ||
         hipModuleGetFunction(&g_router, g_mod, "moe_router") != hipSuccess ||
         hipModuleGetFunction(&g_combine, g_mod, "moe_combine") != hipSuccess ||
@@ -29,7 +31,7 @@ int gpu_ops_init(const char* co_path) {
 void gpu_ops_free(void) {
     if (g_mod) (void)hipModuleUnload(g_mod);
     g_mod = nullptr;
-    g_norm = g_swiglu = g_router = g_combine = g_group = nullptr;
+    g_norm = g_norm_rows = g_swiglu = g_router = g_combine = g_group = nullptr;
 }
 
 hipError_t gpu_add_rmsnorm(const float* x_in, const float* add, float* x_out, const float* w, float* y, int n, int T,
@@ -39,6 +41,9 @@ hipError_t gpu_add_rmsnorm(const float* x_in, const float* add, float* x_out, co
         return hipErrorInvalidValue;
     qmatvec_q8_out o = qmatvec_q8_outputs(q8);
     void* args[] = {(void*)&x_in, (void*)&add, &x_out, (void*)&w, &y, &n, &eps, &o};
+    // One token: spread the row over the GPU. Several: one workgroup per row (16 = NORM_MAXV in gpu_ops.hip).
+    if (T > 1 && n % 256 == 0 && n <= 256 * 16)
+        return hipModuleLaunchKernel(g_norm_rows, (unsigned)T, 1, 1, 256, 1, 1, 0, stream, args, nullptr);
     return hipModuleLaunchKernel(g_norm, (unsigned)((n + 255) / 256), (unsigned)T, 1, 256, 1, 1, 0, stream, args,
                                  nullptr);
 }
