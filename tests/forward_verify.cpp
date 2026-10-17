@@ -404,6 +404,44 @@ int main(int argc, char** argv) {
             if (e != hipSuccess) { fprintf(stderr, "expert down: %s\n", hipGetErrorString(e)); return 1; }
             for (int r = 0; r < T * NU; ++r) sed.add(g_y + (size_t)r * E, &md[(size_t)r * E], E);
 
+            // The same expert projections through the prefill path: entries grouped by expert on the GPU
+            // (gpu_moe_group), then the expert-tiled batched kernels (WMMA where the type has one)
+            Stat sbg, sbu, sbd;
+            {
+                const int tile = qmatvec_mm_tile(), mt = gpu_moe_max_tiles(T, NU, NE, tile);
+                ShmBuf b_gt, b_gp, b_gn, b_ge, b_gs, b_gc;
+                if (!b_gt.alloc("fwdv_moe_gt.bin", (size_t)T * NU) || !b_gp.alloc("fwdv_moe_gp.bin", (size_t)T * NU) ||
+                    !b_gn.alloc("fwdv_moe_gn.bin", 1) || !b_ge.alloc("fwdv_moe_ge.bin", mt) ||
+                    !b_gs.alloc("fwdv_moe_gs.bin", mt) || !b_gc.alloc("fwdv_moe_gc.bin", mt)) {
+                    fprintf(stderr, "alloc failed\n");
+                    return 1;
+                }
+                int *gt = (int*)b_gt.p, *gp = (int*)b_gp.p, *gn = (int*)b_gn.p, *ge = (int*)b_ge.p,
+                    *gs = (int*)b_gs.p, *gc = (int*)b_gc.p;
+                e = gpu_moe_group(gids, T, NU, NE, tile, gt, gp, gn, ge, gs, gc, 0);
+                for (int k = 0; k < 2 && e == hipSuccess; ++k) {
+                    memcpy(g_x, b.data(), (size_t)T * E * sizeof(float));
+                    e = qmatvec_quantize(g_x, T * E, &g_q8, 0);
+                    if (e == hipSuccess)
+                        e = qmatvec_launch_q8_id_batch(W3[k]->type, W3[k]->data, W3[k]->row_bytes, &g_q8, g_y, FE, E, mt,
+                                                       gn, ge, gs, gc, gt, gp, 0);
+                    if (e == hipSuccess) e = hipDeviceSynchronize();
+                    if (e == hipSuccess)
+                        for (int r = 0; r < T * NU; ++r)
+                            (k ? sbu : sbg).add(g_y + (size_t)r * FE, &(*R3[k])[(size_t)r * FE], FE);
+                }
+                if (e == hipSuccess) {
+                    memcpy(g_x, msw.data(), (size_t)T * NU * FE * sizeof(float));
+                    e = qmatvec_quantize(g_x, T * NU * FE, &g_q8, 0);
+                }
+                if (e == hipSuccess)
+                    e = qmatvec_launch_q8_id_batch(L.We_down.type, L.We_down.data, L.We_down.row_bytes, &g_q8, g_y, E, FE,
+                                                   mt, gn, ge, gs, gc, gp, gp, 0);
+                if (e == hipSuccess) e = hipDeviceSynchronize();
+                if (e != hipSuccess) { fprintf(stderr, "grouped expert matmul: %s\n", hipGetErrorString(e)); return 1; }
+                for (int r = 0; r < T * NU; ++r) sbd.add(g_y + (size_t)r * E, &md[(size_t)r * E], E);
+            }
+
             // Shared expert
             std::vector<float> sact((size_t)FS);
             Stat sssw;
@@ -439,6 +477,9 @@ int main(int argc, char** argv) {
             report("blk.0 experts up (int8, by id)", seu);
             report("blk.0 experts SwiGLU", sesw);
             report("blk.0 experts down (int8, by id)", sed);
+            report("blk.0 experts gate, grouped prefill path", sbg);
+            report("blk.0 experts up, grouped prefill path", sbu);
+            report("blk.0 experts down, grouped prefill path", sbd);
             report("blk.0 shared expert gate (qmatvec)", ssg);
             report("blk.0 shared expert up (qmatvec)", ssu);
             report("blk.0 shared expert SwiGLU", sssw);
