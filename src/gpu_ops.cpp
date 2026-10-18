@@ -67,11 +67,13 @@ hipError_t gpu_swiglu(const float* g, const float* u, float* out, int n, const q
 }
 
 hipError_t gpu_moe_router(const float* logits, const float* x, const float* w_shexp, int* ids, float* wts, float* sg,
-                          int n_expert, int n_used, int n, int T, hipStream_t stream) {
+                          int n_expert, int n_used, int n, int T, hipStream_t stream, int ids_stride) {
     if (!g_router) return hipErrorInvalidDeviceFunction;
     if (n_expert <= 0 || n_expert > 1024 || n_used <= 0 || n_used > 64 || n_used > n_expert || T <= 0)
         return hipErrorInvalidValue;
-    void* args[] = {(void*)&logits, (void*)&x, (void*)&w_shexp, &ids, &wts, &sg, &n_expert, &n_used, &n};
+    if (ids_stride == 0) ids_stride = n_used;
+    if (ids_stride < n_used) return hipErrorInvalidValue;
+    void* args[] = {(void*)&logits, (void*)&x, (void*)&w_shexp, &ids, &wts, &sg, &n_expert, &n_used, &n, &ids_stride};
     return hipModuleLaunchKernel(g_router, (unsigned)T, 1, 1, 256, 1, 1, 0, stream, args, nullptr);
 }
 

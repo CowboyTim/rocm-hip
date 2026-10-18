@@ -27,6 +27,7 @@ static hipFunction_t g_fn_mm_id[QMV_MAX_TYPE];  // expert-tiled batched int8 ker
 static hipFunction_t g_fn_wmma[QMV_MAX_TYPE];   // WMMA tiled int8 kernels, matmul_wmma_<type> (Phase 20 W2)
 static hipFunction_t g_fn_wmma_id[QMV_MAX_TYPE];  // WMMA on MoE expert tiles, matmul_wmma_id_<type> (W4)
 static hipFunction_t g_fn_mmf[QMV_MAX_TYPE];     // batched float kernels, matmul_f_<type>
+static hipFunction_t g_lr_fast = nullptr;         // matvec_q8_lr_q4_0_rocmfp4_fast
 static bool g_use_wmma = true;
 static int g_wmma_min_t = 32;  // smaller batches, and N < 64 (a 64-row tile mostly padding), stay on matmul_q8_<type>
 #define QMV_MM_TB 16  // tokens per tile, must match MM_TB in matvec_q.hip
@@ -72,6 +73,7 @@ int qmatvec_init(const char *co_path) {
     }
     if (hipModuleGetFunction(&g_quant, g_mod, "quantize_q8") != hipSuccess) g_quant = nullptr;
     if (hipModuleGetFunction(&g_mm_f32, g_mod, "matmul_f32") != hipSuccess) g_mm_f32 = nullptr;
+    if (hipModuleGetFunction(&g_lr_fast, g_mod, "matvec_q8_lr_q4_0_rocmfp4_fast") != hipSuccess) g_lr_fast = nullptr;
     if (hipModuleGetFunction(&g_quant_rows_q8_0, g_mod, "quantize_rows_q8_0") != hipSuccess) g_quant_rows_q8_0 = nullptr;
     if (hipModuleGetFunction(&g_mv_q8_0s, g_mod, "matvec_q8_0s") != hipSuccess) g_mv_q8_0s = nullptr;
     g_use_wmma = getenv("QMATVEC_NO_WMMA") == nullptr;  // A/B switch
@@ -92,7 +94,7 @@ void qmatvec_free(void) {
     memset(g_fn_wmma_id, 0, sizeof(g_fn_wmma_id));
     memset(g_fn_mmf, 0, sizeof(g_fn_mmf));
     g_quant = nullptr;
-    g_mm_f32 = g_quant_rows_q8_0 = g_mv_q8_0s = nullptr;
+    g_mm_f32 = g_quant_rows_q8_0 = g_mv_q8_0s = g_lr_fast = nullptr;
 }
 
 int qmatvec_supported(int type) {
@@ -223,17 +225,53 @@ static int q8_lanes_per_row(int type, int K, long long rows) {
 
 hipError_t qmatvec_launch_q8_pair(int type, const void *W, int N, float *y, const void *W2, int N2, float *y2,
                                   size_t row_bytes, const qmatvec_q8 *q, int K, hipStream_t stream) {
-    if (!qmatvec_q8_supported(type, K)) return hipErrorInvalidDeviceFunction;
-    if (row_bytes != qt_row_size(type, K) || row_bytes % 4 != 0 || ((uintptr_t)W & 3) != 0 || ((uintptr_t)W2 & 3) != 0 ||
-        K > q->max_k)
+    const void *Ws[] = {W, W2};
+    const int Ns[] = {N, N2};
+    float *ys[] = {y, y2};
+    return qmatvec_launch_q8_multi(type, 2, Ws, Ns, ys, row_bytes, q, K, stream);
+}
+
+int qmatvec_q8_lr_supported(int type, int K) {
+    return g_lr_fast && type == QT_Q4_0_ROCMFP4_FAST && K % 128 == 0 && K <= 1024;  // LR_MAXK in matvec_q.hip
+}
+
+hipError_t qmatvec_launch_q8_lr(int type, const void *W, size_t row_bytes, const float *lo, int n, int K, float scale,
+                                float *y, int N, hipStream_t stream) {
+    if (!qmatvec_q8_lr_supported(type, K)) return hipErrorInvalidDeviceFunction;
+    if (n > K || row_bytes != qt_row_size(type, K) || row_bytes % 4 != 0 || ((uintptr_t)W & 3) != 0)
         return hipErrorInvalidValue;
+    long long rb = (long long)row_bytes;
+    int L = q8_lanes_per_row(type, K, N);
+    void *args[] = {(void *)&W, &rb, (void *)&lo, &n, &K, &scale, &y, &N, &L};
+    const int rows = QMV_ROWS_PER_BLOCK * 32 / L;
+    return hipModuleLaunchKernel(g_lr_fast, (unsigned)((N + rows - 1) / rows), 1, 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0,
+                                 stream, args, nullptr);
+}
+
+hipError_t qmatvec_launch_q8_multi(int type, int n, const void *const *Ws, const int *Ns, float *const *ys,
+                                   size_t row_bytes, const qmatvec_q8 *q, int K, hipStream_t stream) {
+    if (!qmatvec_q8_supported(type, K)) return hipErrorInvalidDeviceFunction;
+    if (n < 1 || n > 4 || row_bytes != qt_row_size(type, K) || row_bytes % 4 != 0 || K > q->max_k)
+        return hipErrorInvalidValue;
+    const void *W[4];
+    float *y[4];
+    int bound[4], Nt = 0;
+    for (int i = 0; i < 4; ++i) {
+        const int j = i < n ? i : n - 1;  // unused slots repeat the last matrix, with no rows
+        if (((uintptr_t)Ws[j] & 3) != 0) return hipErrorInvalidValue;
+        W[i] = Ws[j];
+        y[i] = ys[j];
+        if (i < n) Nt += Ns[i];
+        bound[i] = Nt;
+    }
     const bool kq = type != QT_Q4_0_ROCMFP4 && type != QT_Q4_0_ROCMFP4_FAST;  // K-quants read Q8_K, ROCmFP4 Q8_0
     const int8_t *q8 = kq ? q->qK : q->q0;
     const float *d8 = kq ? q->dK : q->d0;
     const int32_t *bs = q->bsK;
     long long rb = (long long)row_bytes;
-    int N1 = N, Nt = N + N2, L = q8_lanes_per_row(type, K, (long long)N + N2);
-    void *args[] = {(void *)&W, (void *)&W2, &N1, &rb, (void *)&q8, (void *)&d8, (void *)&bs, (void *)&y, (void *)&y2,
+    int L = q8_lanes_per_row(type, K, Nt);
+    void *args[] = {(void *)&W[0], (void *)&W[1], (void *)&W[2], (void *)&W[3], &bound[0], &bound[1], &bound[2], &rb,
+                    (void *)&q8, (void *)&d8, (void *)&bs, (void *)&y[0], (void *)&y[1], (void *)&y[2], (void *)&y[3],
                     &Nt, &K, &L};
     const int rows = QMV_ROWS_PER_BLOCK * 32 / L;
     const unsigned grid = (unsigned)((Nt + rows - 1) / rows);
@@ -272,13 +310,20 @@ hipError_t qmatvec_launch_q8_batch(int type, const void *W, size_t row_bytes, co
 
 hipError_t qmatvec_launch_q8_id(int type, const void *W, size_t row_bytes, const int32_t *ids, int n_used,
                                 int x_per_slot, const qmatvec_q8 *q, float *y, int N, int K, int T, hipStream_t stream) {
-    return qmatvec_launch_q8_id_pair(type, W, nullptr, row_bytes, ids, n_used, x_per_slot, q, y, nullptr, N, K, T,
-                                     stream);
+    return qmatvec_launch_q8_id_x(type, W, nullptr, nullptr, nullptr, row_bytes, ids, n_used, x_per_slot, q, y,
+                                  nullptr, N, K, T, stream);
 }
 
 hipError_t qmatvec_launch_q8_id_pair(int type, const void *W, const void *W2, size_t row_bytes, const int32_t *ids,
                                      int n_used, int x_per_slot, const qmatvec_q8 *q, float *y, float *y2, int N, int K,
                                      int T, hipStream_t stream) {
+    return qmatvec_launch_q8_id_x(type, W, W2, nullptr, nullptr, row_bytes, ids, n_used, x_per_slot, q, y, y2, N, K,
+                                  T, stream);
+}
+
+hipError_t qmatvec_launch_q8_id_x(int type, const void *W, const void *W2, const void *Wx, const void *W2x,
+                                  size_t row_bytes, const int32_t *ids, int n_used, int x_per_slot,
+                                  const qmatvec_q8 *q, float *y, float *y2, int N, int K, int T, hipStream_t stream) {
     if (!qmatvec_q8_supported(type, K) || !g_fn_q8_id[type]) return hipErrorInvalidDeviceFunction;
     const long long in_rows = (long long)T * (x_per_slot ? n_used : 1);
     if (T <= 0 || n_used <= 0 || row_bytes != qt_row_size(type, K) || row_bytes % 4 != 0 || ((uintptr_t)W & 3) != 0 ||
@@ -290,9 +335,9 @@ hipError_t qmatvec_launch_q8_id_pair(int type, const void *W, const void *W2, si
     const int32_t *bs = q->bsK;
     long long rb = (long long)row_bytes;
     int L = q8_lanes_per_row(type, K, (long long)N * n_used * (W2 ? 2 : 1) * T);
-    if (W2 && ((uintptr_t)W2 & 3) != 0) return hipErrorInvalidValue;
+    if ((((uintptr_t)W2 | (uintptr_t)Wx | (uintptr_t)W2x) & 3) != 0) return hipErrorInvalidValue;
     void *args[] = {(void *)&W, (void *)&W2, &rb, (void *)&ids, &n_used, &x_per_slot, (void *)&q8, (void *)&d8,
-                    (void *)&bs, (void *)&y, (void *)&y2, &N, &K, &L};
+                    (void *)&bs, (void *)&y, (void *)&y2, &N, &K, &L, (void *)&Wx, (void *)&W2x};
     const int rows = QMV_ROWS_PER_BLOCK * 32 / L;
     const unsigned gx = (unsigned)((N + rows - 1) / rows);
     return hipModuleLaunchKernel(g_fn_q8_id[type], gx, (unsigned)(n_used * (W2 ? 2 : 1)), (unsigned)T,

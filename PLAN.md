@@ -1215,16 +1215,14 @@ for the symptoms above.
 >   Reference dump: `/data/ref_q38_fast` (prompt "Write a Python function that checks whether a number is prime.").
 > - **Results:** coherent text; `qwen4exp_verify` passes on it (559 of 564 single-layer updates at cosine >= 0.999,
 >   the rest at routing near-ties of the 512-expert router; logits cosine 0.99, same argmax). Generation
->   **35.6 tok/s** (was 31.4; see "generation speed" in Phase 21), prefill **436 tok/s** (2,427 tokens) vs the
->   reference's ~24 / ~345. 4B / 35B unchanged.
+>   **38.1 tok/s** (was 31.4; see "generation speed" and "kernel fusions" in Phase 21), prefill **436 tok/s**
+>   (2,427 tokens) vs the reference's ~24 / ~345. 35B 65.3 tok/s, 4B 63.7.
 > - **Next:**
->   1. speed: per token ~26 ms of GPU time + ~2 ms of launch gaps (~1,250 launches). Matvecs stream ~3.9 GB per
->      token at 160–230 GB/s (~21 ms); the rest is small kernels: hc_norm 98 x 7.9 us, moe_router 48 x 14 us,
->      deltanet_rule 36 x 19 us, ~400 launches of 2–3 us (hc_mix, hc_lowrank, swiglu, moe_combine). Left: fusing
->      small kernels (e.g. swiglu into the experts' gate/up epilogue) at ~1-2% each; **MTP speculative decoding**
->      is the larger lever (the reference: +11–34%), but a rejected draft needs the DeltaNet state of the
->      position before it (118 MB here). Profile: `rocprofv3 --kernel-trace -d <dir> -o run -- <cmd>`, then
->      `tools/prof_summary.py <dir>`;
+>   1. **now: MTP speculative decoding** (user, 2026-10-18: fusions first — done — then MTP). The reference:
+>      +11–34%. The head: `kingjones777/Qwen3.8-Flash-Next-MTP-Heads-GGUF` (`mtp-...-Q4_0_ROCMFP4_FAST.gguf`
+>      2.1 GB; Q8_0 4.1 GB is the one the card measured); its graph: the repo's `qwen4exp-mtp-graph.patch`. A
+>      rejected draft needs the DeltaNet state of the position before it (118 MB here). Profile:
+>      `rocprofv3 --kernel-trace -d <dir> -o run -- <cmd>`, then `tools/prof_summary.py <dir>`;
 >   2. greedy text vs `llama-completion` diverges at the 2nd token on that prompt (a near-tie, see the results);
 >      compare longer greedy runs on prompts without near-ties, or by teacher forcing;
 >   3. MTP draft heads (the model card's MTP-Heads GGUF) for speculative decoding: +11–34% in the reference;
@@ -1950,6 +1948,20 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
   - Int8 lanes per row for ROCmFP4_FAST: the 8-lane cap now applies from 4,096 rows of a launch (16 from 1,024,
     else 32): the mixers' down + inject (324 x 10240) 14.9 → 11.0 us. The virtual-lane sums keep every L
     bit-identical. 35.6 tok/s; greedy output unchanged; 4B / 35B unchanged.
+- **Kernel fusions — 35.6 → 38.1 tok/s (2026-10-18; launches per token ~1,250 → ~930):**
+  - Shared expert as slot NU of the experts' launches when generating (`moe_core_one`): the router writes an
+    extra id -1 (`ids_stride`), the expert-indexed int8 kernels take the shared matrices for it
+    (`qmatvec_launch_q8_id_x`), one SwiGLU over NU + 1 slots, `moe_combine` reads the shared output from slot
+    NU: 3 launches per layer fewer. 35.6 → 37.4 tok/s; the 35B 63.3 → 65.3.
+  - `qmatvec_launch_q8_multi`: up to 4 matrices on the same input in one launch (DeltaNet qkv + z + alpha +
+    beta, attention q + k + v; grouped by type): 37.9.
+  - `matvec_q8_lr_q4_0_rocmfp4_fast`: the mixers' up projection applies SiLU, padding and the Q8_0 quantization
+    of its 320-value input in each workgroup (no `hc_lowrank` launch when generating): 38.2.
+  - All bit-identical (greedy text unchanged, token by token = prefill with QMATVEC_NO_WMMA).
+  - Tried and dropped: a per-wave argmax top-k in `moe_router` instead of the bitonic sort (15.3 vs 14.3 us:
+    the selection is not what costs; the router's remaining ~8 us is elsewhere, unmeasured).
+  - Left: moe_router 48 x 14 us, hc_norm 98 x 7.6 us, deltanet_rule 36 x 19 us, hc_mix 97 x 2.9 us; ~930
+    launches x ~1.7 us of gaps. Per token ~26 ms, of which the matvecs ~20.5 ms.
 
 **Needed from the user:** nothing for now (the model is in `/models`). Constraints here: /dev/shm
 is a 63 GB tmpfs (38 GB free) and the disk has 48 GB free, so a ~50 GB model needs space freed or /dev/shm

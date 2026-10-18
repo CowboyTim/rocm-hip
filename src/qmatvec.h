@@ -82,10 +82,11 @@ static inline qmatvec_q8_out qmatvec_q8_outputs(const qmatvec_q8 *q) {
 size_t qmatvec_q8_bytes(int max_k);
 void qmatvec_q8_bind(qmatvec_q8 *q, void *mem, int max_k);
 
-// 1 if an int8 kernel handles this type at this K (and the activation can be quantized: K % 256 == 0)
+// 1 if an int8 kernel handles this type at this K (ROCmFP4: K % 64, ROCmFP4_FAST: K % 128, K-quants: K % 256)
 int qmatvec_q8_supported(int type, int K);
 
-// Quantize x[K] into q (both formats). K % 256 == 0, K <= q->max_k.
+// Quantize x[K] into q (both formats). K % 32 == 0 (the Q8_K side is complete only for whole 256-value blocks),
+// K <= q->max_k.
 hipError_t qmatvec_quantize(const float *x, int K, const qmatvec_q8 *q, hipStream_t stream);
 
 // y = W x with x given by its quantized form q (from qmatvec_quantize of the same K)
@@ -95,6 +96,14 @@ hipError_t qmatvec_launch_q8(int type, const void *W, size_t row_bytes, const qm
 // Two matvecs of the same type and K on the same input in one launch: y = W x (N rows), y2 = W2 x (N2 rows)
 hipError_t qmatvec_launch_q8_pair(int type, const void *W, int N, float *y, const void *W2, int N2, float *y2,
                                   size_t row_bytes, const qmatvec_q8 *q, int K, hipStream_t stream);
+// One token: y = W x with x = SiLU(lo * scale) for lo [n], zero-padded to K, quantized inside the kernel (the
+// same bits as gpu_hc_lowrank + qmatvec_launch_q8). ROCmFP4_FAST, K % 128 == 0, K <= 1024.
+int qmatvec_q8_lr_supported(int type, int K);
+hipError_t qmatvec_launch_q8_lr(int type, const void *W, size_t row_bytes, const float *lo, int n, int K, float scale,
+                                float *y, int N, hipStream_t stream);
+// n (1..4) matvecs of the same type and K on the same input in one launch: ys[i] = Ws[i] x (Ns[i] rows)
+hipError_t qmatvec_launch_q8_multi(int type, int n, const void *const *Ws, const int *Ns, float *const *ys,
+                                   size_t row_bytes, const qmatvec_q8 *q, int K, hipStream_t stream);
 
 // Batched: Y[t] = W X[t] for T tokens (prefill). q holds the T inputs quantized as one flattened [T * K]
 // vector (qmatvec_quantize(X, T * K, q)); row t of the result goes to y + t * ldy. Same support as
@@ -113,6 +122,11 @@ hipError_t qmatvec_launch_q8_id(int type, const void *W, size_t row_bytes, const
 hipError_t qmatvec_launch_q8_id_pair(int type, const void *W, const void *W2, size_t row_bytes, const int32_t *ids,
                                      int n_used, int x_per_slot, const qmatvec_q8 *q, float *y, float *y2, int N, int K,
                                      int T, hipStream_t stream);
+// The same, where an id of -1 selects one more N-row matrix: Wx (and W2x for the second matrix), e.g. a shared
+// expert given a slot of its own
+hipError_t qmatvec_launch_q8_id_x(int type, const void *W, const void *W2, const void *Wx, const void *W2x,
+                                  size_t row_bytes, const int32_t *ids, int n_used, int x_per_slot,
+                                  const qmatvec_q8 *q, float *y, float *y2, int N, int K, int T, hipStream_t stream);
 hipError_t qmatvec_launch_id(int type, const void *W, size_t row_bytes, const int32_t *ids, int n_used, int x_per_slot,
                              const float *x, float *y, int N, int K, int T, hipStream_t stream);
 

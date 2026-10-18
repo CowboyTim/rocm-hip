@@ -147,7 +147,7 @@ __device__ float block256_max(float v, float* part) {
 
 extern "C" __global__ void __launch_bounds__(256)
 moe_router(const float* logits, const float* x, const float* w_shexp, int* ids, float* wts, float* sg, int n_expert,
-           int n_used, int n) {
+           int n_used, int n, int ids_stride) {
     __shared__ __attribute__((aligned(16))) float p[MOE_MAX_EXPERTS];
     __shared__ int pidx[MOE_MAX_EXPERTS];
     __shared__ float part[8];
@@ -209,9 +209,10 @@ moe_router(const float* logits, const float* x, const float* w_shexp, int* ids, 
             __syncthreads();
         }
     if (tid < n_used) {
-        ids[t * n_used + tid] = pidx[tid];
+        ids[t * ids_stride + tid] = pidx[tid];
         sel_w[tid] = p[tid];
     }
+    if (tid == n_used && ids_stride > n_used) ids[t * ids_stride + n_used] = -1;  // the shared expert's slot
     __syncthreads();
     if (tid == 0) {
         float ws = 0.0f;

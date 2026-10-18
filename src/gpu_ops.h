@@ -30,8 +30,10 @@ hipError_t gpu_swiglu(const float* g, const float* u, float* out, int n, const q
 // MoE router for T tokens: logits [T][n_expert] (ffn_gate_inp output), x [T][n] (the FFN input) and the shared
 // expert's gate vector w_shexp [n] -> ids / wts [T][n_used] (selected experts, descending, and their
 // renormalized softmax weights) and sg [T] (sigmoid shared-expert gate). n_expert <= 1024, n_used <= 64.
+// ids_stride (0: n_used) > n_used: ids rows of ids_stride entries, the one after the selection set to -1 (the
+// shared expert as one more slot of the expert-indexed matvecs, qmatvec_launch_q8_id_x).
 hipError_t gpu_moe_router(const float* logits, const float* x, const float* w_shexp, int* ids, float* wts, float* sg,
-                          int n_expert, int n_used, int n, int T, hipStream_t stream);
+                          int n_expert, int n_used, int n, int T, hipStream_t stream, int ids_stride);
 
 // out [T][n] = sum_j wts[t][j] * down[t][j] + sg[t] * shared[t]; down [T][n_used][n]
 hipError_t gpu_moe_combine(const float* down, const float* wts, const float* shared, const float* sg, float* out,

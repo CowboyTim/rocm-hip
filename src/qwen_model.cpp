@@ -35,6 +35,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <initializer_list>
 #include <unordered_map>
 #include <vector>
 
@@ -491,6 +492,39 @@ struct QwenModel {
         return matvec(A, x, ya, T, c) && matvec(B, x, yb, T, c);
     }
 
+    // Several matrices on the same input x (DeltaNet's qkv / z / alpha / beta, attention's q / k / v): generating
+    // (T = 1) on the int8 path, one launch per group of up to 4 with the same type and row size; otherwise one
+    // matvec each. Every output row has the same arithmetic either way.
+    struct MvOut { const QuantWeight* w; float* y; };
+    bool matvec_multi(std::initializer_list<MvOut> list, const float* x, int T, ProfCat c) {
+        std::vector<MvOut> todo(list);
+        while (!todo.empty()) {
+            const QuantWeight& A = *todo[0].w;
+            if (T != 1 || q8_src != x || q8_k != A.K || q8_t != 1 || !qmatvec_q8_supported(A.type, A.K)) {
+                if (!matvec(A, x, todo[0].y, T, c)) return false;
+                todo.erase(todo.begin());
+                continue;
+            }
+            const void* Ws[4];
+            int Ns[4];
+            float* ys[4];
+            int n = 0;
+            for (size_t i = 0; i < todo.size() && n < 4;) {
+                const QuantWeight& B = *todo[i].w;
+                if (B.type == A.type && B.K == A.K && B.row_bytes == A.row_bytes) {
+                    Ws[n] = B.data, Ns[n] = B.N, ys[n] = todo[i].y, ++n;
+                    prof.bytes[c] += (double)B.row_bytes * B.N;
+                    todo.erase(todo.begin() + (long)i);
+                } else {
+                    ++i;
+                }
+            }
+            if (!check(qmatvec_launch_q8_multi(A.type, n, Ws, Ns, ys, A.row_bytes, &s.q8, A.K, 0), "matvec group"))
+                return false;
+        }
+        return true;
+    }
+
     bool check(hipError_t e, const char* what) {
         if (e != hipSuccess) qwen_set_error("%s: %s", what, hipGetErrorString(e));
         return e == hipSuccess;
@@ -509,8 +543,7 @@ struct QwenModel {
     // q/k norm, RoPE, the KV cache write, causal attention and the output gate are GPU kernels (attention.hip).
     bool full_attention(const LayerWeights& L, int pos0, int T) {
         const int HQ = eng->n_head, HKV = eng->n_head_kv, DQ = HQ * eng->head_dim;
-        if (!matvec(L.Wq, s.xn, s.qfull, T, P_ATTN) || !matvec_pair(L.Wk, L.Wv, s.xn, s.k, s.v, T, P_ATTN))
-            return false;
+        if (!matvec_multi({{&L.Wq, s.qfull}, {&L.Wk, s.k}, {&L.Wv, s.v}}, s.xn, T, P_ATTN)) return false;
         __half* K = kv_cache_k_row(eng->kvc, L.kv_slot, 0);
         __half* V = kv_cache_v_row(eng->kvc, L.kv_slot, 0);
         if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
@@ -529,9 +562,9 @@ struct QwenModel {
     bool linear_attention(int l, const LayerWeights& L, int T) {
         const int NG = eng->ssm_n_group, NV = eng->ssm_dt_rank;
         const float eps = (float)eng->eps;
-        if (!matvec(L.W_qkv, s.xn, s.qkv, T, P_LIN) || !matvec(L.W_z, s.xn, s.z, T, P_LIN)) return false;
-        // alpha and beta: two N = 32 matvecs on the same input
-        if (!matvec_pair(L.W_alpha, L.W_beta, s.xn, s.alpha, s.beta, T, P_LIN)) return false;
+        if (!matvec_multi({{&L.W_qkv, s.qkv}, {&L.W_z, s.z}, {&L.W_alpha, s.alpha}, {&L.W_beta, s.beta}}, s.xn, T,
+                          P_LIN))
+            return false;
         // conv1d + SiLU + q/k L2 norm + gates, then the delta rule + gated norm; alpha/beta become
         // g / sigmoid(beta) in place
         if (!check(deltanet_pre(s.qkv, rs.conv[l], L.ssm_conv1d, eng->ssm_d_conv, s.conv, NG, NV, s.alpha, s.beta,
@@ -605,14 +638,55 @@ struct QwenModel {
         return true;
     }
 
+    // Whether the shared expert can ride along as one more slot of the experts' int8 launches (one token): the
+    // same width, type and row size as the experts, and s.xn quantized
+    bool shared_as_slot(const LayerWeights& L) const {
+        const int E = eng->n_embd, FE = eng->n_ff_exp;
+        return s.B >= 2 && eng->n_ff_shexp == FE && q8_src == s.xn && q8_k == E && q8_t == 1 &&
+               L.W_gate.type == L.We_gate.type && L.W_up.type == L.We_up.type && L.We_gate.type == L.We_up.type &&
+               L.W_down.type == L.We_down.type && L.W_gate.row_bytes == L.We_gate.row_bytes &&
+               L.W_down.row_bytes == L.We_down.row_bytes && qmatvec_q8_supported(L.We_gate.type, E) &&
+               qmatvec_q8_supported(L.We_down.type, FE);
+    }
+
+    // moe_core for one token with the shared expert as slot NU of the experts' launches (ids[NU] = -1 from the
+    // router): gate/up, SwiGLU and down of the experts and the shared expert in 3 launches instead of 6. The
+    // arithmetic per row is the same, and moe_combine adds the shared output last as before, so the results are
+    // the same bit for bit.
+    bool moe_core_one(const LayerWeights& L) {
+        const int E = eng->n_embd, NE = eng->n_expert, NU = eng->n_expert_used, FE = eng->n_ff_exp, NS = NU + 1;
+        prof.bytes[P_FFN] += 2.0 * L.We_gate.row_bytes * FE * NS + (double)L.We_down.row_bytes * E * NS;
+        if (!matvec(L.W_router, s.xn, s.r_logits, 1, P_FFN) ||
+            !check(gpu_moe_router(s.r_logits, s.xn, L.shexp_gate, s.ids, s.wts, s.sg, NE, NU, E, 1, 0, NS),
+                   "moe_router") ||
+            !check(qmatvec_launch_q8_id_x(L.We_gate.type, L.We_gate.data, L.We_up.data, L.W_gate.data, L.W_up.data,
+                                          L.We_gate.row_bytes, s.ids, NS, 0, &s.q8, s.moe_g, s.moe_u, FE, E, 1, 0),
+                   "expert gate/up matvec"))
+            return false;
+        const qmatvec_q8* qx = q8_for(FE, NS, true);
+        if (!check(gpu_swiglu(s.moe_g, s.moe_u, s.moe_act, NS * FE, qx, 0), "swiglu (experts)")) return false;
+        mark(s.moe_act, FE, NS, qx);
+        if (!qx) {
+            qwen_set_error("moe_core_one: no int8 buffer for the expert inputs");
+            return false;
+        }
+        return check(qmatvec_launch_q8_id_x(L.We_down.type, L.We_down.data, nullptr, L.W_down.data, nullptr,
+                                            L.We_down.row_bytes, s.ids, NS, 1, &s.q8, s.moe_down, nullptr, E, FE, 1, 0),
+                     "expert down matvec") &&
+               check(gpu_moe_combine(s.moe_down, s.wts, s.moe_down + (size_t)NU * E, s.sg, s.proj, NU, E, 1, 0),
+                     "moe_combine");
+    }
+
     // The MoE FFN itself, from s.xn (marked) to s.proj
     bool moe_core(const LayerWeights& L, int T) {
         const int E = eng->n_embd, NE = eng->n_expert, NU = eng->n_expert_used, FE = eng->n_ff_exp;
         const int FS = eng->n_ff_shexp;
+        if (T == 1 && shared_as_slot(L)) return moe_core_one(L);
         // A prefill batch groups its (token, slot) entries by expert for the expert-tiled matmuls
         const bool grouped = T > 1;
         if (!matvec(L.W_router, s.xn, s.r_logits, T, P_FFN) ||
-            !check(gpu_moe_router(s.r_logits, s.xn, L.shexp_gate, s.ids, s.wts, s.sg, NE, NU, E, T, 0), "moe_router") ||
+            !check(gpu_moe_router(s.r_logits, s.xn, L.shexp_gate, s.ids, s.wts, s.sg, NE, NU, E, T, 0, 0),
+                   "moe_router") ||
             (grouped && !check(gpu_moe_group(s.ids, T, NU, NE, qmatvec_mm_tile(), s.g_tok, s.g_pair, s.g_ntiles,
                                              s.g_tile_e, s.g_tile_start, s.g_tile_n, 0), "moe_group")) ||
             !matvec_id_gate_up(L.We_gate, L.We_up, s.xn, s.moe_g, s.moe_u, FE, T, grouped, P_FFN) ||
@@ -769,11 +843,19 @@ struct QwenModel {
         const QuantWeight& U = pad != hc_up_pad.end() ? pad->second : M.up;
         const qmatvec_q8* ql = q8_for(U.K, T, true);
         if (!(M.inject.data ? matvec_pair(M.down, M.inject, s.hxn, s.hlo, s.inj, T, c)
-                            : matvec(M.down, s.hxn, s.hlo, T, c)) ||
-            !check(gpu_hc_lowrank(s.hlo, s.hlo_pad, R, U.K, T, HC, ql, 0), "hc_lowrank"))
+                            : matvec(M.down, s.hxn, s.hlo, T, c)))
             return false;
-        mark(s.hlo_pad, U.K, T, ql);
-        if (!matvec(U, s.hlo_pad, s.hgate, T, c)) return false;
+        if (T == 1 && ql && qmatvec_q8_lr_supported(U.type, U.K)) {  // SiLU, padding and quantizing in the matvec
+            prof.bytes[c] += (double)U.row_bytes * U.N;
+            if (!check(qmatvec_launch_q8_lr(U.type, U.data, U.row_bytes, s.hlo, R, U.K, 1.0f / (float)HC, s.hgate,
+                                            U.N, 0),
+                       "hc up (fused)"))
+                return false;
+        } else {
+            if (!check(gpu_hc_lowrank(s.hlo, s.hlo_pad, R, U.K, T, HC, ql, 0), "hc_lowrank")) return false;
+            mark(s.hlo_pad, U.K, T, ql);
+            if (!matvec(U, s.hlo_pad, s.hgate, T, c)) return false;
+        }
         const qmatvec_q8* q = q8_for(E, T);
         if (!check(gpu_hc_mix(s.hxn, s.hgate, s.xn, E, HC, T, q, 0), "hc_mix")) return false;
         mark(s.xn, E, T, q);

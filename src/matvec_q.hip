@@ -689,17 +689,21 @@ __device__ __forceinline__ float rocmfp4_q8_block(const uint32_t qs[4], uint32_t
 #define Q8_REDUCE(acc)                                                              \
     for (int off = L / 2; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
 
-// Row `row` of the (W, y) / (W2, y2) pair: sets wr and yr; returns past the last row (a whole lane group)
+// Row `row` of up to four stacked matrices on the same input: rows 0 .. N1 - 1 from (W, y), N1 .. N2 - 1 from
+// (W2, y2), N2 .. N3 - 1 from (W3, y3), N3 .. N - 1 from (W4, y4). Sets wr and yr; returns past the last row (a
+// whole lane group).
 #define Q8_ROW_SETUP                                                                \
     Q8_ROW_INDEX                                                                    \
     if (row >= N) return;                                                           \
-    const bool second_mat = row >= N1;                                              \
-    const uint8_t *wr = (second_mat ? W2 : W) + (long long)(second_mat ? row - N1 : row) * row_bytes; \
-    float *yr = (second_mat ? y2 : y) + (second_mat ? row - N1 : row);
+    const int mat = (row >= N1) + (row >= N2) + (row >= N3);                        \
+    const int base = mat == 0 ? 0 : mat == 1 ? N1 : mat == 2 ? N2 : N3;             \
+    const uint8_t *wr = (mat == 0 ? W : mat == 1 ? W2 : mat == 2 ? W3 : W4) + (long long)(row - base) * row_bytes; \
+    float *yr = (mat == 0 ? y : mat == 1 ? y2 : mat == 2 ? y3 : y4) + (row - base);
 
 #define Q8_ARGS                                                                                            \
-    const uint8_t *W, const uint8_t *W2, int N1, long long row_bytes, const int8_t *q8, const float *d8, \
-        const int *bs, float *y, float *y2, int N, int K, int L
+    const uint8_t *W, const uint8_t *W2, const uint8_t *W3, const uint8_t *W4, int N1, int N2, int N3,     \
+        long long row_bytes, const int8_t *q8, const float *d8, const int *bs, float *y, float *y2, float *y3, \
+        float *y4, int N, int K, int L
 
 // ROCmFP4 x Q8_0: a lane takes a pair of 18-byte blocks (36 bytes, 4-aligned; the host requires K % 64 == 0)
 __device__ __forceinline__ float mv_rocmfp4(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K, int lane, int L) {
@@ -879,10 +883,12 @@ __device__ __forceinline__ float mv_q5_K(const uint8_t *wr, const int8_t *q8, co
 // reads the token's vector) or row t * n_used + j (x_per_slot = 1: each expert reads its own, e.g. the
 // SwiGLU output going into ffn_down). The selected experts never leave the GPU. With grid (.., 2 n_used, T),
 // slots n_used .. 2 n_used - 1 apply a second matrix of the same shape and type, W2 -> y2, to the same input
-// (the experts' gate and up projections in one launch).
+// (the experts' gate and up projections in one launch). An id of -1 selects the extra matrix Wx (W2x for the
+// second): one more N-row matrix of the same type, e.g. the shared expert as one more slot.
 #define Q8ID_ARGS                                                                                       \
     const uint8_t *W, const uint8_t *W2, long long row_bytes, const int *ids, int n_used, int x_per_slot,     \
-        const int8_t *q8, const float *d8, const int *bs, float *y, float *y2, int N, int K, int L
+        const int8_t *q8, const float *d8, const int *bs, float *y, float *y2, int N, int K, int L,           \
+        const uint8_t *Wx, const uint8_t *W2x
 
 #define MATVEC_Q8_KERNELS(name, FN, KQ)                                                                  \
     extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matvec_q8_##name(Q8_ARGS) {        \
@@ -896,13 +902,45 @@ __device__ __forceinline__ float mv_q5_K(const uint8_t *wr, const int8_t *q8, co
         if (row >= N) return;                                                                            \
         const bool m2 = (int)blockIdx.y >= n_used; /* grid y = 2 n_used: the second matrix (W2 -> y2) */  \
         const int slot = blockIdx.y - (m2 ? n_used : 0), t = blockIdx.z, e = ids[t * n_used + slot];       \
-        const uint8_t *wr = (m2 ? W2 : W) + ((long long)e * N + row) * row_bytes;                        \
+        const uint8_t *wr = e >= 0 ? (m2 ? W2 : W) + ((long long)e * N + row) * row_bytes                \
+                                   : (m2 ? W2x : Wx) + (long long)row * row_bytes;                        \
         const long long in_row = x_per_slot ? (long long)t * n_used + slot : t;                          \
         float acc = FN(wr, q8 + in_row * K, d8 + in_row * (K / ((KQ) ? 256 : 32)), bs + in_row * (K / 16), \
                        K, gl, L);                                                                        \
         Q8_REDUCE(acc)                                                                                   \
         if (gl == 0) (m2 ? y2 : y)[((long long)t * n_used + slot) * N + row] = acc;                      \
     }
+
+// matvec_q8_lr_q4_0_rocmfp4_fast(W, row_bytes, lo, n, K, scale, y, N, L): y = W x for one token, where x is
+// SiLU(lo * scale) zero-padded from n to K values and quantized to Q8_0 by every workgroup into LDS first, with
+// hc_lowrank's and q8_block_value's arithmetic (so the same bits as those two kernels and matvec_q8 after them).
+// The qwen4exp mixers' up projection (K = 384 padded from the rank 320) without the separate hc_lowrank launch.
+// K % 128 == 0, K <= LR_MAXK.
+#define LR_MAXK 1024
+extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
+matvec_q8_lr_q4_0_rocmfp4_fast(const uint8_t *W, long long row_bytes, const float *lo, int n, int K, float scale,
+                               float *y, int N, int L) {
+    __shared__ __attribute__((aligned(16))) int8_t xs[LR_MAXK];
+    __shared__ float xd[LR_MAXK / 32];
+    for (int i = threadIdx.x; i < K; i += 32 * ROWS_PER_BLOCK) {  // whole 32-value blocks per wave (K % 128)
+        float v = 0.0f;
+        if (i < n) {
+            const float a = lo[i] * scale;
+            v = a / (1.0f + __expf(-a));
+        }
+        float am = fabsf(v);
+        for (int off = 16; off > 0; off >>= 1) am = fmaxf(am, __shfl_xor(am, off, 32));
+        const float id0 = am != 0.0f ? 127.0f / am : 0.0f;
+        xs[i] = (int8_t)(int)rintf(v * id0);
+        if ((threadIdx.x & 31) == 0) xd[i / 32] = __half2float(__float2half(am / 127.0f));
+    }
+    __syncthreads();
+    Q8_ROW_INDEX
+    if (row >= N) return;
+    float acc = mv_rocmfp4_fast(W + (long long)row * row_bytes, xs, xd, nullptr, K, gl, L);
+    Q8_REDUCE(acc)
+    if (gl == 0) y[row] = acc;
+}
 
 MATVEC_Q8_KERNELS(q4_0_rocmfp4, mv_rocmfp4, 0)
 MATVEC_Q8_KERNELS(q4_0_rocmfp4_fast, mv_rocmfp4_fast, 0)
