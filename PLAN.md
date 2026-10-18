@@ -1233,10 +1233,21 @@ for the symptoms above.
 >      kernel's xor-tree order, so prefill stays bit-identical. F32 router: one row per 4-wave workgroup,
 >      unrolled 16-byte loads, explicit FMAs (88 → 158 GB/s, 0.95 → 0.53 ms per token). 35B generation
 >      ~57.4 → ~59.4 tok/s. `matvec_bench` also times the router.
->    - Measured dead ends: unrolling the FAST quad loop by 2 (no gain); 8 waves per router row (137 GB/s).
->    - **Next:** a HIP graph per generated token (the ~1.5 ms of gaps between ~800 launches), then the
->      `moe_router` kernel (0.45 ms: 8 serial block-argmax rounds; one sort pass). Large matvecs are at
->      185–205 GB/s of a 256 GB/s theoretical peak, little left there. BF16 LM head: 5.0 ms at 204 GB/s.
+>    - `moe_router`: top-8 by rank in one pass (same selection and order) and unrolled 16-byte loads for the
+>      shared-expert gate: 11.3 → 8.5 µs per call (0.45 → 0.34 ms per token); the rest is single-workgroup
+>      latency. 35B generation ~59.7 tok/s.
+>    - Measured dead ends: unrolling the FAST quad loop by 2 (no gain); 8 waves per router row (137 GB/s);
+>      a HIP graph (micro-benchmark: 2.58 → 2.35 µs per dependent kernel, ~0.2 ms per token, not worth
+>      the per-token parameter updates). Launch count is the lever: ~2 µs per kernel boundary.
+>    - `generate_verify`'s WMMA bound: on the 35B the 561-token prompt's top two logits are 0.16 apart
+>      while the two paths differ by up to ~1.5, so the top-1 check now allows a near-tie (< 0.5) in the
+>      token-by-token logits. WMMA off stays bit-identical.
+>    - **Next:** fewer launches per MoE layer (12 now): shared-expert gate + up as one pair launch, expert
+>      gate + up as one, `moe_combine` folded into the next `add_rmsnorm` (~160 launches, ~0.35 ms per
+>      token). Large matvecs are at 185–205 GB/s of a 256 GB/s theoretical peak, little left there.
+>    - **Open decision (user):** the 1 GB BF16 LM head is 5.0 ms of ~16.8 ms per token. An int8 (Q8_0) copy
+>      would be ~0.5 GB and ~2.7 ms (~+15% tok/s), but its logits would no longer match llama.cpp's BF16
+>      ones exactly.
 >    - Small matrices (shared expert 512 × 2048, 0.56 MB) run at ~120 GB/s: ~4 µs each, launch-bound.
 >
 > **35B speed — DONE ✅ (2026-10-17).** Generation 47 → 57 tok/s, prefill 246 → 515 tok/s.

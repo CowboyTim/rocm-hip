@@ -114,7 +114,7 @@ swiglu(const float* g, const float* u, float* out, int n, Q8Out o) {
 // ---------------------------------------------------------------- mixture of experts (qwen35moe)
 //
 // moe_router   grid T, block 256: per token, softmax over the n_expert router logits, the n_used largest
-//              probabilities in descending order (repeated block argmax; ties go to the lowest expert index),
+//              probabilities in descending order (each by its rank in one pass; ties go to the lowest expert index),
 //              their weights renormalized by max(sum, 6.103515625e-5), and the shared-expert gate
 //              sigmoid(x . w_shexp). As llama.cpp's build_moe_ffn (softmax gating, norm_w, no scale).
 // moe_combine  grid (ceil(n / 256), T), block 256: out = sum_j w_j * down_j (in slot order, as ggml's add chain)
@@ -147,14 +147,26 @@ __device__ float block256_max(float v, float* part) {
 extern "C" __global__ void __launch_bounds__(256)
 moe_router(const float* logits, const float* x, const float* w_shexp, int* ids, float* wts, float* sg, int n_expert,
            int n_used, int n) {
-    __shared__ float p[MOE_MAX_EXPERTS];
+    __shared__ __attribute__((aligned(16))) float p[MOE_MAX_EXPERTS];
     __shared__ float part[8];
-    __shared__ float pa[8];
-    __shared__ int pi[8];
     __shared__ float sel_w[64];
     const int t = blockIdx.x, tid = threadIdx.x;
     logits += (size_t)t * n_expert;
     x += (size_t)t * n;
+
+    // Shared-expert gate first: its loads do not depend on the softmax, so they overlap the logits' loads
+    float d = 0.0f;
+    if (n % 1024 == 0 && (((uintptr_t)x | (uintptr_t)w_shexp) & 15) == 0) {  // uniform; 16-byte loads, unrolled
+#pragma unroll 4
+        for (int i = 4 * tid; i < n; i += 1024) {
+            const float4 a = *(const float4*)(x + i), b = *(const float4*)(w_shexp + i);
+            d += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+        }
+    } else {
+        for (int i = tid; i < n; i += 256) d += x[i] * w_shexp[i];
+    }
+    d = block256_sum(d, part);
+    if (tid == 0) sg[t] = 1.0f / (1.0f + expf(-d));
 
     float mx = -INFINITY;
     for (int e = tid; e < n_expert; e += 256) mx = fmaxf(mx, logits[e]);
@@ -169,29 +181,24 @@ moe_router(const float* logits, const float* x, const float* w_shexp, int* ids, 
     for (int e = tid; e < n_expert; e += 256) p[e] *= inv;
     __syncthreads();
 
-    for (int r = 0; r < n_used; ++r) {
-        float bv = -1.0f;
-        int bi = 0x7fffffff;
-        for (int e = tid; e < n_expert; e += 256)
-            if (p[e] > bv || (p[e] == bv && e < bi)) { bv = p[e]; bi = e; }
-        for (int off = 16; off > 0; off >>= 1) {
-            const float ov = __shfl_xor(bv, off, 32);
-            const int oi = __shfl_xor(bi, off, 32);
-            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    // Top n_used by rank: expert e's rank is the number of experts that beat it (larger p, or equal p and a
+    // lower index), so ranks 0 .. n_used - 1 are the selection in descending order, ties to the lower index
+    for (int e = tid; e < n_expert; e += 256) {
+        const float pe = p[e];
+        int rank = 0, j = 0;
+#pragma unroll 4
+        for (; j + 4 <= n_expert; j += 4) {  // 16-byte LDS reads, several in flight
+            const float4 q = *(const float4*)&p[j];
+            rank += (q.x > pe || (q.x == pe && j < e)) + (q.y > pe || (q.y == pe && j + 1 < e)) +
+                    (q.z > pe || (q.z == pe && j + 2 < e)) + (q.w > pe || (q.w == pe && j + 3 < e));
         }
-        if ((tid & 31) == 0) { pa[tid >> 5] = bv; pi[tid >> 5] = bi; }
-        __syncthreads();
-        if (tid == 0) {
-            float fv = pa[0];
-            int fi = pi[0];
-            for (int k = 1; k < 8; ++k)
-                if (pa[k] > fv || (pa[k] == fv && pi[k] < fi)) { fv = pa[k]; fi = pi[k]; }
-            ids[t * n_used + r] = fi;
-            sel_w[r] = fv;
-            p[fi] = -1.0f;  // taken
+        for (; j < n_expert; ++j) rank += p[j] > pe || (p[j] == pe && j < e);
+        if (rank < n_used) {
+            ids[t * n_used + rank] = e;
+            sel_w[rank] = pe;
         }
-        __syncthreads();
     }
+    __syncthreads();
     if (tid == 0) {
         float ws = 0.0f;
         for (int r = 0; r < n_used; ++r) ws += sel_w[r];
@@ -199,10 +206,6 @@ moe_router(const float* logits, const float* x, const float* w_shexp, int* ids, 
         for (int r = 0; r < n_used; ++r) wts[t * n_used + r] = sel_w[r] / ws;
     }
 
-    float d = 0.0f;
-    for (int i = tid; i < n; i += 256) d += x[i] * w_shexp[i];
-    d = block256_sum(d, part);
-    if (tid == 0) sg[t] = 1.0f / (1.0f + expf(-d));
 }
 
 extern "C" __global__ void __launch_bounds__(256)
