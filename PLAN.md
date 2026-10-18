@@ -1986,7 +1986,32 @@ block-chain style cache managed in Perl.
      kernels update the state in place, so mapping the file directly would overwrite the snapshot, and
      MAP_PRIVATE does not help (registration pins the pages).
    - Pure-attention models (Gemma, GLM, DeepSeek/MLA) resume at any block boundary.
-5. **C API sketch** (thin, the policy stays in Perl):
+5. **Split (decided 2026-10-18, user: "do the block-chain mechanism in C, so snapshots are easier to
+   orchestrate"): mechanism in C, policy in Perl.**
+   - **C (libinference) owns the block store mechanism.**
+     - Chained hashing of the tokens; lookup of the deepest cached block that has a state snapshot (hybrid
+       models; attention-only models resume at any block).
+     - Mapping/stitching the blocks; immutability, and a private copy on a rewind into a shared block.
+     - Taking snapshots *when the forward pass crosses the chosen positions*: prefill micro-batches are cut
+       at block boundaries, and blocks that fill during generation are published as they fill.
+     - Atomic publishing (write to a temp name, rename to the hash), safe with several processes on one store.
+     - Tolerates files deleted underneath it (re-prefills from the deepest surviving point), and touches
+       each file it uses, for the LRU.
+   - **Perl owns the policy.**
+     - Where the store lives and its size budget; LRU eviction (deleting files); moving cold blocks to and
+       from disk; naming and keeping sessions.
+     - Knobs passed to C: block size B (part of H_0), snapshot every N blocks, snapshot at the end of each
+       prompt, and per-request "use / do not publish to the store".
+   - So `generate(..., reuse_prefix => 1)` with a store attached finds the longest cached prefix by itself,
+     both across processes and across restarts.
+   - Granularity: a store resume point is a block boundary that has a snapshot, so at most B - 1 tokens plus
+     the new ones are re-prefilled. Within one process, the in-memory checkpoints (`checkpoint_tail`) still
+     cover turn-to-turn chat exactly.
+   C API sketch (replaces the attach-based one below): `inference_store_open(model, dir, block_tokens,
+   snapshot_every)`, `inference_store_close`, `inference_store_stats(model, ...)` (hits, blocks mapped and
+   published, snapshots), plus the existing generate options; the attach / list functions below stay
+   internal or for tests.
+6. **Earlier C API sketch** (Perl-driven; superseded by 5):
    - `inference_kv_layout(model, &block_tokens, &block_bytes, &state_bytes)`;
    - `inference_session_attach(model, block_paths[], n_blocks, tail_path, tokens, n_tokens, state_path)`:
      maps and registers the blocks (n_tokens of history; state optional for attention-only models);
@@ -1994,11 +2019,17 @@ block-chain style cache managed in Perl.
      Perl can name new ones by hash and link them into its store;
    - `inference_state_save(model, path)` / restore.
    - Files are created by the library in a directory Perl names (`O_EXCL`, then renamed to the hash).
-6. **Capacity.** /dev/shm is a tmpfs, by default limited to half of RAM (63 GB here, 23 GB already used by
+7. **Capacity.** /dev/shm is a tmpfs, by default limited to half of RAM (63 GB here, 23 GB already used by
    the models); its pages are the same RAM the GPU computes from. Remount it larger if the cache needs it
    (`mount -o remount,size=96G /dev/shm`). Example: the 4B at 32 KB/token keeps 1M tokens of prefix cache in
    32 GB.
 
-**Order:** block-major layout behind the current API (tests unchanged; prefill and generation must be
-bit-identical) → attach / save / state files → Perl block store (hashing, LRU, disk tier) and tests: a
-shared system prompt across two sessions, a resumed conversation, a rewind into a shared block.
+**Order:**
+1. Block-major layout behind the current API (tests unchanged; prefill and generation stay bit-identical).
+2. The C block store: hashing, mapping, snapshots at the chosen boundaries, publishing, lookup.
+3. Perl policy helpers: budget/LRU eviction, disk tier, session names.
+4. Tests:
+   - a shared system prompt across two sessions and two processes;
+   - a conversation resumed after a restart;
+   - a rewind into a shared block;
+   - files deleted underneath a running session.
