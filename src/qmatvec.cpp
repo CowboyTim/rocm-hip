@@ -9,6 +9,7 @@
 #include <string.h>
 
 #define QMV_ROWS_PER_BLOCK 4  // must match ROWS_PER_BLOCK in matvec_q.hip
+#define QMV_F32_PARTS 4       // must match F32_PARTS in matvec_q.hip
 #define QMV_MAX_TYPE 128
 
 static hipModule_t g_mod = nullptr;
@@ -95,6 +96,8 @@ hipError_t qmatvec_launch(int type, const void *W, size_t row_bytes, const float
     if (K % tr->blck_size != 0 || row_bytes != qt_row_size(type, K)) return hipErrorInvalidValue;
     long long rb = (long long)row_bytes;
     void *args[] = {(void *)&W, &rb, (void *)&x, (void *)&y, &N, &K};
+    if (type == QT_F32)  // one row per workgroup (matvec_f32)
+        return hipModuleLaunchKernel(g_fn[type], (unsigned)N, 1, 1, 32 * QMV_F32_PARTS, 1, 1, 0, stream, args, nullptr);
     const unsigned grid = (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);
     return hipModuleLaunchKernel(g_fn[type], grid, 1, 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream, args, nullptr);
 }
@@ -103,13 +106,12 @@ hipError_t qmatvec_launch(int type, const void *W, size_t row_bytes, const float
 
 hipError_t qmatvec_launch_batch(int type, const void *W, size_t row_bytes, const float *x, float *y, int N, int K,
                                 int T, hipStream_t stream) {
-    if (T > 1 && type == QT_F32 && g_mm_f32 && K % 4 == 0 && row_bytes == (size_t)K * 4 &&
+    if (T > 1 && type == QT_F32 && g_mm_f32 && K % (4 * QMV_F32_PARTS) == 0 && row_bytes == (size_t)K * 4 &&
         (((uintptr_t)W | (uintptr_t)x) & 15) == 0) {
         long long rb = (long long)row_bytes;
         void *args[] = {(void *)&W, &rb, (void *)&x, (void *)&y, &N, &K, &T};
-        return hipModuleLaunchKernel(g_mm_f32, (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK),
-                                     (unsigned)((T + QMV_MF32_TT - 1) / QMV_MF32_TT), 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1,
-                                     0, stream, args, nullptr);
+        return hipModuleLaunchKernel(g_mm_f32, (unsigned)N, (unsigned)((T + QMV_MF32_TT - 1) / QMV_MF32_TT), 1,
+                                     32 * QMV_F32_PARTS, 1, 1, 0, stream, args, nullptr);
     }
     hipError_t e = hipSuccess;
     for (int t = 0; t < T && e == hipSuccess; ++t)
@@ -164,6 +166,9 @@ static int q8_lanes_per_row(int type, int K) {
     const int tasks = type == QT_Q4_0_ROCMFP4 ? K / 64 : type == QT_Q4_0_ROCMFP4_FAST ? K / 128 : K / 256 * 8;
     int L = 32;
     while (L > (kq ? 8 : 4) && L / 2 >= tasks) L /= 2;
+    // ROCmFP4_FAST: at most 8 lanes per row, i.e. several 68-byte quads per lane. Measured on the 35B: z
+    // (4096 x 2048) 168 -> 184 GB/s, ssm_out (2048 x 4096) 160 -> 190; plain ROCmFP4 is best at 32.
+    if (type == QT_Q4_0_ROCMFP4_FAST && L > 8) L = 8;
     return L;
 }
 

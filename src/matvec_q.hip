@@ -417,60 +417,88 @@ __device__ __forceinline__ float bf16_round(float v) {
 __device__ __forceinline__ float bf16_lo(uint32_t w) { return __uint_as_float(w << 16); }
 __device__ __forceinline__ float bf16_hi(uint32_t w) { return __uint_as_float(w & 0xffff0000u); }
 
-// F32 (e.g. the MoE router, 2 MB per layer): 16-byte loads, 4 weights and 4 activations per lane per step, exact
-// FP32 like ggml (F32's vec_dot_type is F32). The generic one-value-per-lane loop reached ~57 GB/s.
-extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
-matvec_f32(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K) {
-    const int lane = threadIdx.x & 31;
-    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
-    if (row >= N) return;
-    const float *wr = (const float *)(W + (long long)row * row_bytes);
-    float acc = 0.0f;
-    int k0 = 0;
-    if ((((uintptr_t)wr | (uintptr_t)x) & 15) == 0) {  // uniform per row
-        const int n4 = K / 4;
-        for (int i = lane; i < n4; i += 32) {
-            const float4 w = ((const float4 *)wr)[i], v = ((const float4 *)x)[i];
-            acc += w.x * v.x + w.y * v.y + w.z * v.z + w.w * v.w;
-        }
-        k0 = n4 * 4;
-    }
-    for (int k = k0 + lane; k < K; k += 32) acc += wr[k] * x[k];
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
-    if (lane == 0) y[row] = acc;
+// F32 (e.g. the MoE router, 2 MB per layer, but only 256 rows): one row per 128-thread workgroup, so the GPU
+// has enough waves in flight (one wave per row reached ~97 GB/s). Wave w sums quarter w of the row with
+// 16-byte loads, 4 weights and 4 activations per lane per step, exact FP32 like ggml (F32's vec_dot_type is
+// F32); the part sums are added in order. matmul_f32 (several tokens) uses the same partition and
+// order, so prefill is bit-identical to token by token. Launch: grid N, block 128.
+#define F32_PARTS 4
+
+// w . v with explicit FMAs: HIP lets the compiler fuse a * b + c on its own, which it may do differently in
+// matvec_f32 and matmul_f32; written out, both round identically
+__device__ __forceinline__ float dot4f(const float4 w, const float4 v) {
+    return fmaf(w.w, v.w, fmaf(w.z, v.z, fmaf(w.y, v.y, w.x * v.x)));
 }
 
-// F32 for MF32_TT tokens at a time (prefill: the MoE router ran one launch per token). grid (ceil(N /
-// ROWS_PER_BLOCK), ceil(T / MF32_TT)); each weight float4 is loaded once for the tile's tokens. Every token's sum
-// has matvec_f32's expression and order, so the results are bit-identical to it. The host guarantees
-// 16-byte-aligned rows and x, and K % 4 == 0.
+// Quarter `part` of row wr . x, reduced over the wave (vector path: 16-byte-aligned wr / x and K % 16 == 0)
+__device__ __forceinline__ float f32_part_vec(const float4 *wr, const float4 *x, int n4, int part, int lane) {
+    const int q = n4 / F32_PARTS;
+    float acc = 0.0f;
+#pragma unroll 4
+    for (int i = part * q + lane; i < (part + 1) * q; i += 32) acc += dot4f(wr[i], x[i]);
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
+    return acc;
+}
+
+extern "C" __global__ void __launch_bounds__(32 * F32_PARTS)
+matvec_f32(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K) {
+    __shared__ float part[F32_PARTS];
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, row = blockIdx.x;
+    if (row >= N) return;  // uniform per workgroup
+    const float *wr = (const float *)(W + (long long)row * row_bytes);
+    float acc;
+    if ((((uintptr_t)wr | (uintptr_t)x) & 15) == 0 && K % (4 * F32_PARTS) == 0) {  // uniform
+        acc = f32_part_vec((const float4 *)wr, (const float4 *)x, K / 4, w, lane);
+    } else {
+        acc = 0.0f;
+        for (int k = K * w / F32_PARTS + lane; k < K * (w + 1) / F32_PARTS; k += 32) acc += wr[k] * x[k];
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
+    }
+    if (lane == 0) part[w] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = part[0];
+#pragma unroll
+        for (int k = 1; k < F32_PARTS; ++k) s += part[k];
+        y[row] = s;
+    }
+}
+
+// F32 for MF32_TT tokens at a time (prefill: the MoE router ran one launch per token). grid (N, ceil(T /
+// MF32_TT)), block 128; each weight float4 is loaded once for the tile's tokens. Every token's sum has
+// matvec_f32's vector-path partition, expression and order: bit-identical to it. The host guarantees
+// 16-byte-aligned rows and x, and K % 16 == 0.
 #define MF32_TT 8
-extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
+extern "C" __global__ void __launch_bounds__(32 * F32_PARTS)
 matmul_f32(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K, int T) {
-    const int lane = threadIdx.x & 31;
-    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    __shared__ float part[F32_PARTS][MF32_TT];
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, row = blockIdx.x;
     if (row >= N) return;
     const int t0 = blockIdx.y * MF32_TT, nt = min(MF32_TT, T - t0);
     const float4 *wr = (const float4 *)(W + (long long)row * row_bytes);
     const float4 *xt = (const float4 *)(x + (size_t)t0 * K);
-    const int n4 = K / 4;
+    const int n4 = K / 4, q = n4 / F32_PARTS;
     float acc[MF32_TT];
 #pragma unroll
     for (int j = 0; j < MF32_TT; ++j) acc[j] = 0.0f;
-    for (int i = lane; i < n4; i += 32) {
-        const float4 w = wr[i];
+    for (int i = w * q + lane; i < (w + 1) * q; i += 32) {
+        const float4 wv = wr[i];
 #pragma unroll
         for (int j = 0; j < MF32_TT; ++j)
-            if (j < nt) {
-                const float4 v = xt[(size_t)j * n4 + i];
-                acc[j] += w.x * v.x + w.y * v.y + w.z * v.z + w.w * v.w;
-            }
+            if (j < nt) acc[j] += dot4f(wv, xt[(size_t)j * n4 + i]);
     }
 #pragma unroll
     for (int j = 0; j < MF32_TT; ++j) {
         float a = acc[j];
         for (int off = 16; off > 0; off >>= 1) a += __shfl_xor(a, off, 32);
-        if (lane == 0 && j < nt) y[(size_t)(t0 + j) * N + row] = a;
+        if (lane == 0) part[w][j] = a;
+    }
+    __syncthreads();
+    if (threadIdx.x < nt) {
+        float s = part[0][threadIdx.x];
+#pragma unroll
+        for (int k = 1; k < F32_PARTS; ++k) s += part[k][threadIdx.x];
+        y[(size_t)(t0 + threadIdx.x) * N + row] = s;
     }
 }
 
@@ -689,19 +717,34 @@ __device__ __forceinline__ float rocmfp4_fast_q8_block(const uint32_t qs[4], flo
 
 __device__ __forceinline__ float mv_rocmfp4_fast(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K, int lane, int L) {
     (void)bs;
-    const int nquad = K / 128;
-    float acc = 0.0f;
-    for (int p = lane; p < nquad; p += L) {
-        uint32_t qs[4][4];
-        float e[4];
-        rocmfp4_fast_quad(wr + (long long)p * 68, qs, e);
+    // The batched kernel (mmb_rocmfp4_fast) gives each row 32 lanes: lane l sums quads l, l + 32, ... and the
+    // lanes are added by an xor tree. With L < 32 lanes per row, this lane stands in for the 32 / L virtual lanes
+    // lane + k L, keeps their sums apart and adds them in that tree's order (offsets 16 .. L, then Q8_REDUCE
+    // does L / 2 .. 1), so a token gives the same bits here as in a prefill batch.
+    const int nquad = K / 128, V = 32 / L;
+    float a[8];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const int ib = 4 * p + j;
-            acc += rocmfp4_fast_q8_block(qs[j], e[j], q8 + ib * 32, d8[ib]);
+    for (int k = 0; k < 8; ++k) {
+        a[k] = 0.0f;
+        if (k >= V) continue;
+        for (int p = lane + k * L; p < nquad; p += 32) {
+            uint32_t qs[4][4];
+            float e[4];
+            rocmfp4_fast_quad(wr + (long long)p * 68, qs, e);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int ib = 4 * p + j;
+                a[k] += rocmfp4_fast_q8_block(qs[j], e[j], q8 + ib * 32, d8[ib]);
+            }
         }
     }
-    return acc;
+#pragma unroll
+    for (int d = 4; d >= 1; d >>= 1)  // virtual-lane offset d L = 16 .. L
+        if (d < V)
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+                if (k < d) a[k] += a[k + d];
+    return a[0];
 }
 
 // K-quant x Q8_K kernels: the wave works on 4 blocks at a time, 8 lanes per 256-value block, each lane on 16

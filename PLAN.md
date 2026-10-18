@@ -1227,14 +1227,17 @@ for the symptoms above.
 >    - `deltanet_conv` (~100 GB/s) and the quantizing producers (`swiglu`, `add_rmsnorm_rows`) compute both
 >      Q8_0 and Q8_K although each consumer reads one.
 >    - The CPU embedding row decode.
-> 2. **35B generation (16.5 ms GPU per token):**
->    - BF16 LM head: 5.1 ms at ~200 GB/s (1 GB, the bandwidth floor is ~4.2 ms).
->    - Expert matvecs: 3.3 ms at ~160 GB/s.
->    - ROCMFP4_FAST matvecs: 2.9 ms.
->    - The `moe_router` kernel: 0.43 ms. It does 8 serial block-argmax rounds per token; a single sort
->      pass would be faster.
-> 3. **Generation polish:** ROCmFP4 int8 bandwidth (192 vs 240 GB/s); a HIP graph per token (~0.6 ms of
->    gaps).
+> 2. **35B generation (now track, 2026-10-18), ~15.4 ms GPU + ~1.5 ms launch gaps per token:**
+>    - **Done:** ROCMFP4_FAST matvecs take at most 8 lanes per row (FAST 152 → 164 GB/s; z 168 → 187,
+>      ssm_out 160 → 190); each lane keeps its 32 / L virtual-lane sums apart and adds them in the batched
+>      kernel's xor-tree order, so prefill stays bit-identical. F32 router: one row per 4-wave workgroup,
+>      unrolled 16-byte loads, explicit FMAs (88 → 158 GB/s, 0.95 → 0.53 ms per token). 35B generation
+>      ~57.4 → ~59.4 tok/s. `matvec_bench` also times the router.
+>    - Measured dead ends: unrolling the FAST quad loop by 2 (no gain); 8 waves per router row (137 GB/s).
+>    - **Next:** a HIP graph per generated token (the ~1.5 ms of gaps between ~800 launches), then the
+>      `moe_router` kernel (0.45 ms: 8 serial block-argmax rounds; one sort pass). Large matvecs are at
+>      185–205 GB/s of a 256 GB/s theoretical peak, little left there. BF16 LM head: 5.0 ms at 204 GB/s.
+>    - Small matrices (shared expert 512 × 2048, 0.56 MB) run at ~120 GB/s: ~4 µs each, launch-bound.
 >
 > **35B speed — DONE ✅ (2026-10-17).** Generation 47 → 57 tok/s, prefill 246 → 515 tok/s.
 > - **`matvec_bf16`:** 16-byte loads, activations rounded to BF16 as ggml does. The 1 GB LM head went

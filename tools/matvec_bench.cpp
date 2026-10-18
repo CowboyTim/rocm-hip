@@ -74,6 +74,7 @@ int main(int argc, char** argv) {
         add("attn_qkv", L.W_qkv); add("attn_gate (z)", L.W_z); add("ssm_alpha", L.W_alpha);
         add("ssm_beta", L.W_beta); add("ssm_out", L.W_ssm_out);
         add("attn_q", L.Wq); add("attn_k", L.Wk); add("attn_v", L.Wv); add("attn_output", L.Wo);
+        add("moe_router", L.W_router);
     }
     add("lm_head", m->output);
 
