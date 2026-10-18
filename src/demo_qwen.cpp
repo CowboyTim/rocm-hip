@@ -1,6 +1,6 @@
 // demo_qwen.cpp -- text generation with the Qwen3.5 forward pass.
 // Usage: ./qwen_demo <model.gguf> "prompt text" [n_gen] [--temp T] [--top-k K] [--top-p P] [--min-p P]
-//                    [--repeat-penalty R] [--seed S]      (run from build/co)
+//                    [--repeat-penalty R] [--seed S] [--lm-head-q8]      (run from build/co)
 // Greedy by default (--temp 0). QWEN_PROFILE=1 prints the time breakdown.
 
 #include "qwen_model.h"
@@ -15,7 +15,7 @@
 int main(int argc, char** argv) {
     if (argc < 3) {
         printf("Usage: %s <model.gguf> \"prompt text\" [n_gen] [--temp T] [--top-k K] [--top-p P] [--min-p P] "
-               "[--repeat-penalty R] [--seed S]\n", argv[0]);
+               "[--repeat-penalty R] [--seed S] [--lm-head-q8]\n", argv[0]);
         return 1;
     }
 
@@ -24,6 +24,7 @@ int main(int argc, char** argv) {
     int n_gen = 16;
     sampler_params sp = sampler_default_params();
     sp.temperature = 0.0f;  // greedy unless asked
+    bool head_q8 = false;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         const char* v = i + 1 < argc ? argv[i + 1] : "0";
@@ -33,6 +34,7 @@ int main(int argc, char** argv) {
         else if (a == "--min-p") { sp.min_p = (float)atof(v); ++i; }
         else if (a == "--repeat-penalty") { sp.repeat_penalty = (float)atof(v); ++i; }
         else if (a == "--seed") { sp.seed = strtoull(v, nullptr, 10); ++i; }
+        else if (a == "--lm-head-q8") head_q8 = true;
         else n_gen = atoi(argv[i]);
     }
     printf("Sampling: temp %g top_k %d top_p %g min_p %g repeat_penalty %g seed %llu\n", sp.temperature, sp.top_k,
@@ -52,6 +54,15 @@ int main(int argc, char** argv) {
         return 1;
     }
     fprintf(stderr, "[DEMO] KV cache init succeeded\n");
+    if (head_q8) {
+        const int rc = inference_set_lm_head_q8(engine, 1);
+        if (rc < 0) {
+            fprintf(stderr, "LM head Q8_0 copy failed: %s\n", inference_get_last_error());
+            inference_free_model(engine);
+            return 1;
+        }
+        printf("LM head: %s\n", rc == 0 ? "int8 (Q8_0) copy" : "already quantized, unchanged");
+    }
 
     // Get the Qwen model created during kv_cache_init (already configured with embedding table)
     qwen_model_t* model = inference_get_qwen_model(engine);

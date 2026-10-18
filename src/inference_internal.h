@@ -122,6 +122,7 @@ struct inference_model {
     QwenModel* qwen = nullptr;                      // Qwen model handle (set during kv_init)
 
     int n_past = 0;                                     // tokens decoded in the current sequence (next position)
+    int lm_head_q8 = 0;                                 // inference_set_lm_head_q8: use an int8 copy of the LM head
     uint64_t seed = 0;                                  // inference_generate sampler seed
 
     double eps = 1e-5;                                  // normalization epsilon

@@ -910,6 +910,59 @@ int main(int argc, char** argv) {
         if (!ok) ++g_fail;
         printf("  [%s] LM head argmax on reference hidden state: %d (reference %d)\n", ok ? "PASS" : "FAIL", best,
                next_token);
+
+        // Opt-in Q8_0 copy of a float head (inference_set_lm_head_q8): the GPU-built values and scales must be
+        // ggml's quantize_row_q8_0_ref exactly (checked on a few rows), and the logits close to the reference
+        const QuantWeight& H = m->output;
+        if (qmatvec_q8_0s_source_supported(H.type, H.K)) {
+            ShmBuf hq, hd;
+            if (!hq.alloc("fwdv_hq.bin", (size_t)H.N * H.K / 4) || !hd.alloc("fwdv_hd.bin", (size_t)H.N * (H.K / 32) / 2 + 1)) {
+                fprintf(stderr, "alloc failed\n");
+                return 1;
+            }
+            int8_t* qs = (int8_t*)hq.p;
+            uint16_t* qd = (uint16_t*)hd.p;
+            memcpy(g_x, b.data(), (size_t)E * sizeof(float));
+            hipError_t e = qmatvec_quantize_rows_q8_0(H.type, H.data, H.row_bytes, H.N, H.K, qs, qd, 0);
+            if (e == hipSuccess) e = qmatvec_quantize(g_x, E, &g_q8, 0);
+            if (e == hipSuccess) e = qmatvec_launch_q8_0s(qs, qd, &g_q8, g_y, H.N, H.K, 0);
+            if (e == hipSuccess) e = hipDeviceSynchronize();
+            if (e != hipSuccess) { fprintf(stderr, "LM head Q8_0 copy: %s\n", hipGetErrorString(e)); return 1; }
+            int bad = 0;
+            for (const int r : {0, H.N / 2, H.N - 1}) {
+                const uint8_t* wr = (const uint8_t*)H.data + (size_t)r * H.row_bytes;
+                for (int bl = 0; bl < H.K / 32; ++bl) {
+                    float xs[32], amax = 0.0f;
+                    for (int j = 0; j < 32; ++j) {
+                        const int k = bl * 32 + j;
+                        uint16_t h16;
+                        memcpy(&h16, wr + 2 * (size_t)k, 2);
+                        uint32_t u = (uint32_t)h16 << 16;
+                        float bfv;
+                        memcpy(&bfv, &u, 4);
+                        xs[j] = H.type == QT_F32 ? ((const float*)wr)[k] : H.type == QT_F16 ? __half2float(*(const __half*)(wr + 2 * (size_t)k)) : bfv;
+                        amax = std::max(amax, std::fabs(xs[j]));
+                    }
+                    const float dd = amax / 127.0f, id = dd != 0.0f ? 1.0f / dd : 0.0f;
+                    const __half hdd = __float2half(dd);
+                    if (memcmp(&qd[(size_t)r * (H.K / 32) + bl], &hdd, 2) != 0) ++bad;
+                    for (int j = 0; j < 32; ++j)
+                        if (qs[(size_t)r * H.K + bl * 32 + j] != (int8_t)(int)std::round(xs[j] * id)) ++bad;
+                }
+            }
+            if (bad) ++g_fail;
+            printf("  [%s] LM head Q8_0 copy: rows 0, N/2, N-1 as ggml's quantize_row_q8_0_ref (%d mismatches)\n",
+                   bad ? "FAIL" : "PASS", bad);
+            Stat sq;
+            sq.add(g_y, c.data(), H.N);
+            report("LM head Q8_0 copy (opt-in) vs reference logits", sq, 3e-2);
+            int bq = 0;
+            for (int i = 1; i < V; ++i)
+                if (g_y[i] > g_y[bq]) bq = i;
+            if (bq != next_token) ++g_fail;
+            printf("  [%s] LM head Q8_0 copy argmax on reference hidden state: %d (reference %d)\n",
+                   bq == next_token ? "PASS" : "FAIL", bq, next_token);
+        }
     }
 
     // ---- end to end: the engine on the reference tokens, residual stream vs l_out-N after every layer

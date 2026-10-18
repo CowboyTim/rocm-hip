@@ -1595,3 +1595,58 @@ matmul_wmma_q6_K(const uint8_t *W, long long row_bytes, const int8_t *q8, const 
                  long long ldy, int N, int K, int T) {
     wmma_q8k<6>(W, row_bytes, q8, d8, bs, y, ldy, N, K, T);
 }
+
+// ================================================================ int8 copy of a float LM head (opt-in)
+//
+// The 35B's LM head is a 1 GB BF16 matrix, 5 ms of every generated token at ~200 GB/s. On request
+// (inference_set_lm_head_q8) the engine keeps a Q8_0 copy of it: per 32 values d = amax / 127 (stored as
+// FP16) and q = round(x / d), as ggml's quantize_row_q8_0_ref (what llama-quantize writes for a Q8_0 tensor),
+// in a split layout: values qs [N][K] and scales d [N][K / 32]. Logits then differ slightly from the
+// float head's.
+
+// quantize_rows_q8_0  grid N, block 256: row n of W (F32 = 0, F16 = 1 or BF16 = 30, ggml type ids) -> qs, d.
+// Each wave quantizes one 32-value block per step. K % 256 == 0.
+extern "C" __global__ void __launch_bounds__(256)
+quantize_rows_q8_0(const uint8_t *W, long long row_bytes, int type, int K, int8_t *qs, __half *d) {
+    const int n = blockIdx.x, lane = threadIdx.x & 31;
+    const uint8_t *wr = W + (long long)n * row_bytes;
+    for (int k = threadIdx.x; k < K; k += 256) {
+        const float x = type == 0 ? ((const float *)wr)[k] : type == 1 ? fp16(wr + 2 * k) : bf16(wr + 2 * k);
+        float am = fabsf(x);
+        for (int off = 16; off > 0; off >>= 1) am = fmaxf(am, __shfl_xor(am, off, 32));
+        const float dd = am / 127.0f, id = dd != 0.0f ? 1.0f / dd : 0.0f;
+        qs[(long long)n * K + k] = (int8_t)(int)roundf(x * id);
+        if (lane == 0) d[(long long)n * (K / 32) + k / 32] = __float2half(dd);
+    }
+}
+
+// matvec_q8_0s  grid ceil(N / ROWS_PER_BLOCK), block 32 * ROWS_PER_BLOCK: one wave per row, lane by 32-value
+// block; Q8_0 x Q8_0 as ggml's vec_dot_q8_0_q8_0: sum_b (float)isum_b * (d_w * d_x). K % 32 == 0, qs rows
+// 16-byte aligned.
+extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
+matvec_q8_0s(const int8_t *qs, const __half *d, const int8_t *q8, const float *d8, float *y, int N, int K) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= N) return;
+    const int nb = K / 32;
+    const uint4 *wr = (const uint4 *)(qs + (long long)row * K);
+    const __half *dr = d + (long long)row * nb;
+    float acc = 0.0f;
+#pragma unroll 2
+    for (int b = lane; b < nb; b += 32) {
+        const uint4 w0 = wr[2 * b], w1 = wr[2 * b + 1];
+        const int4 x0 = ((const int4 *)q8)[2 * b], x1 = ((const int4 *)q8)[2 * b + 1];
+        int s = 0;
+        s = dot4((int)w0.x, x0.x, s);
+        s = dot4((int)w0.y, x0.y, s);
+        s = dot4((int)w0.z, x0.z, s);
+        s = dot4((int)w0.w, x0.w, s);
+        s = dot4((int)w1.x, x1.x, s);
+        s = dot4((int)w1.y, x1.y, s);
+        s = dot4((int)w1.z, x1.z, s);
+        s = dot4((int)w1.w, x1.w, s);
+        acc += (float)s * (__half2float(dr[b]) * d8[b]);
+    }
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
+    if (lane == 0) y[row] = acc;
+}

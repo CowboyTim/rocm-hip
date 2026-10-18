@@ -31,6 +31,16 @@ hipError_t qmatvec_launch(int type, const void *W, size_t row_bytes, const float
 hipError_t qmatvec_launch_batch(int type, const void *W, size_t row_bytes, const float *x, float *y, int N, int K,
                                 int T, hipStream_t stream);
 
+// Int8 copy of a float (F32 / F16 / BF16) matrix, for the opt-in Q8_0 LM head: ggml's Q8_0 quantization
+// (per 32 values d = amax / 127 as FP16, q = round(x / d)) in a split layout, values qs [N][K] (16-byte
+// aligned) and FP16 scales d [N][K / 32]. K % 256 == 0.
+int qmatvec_q8_0s_source_supported(int type, int K);
+hipError_t qmatvec_quantize_rows_q8_0(int type, const void *W, size_t row_bytes, int N, int K, int8_t *qs, uint16_t *d,
+                                      hipStream_t stream);
+// y = qs x, x quantized into q (its Q8_0 part), as ggml's Q8_0 x Q8_0 dot product.
+hipError_t qmatvec_launch_q8_0s(const int8_t *qs, const uint16_t *d, const struct qmatvec_q8 *q, float *y, int N, int K,
+                                hipStream_t stream);
+
 // ---------------------------------------------------------------- int8 path
 // The activation vector is quantized once (qmatvec_quantize) into both formats ggml's CPU reference uses
 // (Q8_0 for ROCmFP4, Q8_K for K-quants), then int8 matvecs use v_dot4. See matvec_q.hip. Types and shapes

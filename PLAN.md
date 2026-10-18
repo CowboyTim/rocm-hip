@@ -1253,9 +1253,15 @@ for the symptoms above.
 >    - **Next:** large matvecs are at 185–205 GB/s of a 256 GB/s theoretical peak; little is left there.
 >      Remaining per token on the 35B (~14.4 ms GPU): LM head 5.0 ms (see the open decision), ~800
 >      launches at ~2 µs each.
->    - **Open decision (user):** the 1 GB BF16 LM head is 5.0 ms of ~16.8 ms per token. An int8 (Q8_0) copy
->      would be ~0.5 GB and ~2.7 ms (~+15% tok/s), but its logits would no longer match llama.cpp's BF16
->      ones exactly.
+>    - **Opt-in int8 LM head — DONE ✅ (2026-10-18, user: "build it and use a flag").**
+>      `inference_set_lm_head_q8(model, 1)` / `qwen_demo --lm-head-q8`; off by default. A Q8_0 copy of a
+>      float head (ggml's quantize_row_q8_0_ref, split layout: int8 values + FP16 scales) built on the GPU on
+>      first use (~0.25 s, 0.54 GB), read by `matvec_q8_0s` (Q8_0 × Q8_0 like ggml). 35B generation
+>      ~63.3 → **~76.3 tok/s**. Logits vs the BF16 head: cos 0.99996, max 0.6% of the largest; greedy output
+>      identical on 3 prompts × 128 tokens. Already-quantized heads (the 4B's Q6_K) are left alone (returns
+>      1). Tests: `forward_verify` checks the copy against ggml's quantizer bit for bit on sample rows and
+>      the logits vs the reference; `generate_verify` checks the API, and that switching it off restores
+>      the float logits exactly.
 >    - Small matrices (shared expert 512 × 2048, 0.56 MB) run at ~120 GB/s: ~4 µs each, launch-bound.
 >
 > **35B speed — DONE ✅ (2026-10-17).** Generation 47 → 57 tok/s, prefill 246 → 515 tok/s.

@@ -407,6 +407,23 @@ int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
     m->qwen = qwen_model_create(m);
     if (!m->qwen) { set_error("qwen_model_create failed"); return -1; }
     fprintf(stderr, "[KV_INIT] Qwen model created at %p\n", (void*)m->qwen);
+    if (m->lm_head_q8 && qwen_model_set_lm_head_q8(m->qwen, 1) < 0) {
+        set_error("LM head Q8_0 copy failed (details on stderr)");
+        return -1;
+    }
+    return 0;
+}
+
+int inference_set_lm_head_q8(inference_model_t* m, int enable) {
+    if (!m) return INFERENCE_ERR_INVALID_ARG;
+    const int t = m->output.type;
+    if (enable && t != QT_F32 && t != QT_F16 && t != QT_BF16) return 1;  // already quantized
+    m->lm_head_q8 = enable != 0;
+    if (m->qwen && qwen_model_set_lm_head_q8(m->qwen, m->lm_head_q8) < 0) {
+        set_error("LM head Q8_0 copy failed (details on stderr)");
+        m->lm_head_q8 = 0;
+        return INFERENCE_ERR_OUT_OF_MEMORY;
+    }
     return 0;
 }
 

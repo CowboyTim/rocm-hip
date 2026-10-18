@@ -154,6 +154,47 @@ int main(int argc, char** argv) {
         check(rc3 == 0 && (exact ? d3 == 0.0 : same_choice(tc) && cs3 >= 0.995), what);
     }
 
+    // Opt-in int8 LM head: close to the float head's logits, and switching it off gives the float logits back
+    // bit for bit. Heads that are already quantized are left alone (return 1).
+    {
+        const int32_t* pt = prompt.data();
+        const int n = (int)prompt.size();
+        const int V = inference_vocab_size(m);
+        std::vector<float> f0(V), q(V), f1(V);
+        std::vector<int> ids(V);
+        auto logits_of_prompt = [&](std::vector<float>& out) {
+            inference_reset(m);
+            const int rc = inference_prefill(m, pt, n);
+            inference_get_logits(m, ids.data(), out.data());
+            return rc;
+        };
+        int rc = logits_of_prompt(f0);
+        const int on = inference_set_lm_head_q8(m, 1);
+        rc |= logits_of_prompt(q);
+        const int off = inference_set_lm_head_q8(m, 0);
+        rc |= logits_of_prompt(f1);
+        double dot = 0.0, na = 0.0, nb = 0.0;
+        int tf = 0, tq = 0;
+        for (int i = 0; i < V; ++i) {
+            dot += (double)f0[i] * q[i];
+            na += (double)f0[i] * f0[i];
+            nb += (double)q[i] * q[i];
+            if (f0[i] > f0[tf]) tf = i;
+            if (q[i] > q[tq]) tq = i;
+        }
+        const double cs = dot / std::sqrt(na * nb);
+        const bool back = memcmp(f0.data(), f1.data(), (size_t)V * sizeof(float)) == 0;
+        char what[200];
+        if (on == 1) {
+            snprintf(what, sizeof(what), "inference_set_lm_head_q8: head already quantized, logits unchanged");
+            check(rc == 0 && off == 0 && back && memcmp(f0.data(), q.data(), (size_t)V * sizeof(float)) == 0, what);
+        } else {
+            snprintf(what, sizeof(what), "inference_set_lm_head_q8: int8 head logits cos %.7f, top-1 %d / %d; off "
+                     "again: %s", cs, tq, tf, back ? "float logits restored exactly" : "logits DIFFER");
+            check(rc == 0 && on == 0 && off == 0 && cs >= 0.9999 && tq == tf && back, what);
+        }
+    }
+
     sampler_params p = sampler_default_params();  // temperature 0.8, top_k 40, top_p 0.95, min_p 0.05
     p.seed = 1234;
     const std::vector<int> s1 = gen(m, prompt, N, p), s2 = gen(m, prompt, N, p);

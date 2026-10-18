@@ -259,8 +259,14 @@ struct QwenModel {
     bool use_q8 = getenv("QWEN_MATVEC_FP32") == nullptr;
     const float* q8_src = nullptr;
     int q8_k = 0, q8_t = 0;
+    // Opt-in Q8_0 copy of a float LM head (qwen_model_set_lm_head_q8), built on the GPU when first enabled
+    ShmRegion head_mem;
+    int8_t* head_q = nullptr;
+    uint16_t* head_d = nullptr;
+    bool head_q8 = false;
 
     ~QwenModel() {
+        head_mem.free();
         rs.mem.free();
         s.mem.free();
         gpu_ops_free();
@@ -593,14 +599,49 @@ struct QwenModel {
             last.max_k = E;
         }
         const QuantWeight& H = eng->output;
-        prof.bytes[P_HEAD] += (double)H.row_bytes * H.N;
-        const hipError_t e = q8_src == s.xn && qmatvec_q8_supported(H.type, E)
-                                 ? qmatvec_launch_q8(H.type, H.data, H.row_bytes, &last, s.logits, H.N, E, 0)
-                                 : qmatvec_launch(H.type, H.data, H.row_bytes, xl, s.logits, H.N, E, 0);
+        hipError_t e;
+        if (head_q8 && q8_src == s.xn) {  // opt-in Q8_0 copy
+            prof.bytes[P_HEAD] += (double)H.N * H.K * (1.0 + 2.0 / 32);
+            e = qmatvec_launch_q8_0s(head_q, head_d, &last, s.logits, H.N, E, 0);
+        } else {
+            prof.bytes[P_HEAD] += (double)H.row_bytes * H.N;
+            e = q8_src == s.xn && qmatvec_q8_supported(H.type, E)
+                    ? qmatvec_launch_q8(H.type, H.data, H.row_bytes, &last, s.logits, H.N, E, 0)
+                    : qmatvec_launch(H.type, H.data, H.row_bytes, xl, s.logits, H.N, E, 0);
+        }
         if (!check(e, "LM head") || !sync()) return -1;
         if (logits_out) memcpy(logits_out, s.logits, (size_t)eng->vocab_size * sizeof(float));
         prof.lap(P_HEAD);
         prof.tokens += T;
+        return 0;
+    }
+
+    // Use (or stop using) the Q8_0 copy of the LM head; builds it the first time. Only for F32 / F16 / BF16
+    // heads: returns 1 (nothing done) for a head that is already quantized, -1 on error.
+    int set_lm_head_q8(bool on) {
+        const QuantWeight& H = eng->output;
+        if (!on) { head_q8 = false; return 0; }
+        if (!qmatvec_q8_0s_source_supported(H.type, H.K)) return 1;
+        if (!head_q) {
+            float *q = nullptr, *d = nullptr;
+            const size_t sizes[] = {(size_t)H.N * H.K / 4, (size_t)H.N * (H.K / 32) / 2 + 1};
+            float** const ptrs[] = {&q, &d};
+            if (!head_mem.alloc("/dev/shm/qwen_lm_head_q8.bin", sizes, ptrs, 2, hipExtHostRegisterCoarseGrained)) {
+                qwen_set_error("LM head Q8_0 copy: allocation failed");
+                return -1;
+            }
+            head_q = (int8_t*)q;
+            head_d = (uint16_t*)d;
+            if (!check(qmatvec_quantize_rows_q8_0(H.type, H.data, H.row_bytes, H.N, H.K, head_q, head_d, 0),
+                       "LM head Q8_0 copy") ||
+                !sync()) {
+                head_mem.free();
+                head_q = nullptr;
+                head_d = nullptr;
+                return -1;
+            }
+        }
+        head_q8 = true;
         return 0;
     }
 
@@ -660,6 +701,10 @@ void qwen_model_profile_print(qwen_model_t* model, const char* title) {
     if (gpu > 0)
         fprintf(stderr, "[profile]   weights streamed: %.0f MB/token, %.1f GB/s averaged over the GPU sections\n",
                 bytes / n / 1e6, bytes / gpu / 1e9);
+}
+
+int qwen_model_set_lm_head_q8(qwen_model_t* model, int enable) {
+    return model ? model->set_lm_head_q8(enable != 0) : -1;
 }
 
 void qwen_model_set_layer_callback(qwen_model_t* model, qwen_layer_cb cb, void* user) {

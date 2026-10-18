@@ -49,6 +49,11 @@ const float* qwen_model_logits(qwen_model_t* model);
 typedef void (*qwen_layer_cb)(int layer, int pos, const float* x, int n, void* user);
 void qwen_model_set_layer_callback(qwen_model_t* model, qwen_layer_cb cb, void* user);
 
+// Opt-in int8 (Q8_0) copy of a float LM head (F32 / F16 / BF16; the 35B's 1 GB BF16 one): built on the GPU on
+// first use, about half the bytes per token; logits differ slightly from the float head's. enable = 0
+// returns to the original head. Returns 0, 1 if the head is already quantized (nothing to do), -1 on error.
+int qwen_model_set_lm_head_q8(qwen_model_t* model, int enable);
+
 // Wall-time breakdown of the forward passes since the last reset (CPU ops, GPU matvecs, weight bandwidth),
 // printed to stderr under the given title
 void qwen_model_profile_reset(qwen_model_t* model);

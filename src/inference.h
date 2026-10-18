@@ -61,6 +61,13 @@ void inference_kv_cache_free(inference_model_t* model);
 // Seed for inference_generate's sampler (default 0).
 void inference_set_seed(inference_model_t* model, unsigned int seed);
 
+// Opt-in: use an int8 (Q8_0, as llama-quantize writes it) copy of a float (F32 / F16 / BF16) LM head, built
+// on the GPU the first time (~0.25 s; half the head's size in memory). On Qwen3.6-35B-A3B (1 GB BF16 head)
+// generation is ~20% faster; the logits differ slightly from the BF16 head's, so greedy output can change where
+// the top two tokens are close. Off by default; may be called before or after inference_kv_cache_init.
+// Returns 0, 1 if the head is already quantized (nothing changes), negative on error.
+int inference_set_lm_head_q8(inference_model_t* model, int enable);
+
 // The model holds one sequence: tokens are decoded at positions 0, 1, 2, ... (n_past counts them).
 // inference_reset starts a new sequence (position 0, which also clears the DeltaNet recurrent state).
 void inference_reset(inference_model_t* model);
