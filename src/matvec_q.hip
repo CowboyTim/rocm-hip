@@ -397,10 +397,46 @@ __device__ void matvec_coop_impl(const uint8_t *W, long long row_bytes, const fl
         matvec_coop_impl<B>(W, row_bytes, x, y, N, K);                                                     \
     }
 
+// Several tokens (prefill on the float path, e.g. rows too short for the int8 kernels: the qwen4exp mixers'
+// K = 320 up projections): grid (ceil(N / ROWS_PER_BLOCK), ceil(T / MMF_TT)). Each wave reads its row's blocks
+// once per tile of MMF_TT tokens and sums every token exactly as matvec_impl does (same blocks per lane, same
+// order, same reduction), so a prefill stays bit-identical to token by token.
+#define MMF_TT 8
+template <typename B>
+__device__ void matmul_float_impl(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K,
+                                  int T) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= N) return;
+    const int t0 = blockIdx.y * MMF_TT, nt = min(MMF_TT, T - t0);
+    const uint8_t *wr = W + (long long)row * row_bytes;
+    const int nb = K / B::QK;
+    float acc[MMF_TT];
+#pragma unroll
+    for (int j = 0; j < MMF_TT; ++j) acc[j] = 0.0f;
+    for (int ib = lane; ib < nb; ib += 32) {
+        const uint8_t *wb = wr + (long long)ib * B::BYTES;
+#pragma unroll
+        for (int j = 0; j < MMF_TT; ++j)
+            if (j < nt) acc[j] += B::dot(wb, x + (size_t)(t0 + j) * K + (long long)ib * B::QK);
+    }
+#pragma unroll
+    for (int j = 0; j < MMF_TT; ++j) {
+        float a = acc[j];
+        for (int off = 16; off > 0; off >>= 1) a += __shfl_xor(a, off, 32);
+        if (lane == 0 && j < nt) y[(size_t)(t0 + j) * N + row] = a;
+    }
+}
+
 #define MATVEC_KERNEL(name, B)                                                                            \
     extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)                                     \
         matvec_##name(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K) {    \
         matvec_impl<B>(W, row_bytes, x, y, N, K);                                                          \
+    }                                                                                                     \
+    extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)                                     \
+        matmul_f_##name(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K,     \
+                        int T) {                                                                          \
+        matmul_float_impl<B>(W, row_bytes, x, y, N, K, T);                                                 \
     }
 
 MATVEC_KERNEL(f16, BlkF16)

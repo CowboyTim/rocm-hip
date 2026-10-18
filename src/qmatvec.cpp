@@ -26,6 +26,7 @@ static hipFunction_t g_fn_id[QMV_MAX_TYPE];     // expert-indexed float kernels,
 static hipFunction_t g_fn_mm_id[QMV_MAX_TYPE];  // expert-tiled batched int8 kernels, matmul_q8_id_<type>
 static hipFunction_t g_fn_wmma[QMV_MAX_TYPE];   // WMMA tiled int8 kernels, matmul_wmma_<type> (Phase 20 W2)
 static hipFunction_t g_fn_wmma_id[QMV_MAX_TYPE];  // WMMA on MoE expert tiles, matmul_wmma_id_<type> (W4)
+static hipFunction_t g_fn_mmf[QMV_MAX_TYPE];     // batched float kernels, matmul_f_<type>
 static bool g_use_wmma = true;
 static int g_wmma_min_t = 32;  // smaller batches, and N < 64 (a 64-row tile mostly padding), stay on matmul_q8_<type>
 #define QMV_MM_TB 16  // tokens per tile, must match MM_TB in matvec_q.hip
@@ -45,6 +46,7 @@ int qmatvec_init(const char *co_path) {
     memset(g_fn_mm_id, 0, sizeof(g_fn_mm_id));
     memset(g_fn_wmma, 0, sizeof(g_fn_wmma));
     memset(g_fn_wmma_id, 0, sizeof(g_fn_wmma_id));
+    memset(g_fn_mmf, 0, sizeof(g_fn_mmf));
     for (int t = 0; t < QMV_MAX_TYPE; ++t) {
         const qt_traits *tr = qt_get_traits(t);
         if (!tr) continue;
@@ -65,6 +67,8 @@ int qmatvec_init(const char *co_path) {
         if (hipModuleGetFunction(&g_fn_wmma[t], g_mod, name) != hipSuccess) g_fn_wmma[t] = nullptr;
         snprintf(name, sizeof(name), "matmul_wmma_id_%s", tr->name);
         if (hipModuleGetFunction(&g_fn_wmma_id[t], g_mod, name) != hipSuccess) g_fn_wmma_id[t] = nullptr;
+        snprintf(name, sizeof(name), "matmul_f_%s", tr->name);
+        if (hipModuleGetFunction(&g_fn_mmf[t], g_mod, name) != hipSuccess) g_fn_mmf[t] = nullptr;
     }
     if (hipModuleGetFunction(&g_quant, g_mod, "quantize_q8") != hipSuccess) g_quant = nullptr;
     if (hipModuleGetFunction(&g_mm_f32, g_mod, "matmul_f32") != hipSuccess) g_mm_f32 = nullptr;
@@ -86,6 +90,7 @@ void qmatvec_free(void) {
     memset(g_fn_mm_id, 0, sizeof(g_fn_mm_id));
     memset(g_fn_wmma, 0, sizeof(g_fn_wmma));
     memset(g_fn_wmma_id, 0, sizeof(g_fn_wmma_id));
+    memset(g_fn_mmf, 0, sizeof(g_fn_mmf));
     g_quant = nullptr;
     g_mm_f32 = g_quant_rows_q8_0 = g_mv_q8_0s = nullptr;
 }
@@ -108,6 +113,7 @@ hipError_t qmatvec_launch(int type, const void *W, size_t row_bytes, const float
 }
 
 #define QMV_MF32_TT 8  // must match MF32_TT in matvec_q.hip
+#define QMV_MMF_TT 8   // must match MMF_TT in matvec_q.hip
 
 hipError_t qmatvec_launch_batch(int type, const void *W, size_t row_bytes, const float *x, float *y, int N, int K,
                                 int T, hipStream_t stream) {
@@ -117,6 +123,15 @@ hipError_t qmatvec_launch_batch(int type, const void *W, size_t row_bytes, const
         void *args[] = {(void *)&W, &rb, (void *)&x, (void *)&y, &N, &K, &T};
         return hipModuleLaunchKernel(g_mm_f32, (unsigned)N, (unsigned)((T + QMV_MF32_TT - 1) / QMV_MF32_TT), 1,
                                      32 * QMV_F32_PARTS, 1, 1, 0, stream, args, nullptr);
+    }
+    if (T > 1 && type >= 0 && type < QMV_MAX_TYPE && g_fn_mmf[type]) {  // same sums as T launches of matvec_<type>
+        const qt_traits *tr = qt_get_traits(type);
+        if (K % tr->blck_size != 0 || row_bytes != qt_row_size(type, K)) return hipErrorInvalidValue;
+        long long rb = (long long)row_bytes;
+        void *args[] = {(void *)&W, &rb, (void *)&x, (void *)&y, &N, &K, &T};
+        return hipModuleLaunchKernel(g_fn_mmf[type], (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK),
+                                     (unsigned)((T + QMV_MMF_TT - 1) / QMV_MMF_TT), 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0,
+                                     stream, args, nullptr);
     }
     hipError_t e = hipSuccess;
     for (int t = 0; t < T && e == hipSuccess; ++t)

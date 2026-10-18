@@ -94,6 +94,10 @@ const void* gguf_get_tensor_ptr(const gguf_model_t *model, const char* name, siz
 /* Base and size of the whole read-only file mapping, for pinning it once with
  * hipHostRegister(..., hipHostRegisterReadOnly) so kernels read weights in place. */
 const void* gguf_map_base(const gguf_model_t *model, size_t* out_size);
+/* A split model (<prefix>-00001-of-0000N.gguf, opened by its first file) has one mapping per file:
+ * gguf_n_maps of them, the i-th from gguf_map_at (0 is gguf_map_base). One for an unsplit file. */
+int          gguf_n_maps(const gguf_model_t *model);
+const void*  gguf_map_at(const gguf_model_t *model, int i, size_t* out_size);
 
 /* --- Quantization type helpers --- */
 

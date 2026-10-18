@@ -51,25 +51,55 @@ static void seq_reset(inference_model_t* m);
 // All internal types (QuantWeight, LayerWeights, inference_model) are
 // defined in inference_internal.h which is included above.
 
-// Pin the whole GGUF mapping once, read-only. Every weight and norm the kernels read lives inside it,
-// and on UMA the registered host pointer is the device pointer, so nothing is copied.
+// Pin the GGUF mappings once, read-only (every file of a split model). Every weight and norm the kernels read
+// lives inside them, and on UMA the registered host pointer is the device pointer, so nothing is copied. Tensors
+// only the CPU reads are left out: the token embeddings (when the LM head is not tied to them) and the PLE table
+// (qwen4exp: 35.8 GiB, 16 rows per token), so a model bigger than what may be pinned can still run.
 static bool pin_model_memory(inference_model* m) {
-    void* base = (void*)gguf_map_base(m->gguf, &m->map_size);
-    if (!base) return false;
-    hipError_t e = hipHostRegister(base, m->map_size, hipHostRegisterReadOnly);
-    if (e != hipSuccess) {
-        INFER_LOG("[pin_model] hipHostRegister(GGUF map, %zu bytes, ReadOnly) failed: %s\n",
-                m->map_size, hipGetErrorString(e));
-        return false;
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    std::vector<std::pair<const char*, const char*>> skip;  // whole pages inside CPU-only tensors
+    auto cpu_only = [&](const QuantWeight& w) {
+        if (!w.data) return;
+        const uintptr_t b = ((uintptr_t)w.data + page - 1) / page * page;
+        const uintptr_t e = ((uintptr_t)w.data + w.row_bytes * (size_t)w.N) / page * page;
+        if (e > b) skip.push_back({(const char*)b, (const char*)e});
+    };
+    if (m->output.data != m->token_embd.data) cpu_only(m->token_embd);
+    cpu_only(m->ple_table);
+    std::sort(skip.begin(), skip.end());
+    m->pinned_bytes = m->unpinned_bytes = 0;
+    for (int i = 0; i < gguf_n_maps(m->gguf); ++i) {
+        size_t size = 0;
+        const char* base = (const char*)gguf_map_at(m->gguf, i, &size);
+        const char* cur = base;
+        auto pin = [&](const char* end) {
+            if (end <= cur) return true;
+            hipError_t e = hipHostRegister((void*)cur, (size_t)(end - cur), hipHostRegisterReadOnly);
+            if (e != hipSuccess) {
+                INFER_LOG("[pin_model] hipHostRegister(GGUF map %d, %zu bytes, ReadOnly) failed: %s\n", i,
+                          (size_t)(end - cur), hipGetErrorString(e));
+                return false;
+            }
+            m->pinned.push_back({(void*)cur, (size_t)(end - cur)});
+            m->pinned_bytes += (size_t)(end - cur);
+            return true;
+        };
+        for (const auto& r : skip) {
+            if (r.first < base || r.second > base + size) continue;
+            if (!pin(r.first)) return false;
+            m->unpinned_bytes += (size_t)(r.second - r.first);
+            cur = r.second;
+        }
+        if (!pin(base + size)) return false;
     }
-    m->map_base = base;
-    m->map_pinned = true;
+    INFER_LOG("[pin_model] %d file(s): %zu MB registered, %zu MB left to the CPU\n", gguf_n_maps(m->gguf),
+              m->pinned_bytes >> 20, m->unpinned_bytes >> 20);
     return true;
 }
 
 static void unpin_model_memory(inference_model* m) {
-    if (m->map_pinned) (void)hipHostUnregister((void*)m->map_base);
-    m->map_pinned = false;
+    for (const auto& r : m->pinned) (void)hipHostUnregister(r.first);
+    m->pinned.clear();
 }
 
 // Helper: find tensor index by name
@@ -1090,6 +1120,12 @@ int inference_store_open(inference_model_t* m, const char* dir, int snapshot_eve
                                (uint64_t)state_bytes(m)};
     sha256_update(&c, layout, sizeof(layout));
     if (gbase) sha256_update(&c, gbase, std::min(gsize, (size_t)4 << 20));
+    for (int i = 1; i < gguf_n_maps(m->gguf); ++i) {  // the other files of a split model: their sizes
+        size_t sz = 0;
+        gguf_map_at(m->gguf, i, &sz);
+        const uint64_t v = sz;
+        sha256_update(&c, &v, sizeof(v));
+    }
     sha256_final(&c, m->store_root.b);
     m->store_dir = dir;
     m->store_dirfd = dfd;

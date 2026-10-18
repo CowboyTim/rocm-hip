@@ -90,6 +90,7 @@ struct tensor_meta {
     int64_t      ne[4];        /* dimension sizes; ne[i>=n_dims]==1 */
     int          type;         /* ggml_type enum value */
     uint64_t     data_offset;  /* byte offset from start of data blob */
+    int          split;        /* the file (split) holding it: 0 = the one opened */
 };
 
 /* KV scalar value with explicit type tag for correct retrieval */
@@ -117,6 +118,8 @@ struct kv_entry {
 /* Opaque handle matching the public API declaration */
 typedef struct gguf_model gguf_model_t;
 
+#define GGUF_MAX_SPLITS 64
+
 struct gguf_model {
     void           *map_ptr;         /* base pointer from mmap() */
     size_t          map_size;        /* file size we mapped */
@@ -128,6 +131,12 @@ struct gguf_model {
     int64_t         n_kv;            /* total KV pairs */
     struct kv_entry *kvs;            /* heap-allocated array[n_kv] */
     int64_t         n_ctx;           /* requested context length, default 512 */
+    /* A split model (<prefix>-00001-of-0000N.gguf, ...): one mapping per file; maps[0] is map_ptr. Metadata comes
+     * from the first file, tensors from all of them. */
+    int             n_maps;
+    void           *maps[GGUF_MAX_SPLITS];
+    size_t          map_sizes[GGUF_MAX_SPLITS];
+    size_t          data_offs[GGUF_MAX_SPLITS];
 };
 
 /* ---------------------------------------------------------------------------
@@ -296,6 +305,10 @@ static gguf_model_t *load_gguf(const char *path) {
 
     /* Data blob starts at aligned offset after all tensor info */
     model->data_off   = align_up((size_t)(p - base), model->alignment);
+    model->n_maps = 1;
+    model->maps[0] = mapped;
+    model->map_sizes[0] = st.st_size;
+    model->data_offs[0] = model->data_off;
     return model;
 
 fail:
@@ -312,17 +325,8 @@ fail:
     return NULL;
 }
 
-/* ---------------------------------------------------------------------------
- * Public API implementation
- * --------------------------------------------------------------------------- */
-
-gguf_model_t *inference_load_model(const char *path) {
-    if (!path) return NULL;
-    return load_gguf(path);
-}
-
-void inference_free_model(gguf_model_t *model) {
-    if (!model) return;
+/* Free a parsed file's metadata (not its mappings) */
+static void free_meta(gguf_model_t *model) {
     for (int64_t i = 0; i < model->n_kv; ++i) {
         free(model->kvs[i].str_val);
         if (model->kvs[i].arr_strings) {
@@ -332,8 +336,80 @@ void inference_free_model(gguf_model_t *model) {
         free(model->kvs[i].key);
     }
     free(model->tensors); free(model->kvs);
-    if (model->map_ptr) munmap(model->map_ptr, model->map_size);
     free(model);
+}
+
+static void unmap_all(gguf_model_t *model) {
+    for (int i = 0; i < model->n_maps; ++i)
+        if (model->maps[i]) munmap(model->maps[i], model->map_sizes[i]);
+    model->n_maps = 0;
+    model->map_ptr = NULL;
+}
+
+/* A scalar integer KV of the first file, or def */
+static int64_t kv_int_or(const gguf_model_t *m, const char *key, int64_t def);
+
+/* load_gguf, then for a split model (split.count > 1, path <prefix>-00001-of-<count>.gguf as llama.cpp names
+ * them) the other files: their tensors join the first file's, each with its own mapping */
+static gguf_model_t *load_gguf_splits(const char *path) {
+    gguf_model_t *model = load_gguf(path);
+    if (!model) return NULL;
+    const int64_t count = kv_int_or(model, "split.count", 1);
+    if (count <= 1) return model;
+    char suffix[64];
+    snprintf(suffix, sizeof(suffix), "-00001-of-%05d.gguf", (int)count);
+    const size_t pl = strlen(path), sl = strlen(suffix);
+    if (count > GGUF_MAX_SPLITS || pl < sl || strcmp(path + pl - sl, suffix) != 0) {
+        INFER_LOG("gguf_mmap: '%s' is split in %lld files: open the first, named <prefix>%s\n", path, (long long)count,
+                  suffix);
+        unmap_all(model); free_meta(model);
+        return NULL;
+    }
+    for (int i = 1; i < count; ++i) {
+        char *part = (char *)malloc(pl + 1);
+        memcpy(part, path, pl - sl);
+        snprintf(part + pl - sl, sl + 1, "-%05d-of-%05d.gguf", i + 1, (int)count);
+        gguf_model_t *sub = load_gguf(part);
+        if (!sub || kv_int_or(sub, "split.no", -1) != i) {
+            INFER_LOG("gguf_mmap: split %d of '%s' missing or not split %d: %s\n", i + 1, path, i + 1, part);
+            free(part);
+            if (sub) { unmap_all(sub); free_meta(sub); }
+            unmap_all(model); free_meta(model);
+            return NULL;
+        }
+        free(part);
+        struct tensor_meta *all = (struct tensor_meta *)realloc(model->tensors,
+            (size_t)(model->n_tensors + sub->n_tensors) * sizeof(struct tensor_meta));
+        if (!all) { unmap_all(sub); free_meta(sub); unmap_all(model); free_meta(model); return NULL; }
+        model->tensors = all;
+        for (int64_t t = 0; t < sub->n_tensors; ++t) {
+            all[model->n_tensors + t] = sub->tensors[t];
+            all[model->n_tensors + t].split = i;
+        }
+        model->n_tensors += sub->n_tensors;
+        model->maps[i] = sub->map_ptr;
+        model->map_sizes[i] = sub->map_size;
+        model->data_offs[i] = sub->data_off;
+        model->n_maps = i + 1;
+        sub->n_maps = 0;  /* the mapping now belongs to model */
+        free_meta(sub);
+    }
+    return model;
+}
+
+/* ---------------------------------------------------------------------------
+ * Public API implementation
+ * --------------------------------------------------------------------------- */
+
+gguf_model_t *inference_load_model(const char *path) {
+    if (!path) return NULL;
+    return load_gguf_splits(path);
+}
+
+void inference_free_model(gguf_model_t *model) {
+    if (!model) return;
+    unmap_all(model);
+    free_meta(model);
 }
 
 /* --- Tensor introspection --- */
@@ -821,7 +897,7 @@ const void* gguf_get_tensor_ptr(const gguf_model_t *m, const char* name, size_t*
                 *out_bytes = (size_t)total_elems * ts;
             }
 
-            return (const char*)model->map_ptr + model->data_off + tm->data_offset;
+            return (const char*)model->maps[tm->split] + model->data_offs[tm->split] + tm->data_offset;
         }
     }
     return nullptr;
@@ -830,18 +906,13 @@ const void* gguf_get_tensor_ptr(const gguf_model_t *m, const char* name, size_t*
 /* --- Low-level mmap access (for inference engine) --- */
 
 gguf_model_t* gguf_mmap_open(const char* path) {
-    return load_gguf(path);
+    return load_gguf_splits(path);
 }
 
 void gguf_mmap_close(gguf_model_t* model) {
     if (!model) return;
-    if (model->map_ptr) munmap(model->map_ptr, model->map_size);
-    if (model->tensors) free(model->tensors);
-    if (model->kvs) {
-        for (int64_t i = 0; i < model->n_kv; ++i) free(model->kvs[i].key);
-        free(model->kvs);
-    }
-    free(model);
+    unmap_all(model);
+    free_meta(model);
 }
 
 const void* gguf_mmap_get_tensor(const gguf_model_t* model, const char* name, size_t* out_bytes) {
@@ -853,4 +924,17 @@ const void* gguf_map_base(const gguf_model_t *m, size_t* out_size) {
     if (!m) return NULL;
     if (out_size) *out_size = m->map_size;
     return m->map_ptr;
+}
+
+int gguf_n_maps(const gguf_model_t *m) { return m ? m->n_maps : 0; }
+
+const void* gguf_map_at(const gguf_model_t *m, int i, size_t* out_size) {
+    if (!m || i < 0 || i >= m->n_maps) return NULL;
+    if (out_size) *out_size = m->map_sizes[i];
+    return m->maps[i];
+}
+
+static int64_t kv_int_or(const gguf_model_t *m, const char *key, int64_t def) {
+    const int64_t idx = find_kv_idx(m, key);
+    return idx < 0 ? def : kv_as_int64(m, idx);
 }

@@ -130,9 +130,8 @@ struct inference_model {
     std::atomic<int> ref_count{1};                      // reference counting
     std::mutex mtx;                                     // thread safety mutex
 
-    const void* map_base = nullptr;                    // GGUF mapping, pinned once read-only
-    size_t map_size = 0;
-    bool map_pinned = false;
+    std::vector<std::pair<void*, size_t>> pinned;      // registered (read-only) ranges of the GGUF mappings
+    size_t pinned_bytes = 0, unpinned_bytes = 0;       // registered / left to the CPU (token_embd, the PLE table)
 
     QuantWeight token_embd;                            // [vocab x n_embd]; rows decoded on the CPU per token
     QuantWeight output;                                // LM head; same tensor as token_embd when tied

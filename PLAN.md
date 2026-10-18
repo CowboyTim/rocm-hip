@@ -1210,13 +1210,12 @@ for the symptoms above.
 > - **Done (stage 1 core):** hyper-connections, PLE n-gram hash embeddings, the DeltaNet sigmoid output gate, the
 >   dense attention / MoE reused. Verified against the reference on a small random-weight qwen4exp GGUF built
 >   from the release's header (`tools/gen_qwen4exp_tiny.py`, `tests/qwen4exp_verify.cpp`). See Phase 21 below.
-> - **Next, for the release GGUF** (3 shards, 98.5 GiB; nothing downloaded):
->   1. split GGUF loading (`*-0000N-of-0000M.gguf`), tested on a split tiny model;
->   2. do not pin the 35.8 GiB PLE table (the CPU reads 16 rows per token), so ~63 GiB is registered;
->   3. prefill: the mixers' up projections (K = hc_rank = 320) fall back to one float launch per token; give
->      them a batched path;
->   4. the real model needs ~106 GB of storage (/dev/shm has 38 GB free, the disk 44 GB): **user to free space
->      or say where the shards live**; then greedy text vs `llama-completion` and speed.
+> - **Done for the release GGUF:** split GGUF loading; the PLE table and an untied token_embd are not pinned
+>   (~63 GiB registered for the release instead of 98.5); a batched float matmul for rows the int8 kernels
+>   cannot take (the mixers' K = 320 up projections; bit-identical to token by token).
+> - **Next:** the real model needs ~106 GB of storage (/dev/shm has 38 GB free, the disk 44 GB): **user to free
+>   space or say where the shards live**; then greedy text vs `llama-completion` and speed (the reference does
+>   22.6 tok/s; the HC mixers add ~0.34 GB of weights and ~500 launches per token on top of the MoE).
 > - **Other open items:** `perl/ROCm-Inference/t/20-chat.t` with the user's Minijinja module (cargo is installed
 >   now); CPAN packaging; Phase 22b follow-ups (disk-tier timing, block size option, a Perl web service example);
 >   speed: long-context decode attention, the 35B expert matmuls in prefill.
@@ -1897,6 +1896,18 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
   gathered rows bit-exact, gated value 6e-4 relative. Token by token, a split prefill and a restored checkpoint
   equal the prompt at once **bit for bit** with `QMATVEC_NO_WMMA=1` (cosine 0.99994 with WMMA). `store_verify`
   passes on it (reply identical across processes with WMMA off). 4B / 35B checks unchanged, 35B 63.1 tok/s.
+
+- **For the release file — DONE ✅:**
+  - **Split GGUFs** (`gguf_mmap`): opening `<prefix>-00001-of-0000N.gguf` maps all N files (llama.cpp's naming,
+    `split.count` / `split.no`); metadata from the first, tensors from all. `gguf_n_maps` / `gguf_map_at`.
+    `tools/gguf_split.py` splits a GGUF like `llama-gguf-split` (build-cpu's cmake is gone, so the tool is not
+    built); the reference gives identical logits on the 3-way split tiny model, and `qwen4exp_verify` passes on it.
+  - **Pinning:** every file's mapping is registered except whole pages of CPU-only tensors (the PLE table,
+    token_embd when the head is not tied to it): the 35B now registers 18.5 GB and leaves 0.4 GB to the CPU.
+    The store's root hash adds the other files' sizes for split models (unchanged for single files).
+  - **`matmul_f_<type>`** (`matvec_q.hip`): T tokens in tiles of 8 per launch for the float path, each token
+    summed exactly as `matvec_<type>` (so prefill stays bit-identical); `qmatvec_launch_batch` uses it for the
+    non-cooperative types. It replaces one launch per token for the K = 320 mixer up projections.
 
 **Needed from the user:** room for the GGUF files (start with Qwen3.8-Flash-Next ROCmFP4). Constraints here: /dev/shm
 is a 63 GB tmpfs (38 GB free) and the disk has 48 GB free, so a ~50 GB model needs space freed or /dev/shm
