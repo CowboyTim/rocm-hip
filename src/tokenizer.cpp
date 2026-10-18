@@ -11,6 +11,7 @@
 //      the merge table; each final symbol is looked up in the vocab.
 // Supported pre-tokenizers: qwen35, qwen2 (and models that share their regex).
 
+#include "inference_log.h"
 #include "tokenizer.h"
 #include "gguf_mmap.h"
 
@@ -452,7 +453,7 @@ tokenizer_t* tokenizer_load_from_gguf(void* gguf_model) {
 
     const char* model = gguf_tokenizer_type(m);
     if (!model || strcmp(model, "gpt2") != 0) {
-        fprintf(stderr, "[tokenizer] unsupported tokenizer.ggml.model '%s' (only gpt2 BPE)\n", model ? model : "");
+        INFER_LOG("[tokenizer] unsupported tokenizer.ggml.model '%s' (only gpt2 BPE)\n", model ? model : "");
         return nullptr;
     }
     const char* pre = gguf_pre_type(m);
@@ -460,7 +461,7 @@ tokenizer_t* tokenizer_load_from_gguf(void* gguf_model) {
     if (pre && strcmp(pre, "qwen35") == 0) pt = PRE_QWEN35;
     else if (pre && strcmp(pre, "qwen2") == 0) pt = PRE_QWEN2;
     else {
-        fprintf(stderr, "[tokenizer] unsupported tokenizer.ggml.pre '%s' (supported: qwen35, qwen2)\n", pre ? pre : "");
+        INFER_LOG("[tokenizer] unsupported tokenizer.ggml.pre '%s' (supported: qwen35, qwen2)\n", pre ? pre : "");
         return nullptr;
     }
 

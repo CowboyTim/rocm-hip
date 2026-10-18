@@ -1,6 +1,6 @@
 // demo_qwen.cpp -- text generation with the Qwen3.5 forward pass.
-// Usage: ./qwen_demo <model.gguf> "prompt text" [n_gen] [--temp T] [--top-k K] [--top-p P] [--min-p P]
-//                    [--repeat-penalty R] [--seed S] [--lm-head-q8]      (run from build/co)
+// Usage: ./qwen_demo <model.gguf> "prompt text" | @prompt_file [n_gen] [--temp T] [--top-k K] [--top-p P] [--min-p P]
+//                    [--repeat-penalty R] [--seed S] [--lm-head-q8] [--ctx N (default 4096)]
 // Greedy by default (--temp 0). QWEN_PROFILE=1 prints the time breakdown.
 
 #include "qwen_model.h"
@@ -15,16 +15,30 @@
 int main(int argc, char** argv) {
     if (argc < 3) {
         printf("Usage: %s <model.gguf> \"prompt text\" [n_gen] [--temp T] [--top-k K] [--top-p P] [--min-p P] "
-               "[--repeat-penalty R] [--seed S] [--lm-head-q8]\n", argv[0]);
+               "[--repeat-penalty R] [--seed S] [--lm-head-q8] [--ctx N]\n", argv[0]);
         return 1;
     }
 
     const char* model_path = argv[1];
-    const char* prompt = argv[2];
+    // "@path": read the prompt from a file (a single argument is limited to 128 KB)
+    std::string prompt_buf = argv[2];
+    if (prompt_buf.size() > 1 && prompt_buf[0] == '@') {
+        FILE* pf = fopen(prompt_buf.c_str() + 1, "rb");
+        if (!pf) {
+            fprintf(stderr, "cannot read prompt file %s\n", prompt_buf.c_str() + 1);
+            return 1;
+        }
+        prompt_buf.clear();
+        char chunk[65536];
+        for (size_t got; (got = fread(chunk, 1, sizeof(chunk), pf)) > 0;) prompt_buf.append(chunk, got);
+        fclose(pf);
+    }
+    const char* prompt = prompt_buf.c_str();
     int n_gen = 16;
     sampler_params sp = sampler_default_params();
     sp.temperature = 0.0f;  // greedy unless asked
     bool head_q8 = false;
+    int n_ctx = 4096;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         const char* v = i + 1 < argc ? argv[i + 1] : "0";
@@ -35,6 +49,7 @@ int main(int argc, char** argv) {
         else if (a == "--repeat-penalty") { sp.repeat_penalty = (float)atof(v); ++i; }
         else if (a == "--seed") { sp.seed = strtoull(v, nullptr, 10); ++i; }
         else if (a == "--lm-head-q8") head_q8 = true;
+        else if (a == "--ctx") { n_ctx = atoi(v); ++i; }
         else n_gen = atoi(argv[i]);
     }
     printf("Sampling: temp %g top_k %d top_p %g min_p %g repeat_penalty %g seed %llu\n", sp.temperature, sp.top_k,
@@ -48,7 +63,7 @@ int main(int argc, char** argv) {
     }
 
     printf("Initializing KV cache...\n");
-    if (inference_kv_cache_init(engine, 4096) != 0) {
+    if (inference_kv_cache_init(engine, n_ctx) != 0) {
         fprintf(stderr, "KV cache init failed: %s\n", inference_get_last_error());
         inference_free_model(engine);
         return 1;

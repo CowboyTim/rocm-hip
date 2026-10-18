@@ -12,6 +12,7 @@
 // rule over a d_state x d_state state per V head, gated RMSNorm). Their state persists across tokens: the
 // KV cache for attention, RecurrentState (conv + delta-rule state) for DeltaNet. Phase 20 Steps 4-5.
 
+#include "inference_log.h"
 #include "qwen_model.h"
 #include "inference.h"
 #include "inference_internal.h"
@@ -44,7 +45,7 @@ static void qwen_set_error(const char* fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(g_qwen_error, sizeof(g_qwen_error), fmt, ap);
     va_end(ap);
-    fprintf(stderr, "[qwen] %s\n", g_qwen_error);
+    INFER_LOG("[qwen] %s\n", g_qwen_error);
 }
 
 static bool qwen_debug() {
@@ -689,6 +690,8 @@ struct QwenModel {
 };
 
 extern "C" {
+
+const char* qwen_model_last_error(void) { return g_qwen_error; }
 
 qwen_model_t* qwen_model_create(inference_model_t* engine_model) {
     QwenModel* m = new QwenModel();

@@ -1,0 +1,10 @@
+/* libinference.so: export the public C API only (inference.h, tokenizer.h, sampler.h); the engine's internals
+   (qwen_model_*, qmatvec_*, kernels) stay hidden. */
+LIBINFERENCE_1 {
+    global:
+        inference_*;
+        tokenizer_*;
+        sampler_*;
+    local:
+        *;
+};

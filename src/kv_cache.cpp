@@ -3,6 +3,7 @@
 // Pattern matches every other binary in this repo: /dev/shm file -> ftruncate -> mmap(MAP_SHARED)
 // -> hipHostRegister to pin pages. No copies anywhere; kernels address these pages directly.
 
+#include "inference_log.h"
 #include "kv_cache.h"
 
 #include <cstdio>
@@ -41,12 +42,12 @@ __half* row_raw(inference_kv_cache_t* c, bool is_v, int layer, int pos) {
     call_count++;
 
     if (!c || !c->base) {
-        fprintf(stderr, "[KV_CACHE] row_raw #%d FAIL: c=%p base=%p (is_v=%d)\n",
+        INFER_LOG("[KV_CACHE] row_raw #%d FAIL: c=%p base=%p (is_v=%d)\n",
                 call_count, (void*)c, (void*)c ? c->base : nullptr, is_v); fflush(stderr);
         return nullptr;
     }
     if (layer < 0 || layer >= c->cfg.n_layers || pos < 0 || pos >= c->cfg.n_ctx) {
-        fprintf(stderr, "[KV_CACHE] row_raw #%d FAIL: layer=%d n_layers=%d pos=%d n_ctx=%d (is_v=%d)\n",
+        INFER_LOG("[KV_CACHE] row_raw #%d FAIL: layer=%d n_layers=%d pos=%d n_ctx=%d (is_v=%d)\n",
                 call_count, layer, c->cfg.n_layers, pos, c->cfg.n_ctx, is_v); fflush(stderr);
         return nullptr;
     }
@@ -68,10 +69,10 @@ __half* row_raw(inference_kv_cache_t* c, bool is_v, int layer, int pos) {
 extern "C" {
 
 inference_kv_cache_t *kv_cache_create(const char *shm_path, const kv_cache_config_t *cfg_in) {
-    if (!shm_path || !cfg_in) { fprintf(stderr, "kv_cache: null arg\n"); return nullptr; }
+    if (!shm_path || !cfg_in) { INFER_LOG("kv_cache: null arg\n"); return nullptr; }
     const kv_cache_config_t& f = *cfg_in;
     if (f.n_layers <= 0 || f.n_ctx <= 0 || f.head_dim <= 0 || f.n_heads_q <= 0 || f.n_heads_kv <= 0) {
-        fprintf(stderr, "kv_cache: invalid config\n");
+        INFER_LOG("kv_cache: invalid config\n");
         return nullptr;
     }
 
@@ -93,7 +94,7 @@ inference_kv_cache_t *kv_cache_create(const char *shm_path, const kv_cache_confi
     // Coarse-grained: GPU-cacheable, coherent with the CPU at kernel boundaries and syncs. Still zero-copy.
     hipError_t st = hipHostRegister(c->base, c->total_bytes, hipExtHostRegisterCoarseGrained);
     if (st != hipSuccess) {
-        fprintf(stderr, "kv_cache: hipHostRegister failed: %s\n", hipGetErrorString(st));
+        INFER_LOG("kv_cache: hipHostRegister failed: %s\n", hipGetErrorString(st));
         munmap(c->base, c->total_bytes); close(c->fd); delete c; return nullptr;
     }
 
@@ -104,7 +105,7 @@ inference_kv_cache_t *kv_cache_create(const char *shm_path, const kv_cache_confi
         c->zero_copy_ok = (dev == c->base);
     } else {
         // Not fatal on a UMA APU where identity is expected; keep host address as the device view.
-        fprintf(stderr, "kv_cache: WARNING: hipHostGetDevicePointer: %s (using host address)\n",
+        INFER_LOG("kv_cache: WARNING: hipHostGetDevicePointer: %s (using host address)\n",
                 hipGetErrorString(st));
         c->dev_base = c->base;
         c->zero_copy_ok = true;

@@ -1888,8 +1888,25 @@ remounted larger; the reference oracle must also run each model on the CPU for `
   - Tests (`generate_verify`, both models): two chat turns re-rendered as Qwen's template does; turn 2
     reuses turn 1's checkpoint, its reply equals a fresh prefill's (exactly with WMMA off), regenerating
     reuses all but the last 16 tokens.
-- **Next:** step 3 (n_ctx at load, `libinference.so` with only the public API), then the XS module
-  `ROCm::Inference` using perl-minijinja-xs for the template.
+- **Step 3 — DONE ✅: a self-contained shared library.**
+  - `libinference.so.1` (soname, `.so.1.0`, dev symlink) now holds the whole engine (both archives) and exports
+    only the public C API through `src/libinference.map`: `inference_*`, `tokenizer_*`, `sampler_*`.
+  - **Kernels embedded:** `kernels_embed.S` `.incbin`s the four code objects (by absolute path: `.incbin`
+    searches the working directory first, where stale copies of old kernel objects sat in the repo root),
+    `kernel_loader.cpp` loads them with `hipModuleLoadData`; `INFERENCE_KERNEL_DIR=<dir>` loads files instead.
+    No kernel files or working directory are needed any more (tests now run from anywhere).
+  - **Quiet:** diagnostics go to stderr only with `INFERENCE_VERBOSE=1` (`inference_log.h`); model errors
+    reach `inference_get_last_error` (`qwen_model_last_error`).
+  - `tests/capi_smoke.c`: plain C99 against the `.so` alone, run from another directory: template, EOS text,
+    a streamed greedy chat turn with a stop string; zero bytes on stderr. Both models.
+  - **Context length** (`inference_kv_cache_init(model, n_ctx)`; `qwen_demo --ctx N`, prompts from `@file`):
+    a needle in a 29,516-token context at n_ctx 32768 is recalled by both models. Prefill there: 4B 1,264
+    tok/s, 35B 850; generation 41–43 tok/s (63 at short contexts): single-token attention over 30k
+    positions is the next generation bottleneck at long contexts.
+  - Makefile: `all` moved to the end (its prerequisites were expanded before `INFERENCE_SO` was defined, so
+    the `.so` was never built by default); `libinference.so.1` symlink pointed at itself.
+- **Next:** step 4, the XS module `ROCm::Inference` (`perl-minijinja-xs` renders the template). Later:
+  long-context decode attention.
 
 
 The C API (`inference.h`) works for one sequence but lacks what an application needs. Architecture-neutral,

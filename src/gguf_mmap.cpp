@@ -3,6 +3,7 @@
  * Loads a GGUF file via mmap(), parses header + KV pairs + tensor metadata.
  * --------------------------------------------------------------------------- */
 
+#include "inference_log.h"
 #include "gguf_mmap.h"
 #include "quant_types.h"
 
@@ -74,7 +75,7 @@ int gguf_type_is_self_contained(int type) {
             /* For unknown types, treat as self-contained by default.
              * Quantized types store scales internally; only FP16/F32/etc. need no scales at all.
              * If a type truly requires external .scales, it will be added to this list explicitly. */
-            fprintf(stderr, "[gguf_type_is_self_contained] unknown type %d, assuming self-contained\n", type);
+            INFER_LOG("[gguf_type_is_self_contained] unknown type %d, assuming self-contained\n", type);
             return 1;
     }
 }
@@ -149,20 +150,20 @@ static char *read_string(const uint8_t **pp) {
 static gguf_model_t *load_gguf(const char *path) {
     struct stat st;
     if (stat(path, &st) != 0) {
-        fprintf(stderr, "gguf_mmap: cannot stat '%s': %s\n", path, strerror(errno));
+        INFER_LOG("gguf_mmap: cannot stat '%s': %s\n", path, strerror(errno));
         return NULL;
     }
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        fprintf(stderr, "gguf_mmap: cannot open '%s': %s\n", path, strerror(errno));
+        INFER_LOG("gguf_mmap: cannot open '%s': %s\n", path, strerror(errno));
         return NULL;
     }
 
     void *mapped = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (mapped == MAP_FAILED) {
-        fprintf(stderr, "gguf_mmap: mmap failed for '%s': %s\n", path, strerror(errno));
+        INFER_LOG("gguf_mmap: mmap failed for '%s': %s\n", path, strerror(errno));
         return NULL;
     }
 
@@ -170,7 +171,7 @@ static gguf_model_t *load_gguf(const char *path) {
 
     /* Verify magic + version */
     if (memcmp(base, GGUF_MAGIC, 4) != 0 || *(const uint32_t *)(base + 4) != GGUF_VERSION) {
-        fprintf(stderr, "gguf_mmap: invalid GGUF in '%s' (bad magic/version)\n", path);
+        INFER_LOG("gguf_mmap: invalid GGUF in '%s' (bad magic/version)\n", path);
         munmap(mapped, st.st_size); return NULL;
     }
 
@@ -298,7 +299,7 @@ static gguf_model_t *load_gguf(const char *path) {
     return model;
 
 fail:
-    fprintf(stderr, "gguf_mmap: corrupted structure in '%s'\n", path);
+    INFER_LOG("gguf_mmap: corrupted structure in '%s'\n", path);
     munmap(mapped, st.st_size);
     for (int64_t i = 0; i < n_kv; ++i) {
         free(model->kvs[i].key);

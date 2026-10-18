@@ -1,5 +1,7 @@
 // deltanet.cpp -- see deltanet.h.
 
+#include "inference_log.h"
+#include "kernel_loader.h"
 #include "deltanet.h"
 
 #include <stdio.h>
@@ -12,8 +14,8 @@ static const int kRuleCols = 16;
 
 int deltanet_init(const char* co_path) {
     if (g_mod) return 0;
-    if (hipModuleLoad(&g_mod, co_path) != hipSuccess) {
-        fprintf(stderr, "[deltanet] cannot load %s\n", co_path);
+    if (kernel_module_load(&g_mod, co_path) != hipSuccess) {
+        INFER_LOG("[deltanet] cannot load %s\n", co_path);
         g_mod = nullptr;
         return -1;
     }
@@ -22,7 +24,7 @@ int deltanet_init(const char* co_path) {
         hipModuleGetFunction(&g_conv_state, g_mod, "deltanet_conv_state") != hipSuccess ||
         hipModuleGetFunction(&g_rule, g_mod, "deltanet_rule") != hipSuccess ||
         hipModuleGetFunction(&g_norm, g_mod, "deltanet_norm") != hipSuccess) {
-        fprintf(stderr, "[deltanet] kernels missing in %s\n", co_path);
+        INFER_LOG("[deltanet] kernels missing in %s\n", co_path);
         deltanet_free();
         return -1;
     }

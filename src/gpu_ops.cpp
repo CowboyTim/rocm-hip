@@ -1,5 +1,7 @@
 // gpu_ops.cpp -- see gpu_ops.h.
 
+#include "inference_log.h"
+#include "kernel_loader.h"
 #include "gpu_ops.h"
 
 #include <stdio.h>
@@ -10,8 +12,8 @@ static hipFunction_t g_norm = nullptr, g_swiglu = nullptr, g_router = nullptr, g
 
 int gpu_ops_init(const char* co_path) {
     if (g_mod) return 0;
-    if (hipModuleLoad(&g_mod, co_path) != hipSuccess) {
-        fprintf(stderr, "[gpu_ops] cannot load %s\n", co_path);
+    if (kernel_module_load(&g_mod, co_path) != hipSuccess) {
+        INFER_LOG("[gpu_ops] cannot load %s\n", co_path);
         g_mod = nullptr;
         return -1;
     }
@@ -21,7 +23,7 @@ int gpu_ops_init(const char* co_path) {
         hipModuleGetFunction(&g_router, g_mod, "moe_router") != hipSuccess ||
         hipModuleGetFunction(&g_combine, g_mod, "moe_combine") != hipSuccess ||
         hipModuleGetFunction(&g_group, g_mod, "moe_group") != hipSuccess) {
-        fprintf(stderr, "[gpu_ops] kernels missing in %s\n", co_path);
+        INFER_LOG("[gpu_ops] kernels missing in %s\n", co_path);
         gpu_ops_free();
         return -1;
     }

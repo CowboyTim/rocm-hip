@@ -1,5 +1,7 @@
 // qmatvec.cpp — see qmatvec.h.
 
+#include "inference_log.h"
+#include "kernel_loader.h"
 #include "qmatvec.h"
 #include "quant_types.h"
 
@@ -30,8 +32,8 @@ static int g_wmma_min_t = 32;  // smaller batches, and N < 64 (a 64-row tile mos
 
 int qmatvec_init(const char *co_path) {
     if (g_mod) return 0;
-    if (hipModuleLoad(&g_mod, co_path) != hipSuccess) {
-        fprintf(stderr, "[qmatvec] cannot load %s\n", co_path);
+    if (kernel_module_load(&g_mod, co_path) != hipSuccess) {
+        INFER_LOG("[qmatvec] cannot load %s\n", co_path);
         g_mod = nullptr;
         return -1;
     }

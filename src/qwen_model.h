@@ -16,6 +16,9 @@ typedef struct QwenModel qwen_model_t;
 // Create model from an initialized inference_model_t (engine model with loaded weights)
 qwen_model_t* qwen_model_create(inference_model_t* engine_model);
 
+// The last error of a qwen_model call on this thread (empty if none)
+const char* qwen_model_last_error(void);
+
 // Get the qwen model from an inference model (created during kv_cache_init)
 qwen_model_t* inference_get_qwen_model(inference_model_t* model);
 

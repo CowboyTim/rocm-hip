@@ -23,6 +23,9 @@ HIPFLAGS  := -Xarch_device -mno-wavefrontsize64 -isystem $(ROCM_PATH)/include --
 
 LDFLAGS   := -L$(ROCM_PATH)/lib -lamdhip64 -lhsa-runtime64 -Wl,-rpath,$(ROCM_PATH)/lib
 
+# `all` is the default goal; its rule is at the end of the file, after every variable it names is defined
+.DEFAULT_GOAL := all
+
 # Ensure build directories exist
 $(shell mkdir -p $(OBJDIR) $(BINDIR) $(CODIR))
 
@@ -102,7 +105,6 @@ QWEN_MODEL_LIB   = $(BUILDDIR)/libqwen.a
 QWEN_DEMO        = $(BINDIR)/qwen_demo
 
 # --- Build Rules ---
-all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(GENERATE_VERIFY) $(E2E_TEST) $(MATVEC_BENCH) $(WMMA_LAYOUT_VERIFY)
 
 $(WMMA_TARGET): $(WMMA_OBJ) $(WMMA_CO)
 	$(CLANG) $(WMMA_OBJ) $(LDFLAGS) -o $@
@@ -172,8 +174,8 @@ $(ACTFP4_VERIFY): $(TESTSDIR)/actfp4_verify.cpp $(CODIR)/gemm_act_fp4.co
 $(DEQUANT_VERIFY): $(TESTSDIR)/dequant_verify.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/quant_types.h $(SRCDIR)/gguf_mmap.cpp
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/dequant_verify.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
 
-$(MATVEC_VERIFY): $(TESTSDIR)/matvec_verify.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/qmatvec.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(CODIR)/matvec_q.co
-	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/matvec_verify.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(LDFLAGS) -o $@
+$(MATVEC_VERIFY): $(TESTSDIR)/matvec_verify.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/qmatvec.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/kernel_loader.cpp $(OBJDIR)/kernels_embed.o
+	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/matvec_verify.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/kernel_loader.cpp $(OBJDIR)/kernels_embed.o $(LDFLAGS) -o $@
 
 $(TOKENIZER_VERIFY): $(TESTSDIR)/tokenizer_verify.cpp $(SRCDIR)/tokenizer.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/tokenizer.h $(SRCDIR)/unicode_flags.inc
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/tokenizer_verify.cpp $(SRCDIR)/tokenizer.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/quant_types.cpp $(LDFLAGS) -o $@
@@ -210,13 +212,21 @@ $(INFERENCE_LIB): $(SRCDIR)/inference.cpp $(SRCDIR)/inference.h $(SRCDIR)/gguf_m
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/sampler.cpp -o $(OBJDIR)/sampler.o
 	ar rcs $@ $(OBJDIR)/inference.o $(OBJDIR)/gguf_mmap.o $(OBJDIR)/quant_types.o $(OBJDIR)/kv_cache.o $(OBJDIR)/tokenizer.o $(OBJDIR)/sampler.o
 
-# Phase 4: Inference engine shared library (versioned)
+# Inference engine shared library (versioned): the whole engine (both archives, kernels embedded), exporting only
+# the public C API (src/libinference.map: inference_*, tokenizer_*, sampler_*)
 INFERENCE_SO    = $(BUILDDIR)/libinference.so.1
 INFERENCE_SO_1  = $(BUILDDIR)/libinference.so.1.0
-$(INFERENCE_SO_1): $(INFERENCE_LIB)
-	$(CLANG) -shared -Wl,-soname,libinference.so.1 -o $@ $(INFERENCE_LIB) $(LDFLAGS)
+$(INFERENCE_SO_1): $(INFERENCE_LIB) $(QWEN_MODEL_LIB) $(SRCDIR)/libinference.map
+	$(CLANG) -shared -Wl,-soname,libinference.so.1 -Wl,--version-script=$(SRCDIR)/libinference.map -o $@ \
+		-Wl,--whole-archive $(INFERENCE_LIB) $(QWEN_MODEL_LIB) -Wl,--no-whole-archive $(LDFLAGS)
 $(INFERENCE_SO): $(INFERENCE_SO_1)
-	ln -sf libinference.so.1 $@
+	ln -sf libinference.so.1.0 $@
+	ln -sf libinference.so.1 $(BUILDDIR)/libinference.so
+
+# C smoke test of the shared library: plain C, linked against libinference.so only (rpath to build/)
+CAPI_SMOKE = $(BINDIR)/capi_smoke
+$(CAPI_SMOKE): $(TESTSDIR)/capi_smoke.c $(SRCDIR)/inference.h $(SRCDIR)/sampler.h $(SRCDIR)/tokenizer.h $(INFERENCE_SO)
+	cc -std=c99 -Wall -Wextra -O2 -I$(SRCDIR) $< -L$(BUILDDIR) -linference -Wl,-rpath,$(abspath $(BUILDDIR)) -o $@
 
 # pkg-config file
 PKGCONFIG = $(BUILDDIR)/rocm-inference.pc
@@ -242,26 +252,33 @@ install: $(INFERENCE_SO) $(INFERENCE_LIB) $(PKGCONFIG)
 	install -d $(DESTDIR)$(INSTALL_LIBDIR) $(DESTDIR)$(INSTALL_INCDIR) $(DESTDIR)$(INSTALL_PKGCONFIGDIR)
 	cp -f $(INFERENCE_SO_1) $(DESTDIR)$(INSTALL_LIBDIR)/
 	ln -sf libinference.so.1 $(DESTDIR)$(INSTALL_LIBDIR)/libinference.so
-	cp -f $(SRCDIR)/inference.h $(SRCDIR)/sampler.h $(DESTDIR)$(INSTALL_INCDIR)/
+	cp -f $(SRCDIR)/inference.h $(SRCDIR)/sampler.h $(SRCDIR)/tokenizer.h $(DESTDIR)$(INSTALL_INCDIR)/
 	cp -f $(PKGCONFIG) $(DESTDIR)$(INSTALL_PKGCONFIGDIR)/
 
 uninstall:
 	rm -f $(INSTALL_LIBDIR)/libinference.so $(INSTALL_LIBDIR)/libinference.so.1 $(INSTALL_LIBDIR)/libinference.so.1.0
-	rm -f $(INSTALL_INCDIR)/inference.h $(INSTALL_INCDIR)/sampler.h
+	rm -f $(INSTALL_INCDIR)/inference.h $(INSTALL_INCDIR)/sampler.h $(INSTALL_INCDIR)/tokenizer.h
 	rm -f $(INSTALL_PKGCONFIGDIR)/rocm-inference.pc
 
 # Phase 4: Qwen 3 model static library
-QWEN_SRCS = $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_ops.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/deltanet.cpp $(SRCDIR)/attention.cpp $(SRCDIR)/gpu_ops.cpp
-QWEN_HDRS = $(SRCDIR)/qwen_model.h $(SRCDIR)/qwen_ops.h $(SRCDIR)/qmatvec.h $(SRCDIR)/deltanet.h $(SRCDIR)/attention.h $(SRCDIR)/gpu_ops.h $(SRCDIR)/inference_internal.h
+QWEN_SRCS = $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_ops.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/deltanet.cpp $(SRCDIR)/attention.cpp $(SRCDIR)/gpu_ops.cpp $(SRCDIR)/kernel_loader.cpp
+QWEN_HDRS = $(SRCDIR)/qwen_model.h $(SRCDIR)/qwen_ops.h $(SRCDIR)/qmatvec.h $(SRCDIR)/deltanet.h $(SRCDIR)/attention.h $(SRCDIR)/gpu_ops.h $(SRCDIR)/inference_internal.h $(SRCDIR)/kernel_loader.h $(SRCDIR)/inference_log.h
+# The engine's code objects, embedded in the library (kernels_embed.S, loaded by kernel_loader.cpp)
+ENGINE_COS = $(CODIR)/matvec_q.co $(CODIR)/gpu_ops.co $(CODIR)/deltanet.co $(CODIR)/attention.co
 
-$(QWEN_MODEL_LIB): $(QWEN_SRCS) $(QWEN_HDRS) $(SRCDIR)/inference.h $(SRCDIR)/gguf_mmap.h $(SRCDIR)/kv_cache.h
+$(OBJDIR)/kernels_embed.o: $(SRCDIR)/kernels_embed.S $(ENGINE_COS)
+	$(CLANG) -c -DKERNEL_DIR=$(abspath $(CODIR)) $< -o $@
+
+$(QWEN_MODEL_LIB): $(QWEN_SRCS) $(QWEN_HDRS) $(SRCDIR)/inference.h $(SRCDIR)/gguf_mmap.h $(SRCDIR)/kv_cache.h $(OBJDIR)/kernels_embed.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/qwen_model.cpp -o $(OBJDIR)/qwen_model.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/qwen_ops.cpp -o $(OBJDIR)/qwen_ops.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/qmatvec.cpp -o $(OBJDIR)/qmatvec.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/deltanet.cpp -o $(OBJDIR)/deltanet.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/attention.cpp -o $(OBJDIR)/attention.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/gpu_ops.cpp -o $(OBJDIR)/gpu_ops.o
-	ar rcs $@ $(OBJDIR)/qwen_model.o $(OBJDIR)/qwen_ops.o $(OBJDIR)/qmatvec.o $(OBJDIR)/deltanet.o $(OBJDIR)/attention.o $(OBJDIR)/gpu_ops.o
+	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/kernel_loader.cpp -o $(OBJDIR)/kernel_loader.o
+	rm -f $@
+	ar rcs $@ $(OBJDIR)/qwen_model.o $(OBJDIR)/qwen_ops.o $(OBJDIR)/qmatvec.o $(OBJDIR)/deltanet.o $(OBJDIR)/attention.o $(OBJDIR)/gpu_ops.o $(OBJDIR)/kernel_loader.o $(OBJDIR)/kernels_embed.o
 
 # Phase 4: Qwen 3 demo binary
 $(QWEN_DEMO): $(SRCDIR)/demo_qwen.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/matvec_q.co $(CODIR)/deltanet.co $(CODIR)/attention.co $(CODIR)/gpu_ops.co
@@ -328,3 +345,6 @@ verify_minimal: $(TEST_TARGET)
 	@echo "=== Running verify_minimal_test ===" && \
 	export HSA_OVERRIDE_GFX_VERSION=11.5.1 HSA_ENABLE_SDMA=0 && \
 	./$(TEST_TARGET) 2>&1 || echo "Test exited with code $?"
+
+# Last, so that every variable above is defined when its prerequisites are expanded
+all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(GENERATE_VERIFY) $(E2E_TEST) $(MATVEC_BENCH) $(WMMA_LAYOUT_VERIFY) $(CAPI_SMOKE)

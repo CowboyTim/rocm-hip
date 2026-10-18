@@ -1,6 +1,7 @@
 // inference.cpp -- Phase 4: C API implementation for zero-copy ROCmFP4 inference engine.
 // Thin FFI wrappers around the C++ HIP implementation. All state in inference_model_t.
 
+#include "inference_log.h"
 #include "inference.h"
 #include "inference_internal.h"
 #include "gguf_mmap.h"
@@ -53,7 +54,7 @@ static bool pin_model_memory(inference_model* m) {
     if (!base) return false;
     hipError_t e = hipHostRegister(base, m->map_size, hipHostRegisterReadOnly);
     if (e != hipSuccess) {
-        fprintf(stderr, "[pin_model] hipHostRegister(GGUF map, %zu bytes, ReadOnly) failed: %s\n",
+        INFER_LOG("[pin_model] hipHostRegister(GGUF map, %zu bytes, ReadOnly) failed: %s\n",
                 m->map_size, hipGetErrorString(e));
         return false;
     }
@@ -255,7 +256,7 @@ inference_model_t* inference_load_model(const char* gguf_path) {
     clear_error();
     if (!gguf_path) { set_error("NULL path"); return nullptr; }
 
-    fprintf(stderr, "[LOAD] Starting load_model for %s\n", gguf_path); fflush(stderr);
+    INFER_LOG("[LOAD] Starting load_model for %s\n", gguf_path);
     inference_model_t* m = new inference_model();
     m->gguf = gguf_mmap_open(gguf_path);
     if (!m->gguf) { set_error("gguf_mmap_open failed"); delete m; return nullptr; }
@@ -312,7 +313,7 @@ inference_model_t* inference_load_model(const char* gguf_path) {
     m->ssm_n_group = (int)gguf_arch_int(m->gguf, "ssm.group_count", 0);
     m->ssm_dt_rank = (int)gguf_arch_int(m->gguf, "ssm.time_step_rank", 0);
     m->ssm_d_inner = (int)gguf_arch_int(m->gguf, "ssm.inner_size", 0);
-    fprintf(stderr, "[LOAD] arch=%s blocks=%lld (decoder %d + nextn %d) E=%d heads=%d/%d head_dim=%d ff=%d "
+    INFER_LOG("[LOAD] arch=%s blocks=%lld (decoder %d + nextn %d) E=%d heads=%d/%d head_dim=%d ff=%d "
             "n_rot=%d rope_base=%g eps=%g\n", arch ? arch : "?", (long long)n_layer, m->n_layer, m->n_nextn,
             m->n_embd, m->n_head, m->n_head_kv, m->head_dim, m->n_ff, m->n_rot, m->rope_freq_base, m->eps);
 
@@ -342,7 +343,7 @@ inference_model_t* inference_load_model(const char* gguf_path) {
         set_error("output: shape %dx%d, expected %dx%d", m->output.N, m->output.K, m->vocab_size, m->n_embd);
         gguf_mmap_close(m->gguf); delete m; return nullptr;
     }
-    fprintf(stderr, "[LOAD] token_embd type %d, LM head type %d%s\n", m->token_embd.type, m->output.type,
+    INFER_LOG("[LOAD] token_embd type %d, LM head type %d%s\n", m->token_embd.type, m->output.type,
             m->output.data == m->token_embd.data ? " (tied)" : "");
 
     // Create tokenizer from GGUF metadata (Phase 5/8)
@@ -360,18 +361,18 @@ inference_model_t* inference_load_model(const char* gguf_path) {
 
 void inference_free_model(inference_model_t* m) {
     if (!m) return;
-    fprintf(stderr, "[CLEANUP] Starting model free...\n"); fflush(stderr);
-    if (m->tokenizer) { fprintf(stderr, "[CLEANUP] Freeing tokenizer\n"); fflush(stderr); tokenizer_free(m->tokenizer); }
+    INFER_LOG("[CLEANUP] Starting model free...\n");
+    if (m->tokenizer) { INFER_LOG("[CLEANUP] Freeing tokenizer\n"); tokenizer_free(m->tokenizer); }
     // IMPORTANT: unpin must happen BEFORE qwen_model_free since unpin walks layer weights
     // whose device pointers point into the layer scratch buffers we're about to free.
-    fprintf(stderr, "[CLEANUP] Unpinning model memory\n"); fflush(stderr);
+    INFER_LOG("[CLEANUP] Unpinning model memory\n");
     unpin_model_memory(m);
-    if (m->kvc) { fprintf(stderr, "[CLEANUP] Freeing KV cache\n"); fflush(stderr); kv_cache_free(m->kvc); }
-    if (m->qwen) { fprintf(stderr, "[CLEANUP] Freeing qwen model\n"); fflush(stderr); qwen_model_free(m->qwen); }
-    if (m->gguf) { fprintf(stderr, "[CLEANUP] Closing GGUF\n"); fflush(stderr); gguf_mmap_close(m->gguf); }
-    fprintf(stderr, "[CLEANUP] Deleting model struct\n"); fflush(stderr);
+    if (m->kvc) { INFER_LOG("[CLEANUP] Freeing KV cache\n"); kv_cache_free(m->kvc); }
+    if (m->qwen) { INFER_LOG("[CLEANUP] Freeing qwen model\n"); qwen_model_free(m->qwen); }
+    if (m->gguf) { INFER_LOG("[CLEANUP] Closing GGUF\n"); gguf_mmap_close(m->gguf); }
+    INFER_LOG("[CLEANUP] Deleting model struct\n");
     delete m;
-    fprintf(stderr, "[CLEANUP] Model free complete\n"); fflush(stderr);
+    INFER_LOG("[CLEANUP] Model free complete\n");
 }
 
 int32_t* inference_tokenize(inference_model_t* m, const char* text, int* out_len) {
@@ -405,12 +406,12 @@ int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
     m->n_ctx = n_ctx;
     seq_reset(m);
     // Create Qwen model for forward passes
-    fprintf(stderr, "[KV_INIT] About to create qwen model\n"); fflush(stderr);
+    INFER_LOG("[KV_INIT] About to create qwen model\n");
     m->qwen = qwen_model_create(m);
-    if (!m->qwen) { set_error("qwen_model_create failed"); return -1; }
-    fprintf(stderr, "[KV_INIT] Qwen model created at %p\n", (void*)m->qwen);
+    if (!m->qwen) { set_error("model setup failed: %s", qwen_model_last_error()); return -1; }
+    INFER_LOG("[KV_INIT] Qwen model created at %p\n", (void*)m->qwen);
     if (m->lm_head_q8 && qwen_model_set_lm_head_q8(m->qwen, 1) < 0) {
-        set_error("LM head Q8_0 copy failed (details on stderr)");
+        set_error("LM head Q8_0 copy failed: %s", qwen_model_last_error());
         return -1;
     }
     return 0;
@@ -422,7 +423,7 @@ int inference_set_lm_head_q8(inference_model_t* m, int enable) {
     if (enable && t != QT_F32 && t != QT_F16 && t != QT_BF16) return 1;  // already quantized
     m->lm_head_q8 = enable != 0;
     if (m->qwen && qwen_model_set_lm_head_q8(m->qwen, m->lm_head_q8) < 0) {
-        set_error("LM head Q8_0 copy failed (details on stderr)");
+        set_error("LM head Q8_0 copy failed: %s", qwen_model_last_error());
         m->lm_head_q8 = 0;
         return INFERENCE_ERR_OUT_OF_MEMORY;
     }
@@ -461,7 +462,7 @@ int inference_n_past(const inference_model_t* m) {
 static int forward_next(inference_model_t* m, int token_id) {
     if (!m || !m->kvc || !m->qwen) { set_error("Invalid state (call inference_kv_cache_init first)"); return -1; }
     if (m->n_past >= m->n_ctx) { set_error("context full (%d tokens)", m->n_ctx); return INFERENCE_ERR_CONTEXT_FULL; }
-    if (qwen_model_forward(m->qwen, token_id, m->n_past, nullptr) != 0) { set_error("qwen_model_forward failed"); return -1; }
+    if (qwen_model_forward(m->qwen, token_id, m->n_past, nullptr) != 0) { set_error("forward pass failed: %s", qwen_model_last_error()); return -1; }
     ++m->n_past;
     m->seq.push_back(token_id);
     return 0;
@@ -471,7 +472,7 @@ int inference_prefill(inference_model_t* m, const int32_t* tokens, int n) {
     clear_error();
     if (!m || !m->kvc || !m->qwen || !tokens || n <= 0) { set_error("Invalid state or arguments"); return -1; }
     if (m->n_past + n > m->n_ctx) { set_error("context full (%d + %d > %d tokens)", m->n_past, n, m->n_ctx); return INFERENCE_ERR_CONTEXT_FULL; }
-    if (qwen_model_prefill(m->qwen, (const int*)tokens, n, m->n_past, nullptr) != 0) { set_error("qwen_model_prefill failed"); return -1; }
+    if (qwen_model_prefill(m->qwen, (const int*)tokens, n, m->n_past, nullptr) != 0) { set_error("prefill failed: %s", qwen_model_last_error()); return -1; }
     m->n_past += n;
     m->seq.insert(m->seq.end(), tokens, tokens + n);
     return 0;

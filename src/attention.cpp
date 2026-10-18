@@ -1,5 +1,7 @@
 // attention.cpp -- see attention.h.
 
+#include "inference_log.h"
+#include "kernel_loader.h"
 #include "attention.h"
 
 #include <algorithm>
@@ -18,8 +20,8 @@ static bool g_flash_off = false;
 
 int attention_init(const char* co_path) {
     if (g_mod) return 0;
-    if (hipModuleLoad(&g_mod, co_path) != hipSuccess) {
-        fprintf(stderr, "[attention] cannot load %s\n", co_path);
+    if (kernel_module_load(&g_mod, co_path) != hipSuccess) {
+        INFER_LOG("[attention] cannot load %s\n", co_path);
         g_mod = nullptr;
         return -1;
     }
@@ -27,7 +29,7 @@ int attention_init(const char* co_path) {
         hipModuleGetFunction(&g_partial, g_mod, "attn_partial") != hipSuccess ||
         hipModuleGetFunction(&g_combine, g_mod, "attn_combine") != hipSuccess ||
         hipModuleGetFunction(&g_flash, g_mod, "attn_flash") != hipSuccess) {
-        fprintf(stderr, "[attention] kernels missing in %s\n", co_path);
+        INFER_LOG("[attention] kernels missing in %s\n", co_path);
         attention_free();
         return -1;
     }
