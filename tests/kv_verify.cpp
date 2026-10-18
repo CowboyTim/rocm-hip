@@ -197,6 +197,48 @@ int main(int argc, char* argv[]) {
     close(sfd);
     kv_cache_free(cache);
 
+    // --- block slots (Phase 22b): publish, private copy, attach ---
+    {
+        kv_cache_config_t scfg{2, 32, c.n_embd, c.head_dim, c.n_heads_q, c.n_heads_kv, 8};  // 4 slots of 8 positions
+        inference_kv_cache_t* sc = kv_cache_create("/dev/shm", &scfg);
+        report("slot cache: 4 slots of 8 positions", sc && kv_cache_n_slots(sc) == 4);
+        if (sc) {
+            const int dkv = kv_cache_d_kv(sc);
+            for (int p = 0; p < 32; ++p)
+                for (int l = 0; l < 2; ++l)
+                    for (int i = 0; i < dkv; ++i) {
+                        kv_cache_k_row(sc, l, p)[i] = __float2half((float)(p * 3 + l + 1));
+                        kv_cache_v_row(sc, l, p)[i] = __float2half((float)(p * 3 + l + 2));
+                    }
+            char path[96];
+            snprintf(path, sizeof(path), "/dev/shm/kv_verify_block.%d", (int)getpid());
+            unlink(path);
+            const int pub = kv_cache_slot_publish(sc, 1, path);  // positions 8..15
+            struct stat stb;
+            const bool named = pub == 0 && stat(path, &stb) == 0 && (size_t)stb.st_size == kv_cache_block_bytes(sc);
+            report("publish: slot 1 linked under a name, one block long, slot now shared",
+                   named && kv_cache_slot_shared(sc, 1) && kv_cache_slot_publish(sc, 1, path) == 1);
+            // private copy: same data, and writes no longer reach the published file
+            const bool priv = kv_cache_slot_make_private(sc, 1, 1) == 0 && !kv_cache_slot_shared(sc, 1) &&
+                              __half2float(kv_cache_k_row(sc, 1, 9)[0]) == 9 * 3 + 2;
+            kv_cache_k_row(sc, 1, 9)[0] = __float2half(-1.0f);
+            const int pfd = open(path, O_RDONLY);
+            __half first_k1;  // the published file still holds the old row: layer 1 K, position 9 = row 1 of segment 2
+            const off_t at = (off_t)(2 * 8 + 1) * dkv * sizeof(__half);
+            const bool file_kept = pfd >= 0 && pread(pfd, &first_k1, sizeof(first_k1), at) == sizeof(first_k1) &&
+                                   __half2float(first_k1) == 9 * 3 + 2;
+            report("make_private(copy): same rows; later writes do not reach the published block", priv && file_kept);
+            // attach the published block to slot 3 (positions 24..31): it now reads positions 8..15's rows
+            const bool att = pfd >= 0 && kv_cache_slot_attach(sc, 3, pfd) == 0 && kv_cache_slot_shared(sc, 3) &&
+                             __half2float(kv_cache_k_row(sc, 0, 24)[0]) == 8 * 3 + 1 &&
+                             __half2float(kv_cache_v_row(sc, 1, 31)[dkv - 1]) == 15 * 3 + 1 + 2;
+            report("attach: a block file mapped into another slot shows its rows", att);
+            if (pfd >= 0) close(pfd);
+            unlink(path);
+            kv_cache_free(sc);
+        }
+    }
+
     if (g_failures == 0) {
         printf("\n  KV CACHE SELF-TEST PASSED\n");
         return 0;

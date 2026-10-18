@@ -10,7 +10,8 @@
 // with d_kv = n_heads_kv * head_dim. So row p of layer l is at
 //   base + (p / B) * block_bytes + (2 l + is_v) * B * row_bytes + (p % B) * row_bytes
 // and kernels address it from the layer's K (or V) row 0 as (p >> log2 B) * block_stride + (p & (B - 1)) * d_kv
-// (in __half units; kv_cache_block_shift / kv_cache_block_stride). n_ctx is rounded up to whole blocks.
+// (in __half units; kv_cache_block_shift / kv_cache_block_stride). n_ctx is rounded up to whole blocks, and a block
+// is padded to whole pages (block_bytes includes the padding).
 
 #ifndef KV_CACHE_H
 #define KV_CACHE_H
@@ -41,7 +42,8 @@ typedef struct {
 
 #define KV_CACHE_DEFAULT_BLOCK 256
 
-/* Create + map + pin the cache in shm_path. Returns NULL on error (logs to stderr). */
+/* Create + map + pin the cache. Its block slots are anonymous files (O_TMPFILE) in shm_path if that is a
+   directory, else in shm_path's directory (e.g. "/dev/shm"). Returns NULL on error (INFERENCE_VERBOSE logs why). */
 inference_kv_cache_t *kv_cache_create(const char *shm_path, const kv_cache_config_t *cfg);
 
 /* Unregister, munmap and close. No-op on NULL. */
@@ -72,6 +74,19 @@ __half        *kv_cache_k_row(inference_kv_cache_t *c, int layer, int pos);
 const __half  *kv_cache_k_row_const(const inference_kv_cache_t *c, int layer, int pos);
 __half        *kv_cache_v_row(inference_kv_cache_t *c, int layer, int pos);
 const __half  *kv_cache_v_row_const(const inference_kv_cache_t *c, int layer, int pos);
+
+/* Block slots (Phase 22b). Slot i holds positions [i B, (i + 1) B) and is mapped from its own file, registered on
+   its own. A shared slot is a block-store file: it must never be written (the session only appends after it).
+   attach: map an existing block file (exactly kv_cache_block_bytes long) into the slot, shared (read-only if fd
+   is: then a stray CPU or GPU write faults);
+   make_private: give the slot a new anonymous file, with the current contents if copy (before writing into a
+   shared block); publish: link the slot's file under path (no copy; the slot becomes shared). Return 0 on success,
+   -1 on error; publish returns 1 if path already exists. */
+int  kv_cache_n_slots(const inference_kv_cache_t *c);
+int  kv_cache_slot_shared(const inference_kv_cache_t *c, int slot);
+int  kv_cache_slot_attach(inference_kv_cache_t *c, int slot, int fd);
+int  kv_cache_slot_make_private(inference_kv_cache_t *c, int slot, int copy);
+int  kv_cache_slot_publish(inference_kv_cache_t *c, int slot, const char *path);
 
 /* Wipe every byte of the mapping (fresh context / full reset of stored data). */
 void kv_cache_zero(inference_kv_cache_t *c);

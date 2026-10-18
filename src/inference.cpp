@@ -401,7 +401,7 @@ int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
     // One KV layer per full-attention layer (LayerWeights::kv_slot); DeltaNet layers keep recurrent state instead
     kv_cache_config_t cfg{m->n_kv_layers > 0 ? m->n_kv_layers : 1, n_ctx, m->n_embd, m->head_dim, m->n_head,
                           m->n_head_kv};
-    m->kvc = kv_cache_create("/dev/shm/inference_kvc.bin", &cfg);
+    m->kvc = kv_cache_create("/dev/shm", &cfg);
     if (!m->kvc) { set_error("kv_cache_create failed"); return -1; }
     m->n_ctx = n_ctx;
     seq_reset(m);
