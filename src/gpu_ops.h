@@ -45,6 +45,26 @@ static inline int gpu_moe_max_tiles(int T, int n_used, int n_expert, int tile) {
 hipError_t gpu_moe_group(const int* ids, int T, int n_used, int n_expert, int tile, int* tok_rows, int* pair_rows,
                          int* n_tiles, int* tile_e, int* tile_start, int* tile_n, hipStream_t stream);
 
+// Hyper-connections (qwen4exp; gpu_ops.hip): res holds T tokens x hc streams x n values.
+// gpu_hc_norm: if cur [T][n] is set, res[t][c] += cur[t] * 2 * sigmoid(inject[t][c] / hc) first; then
+// y[t][c] = RMSNorm(res[t][c]) * w[c * n ..], quantized into q8 (if set) as one flattened [T * hc * n] vector.
+// n % 256 == 0, n <= 4096.
+hipError_t gpu_hc_norm(float* res, const float* cur, const float* inject, const float* w, float* y, int n, int hc, int T,
+                       float eps, const qmatvec_q8* q8, hipStream_t stream);
+// lo = SiLU(lo / hc) for n values
+hipError_t gpu_hc_lowrank(float* lo, int n, int hc, hipStream_t stream);
+// out[t] = mean over the streams c of xn[t][c] * sigmoid(gate[t][c]), quantized into q8 if set
+hipError_t gpu_hc_mix(const float* xn, const float* gate, float* out, int n, int hc, int T, const qmatvec_q8* q8,
+                      hipStream_t stream);
+// PLE gate (see ple_gate in gpu_ops.hip): key, res, gated, normed [T][hc][n]; value [T][n]; norm gammas [hc * n]
+hipError_t gpu_ple_gate(const float* key, const float* value, const float* res, const float* wk, const float* wq,
+                        const float* wc, float* gated, float* normed, int n, int hc, int T, float eps,
+                        hipStream_t stream);
+// PLE conv: res += gated + SiLU(dilated causal depthwise conv of normed), m channels, K taps (F16 w [m][K]),
+// dilation dil; state [(K - 1) * dil][m] holds the inputs before this batch and is advanced
+hipError_t gpu_ple_conv(const float* normed, const float* gated, float* res, float* state, const void* w, int m, int T,
+                        int K, int dil, hipStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

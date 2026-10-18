@@ -139,6 +139,18 @@ struct Scratch {
     // Attention partial results, per (token, head, 256-position chunk) up to n_ctx (attention.h)
     float* part_ml = nullptr;
     float* part_acc = nullptr;
+    // Hyper-connections (qwen4exp; n_hc streams of n_embd, HCD = n_hc * n_embd per token; empty otherwise)
+    float* res = nullptr;     // the residual streams [HCD]
+    float* hxn = nullptr;     // a mixer's normed streams [HCD], input to its down / inject projections
+    float* hlo = nullptr;     // down projection, then SiLU(. / n_hc) [hc_rank]
+    float* hgate = nullptr;   // up projection: the streams' gate logits [HCD]
+    float* inj = nullptr;     // inject projection: the stream weights' logits [n_hc]
+    // PLE (qwen4exp)
+    float* ple_emb = nullptr;     // the gathered n-gram hash rows [n_embd]
+    float* ple_key = nullptr;     // ple_key projection [HCD]
+    float* ple_val = nullptr;     // ple_value projection [n_embd]
+    float* ple_gated = nullptr;   // value * per-stream gate [HCD]
+    float* ple_normed = nullptr;  // its grouped RMSNorm: the conv input [HCD]
     // Quantized copy of the current matmul input for the int8 kernels (qmatvec.h): B rows of up to the
     // largest per-token K, as one flattened vector of q8_max_k values
     float* q8mem = nullptr;
@@ -152,9 +164,11 @@ struct Scratch {
         const int FF = std::max(m->n_ff, m->n_ff_shexp);  // dense FFN or the shared expert
         const int conv_dim = 2 * m->ssm_n_group * m->ssm_d_state + m->ssm_d_inner, DI = m->ssm_d_inner;
         const int NV = m->ssm_dt_rank, NE = m->n_expert, NU = m->n_expert_used, FE = m->n_ff_exp;
+        const int HCD = m->n_hc * E, NHC = m->n_hc, R = m->hc_rank, PE = m->ple_table.data ? E : 0;
+        const int PHCD = m->ple_table.data ? HCD : 0;
         B = rows;
         const size_t b = (size_t)rows;
-        q8_max_k = (std::max({E, HQ * HD, DI, FF, NU * FE}) + 255) / 256 * 256 * rows;
+        q8_max_k = (std::max({E, HQ * HD, DI, FF, NU * FE, HCD}) + 255) / 256 * 256 * rows;
         const size_t sizes[] = {b * E, b * E, b * E, b * 2 * HQ * HD, b * HQ * HD,
                                 b * HKV * HD, b * HKV * HD, b * HQ * HD, b * E,
                                 b * FF, b * FF, b * FF, (size_t)V,
@@ -162,13 +176,18 @@ struct Scratch {
                                 b * NE, b * NU, b * NU, b, b * NU * FE, b * NU * FE, b * NU * FE, b * NU * E, b * E,
                                 b * NU, b * NU, 1, b * NU, b * NU, b * NU,
                                 attention_part_ml_floats(HQ, n_ctx, rows), attention_part_acc_floats(HQ, n_ctx, rows),
+                                b * HCD, b * HCD, b * R, b * HCD, b * NHC,
+                                b * PE, b * PHCD, b * PE, b * PHCD, b * PHCD,
                                 (qmatvec_q8_bytes(q8_max_k) + 3) / 4};
         float *ids_f = nullptr, *gt = nullptr, *gp = nullptr, *gn = nullptr, *ge = nullptr, *gs = nullptr, *gc = nullptr;
         float** const ptrs[] = {&x, &x_alt, &xn, &qfull, &q, &k, &v, &attn, &proj, &ffg, &ffu, &act, &logits,
                                 &qkv, &conv, &z, &alpha, &beta, &lin,
                                 &r_logits, &ids_f, &wts, &sg, &moe_g, &moe_u, &moe_act, &moe_down, &sh_out,
                                 &gt, &gp, &gn, &ge, &gs, &gc,
-                                &part_ml, &part_acc, &q8mem};
+                                &part_ml, &part_acc,
+                                &res, &hxn, &hlo, &hgate, &inj,
+                                &ple_emb, &ple_key, &ple_val, &ple_gated, &ple_normed,
+                                &q8mem};
         static_assert(sizeof(sizes) / sizeof(sizes[0]) == sizeof(ptrs) / sizeof(ptrs[0]), "scratch table");
         if (!mem.alloc("/dev/shm/qwen_scratch.bin", sizes, ptrs, sizeof(sizes) / sizeof(sizes[0]),
                        hipExtHostRegisterCoarseGrained))
@@ -189,26 +208,44 @@ struct Scratch {
 // layer a conv state [conv_dim][d_conv - 1] and a delta-rule state of dt_rank heads x d_state^2 floats (laid out
 // by deltanet_state_index, deltanet.h). One sequence; zeroed when a sequence starts at pos 0. Only the
 // GPU touches it (the kernels, and hipMemsetAsync for the reset), so it is registered coarse-grained.
+//
+// qwen4exp adds, per PLE layer, the PLE conv's input history [(ple_conv - 1) * ple_ngram][n_hc * n_embd], and once
+// the last ple_ngram - 1 tokens of the sequence (ple_hist, int32, most recent last), which the CPU hashes the next
+// tokens with: kept here so that checkpoints and store snapshots carry them.
 struct RecurrentState {
-    std::vector<float*> conv, ssm;   // indexed by layer; nullptr for full-attention layers
+    std::vector<float*> conv, ssm, ple;   // indexed by layer; nullptr where the layer has none
+    int32_t* ple_hist = nullptr;
     ShmRegion mem;
 
     bool alloc(const inference_model* eng) {
         const int conv_dim = 2 * eng->ssm_n_group * eng->ssm_d_state + eng->ssm_d_inner;
         conv.assign(eng->n_layer, nullptr);
         ssm.assign(eng->n_layer, nullptr);
+        ple.assign(eng->n_layer, nullptr);
         std::vector<size_t> sizes;
         std::vector<float**> ptrs;
+        float* hist = nullptr;
         for (int l = 0; l < eng->n_layer; ++l) {
+            if (eng->layers[l].ple) {
+                sizes.push_back((size_t)(eng->ple_conv - 1) * eng->ple_ngram * eng->n_hc * eng->n_embd);
+                ptrs.push_back(&ple[l]);
+            }
             if (eng->layers[l].kind != LAYER_LINEAR_ATTN) continue;
             sizes.push_back((size_t)conv_dim * (eng->ssm_d_conv - 1));
             ptrs.push_back(&conv[l]);
             sizes.push_back((size_t)eng->ssm_dt_rank * eng->ssm_d_state * eng->ssm_d_state);
             ptrs.push_back(&ssm[l]);
         }
+        if (eng->ple_table.data) {
+            sizes.push_back((size_t)eng->ple_ngram - 1);
+            ptrs.push_back(&hist);
+        }
         if (sizes.empty()) return true;
-        return mem.alloc("/dev/shm/qwen_recurrent_state.bin", sizes.data(), ptrs.data(), sizes.size(),
-                         hipExtHostRegisterCoarseGrained);
+        if (!mem.alloc("/dev/shm/qwen_recurrent_state.bin", sizes.data(), ptrs.data(), sizes.size(),
+                       hipExtHostRegisterCoarseGrained))
+            return false;
+        ple_hist = (int32_t*)hist;
+        return true;
     }
 
     hipError_t reset() {
@@ -451,7 +488,7 @@ struct QwenModel {
         if (!check(deltanet_pre(s.qkv, rs.conv[l], L.ssm_conv1d, eng->ssm_d_conv, s.conv, NG, NV, s.alpha, s.beta,
                                 L.ssm_dt, L.ssm_a, s.alpha, s.beta, eps, T, 0), "deltanet_pre") ||
             !check(deltanet_rule(rs.ssm[l], s.conv, s.alpha, s.beta, s.z, L.ssm_norm, s.lin, NG, NV, eps, T,
-                                 q8_for(eng->ssm_d_inner, T), 0),
+                                 eng->gdn_sigmoid_gate ? 1 : 0, q8_for(eng->ssm_d_inner, T), 0),
                    "deltanet_rule"))
             return false;
         mark(s.lin, eng->ssm_d_inner, T, q8_for(eng->ssm_d_inner, T));
@@ -504,15 +541,25 @@ struct QwenModel {
     // gate/up, SwiGLU, down (expert-indexed matvecs reading s.ids) -> weighted sum + gated shared expert
     // (moe_combine). The residual adds and norms around it are the same as the dense FFN's.
     bool moe_ffn(const LayerWeights& L, const float* next_norm, int T) {
-        const int E = eng->n_embd, NE = eng->n_expert, NU = eng->n_expert_used, FE = eng->n_ff_exp;
-        const int FS = eng->n_ff_shexp;
+        const int E = eng->n_embd;
         const float eps = (float)eng->eps;
         const qmatvec_q8* qe = q8_for(E, T);
         if (!check(gpu_add_rmsnorm(s.x, s.proj, s.x_alt, L.ffn_norm, s.xn, E, T, eps, qe, 0), "add_rmsnorm"))
             return false;
         std::swap(s.x, s.x_alt);
         mark(s.xn, E, T, qe);
+        if (!moe_core(L, T) || !check(gpu_add_rmsnorm(s.x, s.proj, s.x_alt, next_norm, s.xn, E, T, eps, qe, 0),
+                                      "add_rmsnorm"))
+            return false;
+        std::swap(s.x, s.x_alt);
+        mark(s.xn, E, T, qe);
+        return true;
+    }
 
+    // The MoE FFN itself, from s.xn (marked) to s.proj
+    bool moe_core(const LayerWeights& L, int T) {
+        const int E = eng->n_embd, NE = eng->n_expert, NU = eng->n_expert_used, FE = eng->n_ff_exp;
+        const int FS = eng->n_ff_shexp;
         // A prefill batch groups its (token, slot) entries by expert for the expert-tiled matmuls
         const bool grouped = T > 1;
         if (!matvec(L.W_router, s.xn, s.r_logits, T, P_FFN) ||
@@ -531,13 +578,8 @@ struct QwenModel {
         const qmatvec_q8* qs = q8_for(FS, T);
         if (!check(gpu_swiglu(s.ffg, s.ffu, s.act, T * FS, qs, 0), "swiglu (shared expert)")) return false;
         mark(s.act, FS, T, qs);
-        if (!matvec(L.W_down, s.act, s.sh_out, T, P_FFN) ||
-            !check(gpu_moe_combine(s.moe_down, s.wts, s.sh_out, s.sg, s.proj, NU, E, T, 0), "moe_combine") ||
-            !check(gpu_add_rmsnorm(s.x, s.proj, s.x_alt, next_norm, s.xn, E, T, eps, qe, 0), "add_rmsnorm"))
-            return false;
-        std::swap(s.x, s.x_alt);
-        mark(s.xn, E, T, qe);
-        return true;
+        return matvec(L.W_down, s.act, s.sh_out, T, P_FFN) &&
+               check(gpu_moe_combine(s.moe_down, s.wts, s.sh_out, s.sg, s.proj, NU, E, T, 0), "moe_combine");
     }
 
     // Residual add of the mixer output, the FFN's RMSNorm, SwiGLU FFN, then the residual add of its output
@@ -577,6 +619,7 @@ struct QwenModel {
             return -1;
         }
 
+        if (eng->n_hc > 0) return forward_hc(tokens, T, pos0, logits_out);
         prof.start();
         for (int t = 0; t < T; ++t) {
             if (tokens[t] < 0 || tokens[t] >= eng->vocab_size) { qwen_set_error("token %d out of range", tokens[t]); return -1; }
@@ -618,6 +661,13 @@ struct QwenModel {
             }
         }
 
+        return lm_head(T, logits_out);
+    }
+
+    // The LM head on the last of T tokens of s.xn (its row of the quantized buffer when s.q8 holds them), then
+    // the sync that ends the forward pass; the logits are copied to logits_out if given
+    int lm_head(int T, float* logits_out) {
+        const int E = eng->n_embd;
         // LM head on the last token only: its row of s.xn, and its row of the quantized buffer
         const float* xl = s.xn + (size_t)(T - 1) * E;
         qmatvec_q8 last = s.q8;
@@ -646,6 +696,151 @@ struct QwenModel {
         prof.lap(P_HEAD);
         prof.tokens += T;
         return 0;
+    }
+
+    // ------------------------------------------------------------ hyper-connections (qwen4exp)
+
+    // Combine the block output cur (none: just normalize) into the residual streams with the stream weights in
+    // s.inj, then the mixer's per-stream RMSNorm with gamma w into s.hxn (quantized for the down / inject matvecs)
+    bool hc_norm(const float* cur, const float* w, int T) {
+        const int HCD = eng->n_hc * eng->n_embd;
+        const qmatvec_q8* q = q8_for(HCD, T);
+        if (!check(gpu_hc_norm(s.res, cur, s.inj, w, s.hxn, eng->n_embd, eng->n_hc, T, (float)eng->eps, q, 0),
+                   "hc_norm"))
+            return false;
+        mark(s.hxn, HCD, T, q);
+        return true;
+    }
+
+    // The rest of a mixer, from s.hxn: the block input in s.xn (quantized), and s.inj when M has an inject
+    bool hc_mix(const HcMix& M, int T, ProfCat c) {
+        const int E = eng->n_embd, HC = eng->n_hc, R = eng->hc_rank;
+        if (!(M.inject.data ? matvec_pair(M.down, M.inject, s.hxn, s.hlo, s.inj, T, c)
+                            : matvec(M.down, s.hxn, s.hlo, T, c)) ||
+            !check(gpu_hc_lowrank(s.hlo, T * R, HC, 0), "hc_lowrank") || !produced(s.hlo, R, T) ||
+            !matvec(M.up, s.hlo, s.hgate, T, c))
+            return false;
+        const qmatvec_q8* q = q8_for(E, T);
+        if (!check(gpu_hc_mix(s.hxn, s.hgate, s.xn, E, HC, T, q, 0), "hc_mix")) return false;
+        mark(s.xn, E, T, q);
+        return true;
+    }
+
+    // The PLE rows of T tokens at pos0 (CPU): each token's n-gram hash rows, decoded into s.ple_emb, and the
+    // token history in rs.ple_hist advanced. As llama.cpp's llm_graph_input_ple::set_input: positions before the
+    // sequence start read as EOS, and an EOS among a token's predecessors hides the ones before it.
+    bool ple_rows(const int* tokens, int T, int pos0) {
+        const int NG = eng->ple_ngram, PER = eng->ple_per_ngram, PD = eng->ple_dim, E = eng->n_embd;
+        const int64_t eos = eng->ple_eos;
+        int32_t* hist = rs.ple_hist;  // NG - 1 tokens before this batch, most recent last
+        if (pos0 == 0)
+            for (int i = 0; i < NG - 1; ++i) hist[i] = (int32_t)eos;
+        for (int t = 0; t < T; ++t) {
+            int64_t ctx[8];
+            ctx[0] = tokens[t];
+            bool cut = false;
+            for (int k = 1; k < NG; ++k) {
+                const int j = t - k;
+                ctx[k] = cut ? eos : j >= 0 ? tokens[j] : hist[NG - 1 + j];
+                if (ctx[k] == eos) cut = true;
+            }
+            for (int n = 2; n <= NG; ++n) {
+                uint64_t mixed = (uint64_t)ctx[0] * eng->ple_mult[0];
+                for (int k = 1; k < n; ++k) mixed ^= (uint64_t)ctx[k] * eng->ple_mult[k];
+                for (int g = 0; g < PER; ++g) {
+                    const int h = (n - 2) * PER + g;
+                    const uint64_t row = mixed % eng->ple_vocab[h] + eng->ple_offset[h];
+                    if (qt_to_float(eng->ple_table.type, eng->ple_table.row((int)row), s.ple_emb + (size_t)t * E + h * PD,
+                                    PD) != 0) {
+                        qwen_set_error("cannot decode per_layer_token_embd type %d", eng->ple_table.type);
+                        return false;
+                    }
+                }
+            }
+        }
+        // the last NG - 1 tokens of (history, batch)
+        std::vector<int32_t> all(hist, hist + NG - 1);
+        all.insert(all.end(), tokens, tokens + T);
+        memcpy(hist, all.data() + all.size() - (NG - 1), sizeof(int32_t) * (NG - 1));
+        return true;
+    }
+
+    // PLE on layer l: residual streams += gated value + SiLU(dilated conv of its grouped norm), from s.ple_emb
+    bool ple(int l, const LayerWeights& L, int T) {
+        const int E = eng->n_embd, HC = eng->n_hc;
+        return produced(s.ple_emb, E, T) &&
+               matvec_pair(L.ple_key, L.ple_value, s.ple_emb, s.ple_key, s.ple_val, T, P_LIN) &&
+               check(gpu_ple_gate(s.ple_key, s.ple_val, s.res, L.ple_norm_key, L.ple_norm_query, L.ple_norm_conv,
+                                  s.ple_gated, s.ple_normed, E, HC, T, (float)eng->eps, 0),
+                     "ple_gate") &&
+               check(gpu_ple_conv(s.ple_normed, s.ple_gated, s.res, rs.ple[l], L.ple_conv1d, HC * E, T, eng->ple_conv,
+                                  eng->ple_ngram, 0),
+                     "ple_conv");
+    }
+
+    // forward() for hyper-connection models: the residual is n_hc streams; each block reads a mixer's output and
+    // its result is combined back into every stream (llama.cpp qwen4exp graph)
+    int forward_hc(const int* tokens, int T, int pos0, float* logits_out) {
+        const int E = eng->n_embd, HC = eng->n_hc, HCD = HC * E;
+        prof.start();
+        if (eng->ple_table.data && pos0 > 0 && !sync()) return -1;  // a queued state restore may set ple_hist
+        for (int t = 0; t < T; ++t) {
+            if (tokens[t] < 0 || tokens[t] >= eng->vocab_size) { qwen_set_error("token %d out of range", tokens[t]); return -1; }
+            float* r = s.res + (size_t)t * HCD;  // every stream starts as the embedding
+            if (qt_to_float(eng->token_embd.type, eng->token_embd.row(tokens[t]), r, E) != 0) {
+                qwen_set_error("cannot decode token_embd type %d", eng->token_embd.type);
+                return -1;
+            }
+            for (int c = 1; c < HC; ++c) memcpy(r + (size_t)c * E, r, sizeof(float) * E);
+        }
+        // The reset (a GPU memset) also clears ple_hist, which the CPU writes next: wait for it
+        if (pos0 == 0 && (!check(rs.reset(), "recurrent state reset") || (eng->ple_table.data && !sync()))) return -1;
+        if (eng->ple_table.data && !ple_rows(tokens, T, pos0)) return -1;
+        prof.lap(P_EMBED);
+
+        const bool per_layer = layer_cb || qwen_debug();
+        for (int l = 0; l < eng->n_layer; ++l) {
+            const LayerWeights& L = eng->layers[l];
+            const bool attn = L.kind == LAYER_FULL_ATTN;
+            const ProfCat pc = attn ? P_ATTN : P_LIN;
+            if (L.ple && !ple(l, L, T)) return -1;
+            if ((l == 0 || L.ple) && !hc_norm(nullptr, L.hc_attn.norm, T)) return -1;
+            if (!hc_mix(L.hc_attn, T, pc) || !(attn ? full_attention(L, pos0, T) : linear_attention(l, L, T)) ||
+                !section(pc))
+                return -1;
+            const float* next = l + 1 < eng->n_layer ? eng->layers[l + 1].hc_attn.norm : eng->hc_head.norm;
+            if (!hc_norm(s.proj, L.hc_ffn.norm, T) || !hc_mix(L.hc_ffn, T, P_FFN) || !ffn_core(L, T) ||
+                !hc_norm(s.proj, next, T) || !section(P_FFN))
+                return -1;
+            if (per_layer) {
+                if (!sync()) return -1;
+                for (int t = 0; t < T; ++t) {
+                    const float* xt = s.res + (size_t)t * HCD;
+                    if (layer_cb) layer_cb(l, pos0 + t, xt, HCD, layer_cb_user);
+                    if (qwen_debug()) {
+                        double ss = 0.0;
+                        for (int i = 0; i < HCD; ++i) ss += (double)xt[i] * xt[i];
+                        fprintf(stderr, "[qwen] pos %d blk %2d %-6s rms(res)=%.5g res[0..3]=%.5g %.5g %.5g %.5g\n",
+                                pos0 + t, l, attn ? "attn" : "linear", sqrt(ss / HCD), xt[0], xt[1], xt[2], xt[3]);
+                    }
+                }
+                prof.start();
+            }
+        }
+        if (!hc_mix(eng->hc_head, T, P_HEAD)) return -1;
+        return lm_head(T, logits_out);
+    }
+
+    // The FFN of a hyper-connection block, from s.xn to s.proj: MoE, or a dense SwiGLU
+    bool ffn_core(const LayerWeights& L, int T) {
+        if (L.moe) return moe_core(L, T);
+        const int FF = eng->n_ff;
+        const qmatvec_q8* qf = q8_for(FF, T);
+        if (!matvec_pair(L.W_gate, L.W_up, s.xn, s.ffg, s.ffu, T, P_FFN) ||
+            !check(gpu_swiglu(s.ffg, s.ffu, s.act, FF * T, qf, 0), "swiglu"))
+            return false;
+        mark(s.act, FF, T, qf);
+        return matvec(L.W_down, s.act, s.proj, T, P_FFN);
     }
 
     // Use (or stop using) the Q8_0 copy of the LM head; builds it the first time. Only for F32 / F16 / BF16

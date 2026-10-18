@@ -157,8 +157,87 @@ static bool check_shape(const char* what, int layer, const QuantWeight& w, int N
     return false;
 }
 
+// Bind a hyper-connection mixer <prefix>_{norm,down,up,inject}.weight (inject only with_inject)
+static bool bind_hc_mix(inference_model* m, const char* prefix, HcMix& h, bool with_inject) {
+    const int HCD = m->n_hc * m->n_embd, R = m->hc_rank;
+    char name[160];
+    auto nm = [&](const char* t) { snprintf(name, sizeof(name), "%s_%s.weight", prefix, t); return name; };
+    if (!bind_norm(m->gguf, nm("norm"), HCD, h.norm, true) || !bind_weight(m->gguf, nm("down"), h.down, true) ||
+        !bind_weight(m->gguf, nm("up"), h.up, true) ||
+        (with_inject && !bind_weight(m->gguf, nm("inject"), h.inject, true)))
+        return false;
+    if (h.down.N != R || h.down.K != HCD || h.up.N != HCD || h.up.K != R ||
+        (with_inject && (h.inject.N != m->n_hc || h.inject.K != HCD))) {
+        set_error("%s: hyper-connection shapes do not match n_hc %d x n_embd %d, rank %d", prefix, m->n_hc, m->n_embd,
+                  R);
+        return false;
+    }
+    return true;
+}
+
+// A numeric metadata array as uint64 values (U32 / I32 / U64 / I64 elements). Returns false if absent.
+static bool kv_u64_array(gguf_model_t* gguf, const char* key, std::vector<uint64_t>& out) {
+    int32_t type = -1;
+    const void* data = nullptr;
+    size_t n = 0;
+    if (gguf_kv_get_array(gguf, key, &type, &data, &n) != 0) return false;
+    out.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        switch (type) {
+            case 4: out[i] = ((const uint32_t*)data)[i]; break;
+            case 5: out[i] = (uint64_t)(int64_t)((const int32_t*)data)[i]; break;
+            case 10: case 11: memcpy(&out[i], (const char*)data + 8 * i, 8); break;
+            default: return false;
+        }
+    }
+    return true;
+}
+
+// qwen4exp hyperparameters (hyper-connections, PLE) and its global tensors; nothing for other architectures
+static bool load_qwen4exp(inference_model* m, std::vector<int>& ple_layers) {
+    const std::string a = m->model_name + ".";
+    m->n_hc = (int)gguf_arch_int(m->gguf, "hyper_connection.count", 0);
+    if (m->n_hc <= 0) return true;
+    m->hc_rank = (int)gguf_arch_int(m->gguf, "hyper_connection.low_rank", 0);
+    m->gdn_sigmoid_gate = true;
+    if (m->hc_rank <= 0) { set_error("hyper_connection.low_rank missing"); return false; }
+    if (!bind_hc_mix(m, "output_hc", m->hc_head, false)) return false;
+    // QSA sparse attention is not implemented: only dense attention (every compress ratio 0, as released)
+    std::vector<uint64_t> ratios;
+    if (kv_u64_array(m->gguf, (a + "attention.compress_ratios").c_str(), ratios))
+        for (uint64_t r : ratios)
+            if (r != 0) { set_error("QSA sparse attention (compress ratio %llu) is not supported", (unsigned long long)r); return false; }
+    std::vector<uint64_t> pl;
+    if (!kv_u64_array(m->gguf, (a + "ple.layers").c_str(), pl) || pl.empty()) return true;
+    for (uint64_t l : pl) ple_layers.push_back((int)l);
+    m->ple_ngram = (int)gguf_arch_int(m->gguf, "ple.ngram_size", 0);
+    m->ple_per_ngram = (int)gguf_arch_int(m->gguf, "ple.heads_per_ngram", 0);
+    m->ple_conv = (int)gguf_arch_int(m->gguf, "ple.conv_kernel", 0);
+    m->ple_eos = (int)gguf_arch_int(m->gguf, "ple.eos_token_id", -1);
+    m->ple_dim = (int)gguf_arch_int(m->gguf, "embedding_length_per_layer_input", 0);
+    const int heads = (m->ple_ngram - 1) * m->ple_per_ngram;
+    if (m->ple_ngram < 2 || m->ple_ngram > 8 || m->ple_per_ngram <= 0 || m->ple_conv < 1 || m->ple_eos < 0 ||
+        heads * m->ple_dim != m->n_embd || !kv_u64_array(m->gguf, (a + "ple.layer_multipliers").c_str(), m->ple_mult) ||
+        !kv_u64_array(m->gguf, (a + "ple.head_offsets").c_str(), m->ple_offset) ||
+        !kv_u64_array(m->gguf, (a + "ple.head_vocab_sizes").c_str(), m->ple_vocab) ||
+        (int)m->ple_mult.size() < m->ple_ngram || (int)m->ple_offset.size() != heads ||
+        (int)m->ple_vocab.size() != heads) {
+        set_error("bad PLE hparams (ngram %d, heads/ngram %d, dim %d, conv %d)", m->ple_ngram, m->ple_per_ngram,
+                  m->ple_dim, m->ple_conv);
+        return false;
+    }
+    if (!bind_weight(m->gguf, "per_layer_token_embd.weight", m->ple_table, true)) return false;
+    for (int h = 0; h < heads; ++h)
+        if (m->ple_table.K != m->ple_dim || m->ple_vocab[h] == 0 ||
+            m->ple_offset[h] + m->ple_vocab[h] > (uint64_t)m->ple_table.N) {
+            set_error("per_layer_token_embd: %d rows of %d do not hold PLE head %d", m->ple_table.N, m->ple_table.K, h);
+            return false;
+        }
+    return true;
+}
+
 // Bind every per-layer tensor, classify each block, and check shapes against the hyperparameters
-static bool load_model_weights(inference_model* m) {
+static bool load_model_weights(inference_model* m, const std::vector<int>& ple_layers) {
     const int E = m->n_embd, HD = m->head_dim, HQ = m->n_head, HKV = m->n_head_kv, FF = m->n_ff;
     m->layers.resize(m->n_layer);
     char name[128];
@@ -179,8 +258,34 @@ static bool load_model_weights(inference_model* m) {
         L.kind = linear ? LAYER_LINEAR_ATTN : LAYER_FULL_ATTN;
         if (full) L.kv_slot = m->n_kv_layers++;  // only attention layers get KV cache space
 
-        if (!bind_norm(m->gguf, nm(i, "attn_norm.weight"), E, L.attn_norm, true)) return false;
-        if (!bind_norm(m->gguf, nm(i, "post_attention_norm.weight"), E, L.ffn_norm, true)) return false;
+        if (m->n_hc > 0) {  // hyper-connection mixers in place of the norms
+            if (!bind_hc_mix(m, nm(i, "hc_attn"), L.hc_attn, true) || !bind_hc_mix(m, nm(i, "hc_ffn"), L.hc_ffn, true))
+                return false;
+        } else {
+            if (!bind_norm(m->gguf, nm(i, "attn_norm.weight"), E, L.attn_norm, true)) return false;
+            if (!bind_norm(m->gguf, nm(i, "post_attention_norm.weight"), E, L.ffn_norm, true)) return false;
+        }
+        L.ple = std::find(ple_layers.begin(), ple_layers.end(), i) != ple_layers.end();
+        if (L.ple) {
+            const int HCD = m->n_hc * E;
+            if (!bind_weight(m->gguf, nm(i, "ple_key.weight"), L.ple_key, true) ||
+                !bind_weight(m->gguf, nm(i, "ple_value.weight"), L.ple_value, true) ||
+                !bind_norm(m->gguf, nm(i, "ple_norm_key.weight"), HCD, L.ple_norm_key, true) ||
+                !bind_norm(m->gguf, nm(i, "ple_norm_query.weight"), HCD, L.ple_norm_query, true) ||
+                !bind_norm(m->gguf, nm(i, "ple_norm_conv.weight"), HCD, L.ple_norm_conv, true) ||
+                !check_shape("ple_key", i, L.ple_key, HCD, E) || !check_shape("ple_value", i, L.ple_value, E, E))
+                return false;
+            const int idx = find_tensor_index(m->gguf, nm(i, "ple_conv1d.weight"));
+            const int64_t* ne = idx >= 0 ? gguf_tensor_ne(m->gguf, idx) : nullptr;
+            size_t bytes = 0;
+            const void* p = idx >= 0 ? gguf_get_tensor_ptr(m->gguf, name, &bytes) : nullptr;
+            if (!p || gguf_tensor_type(m->gguf, idx) != QT_F16 || ne[0] != m->ple_conv || ne[1] != HCD ||
+                bytes != (size_t)m->ple_conv * HCD * 2) {
+                set_error("blk.%d.ple_conv1d: expected F16[%d x %d]", i, m->ple_conv, HCD);
+                return false;
+            }
+            L.ple_conv1d = (const uint16_t*)p;
+        }
 
         if (L.kind == LAYER_LINEAR_ATTN) {
             const int DS = m->ssm_d_state, NG = m->ssm_n_group, NV = m->ssm_dt_rank, DI = m->ssm_d_inner;
@@ -332,14 +437,15 @@ inference_model_t* inference_load_model(const char* gguf_path) {
         gguf_mmap_close(m->gguf); delete m; return nullptr;
     }
 
-    // Per-layer weights and norms
-    if (!load_model_weights(m)) {
+    // Per-layer weights and norms (qwen4exp: hyper-connection mixers and the PLE layers instead of the norms)
+    std::vector<int> ple_layers;
+    if (!load_qwen4exp(m, ple_layers) || !load_model_weights(m, ple_layers)) {
         gguf_mmap_close(m->gguf); delete m; return nullptr;
     }
 
     // LM head: output.weight when present, else tied to token_embd
     if (!bind_weight(m->gguf, "output.weight", m->output, false) ||
-        !bind_norm(m->gguf, "output_norm.weight", m->n_embd, m->output_norm, true)) {
+        !bind_norm(m->gguf, "output_norm.weight", m->n_embd, m->output_norm, m->n_hc == 0)) {
         gguf_mmap_close(m->gguf); delete m; return nullptr;
     }
     if (!m->output.data) m->output = m->token_embd;

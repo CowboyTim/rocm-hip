@@ -9,6 +9,7 @@
 // Same math as qwen_rmsnorm / the CPU SwiGLU in qwen_ops (the reference); the sum of squares is a float
 // tree reduction here, a double loop there.
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include "q8_device.h"
@@ -250,5 +251,157 @@ moe_group(const int* ids, int T, int n_used, int n_expert, int tile, int* tok_ro
         const int p = off[ids[i]]++;
         tok_rows[p] = i / n_used;
         pair_rows[p] = i;
+    }
+}
+
+// ---------------------------------------------------------------- hyper-connections + PLE (qwen4exp)
+//
+// The residual is hc streams of n values per token, rows r = t * hc + c of res. As llama.cpp's qwen4exp graph
+// (build_hc_mix / build_hc_combine / build_ple), each op in the reference's order.
+//
+// hc_norm     grid T * hc, block 256: with cur, first the combine res[r] += cur[t] * 2 * sigmoid(inject[t][c] /
+//             hc); then y[r] = RMSNorm(res[r]) * w[c * n ..] (per stream, gamma over all hc * n values), quantized
+//             as one flattened vector. n % 256 == 0, n <= 256 * NORM_MAXV.
+// hc_lowrank  lo = SiLU(lo / hc), element-wise
+// hc_mix      grid (ceil(n / 256), T): out[t] = (sum over c of xn[r] * sigmoid(gate[r])) / hc, streams added in
+//             order; quantized (n % 256 == 0 when set)
+
+__device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + __expf(-x)); }
+
+extern "C" __global__ void __launch_bounds__(256)
+hc_norm(float* res, const float* cur, const float* inject, const float* w, float* y, int n, int hc, float eps,
+        Q8Out o) {
+    __shared__ float part[8];
+    __shared__ Q8Shared sh;
+    const int r = blockIdx.x, t = r / hc, c = r % hc, tid = threadIdx.x, nb = n / 256;
+    float* x = res + (size_t)r * n;
+    const float inv_hc = 1.0f / (float)hc;
+    const float wt = cur ? 2.0f * sigmoidf_(inject[t * hc + c] * inv_hc) : 0.0f;
+    float v[NORM_MAXV];
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < NORM_MAXV; ++j)
+        if (j < nb) {
+            const int k = tid + 256 * j;
+            v[j] = x[k];
+            if (cur) {
+                v[j] = __fadd_rn(v[j], __fmul_rn(cur[(size_t)t * n + k], wt));
+                x[k] = v[j];
+            }
+            ss += v[j] * v[j];
+        }
+    const float inv = rsqrtf(block256_sum(ss, part) / n + eps);
+#pragma unroll
+    for (int j = 0; j < NORM_MAXV; ++j)
+        if (j < nb) {  // uniform
+            const int k = tid + 256 * j;
+            const float out = v[j] * inv * w[c * n + k];
+            y[(size_t)r * n + k] = out;
+            if (o.qK) q8_block_value(out, true, r * nb + j, tid, sh, o);
+        }
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+hc_lowrank(float* lo, int n, float scale) {
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    if (i < n) {
+        const float a = lo[i] * scale;
+        lo[i] = a / (1.0f + __expf(-a));
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+hc_mix(const float* xn, const float* gate, float* out, int n, int hc, Q8Out o) {
+    __shared__ Q8Shared sh;
+    const int t = blockIdx.y, i = blockIdx.x * 256 + threadIdx.x;
+    float v = 0.0f;
+    if (i < n) {
+        const size_t base = (size_t)t * hc * n + i;
+        v = __fmul_rn(xn[base], sigmoidf_(gate[base]));
+        for (int c = 1; c < hc; ++c) v = __fadd_rn(v, __fmul_rn(xn[base + (size_t)c * n], sigmoidf_(gate[base + (size_t)c * n])));
+        v *= 1.0f / (float)hc;
+        out[(size_t)t * n + i] = v;
+    }
+    if (o.qK) q8_block_value(v, i < n, t * (n / 256) + blockIdx.x, threadIdx.x, sh, o);  // uniform
+}
+
+// ple_gate  grid T, block 256: per stream c, s = (RMSNorm(key[r]) * wk) . (RMSNorm(res[r]) * wq) / sqrt(n),
+//           gate = sigmoid(sgn(s) * sqrt(max(|s|, 1e-6))); gated[r] = value[t] * gate,
+//           normed[r] = RMSNorm(gated[r]) * wc. key, res, gated, normed: [T][hc][n]; value [T][n].
+extern "C" __global__ void __launch_bounds__(256)
+ple_gate(const float* key, const float* value, const float* res, const float* wk, const float* wq, const float* wc,
+         float* gated, float* normed, int n, int hc, float eps) {
+    __shared__ float part[8];
+    const int t = blockIdx.x, tid = threadIdx.x, nb = n / 256;
+    float val[NORM_MAXV];
+#pragma unroll
+    for (int j = 0; j < NORM_MAXV; ++j)
+        if (j < nb) val[j] = value[(size_t)t * n + tid + 256 * j];
+    for (int c = 0; c < hc; ++c) {
+        const size_t r = ((size_t)t * hc + c) * n;
+        float kx[NORM_MAXV], qx[NORM_MAXV];
+        float sk = 0.0f, sq = 0.0f;
+#pragma unroll
+        for (int j = 0; j < NORM_MAXV; ++j)
+            if (j < nb) {
+                kx[j] = key[r + tid + 256 * j];
+                qx[j] = res[r + tid + 256 * j];
+                sk += kx[j] * kx[j];
+                sq += qx[j] * qx[j];
+            }
+        const float ik = rsqrtf(block256_sum(sk, part) / n + eps), iq = rsqrtf(block256_sum(sq, part) / n + eps);
+        float d = 0.0f;
+#pragma unroll
+        for (int j = 0; j < NORM_MAXV; ++j)
+            if (j < nb) {
+                const int k = c * n + tid + 256 * j;
+                d += (kx[j] * ik * wk[k]) * (qx[j] * iq * wq[k]);
+            }
+        const float s = block256_sum(d, part) * (1.0f / sqrtf((float)n));
+        const float mag = sqrtf(fmaxf(fabsf(s), 1e-6f));
+        const float g = sigmoidf_((s > 0.0f ? 1.0f : s < 0.0f ? -1.0f : 0.0f) * mag);
+        float sg = 0.0f;
+#pragma unroll
+        for (int j = 0; j < NORM_MAXV; ++j)
+            if (j < nb) {
+                kx[j] = val[j] * g;
+                sg += kx[j] * kx[j];
+            }
+        const float ig = rsqrtf(block256_sum(sg, part) / n + eps);
+#pragma unroll
+        for (int j = 0; j < NORM_MAXV; ++j)
+            if (j < nb) {
+                const int k = tid + 256 * j;
+                gated[r + k] = kx[j];
+                normed[r + k] = kx[j] * ig * wc[c * n + k];
+            }
+    }
+}
+
+// ple_conv  grid ceil(m / 256), block 256, one thread per channel ch of m = hc * n: the depthwise causal conv of
+//           normed over the tokens, K taps dilated by dil (tap k reads (K - 1 - k) * dil positions back; earlier
+//           positions come from state [(K - 1) * dil][m], oldest first), then res += gated + SiLU(conv). The last
+//           (K - 1) * dil inputs become the new state. w: F16 [m][K].
+extern "C" __global__ void __launch_bounds__(256)
+ple_conv(const float* normed, const float* gated, float* res, float* state, const __half* w, int m, int T, int K,
+         int dil) {
+    const int ch = blockIdx.x * 256 + threadIdx.x;
+    if (ch >= m) return;
+    const int H = (K - 1) * dil;
+    for (int t = 0; t < T; ++t) {
+        float acc = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            const int j = t - (K - 1 - k) * dil;
+            const float x = j >= 0 ? normed[(size_t)j * m + ch] : state[(size_t)(H + j) * m + ch];
+            const float term = x * __half2float(w[(size_t)ch * K + k]);
+            acc = k == 0 ? term : acc + term;
+        }
+        const size_t i = (size_t)t * m + ch;
+        res[i] += gated[i] + acc / (1.0f + __expf(-acc));
+    }
+    // new state row i = combined[T + i], combined = state ++ normed; ascending i only reads rows > i of state
+    for (int i = 0; i < H; ++i) {
+        const int src = T + i;
+        state[(size_t)i * m + ch] = src < H ? state[(size_t)src * m + ch] : normed[(size_t)(src - H) * m + ch];
     }
 }

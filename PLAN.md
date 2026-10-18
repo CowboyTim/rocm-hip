@@ -1206,18 +1206,20 @@ for the symptoms above.
 
 ### 20.3 Plan
 
-> **▶ NEXT STEP (as of 2026-10-18, HEAD ae4c968):**
-> - **Done:** Phase 22 (streaming C API, chat template access + prefix reuse, self-contained `libinference.so`,
->   Perl XS module `ROCm::Inference`) and Phase 22b (KV block store: block-major layout, slots as files, store
->   in C, Perl policy `ROCm::Inference::Store`). Both are at the end of this file.
-> - **Open, small:**
->   - run `perl/ROCm-Inference/t/20-chat.t` where the user's `Minijinja` module is installed (no cargo here);
->   - CPAN packaging (`Makefile.PL` building or locating libinference);
->   - Phase 22b follow-ups: a disk-tier timing, a configurable block size, a Perl web service example.
-> - **Waiting on the user:** Phase 21, more architectures, Qwen3.8-Flash-Next (`qwen4exp`) first. It needs the
->   GGUF, and room in /dev/shm or on disk.
-> - **Possible speed items:** long-context decode attention (generation 63 → 42 tok/s at 30k tokens), the 35B
->   expert matmuls in prefill.
+> **▶ NEXT STEP (as of 2026-10-18): Phase 21, Qwen3.8-Flash-Next (`qwen4exp`), stage 1 continues.**
+> - **Done (stage 1 core):** hyper-connections, PLE n-gram hash embeddings, the DeltaNet sigmoid output gate, the
+>   dense attention / MoE reused. Verified against the reference on a small random-weight qwen4exp GGUF built
+>   from the release's header (`tools/gen_qwen4exp_tiny.py`, `tests/qwen4exp_verify.cpp`). See Phase 21 below.
+> - **Next, for the release GGUF** (3 shards, 98.5 GiB; nothing downloaded):
+>   1. split GGUF loading (`*-0000N-of-0000M.gguf`), tested on a split tiny model;
+>   2. do not pin the 35.8 GiB PLE table (the CPU reads 16 rows per token), so ~63 GiB is registered;
+>   3. prefill: the mixers' up projections (K = hc_rank = 320) fall back to one float launch per token; give
+>      them a batched path;
+>   4. the real model needs ~106 GB of storage (/dev/shm has 38 GB free, the disk 44 GB): **user to free space
+>      or say where the shards live**; then greedy text vs `llama-completion` and speed.
+> - **Other open items:** `perl/ROCm-Inference/t/20-chat.t` with the user's Minijinja module (cargo is installed
+>   now); CPAN packaging; Phase 22b follow-ups (disk-tier timing, block size option, a Perl web service example);
+>   speed: long-context decode attention, the 35B expert matmuls in prefill.
 > - The speed work below (Phase 20) is done for now.
 >
 > **Earlier NEXT STEP (2026-10-17): make the 4B fast, then batched prefill, then Step 6 (35B MoE).**
@@ -1829,7 +1831,7 @@ single `QuantWeight` definition, removal of stale files.
 | TYPE13/TYPE100 scale extraction | Folded into Step 3, verified against the reference dequant. |
 | "Weights need calibration" (Phase 19) | Incorrect; the weights are fine, the decode and architecture mapping are not. |
 
-## Phase 21 – More architectures — PLAN (2026-10-18)
+## Phase 21 – More architectures — IN PROGRESS (Qwen3.8-Flash-Next stage 1 core done, 2026-10-18)
 
 User's list: **Qwen3.8-Flash-Next (most important: coding)**, Nemotron, Gemma, DeepSeek, Kimi, GLM. The
 llama.cpp reference here (ROCmFPX, `llama.cpp/`) implements all of them, so each gets the same oracle
@@ -1866,7 +1868,37 @@ DeepSeek-V4); MoE routing variants (softmax top-k; sigmoid + bias + groups); sli
 Every new GGUF can bring new quant types (e.g. ROCMI4, Q4_K_M, Q8_0, IQ*): each is added with its int8 and
 WMMA kernels, checked against the reference dequantizer (the "all quant types" goal).
 
-**Needed from the user:** the GGUF files (start with Qwen3.8-Flash-Next ROCmFP4). Constraints here: /dev/shm
+**Qwen3.8-Flash-Next progress (2026-10-18).**
+- **The release GGUF** (`kingjones777/Qwen3.8-Flash-Next-ROCmFP4-STRIX_LEAN-GGUF`, 3 shards, 98.5 GiB, 177B
+  parameters of which 51.2B are the PLE table). Only its header was fetched (HTTP range request, first 32 MB of
+  shard 1; kept as `/dev/shm/models/Qwen3.8-Flash-Next-header-00001.bin`). From it: 48 layers (every 4th full
+  attention, 24 / 2 heads × 256), n_embd 2560, **4 hyper-connection streams, rank 320**, 512 experts (top 10,
+  width 640, shared expert 640), DeltaNet 16 k-heads / 48 v-heads × 128, IMRoPE sections [11, 11, 10, 0], PLE on
+  layer 1 (3-grams, 8 heads per n-gram, 16 × 160-wide rows, conv 4 dilated by 3). **All compress ratios are 0:
+  QSA is off, attention is dense everywhere**, so stage 2 is not needed for this file (the loader refuses a
+  ratio > 0). Types: ROCMFP4 / ROCMFP4_FAST weights (both supported), Q5_K token_embd, Q6_K head, Q5_1 PLE table,
+  F16 PLE conv, F32 norms and router.
+- **Oracle without the weights:** `tools/gen_qwen4exp_tiny.py <header> <out.gguf>` writes a random-weight model
+  with the release's tensor names, layer pattern, per-tensor quant types and tokenizer at small widths (n_embd
+  512, 8 layers, 16 experts, rank 320, PLE on layer 1; 250 MB). `ref_dump acts` runs it (`/dev/shm/ref_qwen4exp_tiny`).
+- **Engine (stage 1 core) — DONE ✅:**
+  - Loader: `hyper_connection.*`, `ple.*`, per-layer `hc_{attn,ffn}_{norm,down,up,inject}`, `output_hc_*` (no
+    output_norm), the PLE tensors (`HcMix`, `inference_internal.h`).
+  - Kernels (`gpu_ops.hip`): `hc_norm` (combine `res += cur * 2 sigmoid(inject / hc)` fused with the per-stream
+    RMSNorm and Q8 quantization), `hc_lowrank`, `hc_mix` (sigmoid-gated stream mean), `ple_gate`, `ple_conv`
+    (dilated causal depthwise conv with state, `res += gated + SiLU(conv)`). `deltanet_rule` takes the sigmoid
+    output gate.
+  - `QwenModel::forward_hc`: residual = n_hc streams; mixers before each mixer / FFN and as the final norm; the
+    attention, DeltaNet and MoE code unchanged (`moe_core` split out of `moe_ffn`, `lm_head` out of `forward`).
+  - PLE on the CPU: n-gram hash (EOS cuts) and the Q5_1 row decode, like the embedding row; the PLE conv state
+    and the last 2 tokens live in the recurrent state, so checkpoints and store snapshots carry them.
+- **Results** (`qwen4exp_verify`, tiny model, 19-token prompt): residual streams after every layer vs
+  `l_last-N` worst cosine 0.9988; last logits cosine 0.99989 (argmax differs on a 0.02 near-tie). PLE alone:
+  gathered rows bit-exact, gated value 6e-4 relative. Token by token, a split prefill and a restored checkpoint
+  equal the prompt at once **bit for bit** with `QMATVEC_NO_WMMA=1` (cosine 0.99994 with WMMA). `store_verify`
+  passes on it (reply identical across processes with WMMA off). 4B / 35B checks unchanged, 35B 63.1 tok/s.
+
+**Needed from the user:** room for the GGUF files (start with Qwen3.8-Flash-Next ROCmFP4). Constraints here: /dev/shm
 is a 63 GB tmpfs (38 GB free) and the disk has 48 GB free, so a ~50 GB model needs space freed or /dev/shm
 remounted larger; the reference oracle must also run each model on the CPU for `ref_dump`.
 

@@ -193,7 +193,7 @@ deltanet_rule(float* state, const float* conv_out, const float* g, const float* 
 
 // Two heads per 256-thread workgroup: waves 0-3 hold head 2 b, waves 4-7 head 2 b + 1
 extern "C" __global__ void __launch_bounds__(256)
-deltanet_norm(float* out, const float* z, const float* norm_w, float eps, Q8Out o) {
+deltanet_norm(float* out, const float* z, const float* norm_w, float eps, int sigmoid_gate, Q8Out o) {
     __shared__ float part[8];
     __shared__ Q8Shared sh;
     const int t = threadIdx.x, w = t >> 5;
@@ -205,7 +205,8 @@ deltanet_norm(float* out, const float* z, const float* norm_w, float eps, Q8Out 
     __syncthreads();
     const int w0 = w & 4;
     ss = part[w0] + part[w0 + 1] + part[w0 + 2] + part[w0 + 3];
-    const float y = v * rsqrtf(ss / DS + eps) * norm_w[t & (DS - 1)] * silu(z[i]);
+    const float zi = z[i];
+    const float y = v * rsqrtf(ss / DS + eps) * norm_w[t & (DS - 1)] * (sigmoid_gate ? 1.0f / (1.0f + __expf(-zi)) : silu(zi));
     out[i] = y;
     if (o.qK) q8_block_value(y, true, blockIdx.x, t, sh, o);
 }

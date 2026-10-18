@@ -41,10 +41,11 @@ static inline size_t deltanet_state_index(int h, int i, int j) {
 
 // Delta rule + gated RMSNorm for every V head. state: [n_v][128 * 128], laid out by deltanet_state_index.
 // conv_out from deltanet_pre; z, out: [T][n_v * 128]; norm_w: ssm_norm [128]. T * n_v * 128 must be a
-// multiple of 256. q8 != NULL: also quantize out for the int8 matvecs (all T rows, as one flattened vector).
+// multiple of 256. The output gate is SiLU(z) (qwen35), or sigmoid(z) with sigmoid_gate (qwen4exp). q8 != NULL:
+// also quantize out for the int8 matvecs (all T rows, as one flattened vector).
 hipError_t deltanet_rule(float* state, const float* conv_out, const float* g, const float* beta, const float* z,
-                         const float* norm_w, float* out, int n_k, int n_v, float eps, int T, const qmatvec_q8* q8,
-                         hipStream_t stream);
+                         const float* norm_w, float* out, int n_k, int n_v, float eps, int T, int sigmoid_gate,
+                         const qmatvec_q8* q8, hipStream_t stream);
 
 #ifdef __cplusplus
 }

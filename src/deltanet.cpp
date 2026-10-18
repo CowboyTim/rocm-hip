@@ -60,8 +60,8 @@ hipError_t deltanet_pre(const float* qkv, float* conv_state, const float* conv_w
 }
 
 hipError_t deltanet_rule(float* state, const float* conv_out, const float* g, const float* beta, const float* z,
-                         const float* norm_w, float* out, int n_k, int n_v, float eps, int T, const qmatvec_q8* q8,
-                         hipStream_t stream) {
+                         const float* norm_w, float* out, int n_k, int n_v, float eps, int T, int sigmoid_gate,
+                         const qmatvec_q8* q8, hipStream_t stream) {
     if (!g_rule) return hipErrorInvalidDeviceFunction;
     const long long n = (long long)T * n_v * DELTANET_HEAD_SIZE;
     if (T <= 0 || n % 256 != 0 || (q8 && n > q8->max_k)) return hipErrorInvalidValue;
@@ -70,6 +70,6 @@ hipError_t deltanet_rule(float* state, const float* conv_out, const float* g, co
                                          args, nullptr);
     if (e != hipSuccess) return e;
     qmatvec_q8_out o = qmatvec_q8_outputs(q8);
-    void* nargs[] = {&out, (void*)&z, (void*)&norm_w, &eps, &o};
+    void* nargs[] = {&out, (void*)&z, (void*)&norm_w, &eps, &sigmoid_gate, &o};
     return hipModuleLaunchKernel(g_norm, (unsigned)(n / 256), 1, 1, 256, 1, 1, 0, stream, nargs, nullptr);
 }

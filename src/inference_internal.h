@@ -45,6 +45,18 @@ enum LayerKind : int8_t {
     LAYER_LINEAR_ATTN = 1,  // Gated DeltaNet: attn_qkv, attn_gate, ssm_* tensors
 };
 
+// Hyper-connection mixer (qwen4exp): the residual is n_hc parallel streams of n_embd. In place of every RMSNorm,
+// a mixer normalizes each stream (one RMSNorm per stream, gamma over all n_hc * n_embd values), gates the result
+// with sigmoid(up(SiLU(down(xn) / n_hc))) and averages the streams into the block input; inject (N = n_hc)
+// gives the per-stream weights 2 * sigmoid(inject(xn) / n_hc) of the block output added back to each stream.
+// The final mixer (output_hc_*) has no inject and replaces output_norm. llama.cpp qwen4exp build_hc_mix.
+struct HcMix {
+    const float* norm = nullptr;                      // [n_hc * n_embd] F32
+    QuantWeight down;                                 // [hc_rank x n_hc * n_embd]
+    QuantWeight up;                                   // [n_hc * n_embd x hc_rank]
+    QuantWeight inject;                               // [n_hc x n_hc * n_embd]; none for the final mixer
+};
+
 struct LayerWeights {
     LayerKind kind = LAYER_FULL_ATTN;
     int kv_slot = -1;                                 // full attention: this layer's KV cache layer; else -1
@@ -71,6 +83,18 @@ struct LayerWeights {
     QuantWeight We_gate, We_up;                       // ffn_{gate,up}_exps: [n_expert * n_ff_exp x n_embd]
     QuantWeight We_down;                              // ffn_down_exps: [n_expert * n_embd x n_ff_exp]
     const float* shexp_gate = nullptr;                // ffn_gate_inp_shexp: [n_embd] F32, shared-expert gate
+
+    // Hyper-connections (qwen4exp): mixers before the token mixer and before the FFN (attn_norm / ffn_norm unset)
+    HcMix hc_attn, hc_ffn;
+    // PLE n-gram hash embedding (qwen4exp, on the layers in ple.layers): applied to the residual streams before
+    // this layer's mixer (llama.cpp qwen4exp build_ple)
+    bool ple = false;
+    QuantWeight ple_key;                              // [n_hc * n_embd x n_embd] (input: the gathered rows)
+    QuantWeight ple_value;                            // [n_embd x n_embd]
+    const float* ple_norm_key = nullptr;              // [n_hc * n_embd] F32 each
+    const float* ple_norm_query = nullptr;
+    const float* ple_norm_conv = nullptr;
+    const uint16_t* ple_conv1d = nullptr;             // F16 [n_hc * n_embd][ple_conv_kernel], taps contiguous
 };
 
 // The complete inference_model struct - MUST match exactly between all TUs.
@@ -115,6 +139,18 @@ struct inference_model {
     const float* output_norm = nullptr;                // [n_embd] F32 final RMSNorm gamma
 
     std::vector<LayerWeights> layers;                  // per-layer attention + MLP weights
+
+    // qwen4exp (Qwen3.8-Flash-Next). n_hc == 0: a plain residual stream (qwen35 / qwen35moe).
+    int n_hc = 0;                                       // hyper_connection.count: parallel residual streams
+    int hc_rank = 0;                                    // hyper_connection.low_rank
+    HcMix hc_head;                                      // output_hc_*: the final mixer, in place of output_norm
+    bool gdn_sigmoid_gate = false;                      // DeltaNet output gate sigmoid(z) instead of SiLU(z)
+    // PLE n-gram hash embeddings: a token's row of head h is (t0*m0 ^ t1*m1 ^ .. ^ t_{n-1}*m_{n-1}) % vocab[h] +
+    // offset[h] for its n-gram of the n - 1 previous tokens (n = 2 .. ple_ngram, ple_per_ngram heads each); the
+    // rows (ple_dim values each) of all heads, concatenated, are the PLE input
+    int ple_ngram = 0, ple_per_ngram = 0, ple_conv = 0, ple_dim = 0, ple_eos = -1;
+    std::vector<uint64_t> ple_mult, ple_offset, ple_vocab;
+    QuantWeight ple_table;                              // per_layer_token_embd [rows x ple_dim], rows read on the CPU
 
     inference_kv_cache_t* kvc = nullptr;               // KV cache manager handle
     void* scratch_base = nullptr;                      // temporary scratch buffer base
