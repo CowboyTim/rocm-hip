@@ -92,14 +92,16 @@ hipError_t gpu_moe_group(const int* ids, int T, int n_used, int n_expert, int ti
     return hipModuleLaunchKernel(g_group, 1, 1, 1, 256, 1, 1, 0, stream, args, nullptr);
 }
 
-hipError_t gpu_hc_norm(float* res, const float* cur, const float* inject, const float* w, float* y, int n, int hc, int T,
-                       float eps, const qmatvec_q8* q8, hipStream_t stream) {
+hipError_t gpu_hc_norm(const float* res_in, float* res_out, const float* cur, const float* inject, const float* w,
+                       float* y, int n, int hc, int T, float eps, const qmatvec_q8* q8, hipStream_t stream) {
     if (!g_hc_norm) return hipErrorInvalidDeviceFunction;
     if (T <= 0 || hc <= 0 || n % 256 != 0 || n > 256 * 16 || (q8 && (long long)n * hc * T > q8->max_k))
         return hipErrorInvalidValue;
+    // Few rows (generating): spread each over n / 256 workgroups, which needs res_out != res_in when combining
+    const unsigned split = T <= 4 && (!cur || res_out != res_in) ? (unsigned)(n / 256) : 1u;
     qmatvec_q8_out o = qmatvec_q8_outputs(q8);
-    void* args[] = {&res, (void*)&cur, (void*)&inject, (void*)&w, &y, &n, &hc, &eps, &o};
-    return hipModuleLaunchKernel(g_hc_norm, (unsigned)(T * hc), 1, 1, 256, 1, 1, 0, stream, args, nullptr);
+    void* args[] = {(void*)&res_in, &res_out, (void*)&cur, (void*)&inject, (void*)&w, &y, &n, &hc, &eps, &o};
+    return hipModuleLaunchKernel(g_hc_norm, split, (unsigned)(T * hc), 1, 256, 1, 1, 0, stream, args, nullptr);
 }
 
 hipError_t gpu_hc_lowrank(const float* lo, float* out, int n, int np, int T, int hc, const qmatvec_q8* q8,

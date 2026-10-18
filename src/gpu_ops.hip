@@ -115,7 +115,7 @@ swiglu(const float* g, const float* u, float* out, int n, Q8Out o) {
 // ---------------------------------------------------------------- mixture of experts (qwen35moe)
 //
 // moe_router   grid T, block 256: per token, softmax over the n_expert router logits, the n_used largest
-//              probabilities in descending order (each by its rank in one pass; ties go to the lowest expert index),
+//              probabilities in descending order (a bitonic sort; ties go to the lowest expert index),
 //              their weights renormalized by max(sum, 6.103515625e-5), and the shared-expert gate
 //              sigmoid(x . w_shexp). As llama.cpp's build_moe_ffn (softmax gating, norm_w, no scale).
 // moe_combine  grid (ceil(n / 256), T), block 256: out = sum_j w_j * down_j (in slot order, as ggml's add chain)
@@ -149,6 +149,7 @@ extern "C" __global__ void __launch_bounds__(256)
 moe_router(const float* logits, const float* x, const float* w_shexp, int* ids, float* wts, float* sg, int n_expert,
            int n_used, int n) {
     __shared__ __attribute__((aligned(16))) float p[MOE_MAX_EXPERTS];
+    __shared__ int pidx[MOE_MAX_EXPERTS];
     __shared__ float part[8];
     __shared__ float sel_w[64];
     const int t = blockIdx.x, tid = threadIdx.x;
@@ -182,22 +183,34 @@ moe_router(const float* logits, const float* x, const float* w_shexp, int* ids, 
     for (int e = tid; e < n_expert; e += 256) p[e] *= inv;
     __syncthreads();
 
-    // Top n_used by rank: expert e's rank is the number of experts that beat it (larger p, or equal p and a
-    // lower index), so ranks 0 .. n_used - 1 are the selection in descending order, ties to the lower index
-    for (int e = tid; e < n_expert; e += 256) {
-        const float pe = p[e];
-        int rank = 0, j = 0;
-#pragma unroll 4
-        for (; j + 4 <= n_expert; j += 4) {  // 16-byte LDS reads, several in flight
-            const float4 q = *(const float4*)&p[j];
-            rank += (q.x > pe || (q.x == pe && j < e)) + (q.y > pe || (q.y == pe && j + 1 < e)) +
-                    (q.z > pe || (q.z == pe && j + 2 < e)) + (q.w > pe || (q.w == pe && j + 3 < e));
+    // Top n_used: a bitonic sort of (p, index) pairs, descending by p, ties to the lower index (the order of the
+    // ranks the reference's argsort gives), padded to a power of two with p = -1; the first n_used entries are
+    // the selection in order. 45 compare-exchange steps for 512 experts: a scan of all experts per expert
+    // (their ranks) took ~15 us.
+    int n2 = 1;
+    while (n2 < n_expert) n2 <<= 1;
+    for (int e = tid; e < n2; e += 256) {
+        if (e >= n_expert) p[e] = -1.0f;
+        pidx[e] = e;
+    }
+    __syncthreads();
+    for (int k = 2; k <= n2; k <<= 1)
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = tid; i < n2 / 2; i += 256) {
+                const int a = 2 * j * (i / j) + (i % j), b = a + j;
+                const float pa = p[a], pb = p[b];
+                const int ia = pidx[a], ib = pidx[b];
+                const bool b_first = pb > pa || (pb == pa && ib < ia);  // b sorts before a
+                if ((a & k) == 0 ? b_first : !b_first) {
+                    p[a] = pb, p[b] = pa;
+                    pidx[a] = ib, pidx[b] = ia;
+                }
+            }
+            __syncthreads();
         }
-        for (; j < n_expert; ++j) rank += p[j] > pe || (p[j] == pe && j < e);
-        if (rank < n_used) {
-            ids[t * n_used + rank] = e;
-            sel_w[rank] = pe;
-        }
+    if (tid < n_used) {
+        ids[t * n_used + tid] = pidx[tid];
+        sel_w[tid] = p[tid];
     }
     __syncthreads();
     if (tid == 0) {
@@ -259,9 +272,12 @@ moe_group(const int* ids, int T, int n_used, int n_expert, int tile, int* tok_ro
 // The residual is hc streams of n values per token, rows r = t * hc + c of res. As llama.cpp's qwen4exp graph
 // (build_hc_mix / build_hc_combine / build_ple), each op in the reference's order.
 //
-// hc_norm     grid T * hc, block 256: with cur, first the combine res[r] += cur[t] * 2 * sigmoid(inject[t][c] /
-//             hc); then y[r] = RMSNorm(res[r]) * w[c * n ..] (per stream, gamma over all hc * n values), quantized
-//             as one flattened vector. n % 256 == 0, n <= 256 * NORM_MAXV.
+// hc_norm     grid (S, T * hc), block 256: with cur, first the combine res_out[r] = res_in[r] + cur[t] * 2 *
+//             sigmoid(inject[t][c] / hc); then y[r] = RMSNorm(res[r]) * w[c * n ..] (per stream, gamma over all
+//             hc * n values), quantized as one flattened vector. n % 256 == 0, n <= 256 * NORM_MAXV. S = 1: a
+//             workgroup per row (prefill; res_out may be res_in). S = n / 256: the row is spread over S
+//             workgroups (one token: 4 rows would leave the GPU idle), each summing the whole row in the same
+//             order and writing its own 256 values; res_out must not be res_in (the caller ping-pongs).
 // hc_lowrank  out[t] = SiLU(lo[t] / hc) for rows of n values, zero-padded to rows of np (the up projection's
 //             padded K), quantized as one flattened vector (np % 32 == 0 when set)
 // hc_mix      grid (ceil(n / 256), T): out[t] = (sum over c of xn[r] * sigmoid(gate[r])) / hc, streams added in
@@ -270,32 +286,39 @@ moe_group(const int* ids, int T, int n_used, int n_expert, int tile, int* tok_ro
 __device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + __expf(-x)); }
 
 extern "C" __global__ void __launch_bounds__(256)
-hc_norm(float* res, const float* cur, const float* inject, const float* w, float* y, int n, int hc, float eps,
-        Q8Out o) {
+hc_norm(const float* res_in, float* res_out, const float* cur, const float* inject, const float* w, float* y, int n,
+        int hc, float eps, Q8Out o) {
     __shared__ float part[8];
     __shared__ Q8Shared sh;
-    const int r = blockIdx.x, t = r / hc, c = r % hc, tid = threadIdx.x, nb = n / 256;
-    float* x = res + (size_t)r * n;
+    const int r = blockIdx.y, t = r / hc, c = r % hc, tid = threadIdx.x, nb = n / 256;
+    const bool split = gridDim.x > 1;
+    const float* x = res_in + (size_t)r * n;
+    float* xo = res_out + (size_t)r * n;
     const float inv_hc = 1.0f / (float)hc;
-    const float wt = cur ? 2.0f * sigmoidf_(inject[t * hc + c] * inv_hc) : 0.0f;
-    float v[NORM_MAXV];
-    float ss = 0.0f;
+    // every load first (the residual, the block output, the stream weight), then the arithmetic: a token's
+    // rows are spread over many small workgroups, whose time is the latency of these loads
+    float v[NORM_MAXV], u[NORM_MAXV];
 #pragma unroll
     for (int j = 0; j < NORM_MAXV; ++j)
         if (j < nb) {
             const int k = tid + 256 * j;
             v[j] = x[k];
-            if (cur) {
-                v[j] = __fadd_rn(v[j], __fmul_rn(cur[(size_t)t * n + k], wt));
-                x[k] = v[j];
-            }
+            u[j] = cur ? cur[(size_t)t * n + k] : 0.0f;
+        }
+    const float wt = cur ? 2.0f * sigmoidf_(inject[t * hc + c] * inv_hc) : 0.0f;
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < NORM_MAXV; ++j)
+        if (j < nb) {
+            if (cur) v[j] = __fadd_rn(v[j], __fmul_rn(u[j], wt));
             ss += v[j] * v[j];
         }
     const float inv = rsqrtf(block256_sum(ss, part) / n + eps);
 #pragma unroll
     for (int j = 0; j < NORM_MAXV; ++j)
-        if (j < nb) {  // uniform
+        if (j < nb && (!split || j == (int)blockIdx.x)) {  // uniform
             const int k = tid + 256 * j;
+            if (cur) xo[k] = v[j];
             const float out = v[j] * inv * w[c * n + k];
             y[(size_t)r * n + k] = out;
             if (o.qK) q8_block_value(out, true, r * nb + j, tid, sh, o);

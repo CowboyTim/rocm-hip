@@ -47,11 +47,12 @@ hipError_t gpu_moe_group(const int* ids, int T, int n_used, int n_expert, int ti
                          int* n_tiles, int* tile_e, int* tile_start, int* tile_n, hipStream_t stream);
 
 // Hyper-connections (qwen4exp; gpu_ops.hip): res holds T tokens x hc streams x n values.
-// gpu_hc_norm: if cur [T][n] is set, res[t][c] += cur[t] * 2 * sigmoid(inject[t][c] / hc) first; then
-// y[t][c] = RMSNorm(res[t][c]) * w[c * n ..], quantized into q8 (if set) as one flattened [T * hc * n] vector.
-// n % 256 == 0, n <= 4096.
-hipError_t gpu_hc_norm(float* res, const float* cur, const float* inject, const float* w, float* y, int n, int hc, int T,
-                       float eps, const qmatvec_q8* q8, hipStream_t stream);
+// gpu_hc_norm: if cur [T][n] is set, res_out[t][c] = res_in[t][c] + cur[t] * 2 * sigmoid(inject[t][c] / hc)
+// first (res_out unused without cur); then y[t][c] = RMSNorm(that) * w[c * n ..], quantized into q8 (if set) as
+// one flattened [T * hc * n] vector. n % 256 == 0, n <= 4096. res_out may be res_in, but a different buffer lets a
+// few tokens spread over many workgroups (same results either way).
+hipError_t gpu_hc_norm(const float* res_in, float* res_out, const float* cur, const float* inject, const float* w,
+                       float* y, int n, int hc, int T, float eps, const qmatvec_q8* q8, hipStream_t stream);
 // out[t] = SiLU(lo[t] / hc) for T rows of n values (lo [T][n]), zero-padded to rows of np >= n (out [T][np]);
 // quantized into q8 if set (np % 32 == 0)
 hipError_t gpu_hc_lowrank(const float* lo, float* out, int n, int np, int T, int hc, const qmatvec_q8* q8,

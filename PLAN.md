@@ -1215,11 +1215,16 @@ for the symptoms above.
 >   Reference dump: `/data/ref_q38_fast` (prompt "Write a Python function that checks whether a number is prime.").
 > - **Results:** coherent text; `qwen4exp_verify` passes on it (559 of 564 single-layer updates at cosine >= 0.999,
 >   the rest at routing near-ties of the 512-expert router; logits cosine 0.99, same argmax). Generation
->   **31.4 tok/s**, prefill **436 tok/s** (2,427 tokens) vs the reference's ~24 / ~345. 4B / 35B unchanged.
+>   **35.6 tok/s** (was 31.4; see "generation speed" in Phase 21), prefill **436 tok/s** (2,427 tokens) vs the
+>   reference's ~24 / ~345. 4B / 35B unchanged.
 > - **Next:**
->   1. speed: generation streams ~3.9 GB per token (dense DeltaNet / attention projections 1.4 GB, experts 1.25 GB,
->      HC mixers 0.34 GB, head 0.52 GB) at ~120 GB/s; FFN section 18.6 ms of 36 ms per token. Profile with
->      rocprofv3 (`rocprofv3 --kernel-trace --stats -d <dir> -- <cmd>`, results in a SQLite db: table `kernels`);
+>   1. speed: per token ~26 ms of GPU time + ~2 ms of launch gaps (~1,250 launches). Matvecs stream ~3.9 GB per
+>      token at 160–230 GB/s (~21 ms); the rest is small kernels: hc_norm 98 x 7.9 us, moe_router 48 x 14 us,
+>      deltanet_rule 36 x 19 us, ~400 launches of 2–3 us (hc_mix, hc_lowrank, swiglu, moe_combine). Left: fusing
+>      small kernels (e.g. swiglu into the experts' gate/up epilogue) at ~1-2% each; **MTP speculative decoding**
+>      is the larger lever (the reference: +11–34%), but a rejected draft needs the DeltaNet state of the
+>      position before it (118 MB here). Profile: `rocprofv3 --kernel-trace -d <dir> -o run -- <cmd>`, then
+>      `tools/prof_summary.py <dir>`;
 >   2. greedy text vs `llama-completion` diverges at the 2nd token on that prompt (a near-tie, see the results);
 >      compare longer greedy runs on prompts without near-ties, or by teacher forcing;
 >   3. MTP draft heads (the model card's MTP-Heads GGUF) for speculative decoding: +11–34% in the reference;
@@ -1935,6 +1940,16 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
   - After: 559 of 564 updates >= 0.999 (the 5 others at the smallest router gaps), worst residual cosine 0.95,
     logits 0.99. Prefill 168 → 292 → **436 tok/s**, generation **31.4 tok/s** (reference ~345 / ~24).
   - `store_verify` passes on it (snapshots 118 MB). `tools/gguf_info.py` prints a GGUF's header.
+
+- **Generation speed — 31.4 → 35.6 tok/s (2026-10-18)**, from a rocprofv3 kernel trace (`tools/prof_summary.py`):
+  - `hc_norm` (98 per token): one token's 4 rows were 4 workgroups, 31 us each. Now spread over n / 256 workgroups
+    per row (each sums the whole row in the batched order, writes its 256 values; residual ping-pong
+    `res` / `res_alt`), loads issued before the arithmetic: 7.9 us. 31.4 → 34.7 tok/s.
+  - `moe_router`: ranking 512 experts by scanning all of them took ~15 us of its 21; a bitonic sort of
+    (p, index) pairs (same order: larger p, then lower index) brings it to 14 us. Selection identical.
+  - Int8 lanes per row for ROCmFP4_FAST: the 8-lane cap now applies from 4,096 rows of a launch (16 from 1,024,
+    else 32): the mixers' down + inject (324 x 10240) 14.9 → 11.0 us. The virtual-lane sums keep every L
+    bit-identical. 35.6 tok/s; greedy output unchanged; 4B / 35B unchanged.
 
 **Needed from the user:** nothing for now (the model is in `/models`). Constraints here: /dev/shm
 is a 63 GB tmpfs (38 GB free) and the disk has 48 GB free, so a ~50 GB model needs space freed or /dev/shm

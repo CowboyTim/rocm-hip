@@ -207,14 +207,17 @@ hipError_t qmatvec_quantize(const float *x, int K, const qmatvec_q8 *q, hipStrea
 // Lanes per row for the int8 matvec kernels: the smallest power of two (>= 4, >= 8 for K-quants, which use 8
 // lanes per 256-value block) that still gives every lane a task, so short rows (K = 512 MoE experts) don't
 // leave most of the wave idle. See Q8_ROW_INDEX in matvec_q.hip.
-static int q8_lanes_per_row(int type, int K) {
+static int q8_lanes_per_row(int type, int K, long long rows) {
     const bool kq = type != QT_Q4_0_ROCMFP4 && type != QT_Q4_0_ROCMFP4_FAST;
     const int tasks = type == QT_Q4_0_ROCMFP4 ? K / 64 : type == QT_Q4_0_ROCMFP4_FAST ? K / 128 : K / 256 * 8;
     int L = 32;
     while (L > (kq ? 8 : 4) && L / 2 >= tasks) L /= 2;
     // ROCmFP4_FAST: at most 8 lanes per row, i.e. several 68-byte quads per lane. Measured on the 35B: z
-    // (4096 x 2048) 168 -> 184 GB/s, ssm_out (2048 x 4096) 160 -> 190; plain ROCmFP4 is best at 32.
-    if (type == QT_Q4_0_ROCMFP4_FAST && L > 8) L = 8;
+    // (4096 x 2048) 168 -> 184 GB/s, ssm_out (2048 x 4096) 160 -> 190; plain ROCmFP4 is best at 32. Matrices
+    // of few rows (all rows of the launch) need more lanes to keep enough loads in flight: the qwen4exp mixers'
+    // down + inject (324 x 10240) ran at 118 GB/s with 8.
+    const int cap = rows >= 4096 ? 8 : rows >= 1024 ? 16 : 32;
+    if (type == QT_Q4_0_ROCMFP4_FAST && L > cap) L = cap;
     return L;
 }
 
@@ -229,7 +232,7 @@ hipError_t qmatvec_launch_q8_pair(int type, const void *W, int N, float *y, cons
     const float *d8 = kq ? q->dK : q->d0;
     const int32_t *bs = q->bsK;
     long long rb = (long long)row_bytes;
-    int N1 = N, Nt = N + N2, L = q8_lanes_per_row(type, K);
+    int N1 = N, Nt = N + N2, L = q8_lanes_per_row(type, K, (long long)N + N2);
     void *args[] = {(void *)&W, (void *)&W2, &N1, &rb, (void *)&q8, (void *)&d8, (void *)&bs, (void *)&y, (void *)&y2,
                     &Nt, &K, &L};
     const int rows = QMV_ROWS_PER_BLOCK * 32 / L;
@@ -286,7 +289,7 @@ hipError_t qmatvec_launch_q8_id_pair(int type, const void *W, const void *W2, si
     const float *d8 = kq ? q->dK : q->d0;
     const int32_t *bs = q->bsK;
     long long rb = (long long)row_bytes;
-    int L = q8_lanes_per_row(type, K);
+    int L = q8_lanes_per_row(type, K, (long long)N * n_used * (W2 ? 2 : 1) * T);
     if (W2 && ((uintptr_t)W2 & 3) != 0) return hipErrorInvalidValue;
     void *args[] = {(void *)&W, (void *)&W2, &rb, (void *)&ids, &n_used, &x_per_slot, (void *)&q8, (void *)&d8,
                     (void *)&bs, (void *)&y, (void *)&y2, &N, &K, &L};

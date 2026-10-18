@@ -142,6 +142,7 @@ struct Scratch {
     float* part_acc = nullptr;
     // Hyper-connections (qwen4exp; n_hc streams of n_embd, HCD = n_hc * n_embd per token; empty otherwise)
     float* res = nullptr;     // the residual streams [HCD]
+    float* res_alt = nullptr; // the other residual buffer: hc_norm's combine writes res + update here, then they swap
     float* hxn = nullptr;     // a mixer's normed streams [HCD], input to its down / inject projections
     float* hlo = nullptr;     // down projection [hc_rank]
     float* hlo_pad = nullptr; // SiLU(hlo / n_hc), zero-padded to hc_rank_pad: the up projection's input
@@ -179,7 +180,7 @@ struct Scratch {
                                 b * NE, b * NU, b * NU, b, b * NU * FE, b * NU * FE, b * NU * FE, b * NU * E, b * E,
                                 b * NU, b * NU, 1, b * NU, b * NU, b * NU,
                                 attention_part_ml_floats(HQ, n_ctx, rows), attention_part_acc_floats(HQ, n_ctx, rows),
-                                b * HCD, b * HCD, b * R, b * RP, b * HCD, b * NHC,
+                                b * HCD, b * HCD, b * HCD, b * R, b * RP, b * HCD, b * NHC,
                                 b * PE, b * PHCD, b * PE, b * PHCD, b * PHCD,
                                 (qmatvec_q8_bytes(q8_max_k) + 3) / 4};
         float *ids_f = nullptr, *gt = nullptr, *gp = nullptr, *gn = nullptr, *ge = nullptr, *gs = nullptr, *gc = nullptr;
@@ -188,7 +189,7 @@ struct Scratch {
                                 &r_logits, &ids_f, &wts, &sg, &moe_g, &moe_u, &moe_act, &moe_down, &sh_out,
                                 &gt, &gp, &gn, &ge, &gs, &gc,
                                 &part_ml, &part_acc,
-                                &res, &hxn, &hlo, &hlo_pad, &hgate, &inj,
+                                &res, &res_alt, &hxn, &hlo, &hlo_pad, &hgate, &inj,
                                 &ple_emb, &ple_key, &ple_val, &ple_gated, &ple_normed,
                                 &q8mem};
         static_assert(sizeof(sizes) / sizeof(sizes[0]) == sizeof(ptrs) / sizeof(ptrs[0]), "scratch table");
@@ -753,9 +754,10 @@ struct QwenModel {
     bool hc_norm(const float* cur, const float* w, int T) {
         const int HCD = eng->n_hc * eng->n_embd;
         const qmatvec_q8* q = q8_for(HCD, T);
-        if (!check(gpu_hc_norm(s.res, cur, s.inj, w, s.hxn, eng->n_embd, eng->n_hc, T, (float)eng->eps, q, 0),
+        if (!check(gpu_hc_norm(s.res, s.res_alt, cur, s.inj, w, s.hxn, eng->n_embd, eng->n_hc, T, (float)eng->eps, q, 0),
                    "hc_norm"))
             return false;
+        if (cur) std::swap(s.res, s.res_alt);
         mark(s.hxn, HCD, T, q);
         return true;
     }
