@@ -94,9 +94,6 @@ FORWARD_VERIFY   = $(BINDIR)/forward_verify
 ATTN_VERIFY      = $(BINDIR)/attn_verify
 
 # Phase 4: Model architecture kernels
-SWIGLU_CO        = $(CODIR)/swiglu.co
-EMBEDDING_CO     = $(CODIR)/embedding_lookup.co
-QWEN_MODEL_CO    = $(CODIR)/qwen_model.co
 
 # Phase 4: Inference engine library and demo
 INFERENCE_LIB    = $(BUILDDIR)/libinference.a
@@ -192,18 +189,6 @@ $(SAMPLER_VERIFY): $(TESTSDIR)/sampler_verify.cpp $(SRCDIR)/sampler.cpp $(SRCDIR
 $(ATTN_VERIFY): $(TESTSDIR)/attn_verify.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/kv_cache.h $(CODIR)/kv_cache_store.co $(CODIR)/gemm_act_fp4.co $(CODIR)/fp16_gemm.co $(CODIR)/layernorm.co $(CODIR)/rope_embedding.co $(CODIR)/softmax_masked.co
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/attn_verify.cpp $(SRCDIR)/kv_cache.cpp $(LDFLAGS) -o $@
 
-# Phase 4: SwiGLU kernel (.co for runtime loading)
-$(SWIGLU_CO): $(SRCDIR)/swiglu.hip
-	$(HIPCC) $(HIPFLAGS) -c $< -o $@
-
-# Phase 4: Embedding lookup kernel (.co for runtime loading)
-$(EMBEDDING_CO): $(SRCDIR)/embedding_lookup.hip
-	$(HIPCC) $(HIPFLAGS) -c $< -o $@
-
-# Phase 4: Qwen 3 model kernel (.co for runtime loading)
-$(QWEN_MODEL_CO): $(SRCDIR)/qwen_model.hip
-	$(HIPCC) $(HIPFLAGS) -c $< -o $@
-
 # Phase 4: Inference engine static library
 $(INFERENCE_LIB): $(SRCDIR)/inference.cpp $(SRCDIR)/inference.h $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/gguf_mmap.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/quant_types.h $(SRCDIR)/kv_cache.cpp $(SRCDIR)/kv_cache.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/tokenizer.h $(SRCDIR)/unicode_flags.inc $(SRCDIR)/sampler.cpp $(SRCDIR)/sampler.h $(SRCDIR)/qwen_model.h $(SRCDIR)/sha256.cpp $(SRCDIR)/sha256.h $(SRCDIR)/inference_internal.h
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/inference.cpp -o $(OBJDIR)/inference.o
@@ -260,9 +245,10 @@ INSTALL_PKGCONFIGDIR = $(PREFIX)/lib/pkgconfig
 install: $(INFERENCE_SO) $(INFERENCE_LIB) $(PKGCONFIG)
 	install -d $(DESTDIR)$(INSTALL_LIBDIR) $(DESTDIR)$(INSTALL_INCDIR) $(DESTDIR)$(INSTALL_PKGCONFIGDIR)
 	cp -f $(INFERENCE_SO_1) $(DESTDIR)$(INSTALL_LIBDIR)/
+	ln -sf libinference.so.1.0 $(DESTDIR)$(INSTALL_LIBDIR)/libinference.so.1
 	ln -sf libinference.so.1 $(DESTDIR)$(INSTALL_LIBDIR)/libinference.so
 	cp -f $(SRCDIR)/inference.h $(SRCDIR)/sampler.h $(SRCDIR)/tokenizer.h $(DESTDIR)$(INSTALL_INCDIR)/
-	cp -f $(PKGCONFIG) $(DESTDIR)$(INSTALL_PKGCONFIGDIR)/
+	sed 's|^prefix=.*|prefix=$(PREFIX)|' $(PKGCONFIG) > $(DESTDIR)$(INSTALL_PKGCONFIGDIR)/rocm-inference.pc
 
 uninstall:
 	rm -f $(INSTALL_LIBDIR)/libinference.so $(INSTALL_LIBDIR)/libinference.so.1 $(INSTALL_LIBDIR)/libinference.so.1.0
@@ -364,4 +350,4 @@ verify_minimal: $(TEST_TARGET)
 	./$(TEST_TARGET) 2>&1 || echo "Test exited with code $?"
 
 # Last, so that every variable above is defined when its prerequisites are expanded
-all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(SWIGLU_CO) $(EMBEDDING_CO) $(QWEN_MODEL_CO) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(GENERATE_VERIFY) $(QWEN4EXP_VERIFY) $(MTP_VERIFY) $(E2E_TEST) $(MATVEC_BENCH) $(WMMA_LAYOUT_VERIFY) $(CAPI_SMOKE) $(STORE_VERIFY)
+all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(GENERATE_VERIFY) $(QWEN4EXP_VERIFY) $(MTP_VERIFY) $(E2E_TEST) $(MATVEC_BENCH) $(WMMA_LAYOUT_VERIFY) $(CAPI_SMOKE) $(STORE_VERIFY)

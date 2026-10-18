@@ -80,7 +80,7 @@ int qmatvec_init(const char *co_path) {
     if (hipModuleGetFunction(&g_lr_fast, g_mod, "matvec_q8_lr_q4_0_rocmfp4_fast") != hipSuccess) g_lr_fast = nullptr;
     if (hipModuleGetFunction(&g_quant_rows_q8_0, g_mod, "quantize_rows_q8_0") != hipSuccess) g_quant_rows_q8_0 = nullptr;
     if (hipModuleGetFunction(&g_mv_q8_0s, g_mod, "matvec_q8_0s") != hipSuccess) g_mv_q8_0s = nullptr;
-    g_use_wmma = getenv("QMATVEC_NO_WMMA") == nullptr;  // A/B switch
+    g_use_wmma = getenv("QMATVEC_NO_WMMA") == nullptr && getenv("QMATVEC_NO_WMMA_MM") == nullptr;  // A/B: all / matmuls only
     if (const char *v = getenv("QMATVEC_WMMA_MIN_T")) g_wmma_min_t = atoi(v);  // tests: route small batches to WMMA
     return 0;
 }

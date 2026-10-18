@@ -1,10 +1,13 @@
 Inference.xs
 lib/ROCm/Inference.pm
+lib/ROCm/Inference/Store.pm
 Makefile.PL
 MANIFEST
+MANIFEST.SKIP
+README
 t/00-load.t
 t/10-generate.t
 t/20-chat.t
 t/30-store.t
-lib/ROCm/Inference/Store.pm
 t/40-store-policy.t
+t/50-draft.t

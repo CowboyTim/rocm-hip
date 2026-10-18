@@ -33,7 +33,7 @@ int attention_init(const char* co_path) {
         attention_free();
         return -1;
     }
-    g_flash_off = getenv("QMATVEC_NO_WMMA") != nullptr;
+    g_flash_off = getenv("QMATVEC_NO_WMMA") != nullptr || getenv("ATTN_NO_FLASH") != nullptr;  // A/B: attention only
     return 0;
 }
 

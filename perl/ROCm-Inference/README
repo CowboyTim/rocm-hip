@@ -1,0 +1,30 @@
+ROCm::Inference
+===============
+
+Perl binding of libinference, the zero-copy LLM inference engine of the rocm-hip repository for AMD Strix Halo
+(gfx1151, ROCm): Qwen3.5 / Qwen3.6 (dense and MoE) and Qwen3.8-Flash-Next with MTP speculative decoding, GGUF
+models memory-mapped in place, a KV block store of mmap()ed files shared between processes.
+
+The XS maps the C API function by function (the model handle first); chat templates are rendered in Perl with
+the Minijinja module; the KV store's policy (eviction, disk tier) is ROCm::Inference::Store.
+
+INSTALLATION
+
+    perl Makefile.PL
+    make
+    make test
+    make install
+
+Makefile.PL finds libinference through ROCM_INFERENCE_PREFIX (an installed copy, `make install PREFIX=...` in
+rocm-hip), pkg-config (rocm-inference), or the rocm-hip checkout the module sits in (perl/ROCm-Inference),
+building libinference.so there when needed (ROCm / hipcc).
+
+Tests beyond t/00-load.t need the GPU and models, given by environment variables:
+
+    ROCM_INFERENCE_TEST_MODEL=/path/Qwen3.5-4B-ROCMFP4.gguf
+    ROCM_INFERENCE_TEST_QWEN38=/path/Qwen3.8-Flash-Next-...-00001-of-00003.gguf
+    ROCM_INFERENCE_TEST_DRAFT=/path/mtp-Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST.gguf
+
+LICENSE
+
+MIT.

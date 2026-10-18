@@ -1,0 +1,10 @@
+^blib/
+^Makefile$
+^Makefile\.old$
+^MYMETA\.
+^pm_to_blib$
+^Inference\.(c|o|bs)$
+^ROCm-Inference-
+\.so$
+~$
+\.bak$

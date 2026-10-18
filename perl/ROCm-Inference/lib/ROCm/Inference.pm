@@ -150,6 +150,14 @@ C<tokens_from_store>, C<block_tokens>, C<block_bytes>, C<snapshot_bytes>.
 
 The store file names of the token list's full blocks, in order (e.g. to keep a system prompt from eviction).
 
+=item set_draft_model($m, $path) / set_draft_model($m, undef)
+
+Load an MTP draft head for speculative decoding (Qwen3.8-Flash-Next: a nextn sidecar GGUF such as
+F<mtp-Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST.gguf>), or unload it. C<generate> then decodes each token
+together with the head's guess of the next one and keeps the guess when it is the token that is sampled
+anyway: the same tokens as without the head, for any sampling options, about twice as many per pass when the
+head guesses well. Dies when the file is not a head for this model. Before or after C<kv_cache_init>.
+
 =item chat_render($m, \@messages, %vars) / chat($m, \@messages, \%options)
 
 Render a conversation with the model's chat template / render it and generate the reply.

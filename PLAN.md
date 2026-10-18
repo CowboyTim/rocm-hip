@@ -1175,7 +1175,9 @@ for the symptoms above.
 - **CPU fallbacks in the hot path**: embedding lookup, attention scoring, LM head (248k × 2560 dot products per token) run on CPU. Fine for correctness work; track them for removal later.
 - **Interface drift**: kernel signatures changed (Phase 18) without updating the tests, and nothing caught it. Add `make test` that runs every `*_verify` and fails on a non-zero exit, and run it before each commit.
 - **Duplicated structs**: `QuantWeight` is mirrored in `inference.cpp` and `qwen_model.cpp` (Phase 18 notes). Keep a single definition in `inference_internal.h`.
-- **Stale files**: `src/swiglu.hip.backup`; `verify_minimal*` scratch tests in `src/`.
+- **Stale files**: `verify_minimal*` scratch tests in `src/`. (Removed 2026-10-18: the Phase 4 kernels
+  `swiglu.hip` (+ `.backup`), `embedding_lookup.hip`, `qwen_model.hip` and their `.co` targets, unused since
+  the qmatvec engine; stale `*.co` copies in the repo root.)
 - **Arch keys**: GGUF key lookups hard-code `qwen35.`. Read `general.architecture` and build `<arch>.<key>`.
 - 14 compiler warnings (were zero after 9b8ba6b).
 
@@ -1230,6 +1232,15 @@ for the symptoms above.
 >      compare longer greedy runs on prompts without near-ties, or by teacher forcing;
 >   3. MTP draft heads (the model card's MTP-Heads GGUF) for speculative decoding: +11–34% in the reference;
 >   4. the STRIX_LEAN release (Q5_K token_embd, Q5_1 PLE table, Q6_K head) if the user wants it.
+>   2. **WMMA (user, 2026-10-18: investigate WMMA)** — findings and next steps in Phase 21 "WMMA". Most
+>      promising: the MoE expert WMMA kernel is 51% of Qwen3.8 prefill at ~4–5 TOPS: tiles of 16 entries read
+>      each expert ~2x per 1,024-token batch (~20 entries per expert with 512 experts); 32–64-entry tiles or
+>      larger prefill batches should read them once (prefill 434 → ~600 tok/s?).
+> - **Perl module (2026-10-18):** `Makefile.PL` finds libinference via ROCM_INFERENCE_PREFIX, pkg-config
+>   (`rocm-inference`) or the rocm-hip checkout (building `libinference.so` there if missing); tests:
+>   `t/00-load.t` without GPU (exports, error paths), the rest with ROCM_INFERENCE_TEST_MODEL /
+>   ROCM_INFERENCE_TEST_QWEN38 + ROCM_INFERENCE_TEST_DRAFT (`t/50-draft.t`: speculative = plain). `make dist` /
+>   `disttest` and an install-prefix build of the tarball pass (75 / 83 tests with models).
 > - **Other open items:** `perl/ROCm-Inference/t/20-chat.t` with the user's Minijinja module (cargo is installed
 >   now); CPAN packaging; Phase 22b follow-ups (disk-tier timing, block size option, a Perl web service example);
 >   speed: long-context decode attention, the 35B expert matmuls in prefill.
@@ -1998,6 +2009,24 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
   - **Speed:** plain 38.1 tok/s; speculative 42.7 (first) → 49.5 (few-token kernels) → 52.0 / 49.9 (2-row LM
     head in one read) on the code / reasoning prompts, ~2 tokens per pass. Through the library ~45 tok/s incl.
     the prompt. Per pass (~40 ms): projections 13.5 ms, experts 12.3, LM head 2.3, the head ~2.5.
+
+- **WMMA investigation (2026-10-18).** New A/B switches: `QMATVEC_NO_WMMA_MM=1` (int8 WMMA matmuls off),
+  `ATTN_NO_FLASH=1` (FP16 WMMA flash attention off); `QMATVEC_NO_WMMA=1` is both.
+  - **Accuracy:** on Qwen3.8 (12-token prompt, `qwen4exp_verify`), prefill vs token by token differs only with
+    the WMMA matmuls on (cosine 0.998, max 4% relative); flash attention is not used below 16 tokens. The
+    cause is the MoE: the grouped expert path (from 8 tokens) always takes `matmul_wmma_id`, whose integer
+    products are exact but whose per-block float scaling is summed in another order; the 512-expert router's
+    near-ties amplify that. It is not less accurate: vs the reference, worst residual cosine 0.953 (WMMA) vs
+    0.964 (off), logits 0.991 vs 0.990, 559 / 564 single-layer updates either way. Making the WMMA kernels
+    sum in the single-token order (bit-identical prefill with WMMA, e.g. for prefix reuse across paths) would
+    mean accumulating per 32-value block in the virtual-lane order: possible, likely slower; not planned.
+  - **Speed (Qwen3.8 prefill, 2,427 tokens, 5.6 s):** `matmul_wmma_id` (experts) 2.82 s = 51%, `matmul_wmma`
+    (dense) 1.23 s = 22%, `attn_flash` 0.17 s. Experts per 1,024-token batch: ~10,240 (token, slot) entries
+    over 512 experts, ~20 each, in tiles of 16 → each expert's 0.87 MB matrix is read ~2x per batch: gate / up
+    7.5 ms, down 8.2 ms per layer per batch ≈ 120–135 GB/s and ~4–5 TOPS (the int8 WMMA peak is far higher).
+    **Next:** tiles of 32 / 64 entries (or 2,048-token batches when the attention partials allow) so each
+    expert is read once; measure the dense `matmul_wmma` against the roofline the same way (20480-row
+    tiles at 1.4 ms); FP16 flash attention precision on long contexts (only a 30k needle test so far).
 
 **Needed from the user:** nothing for now (the model is in `/models`, the head in `/data/mtp`). Constraints here: /dev/shm
 is a 63 GB tmpfs (38 GB free) and the disk has 48 GB free, so a ~50 GB model needs space freed or /dev/shm
