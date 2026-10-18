@@ -491,9 +491,10 @@ static std::string store_name(const inference_model::Hash& h, const char* ext) {
     return s + "." + ext;
 }
 
-static bool store_has(const inference_model_t* m, const std::string& name) {
+// A complete store file: present with its exact size (a file still being copied in counts as missing)
+static bool store_has(const inference_model_t* m, const std::string& name, size_t bytes = 0) {
     struct stat st;
-    return fstatat(m->store_dirfd, name.c_str(), &st, 0) == 0;
+    return fstatat(m->store_dirfd, name.c_str(), &st, 0) == 0 && (bytes == 0 || (size_t)st.st_size == bytes);
 }
 
 // Mark a store file as used now (the Perl side's LRU eviction looks at mtime)
@@ -848,9 +849,9 @@ static int store_lookup(inference_model_t* m, const int32_t* p, int n, std::vect
     int best = 0;
     for (int j = 1; j <= K; ++j) {
         const inference_model::Hash h = block_hash(j > 1 ? (*hs)[j - 2] : m->store_root, p + (size_t)(j - 1) * B, B);
-        if (!store_has(m, store_name(h, "kvb"))) break;
+        if (!store_has(m, store_name(h, "kvb"), kv_cache_block_bytes(m->kvc))) break;
         hs->push_back(h);
-        if (!recurrent || store_has(m, store_name(h, "rst"))) best = j;
+        if (!recurrent || store_has(m, store_name(h, "rst"), state_bytes(m))) best = j;
     }
     hs->resize((size_t)best);
     return best * B;

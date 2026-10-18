@@ -2066,9 +2066,21 @@ block-chain style cache managed in Perl.
      store_block_names`, `t/30-store.t`.
    - **Time to first token, 7,392-token prompt: 4B 4,522 → 258 ms, 35B 6,921 → 415 ms** (7,168 tokens from
      the store).
-3. Perl policy helpers: budget/LRU eviction, disk tier, session names.
+3. Perl policy helpers: budget/LRU eviction, disk tier, session names. **DONE ✅ (2026-10-18)**:
+   `ROCm::Inference::Store` (plain functions, no GPU needed): `store_usage`, `store_files`,
+   `store_evict($dir, max_bytes, keep)` (LRU by mtime; a kept block keeps its snapshot),
+   `store_spill($hot, $cold, ...)` (the same, moving files to a cold tier), `store_fetch($cold, $hot, @names)`
+   (atomic copy back). The library now treats a store file with the wrong size as missing, so a file being
+   copied in is never mapped. `t/40-store-policy.t`. Sessions need no KV work: a conversation is its
+   messages (JSON); re-rendering it with `reuse_prefix` finds its blocks.
 4. Tests:
    - a shared system prompt across two sessions and two processes;
    - a conversation resumed after a restart;
    - a rewind into a shared block;
    - files deleted underneath a running session.
+   **Covered ✅** by `tests/store_verify.sh` (separate processes = restarts; rewind; deletion) and the Perl
+   `t/30-store.t` / `t/40-store-policy.t`.
+
+**Next (Phase 22b follow-ups):** a disk-tier timing (cold blocks read from disk, not tmpfs); a configurable
+block size at `inference_kv_cache_init`; the Perl web service example (OpenAI-style chat endpoint over
+`chat()` + the store).
