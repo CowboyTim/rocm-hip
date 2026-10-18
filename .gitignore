@@ -48,3 +48,12 @@ mandelbrot.ppm
 # CocoIndex Code (ccc)
 /.cocoindex_code/
 build/
+
+# Perl module build output (perl/ROCm-Inference)
+perl/*/blib/
+perl/*/Makefile
+perl/*/Makefile.old
+perl/*/MYMETA.*
+perl/*/pm_to_blib
+perl/*/*.c
+perl/*/*.bs

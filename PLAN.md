@@ -1905,8 +1905,26 @@ remounted larger; the reference oracle must also run each model on the CPU for `
     positions is the next generation bottleneck at long contexts.
   - Makefile: `all` moved to the end (its prerequisites were expanded before `INFERENCE_SO` was defined, so
     the `.so` was never built by default); `libinference.so.1` symlink pointed at itself.
-- **Next:** step 4, the XS module `ROCm::Inference` (`perl-minijinja-xs` renders the template). Later:
-  long-context decode attention.
+- **Step 4 — first version ✅: Perl XS module `ROCm::Inference`** (`perl/ROCm-Inference/`). Design (user,
+  2026-10-18): not overly OO; the XS maps the C library function by function, everything else is plain Perl
+  (Jinja via the user's `Minijinja` module, web service, files, KV cache handling).
+  - `Inference.xs`: one function per C call, model handle first (a blessed scalar ref only so that it frees
+    itself; no methods). Errors croak with the library's message; text in/out as Perl character strings;
+    token lists as array refs. `generate($m, \@prompt, \%opts)` → `(\@ids, $reason)` with all sampler /
+    stop / reuse options and an `on_token` Perl callback (true return stops; a `die` in it propagates).
+    `get_logits` returns packed floats. Constants `STOP_*`.
+  - `lib/ROCm/Inference.pm`: exports, POD, and plain-Perl `chat_render($m, \@messages, %vars)` (the GGUF
+    template through `Minijinja::render_str`, with bos/eos tokens and `add_generation_prompt`) and
+    `chat($m, \@messages, \%opts)` (render, tokenize, generate with `reuse_prefix`).
+  - `Makefile.PL`: links `libinference.so` from this checkout's `build/` (or `ROCM_INFERENCE_PREFIX`) with
+    an rpath. Tests: `t/00-load.t` (no GPU), `t/10-generate.t` (22 tests with `ROCM_INFERENCE_TEST_MODEL`:
+    tokenize/UTF-8 round trips, streaming, stop string / callback / die, chat turns with prefix reuse,
+    logits, freed handle), `t/20-chat.t` (MiniJinja chat; skipped here: Minijinja needs the Rust
+    minijinja-cabi library and there is no cargo on this machine). All pass on both models.
+- **Next:** run `t/20-chat.t` with Minijinja installed (the Qwen template uses `.startswith` / `.split` /
+  `namespace` / `raise_exception`: check the module supports them); session save/load (KV cache + recurrent
+  state + token history to a file) for the Perl side's KV cache handling; CPAN packaging (build or locate
+  libinference). Later: long-context decode attention.
 
 
 The C API (`inference.h`) works for one sequence but lacks what an application needs. Architecture-neutral,

@@ -1,0 +1,7 @@
+Inference.xs
+lib/ROCm/Inference.pm
+Makefile.PL
+MANIFEST
+t/00-load.t
+t/10-generate.t
+t/20-chat.t
