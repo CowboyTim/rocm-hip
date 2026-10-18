@@ -218,6 +218,14 @@ int kv_cache_slot_make_private(inference_kv_cache_t *c, int slot, int copy) {
     return 0;
 }
 
+int kv_cache_set_dir(inference_kv_cache_t *c, const char *dir) {
+    if (!c || !dir) return -1;
+    c->dir = dir;
+    for (size_t i = 0; i < c->slot_fd.size(); ++i)
+        if (!c->slot_shared[i] && kv_cache_slot_make_private(c, (int)i, 1) != 0) return -1;
+    return 0;
+}
+
 int kv_cache_slot_publish(inference_kv_cache_t *c, int slot, const char *path) {
     if (!c || slot < 0 || slot >= (int)c->slot_fd.size() || !path) return -1;
     char proc[64];

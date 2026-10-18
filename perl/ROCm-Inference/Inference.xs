@@ -365,6 +365,62 @@ last_prompt_stats(h)
     PUSHs(sv_2mortal(newSViv(reused)));
     PUSHs(sv_2mortal(newSViv(prefilled)));
 
+void
+store_open(h, dir, snapshot_every = 4)
+    SV* h
+    const char* dir
+    int snapshot_every
+  CODE:
+    const int rc = inference_store_open(handle_ptr(aTHX_ h, 0), dir, snapshot_every);
+    if (rc != 0) croak_last(aTHX_ "store_open", rc);
+
+void
+store_close(h)
+    SV* h
+  CODE:
+    inference_store_close(handle_ptr(aTHX_ h, 0));
+
+SV*
+store_stats(h)
+    SV* h
+  CODE:
+    inference_store_stats st;
+    if (inference_store_get_stats(handle_ptr(aTHX_ h, 0), &st) != 0) croak("ROCm::Inference::store_stats failed");
+    HV* hv = newHV();
+    (void)hv_stores(hv, "blocks_published", newSViv((IV)st.blocks_published));
+    (void)hv_stores(hv, "blocks_attached", newSViv((IV)st.blocks_attached));
+    (void)hv_stores(hv, "snapshots_saved", newSViv((IV)st.snapshots_saved));
+    (void)hv_stores(hv, "snapshots_restored", newSViv((IV)st.snapshots_restored));
+    (void)hv_stores(hv, "tokens_from_store", newSViv((IV)st.tokens_from_store));
+    (void)hv_stores(hv, "block_tokens", newSViv(st.block_tokens));
+    (void)hv_stores(hv, "block_bytes", newSViv((IV)st.block_bytes));
+    (void)hv_stores(hv, "snapshot_bytes", newSViv((IV)st.snapshot_bytes));
+    RETVAL = newRV_noinc((SV*)hv);
+  OUTPUT:
+    RETVAL
+
+void
+store_block_names(h, ids_ref)
+    SV* h
+    SV* ids_ref
+  PPCODE:
+    /* The store files (<hash>.kvb) of the token list's full blocks, in order */
+    inference_model_t* m = handle_ptr(aTHX_ h, 0);
+    int n = 0;
+    int32_t* ids = ids_from_av(aTHX_ ids_ref, &n);
+    const int len = inference_store_block_names(m, ids, n, NULL, 0);
+    if (len < 0) { Safefree(ids); croak("ROCm::Inference::store_block_names: no store open"); }
+    char* buf;
+    Newx(buf, len + 1, char);
+    inference_store_block_names(m, ids, n, buf, len + 1);
+    Safefree(ids);
+    for (char *p = buf, *e; *p; p = e + 1) {
+        e = strchr(p, '\n');
+        if (!e) break;
+        XPUSHs(sv_2mortal(newSVpvn(p, (STRLEN)(e - p))));
+    }
+    Safefree(buf);
+
 SV*
 last_error()
   CODE:

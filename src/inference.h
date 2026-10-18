@@ -158,6 +158,37 @@ int inference_generate_stream(inference_model_t* model, const int32_t* prompt_id
 // How the last inference_generate_stream prompt was handled: tokens reused from the sequence, tokens prefilled.
 int inference_last_prompt_stats(const inference_model_t* model, int* reused, int* prefilled);
 
+// ---- KV block store (Phase 22b): prompts shared across sessions, processes and restarts.
+// With a store open, every full KV block (inference_store_get_stats: block_tokens positions, all layers) is
+// published as a file <chain hash>.kvb in dir, and the recurrent state (hybrid models) is saved as <chain hash>.rst
+// at chosen block boundaries: every snapshot_every-th one (0: none) and the last one of each
+// inference_generate_stream prompt. The chain hash covers the model, the layout and every token up to the end of
+// the block, so equal prefixes give equal names. A reuse_prefix prompt then starts from the deepest block chain in
+// the store that ends in a snapshot, when that reaches further than the current sequence: the blocks are mapped
+// in place (no copy), the snapshot is read back. Store blocks are never written; the files can be deleted at
+// any time (LRU eviction is the caller's: files are touched when used) and moved to and from other storage.
+// dir must support O_TMPFILE (tmpfs such as /dev/shm, ext4, xfs, btrfs); the KV cache's own block files move
+// there. Returns 0, negative on error.
+int inference_store_open(inference_model_t* model, const char* dir, int snapshot_every);
+void inference_store_close(inference_model_t* model);
+
+typedef struct inference_store_stats {
+    long long blocks_published;    // blocks this model wrote to the store
+    long long blocks_attached;     // store blocks mapped into the sequence
+    long long snapshots_saved, snapshots_restored;
+    long long tokens_from_store;   // prompt tokens taken from the store instead of prefilled
+    int block_tokens;              // positions per block
+    long long block_bytes;         // size of a .kvb file
+    long long snapshot_bytes;      // size of a .rst file (0: no recurrent layers)
+} inference_store_stats;
+
+int inference_store_get_stats(const inference_model_t* model, inference_store_stats* stats);
+
+// The store file names (<hash>.kvb, one per line, in order) of the full blocks of a token list: e.g. to keep a
+// system prompt's blocks from eviction. A block's .rst snapshot, if any, has the same name with .rst. Writes at
+// most max_len - 1 bytes plus a NUL; returns the full length, negative on error.
+int inference_store_block_names(const inference_model_t* model, const int32_t* tokens, int n, char* out, int max_len);
+
 // ---- Chat. Templates are rendered outside this library (e.g. with a Jinja engine, as the Perl module does with
 // MiniJinja): render the conversation to text, tokenize it (special tokens in the text, such as <|im_start|>,
 // become their ids), then generate with reuse_prefix so each turn only prefills what changed.

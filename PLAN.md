@@ -2036,6 +2036,36 @@ block-chain style cache managed in Perl.
    - Greedy tokens on a 2,456-token prompt are identical to the previous build on both models; speed is
      unchanged.
 2. The C block store: hashing, mapping, snapshots at the chosen boundaries, publishing, lookup.
+   **DONE ✅ (2026-10-18).**
+   - **2a, KV slots as files** (`kv_cache`): each block slot is its own `O_TMPFILE` file, mapped at its place in
+     one reserved range and registered on its own. Measured first (`scratchpad/kvslot.hip`): per-slot
+     registration works across slot boundaries, remapping a slot takes 1.5–2.6 ms, `linkat` publishes a slot
+     with no copy, on tmpfs and on disk.
+     - `kv_cache_slot_attach`: map a store file into a slot (read-only files are mapped and registered
+       read-only, so stray writes fault).
+     - `kv_cache_slot_make_private`: a new private file, optionally copying the rows.
+     - `kv_cache_slot_publish`: link the slot's file under a name.
+     - `kv_cache_set_dir`; blocks are padded to whole pages.
+   - **2b, the store** (`inference_store_open(model, dir, snapshot_every)`, `_close`, `_get_stats`,
+     `_block_names`):
+     - Names are `<sha256 chain>.kvb` / `.rst`; the root hash covers the GGUF size and first 4 MB and the
+       block/state layout. `src/sha256.cpp` passes the FIPS test vectors.
+     - Every full block is published when the forward pass completes it; a block already published by
+       another process is left alone (`EEXIST`).
+     - Prefill is cut at snapshot boundaries (every N blocks, and the last boundary of each prompt). A snapshot
+       is written to an `O_TMPFILE` and linked once complete, so no partial files are ever visible.
+     - A `reuse_prefix` prompt takes the deepest chain of present blocks that ends in a snapshot when it beats
+       the in-memory options: the blocks are mapped in place, the snapshot is read back.
+     - Before any forward pass, the slots about to be written are made private, copying the rows already in
+       the first slot if the write starts mid-block (copy on write).
+     - Used files are touched (mtime) for LRU eviction on the Perl side.
+   - Tests: `tests/store_verify.sh` (separate processes over one store: publish; same prompt from the store
+     with an identical reply under `QMATVEC_NO_WMMA`; a 3-block shared prefix resumes at the 2-block snapshot;
+     shared files unchanged after a divergence; a deleted middle block stops lookup and is republished), both
+     models. `kv_verify` checks the slot operations. Perl: `store_open / store_close / store_stats /
+     store_block_names`, `t/30-store.t`.
+   - **Time to first token, 7,392-token prompt: 4B 4,522 → 258 ms, 35B 6,921 → 415 ms** (7,168 tokens from
+     the store).
 3. Perl policy helpers: budget/LRU eviction, disk tier, session names.
 4. Tests:
    - a shared system prompt across two sessions and two processes;

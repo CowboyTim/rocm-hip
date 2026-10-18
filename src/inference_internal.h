@@ -12,6 +12,7 @@
 #include <vector>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 #include "inference.h"       // opaque handle typedefs
 #include "gguf_mmap.h"        // gguf_model_t* forward decl
@@ -128,6 +129,17 @@ struct inference_model {
     std::vector<Checkpoint> ckpts;                      // saved recurrent states, by position in seq
     uint64_t ckpt_clock = 0;
     int last_reused = 0, last_prefilled = 0;            // inference_last_prompt_stats
+    // KV block store (Phase 22b, inference_store_open): blocks published as <chain hash>.kvb, recurrent state
+    // snapshots at block boundaries as <chain hash>.rst
+    struct Hash { uint8_t b[32]; bool operator==(const Hash& o) const { return memcmp(b, o.b, 32) == 0; } };
+    std::string store_dir;                              // empty: no store
+    int store_dirfd = -1;
+    int store_snapshot_every = 0;                       // snapshot every N block boundaries (0: only prompt ends)
+    int store_snapshot_at = -1;                         // block boundary of the current prompt's end: snapshot too
+    Hash store_root{};                                  // chain hash before block 0 (model and layout identity)
+    std::vector<Hash> chain;                            // chain[i]: hash after block i of seq
+    size_t published = 0;                               // full blocks of seq that are in the store
+    long long st_published = 0, st_attached = 0, st_snap_saved = 0, st_snap_restored = 0, st_tokens = 0;
     std::unordered_map<std::string, std::string> chat_templates;  // inference_chat_template, by name
     int lm_head_q8 = 0;                                 // inference_set_lm_head_q8: use an int8 copy of the LM head
     uint64_t seed = 0;                                  // inference_generate sampler seed

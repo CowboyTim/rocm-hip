@@ -20,6 +20,7 @@ our @EXPORT_OK = qw(
     tokenize detokenize chat_template bos_id eos_id token_is_eog vocab_size
     n_ctx n_past reset prefill decode_token get_logits
     generate last_prompt_stats last_error
+    store_open store_close store_stats store_block_names
     chat_render chat
     STOP_NONE STOP_EOG STOP_MAX_TOKENS STOP_STRING STOP_CALLBACK STOP_CONTEXT_FULL
 );
@@ -131,6 +132,23 @@ Options: C<max_new_tokens> (256), C<temperature> (0.8; 0 = greedy), C<top_k>, C<
 C<repeat_penalty>, C<repeat_last_n>, C<seed>, C<stop> (array ref of strings), C<ignore_eog>,
 C<reuse_prefix> (the prompt is the whole sequence; the shared prefix is reused), C<checkpoint_tail>, and
 C<on_token> (called with the token id and the text that is ready; return true to stop).
+
+=item store_open($m, $dir [, $snapshot_every = 4]) / store_close($m)
+
+Attach a KV block store: a directory (e.g. under F</dev/shm>) that holds the KV cache of every full
+block of every sequence as a file named by the chained hash of its tokens, plus recurrent-state snapshots
+every C<$snapshot_every> blocks and at the end of each prompt. Prompts generated with C<reuse_prefix> then
+start from the longest prefix any process stored, mapped in place without copying. The files are plain:
+delete them to evict (the library touches them when used), move them to other storage and back.
+
+=item store_stats($m)
+
+A hash ref: C<blocks_published>, C<blocks_attached>, C<snapshots_saved>, C<snapshots_restored>,
+C<tokens_from_store>, C<block_tokens>, C<block_bytes>, C<snapshot_bytes>.
+
+=item store_block_names($m, \@ids)
+
+The store file names of the token list's full blocks, in order (e.g. to keep a system prompt from eviction).
 
 =item chat_render($m, \@messages, %vars) / chat($m, \@messages, \%options)
 

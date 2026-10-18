@@ -60,6 +60,12 @@ void qwen_model_set_layer_callback(qwen_model_t* model, qwen_layer_cb cb, void* 
 int qwen_model_is_recurrent(const qwen_model_t* model);
 int qwen_model_state_save(qwen_model_t* model, int slot);
 int qwen_model_state_restore(qwen_model_t* model, int slot);
+// The whole recurrent state in host memory (pinned, coarse-grained; *bytes its size, 0 / NULL without recurrent
+// layers), for writing it to a file and reading it back (the KV block store). Only after qwen_model_sync: the GPU
+// may still be writing it; a CPU write is seen by the next forward pass.
+void* qwen_model_state_memory(qwen_model_t* model, size_t* bytes);
+// Wait for the model's queued GPU work. Returns 0, -1 on error.
+int qwen_model_sync(qwen_model_t* model);
 
 // Opt-in int8 (Q8_0) copy of a float LM head (F32 / F16 / BF16; the 35B's 1 GB BF16 one): built on the GPU on
 // first use, about half the bytes per token; logits differ slightly from the float head's. enable = 0

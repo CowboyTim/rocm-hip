@@ -87,6 +87,9 @@ int  kv_cache_slot_shared(const inference_kv_cache_t *c, int slot);
 int  kv_cache_slot_attach(inference_kv_cache_t *c, int slot, int fd);
 int  kv_cache_slot_make_private(inference_kv_cache_t *c, int slot, int copy);
 int  kv_cache_slot_publish(inference_kv_cache_t *c, int slot, const char *path);
+/* Move the private slots' files to dir (contents kept): publishing links a slot's file into the store directory,
+   which must be on the same filesystem. Returns 0, -1 on error. */
+int  kv_cache_set_dir(inference_kv_cache_t *c, const char *dir);
 
 /* Wipe every byte of the mapping (fresh context / full reset of stored data). */
 void kv_cache_zero(inference_kv_cache_t *c);

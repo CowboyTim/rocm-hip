@@ -10,6 +10,7 @@
 #include "tokenizer.h"
 #include "sampler.h"
 #include "qwen_model.h"
+#include "sha256.h"
 #include <hip/hip_runtime.h>
 
 #include <vector>
@@ -23,6 +24,9 @@
 #include <cmath>
 #include <cstdarg>
 #include <sys/stat.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -367,6 +371,7 @@ void inference_free_model(inference_model_t* m) {
     // whose device pointers point into the layer scratch buffers we're about to free.
     INFER_LOG("[CLEANUP] Unpinning model memory\n");
     unpin_model_memory(m);
+    inference_store_close(m);
     if (m->kvc) { INFER_LOG("[CLEANUP] Freeing KV cache\n"); kv_cache_free(m->kvc); }
     if (m->qwen) { INFER_LOG("[CLEANUP] Freeing qwen model\n"); qwen_model_free(m->qwen); }
     if (m->gguf) { INFER_LOG("[CLEANUP] Closing GGUF\n"); gguf_mmap_close(m->gguf); }
@@ -448,6 +453,8 @@ static void seq_reset(inference_model_t* m) {
     m->n_past = 0;
     m->seq.clear();
     m->ckpts.clear();
+    m->chain.clear();
+    m->published = 0;
 }
 
 void inference_reset(inference_model_t* m) {
@@ -458,23 +465,172 @@ int inference_n_past(const inference_model_t* m) {
     return m ? m->n_past : 0;
 }
 
+// ---- KV block store helpers (Phase 22b; inference_store_open)
+
+static int kv_B(const inference_model_t* m) { return m->kvc ? kv_cache_block_tokens(m->kvc) : 1; }
+
+// Chained block hash: SHA-256 of the previous hash and the block's token ids (32-bit little endian)
+static inference_model::Hash block_hash(const inference_model::Hash& prev, const int32_t* tokens, int n) {
+    sha256_ctx c;
+    sha256_init(&c);
+    sha256_update(&c, prev.b, sizeof(prev.b));
+    for (int i = 0; i < n; ++i) {
+        const uint32_t t = (uint32_t)tokens[i];
+        const uint8_t le[4] = {(uint8_t)t, (uint8_t)(t >> 8), (uint8_t)(t >> 16), (uint8_t)(t >> 24)};
+        sha256_update(&c, le, 4);
+    }
+    inference_model::Hash h;
+    sha256_final(&c, h.b);
+    return h;
+}
+
+static std::string store_name(const inference_model::Hash& h, const char* ext) {
+    static const char* hx = "0123456789abcdef";
+    std::string s;
+    for (uint8_t b : h.b) s += hx[b >> 4], s += hx[b & 15];
+    return s + "." + ext;
+}
+
+static bool store_has(const inference_model_t* m, const std::string& name) {
+    struct stat st;
+    return fstatat(m->store_dirfd, name.c_str(), &st, 0) == 0;
+}
+
+// Mark a store file as used now (the Perl side's LRU eviction looks at mtime)
+static void store_touch(const inference_model_t* m, const std::string& name) {
+    (void)utimensat(m->store_dirfd, name.c_str(), nullptr, 0);
+}
+
+static size_t state_bytes(const inference_model_t* m) {
+    size_t b = 0;
+    (void)qwen_model_state_memory(m->qwen, &b);
+    return b;
+}
+
+// Hashes of the sequence's full blocks
+static void chain_extend(inference_model_t* m) {
+    const size_t B = (size_t)kv_B(m);
+    while ((m->chain.size() + 1) * B <= m->seq.size()) {
+        const size_t i = m->chain.size();
+        m->chain.push_back(block_hash(i ? m->chain[i - 1] : m->store_root, m->seq.data() + i * B, (int)B));
+    }
+}
+
+// Rewind the sequence to len tokens; its block hashes and published count follow
+static void seq_truncate(inference_model_t* m, int len) {
+    m->n_past = len;
+    m->seq.resize((size_t)len);
+    const size_t full = (size_t)len / (size_t)kv_B(m);
+    if (m->chain.size() > full) m->chain.resize(full);
+    if (m->published > full) m->published = full;
+}
+
+// Store blocks are shared and never written: before positions [p, p + n) are written, their slots become private
+// (keeping the rows before p in p's own slot)
+static int ensure_writable(inference_model_t* m, int p, int n) {
+    if (!m->kvc || n <= 0) return 0;
+    const int B = kv_B(m);
+    for (int s = p / B; s <= (p + n - 1) / B && s < kv_cache_n_slots(m->kvc); ++s)
+        if (kv_cache_slot_shared(m->kvc, s) && kv_cache_slot_make_private(m->kvc, s, s == p / B && p % B != 0) != 0) {
+            set_error("cannot make KV block %d private", s);
+            return -1;
+        }
+    return 0;
+}
+
+// The recurrent state as <hash>.rst: written to an anonymous file, linked under its name once complete
+static int store_save_state(inference_model_t* m, const inference_model::Hash& h) {
+    size_t bytes = 0;
+    void* mem = qwen_model_state_memory(m->qwen, &bytes);
+    if (!mem || bytes == 0) return 0;  // no recurrent layers
+    const std::string name = store_name(h, "rst");
+    if (store_has(m, name)) {
+        store_touch(m, name);
+        return 0;
+    }
+    if (qwen_model_sync(m->qwen) != 0) { set_error("sync failed: %s", qwen_model_last_error()); return -1; }
+    const int fd = openat(m->store_dirfd, ".", O_TMPFILE | O_RDWR | O_CLOEXEC, 0644);
+    if (fd < 0) { set_error("store: cannot create a state file: %s", strerror(errno)); return -1; }
+    for (size_t done = 0; done < bytes;) {
+        const ssize_t w = write(fd, (const char*)mem + done, bytes - done);
+        if (w <= 0) {
+            close(fd);
+            set_error("store: writing a state snapshot failed: %s", strerror(errno));
+            return -1;
+        }
+        done += (size_t)w;
+    }
+    char proc[64];
+    snprintf(proc, sizeof(proc), "/proc/self/fd/%d", fd);
+    const int rc = linkat(AT_FDCWD, proc, m->store_dirfd, name.c_str(), AT_SYMLINK_FOLLOW);
+    const int err = errno;
+    close(fd);
+    if (rc != 0 && err != EEXIST) { set_error("store: linking %s failed: %s", name.c_str(), strerror(err)); return -1; }
+    if (rc == 0) ++m->st_snap_saved;
+    return 0;
+}
+
+static bool snapshot_boundary(const inference_model_t* m, int k) {
+    return k > 0 && (k == m->store_snapshot_at || (m->store_snapshot_every > 0 && k % m->store_snapshot_every == 0));
+}
+
+// After a forward pass: publish the blocks it completed, and snapshot the state at a chosen block boundary
+static int store_after_forward(inference_model_t* m) {
+    if (m->store_dirfd < 0) return 0;
+    chain_extend(m);
+    if (m->published < m->chain.size() && qwen_model_sync(m->qwen) != 0) {
+        set_error("sync failed: %s", qwen_model_last_error());
+        return -1;
+    }
+    for (; m->published < m->chain.size(); ++m->published) {
+        const int i = (int)m->published;
+        if (kv_cache_slot_shared(m->kvc, i)) continue;  // already a store block
+        const std::string path = m->store_dir + "/" + store_name(m->chain[i], "kvb");
+        const int rc = kv_cache_slot_publish(m->kvc, i, path.c_str());
+        if (rc < 0) { set_error("store: publishing KV block %d failed", i); return -1; }
+        if (rc == 0) ++m->st_published;  // 1: another session published the same block already
+    }
+    const int B = kv_B(m), k = m->n_past / B;
+    if (m->n_past % B == 0 && snapshot_boundary(m, k) && state_bytes(m) > 0) return store_save_state(m, m->chain[k - 1]);
+    return 0;
+}
+
 // One forward pass for token at position n_past (the next position of the current sequence)
 static int forward_next(inference_model_t* m, int token_id) {
     if (!m || !m->kvc || !m->qwen) { set_error("Invalid state (call inference_kv_cache_init first)"); return -1; }
     if (m->n_past >= m->n_ctx) { set_error("context full (%d tokens)", m->n_ctx); return INFERENCE_ERR_CONTEXT_FULL; }
+    if (ensure_writable(m, m->n_past, 1) != 0) return -1;
     if (qwen_model_forward(m->qwen, token_id, m->n_past, nullptr) != 0) { set_error("forward pass failed: %s", qwen_model_last_error()); return -1; }
     ++m->n_past;
     m->seq.push_back(token_id);
-    return 0;
+    return store_after_forward(m);
 }
 
 int inference_prefill(inference_model_t* m, const int32_t* tokens, int n) {
     clear_error();
     if (!m || !m->kvc || !m->qwen || !tokens || n <= 0) { set_error("Invalid state or arguments"); return -1; }
     if (m->n_past + n > m->n_ctx) { set_error("context full (%d + %d > %d tokens)", m->n_past, n, m->n_ctx); return INFERENCE_ERR_CONTEXT_FULL; }
-    if (qwen_model_prefill(m->qwen, (const int*)tokens, n, m->n_past, nullptr) != 0) { set_error("prefill failed: %s", qwen_model_last_error()); return -1; }
-    m->n_past += n;
-    m->seq.insert(m->seq.end(), tokens, tokens + n);
+    // With a block store, the prefill is cut at the block boundaries that get a state snapshot
+    const bool snap = m->store_dirfd >= 0 && state_bytes(m) > 0;
+    const int B = kv_B(m);
+    for (int done = 0; done < n;) {
+        int len = n - done;
+        if (snap)
+            for (int b = (m->n_past / B + 1) * B; b < m->n_past + len; b += B)
+                if (snapshot_boundary(m, b / B)) {
+                    len = b - m->n_past;
+                    break;
+                }
+        if (ensure_writable(m, m->n_past, len) != 0) return -1;
+        if (qwen_model_prefill(m->qwen, (const int*)tokens + done, len, m->n_past, nullptr) != 0) {
+            set_error("prefill failed: %s", qwen_model_last_error());
+            return -1;
+        }
+        m->n_past += len;
+        m->seq.insert(m->seq.end(), tokens + done, tokens + done + len);
+        done += len;
+        if (store_after_forward(m) != 0) return -1;
+    }
     return 0;
 }
 
@@ -681,34 +837,104 @@ static int prefill_with_checkpoint(inference_model_t* m, const int32_t* tokens, 
 // the current sequence is a prefix of the prompt; otherwise rewind to the latest point at or before the
 // divergence (any position for attention-only models; a checkpoint for recurrent ones; else a new sequence).
 // At least the prompt's last token is always decoded, so the logits are its.
+// Deepest store resume point for prompt p: the most blocks 0 .. j - 1 whose .kvb files are all present, ending at a
+// block with a state snapshot (recurrent models). Leaves at least the last prompt token to decode. Returns j * B and
+// the blocks' hashes.
+static int store_lookup(inference_model_t* m, const int32_t* p, int n, std::vector<inference_model::Hash>* hs) {
+    hs->clear();
+    if (m->store_dirfd < 0) return 0;
+    const int B = kv_B(m), K = (n - 1) / B;
+    const bool recurrent = state_bytes(m) > 0;
+    int best = 0;
+    for (int j = 1; j <= K; ++j) {
+        const inference_model::Hash h = block_hash(j > 1 ? (*hs)[j - 2] : m->store_root, p + (size_t)(j - 1) * B, B);
+        if (!store_has(m, store_name(h, "kvb"))) break;
+        hs->push_back(h);
+        if (!recurrent || store_has(m, store_name(h, "rst"))) best = j;
+    }
+    hs->resize((size_t)best);
+    return best * B;
+}
+
+// Make the sequence the store's first j = start / B blocks of prompt p: map the block files (blocks the sequence
+// already holds stay as they are) and load the state snapshot
+static int store_attach(inference_model_t* m, const int32_t* p, int start, const std::vector<inference_model::Hash>& hs) {
+    const int j = start / kv_B(m);
+    if (qwen_model_sync(m->qwen) != 0) { set_error("sync failed: %s", qwen_model_last_error()); return -1; }
+    for (int i = 0; i < j; ++i) {
+        const std::string name = store_name(hs[i], "kvb");
+        store_touch(m, name);
+        if (i < (int)m->chain.size() && m->chain[i] == hs[i]) continue;  // the same block is already there
+        const int fd = openat(m->store_dirfd, name.c_str(), O_RDONLY | O_CLOEXEC);
+        const int rc = fd >= 0 ? kv_cache_slot_attach(m->kvc, i, fd) : -1;
+        if (fd >= 0) close(fd);
+        if (rc != 0) { set_error("store: cannot map KV block %s", name.c_str()); return -1; }
+        ++m->st_attached;
+    }
+    size_t bytes = 0;
+    void* mem = qwen_model_state_memory(m->qwen, &bytes);
+    if (bytes > 0) {
+        const std::string name = store_name(hs[j - 1], "rst");
+        const int fd = openat(m->store_dirfd, name.c_str(), O_RDONLY | O_CLOEXEC);
+        size_t done = 0;
+        while (fd >= 0 && done < bytes) {
+            const ssize_t r = pread(fd, (char*)mem + done, bytes - done, (off_t)done);
+            if (r <= 0) break;
+            done += (size_t)r;
+        }
+        if (fd >= 0) close(fd);
+        if (done != bytes) {
+            seq_reset(m);  // the state is now partly overwritten: nothing of the old sequence is valid
+            set_error("store: cannot read state snapshot %s", name.c_str());
+            return -1;
+        }
+        store_touch(m, name);
+        ++m->st_snap_restored;
+    }
+    m->n_past = start;
+    m->seq.assign(p, p + start);
+    m->chain = hs;
+    m->published = (size_t)j;
+    m->ckpts.clear();  // in-memory checkpoints belong to the old sequence
+    m->st_tokens += start;
+    return 0;
+}
+
+// Make the sequence equal to prompt[0, n), reusing as much as possible: the current sequence when the prompt
+// extends it; else the latest point at or before the divergence (any position for attention-only models, an
+// in-memory checkpoint for recurrent ones); or the block store, when it reaches further; else a new sequence.
+// At least the prompt's last token is always decoded, so the logits are its.
 static int sync_prompt(inference_model_t* m, const int32_t* p, int n, int tail) {
     size_t L = 0;
     while (L < m->seq.size() && L < (size_t)n && m->seq[L] == p[L]) ++L;
-    int start;
-    if (L == m->seq.size() && (L < (size_t)n || m->n_past > 0)) {
+    int start = 0, ck = -1;
+    const bool extend = L == m->seq.size() && (L < (size_t)n || m->n_past > 0);
+    if (extend) {
         start = (int)L;  // the prompt extends the sequence (or equals it: its logits are current)
     } else {
         const int target = std::min((int)L, n - 1);
-        start = 0;
         if (!qwen_model_is_recurrent(m->qwen)) {
             start = target;
         } else {
-            int best = -1;
             for (size_t i = 0; i < m->ckpts.size(); ++i)
-                if (m->ckpts[i].pos <= target && (best < 0 || m->ckpts[i].pos > m->ckpts[best].pos)) best = (int)i;
-            if (best >= 0) {
-                if (qwen_model_state_restore(m->qwen, m->ckpts[best].slot) != 0) {
-                    set_error("recurrent state restore failed");
-                    return -1;
-                }
-                start = m->ckpts[best].pos;
-            }
+                if (m->ckpts[i].pos <= target && (ck < 0 || m->ckpts[i].pos > m->ckpts[ck].pos)) ck = (int)i;
+            start = ck >= 0 ? m->ckpts[ck].pos : 0;
+        }
+    }
+    std::vector<inference_model::Hash> hs;
+    const int from_store = store_lookup(m, p, n, &hs);
+    if (from_store > start) {
+        if (store_attach(m, p, from_store, hs) != 0) return -1;
+        start = from_store;
+    } else if (!extend) {
+        if (ck >= 0 && qwen_model_state_restore(m->qwen, m->ckpts[ck].slot) != 0) {
+            set_error("recurrent state restore failed");
+            return -1;
         }
         if (start == 0) {
             seq_reset(m);
         } else {
-            m->n_past = start;
-            m->seq.resize((size_t)start);
+            seq_truncate(m, start);
             std::vector<inference_model::Checkpoint> keep;  // later checkpoints belong to the discarded tokens
             for (const auto& c : m->ckpts)
                 if (c.pos <= start) keep.push_back(c);
@@ -718,6 +944,94 @@ static int sync_prompt(inference_model_t* m, const int32_t* p, int n, int tail) 
     m->last_reused = start;
     m->last_prefilled = n - start;
     return prefill_with_checkpoint(m, p + start, n - start, tail);
+}
+
+// ---- Block store API
+
+int inference_store_open(inference_model_t* m, const char* dir, int snapshot_every) {
+    clear_error();
+    if (!m || !m->kvc || !m->qwen || !dir || !dir[0] || snapshot_every < 0) {
+        set_error("Invalid state or arguments (call inference_kv_cache_init first)");
+        return INFERENCE_ERR_INVALID_ARG;
+    }
+    inference_store_close(m);
+    const int dfd = open(dir, O_DIRECTORY | O_RDONLY | O_CLOEXEC);
+    if (dfd < 0) { set_error("store: cannot open directory %s: %s", dir, strerror(errno)); return INFERENCE_ERR_INVALID_ARG; }
+    const int probe = openat(dfd, ".", O_TMPFILE | O_RDWR | O_CLOEXEC, 0644);
+    if (probe < 0) {
+        set_error("store: %s does not support anonymous files (O_TMPFILE): %s", dir, strerror(errno));
+        close(dfd);
+        return INFERENCE_ERR_INVALID_ARG;
+    }
+    close(probe);
+    // Blocks are published by linking a slot's own file, so the slots must live on the store's filesystem
+    if (kv_cache_set_dir(m->kvc, dir) != 0) {
+        set_error("store: cannot move the KV slots to %s", dir);
+        close(dfd);
+        return INFERENCE_ERR_KV_CACHE;
+    }
+    // Root of every chain: the model (file size and its first 4 MB: header, metadata, the first tensors) and
+    // the layout of the blocks and snapshots
+    sha256_ctx c;
+    sha256_init(&c);
+    const char tag[] = "rocm-inference kv-store v1";
+    sha256_update(&c, tag, sizeof(tag));
+    size_t gsize = 0;
+    const void* gbase = gguf_map_base(m->gguf, &gsize);
+    const uint64_t layout[] = {(uint64_t)gsize, (uint64_t)kv_cache_block_tokens(m->kvc), (uint64_t)m->n_kv_layers,
+                               (uint64_t)kv_cache_d_kv(m->kvc), (uint64_t)kv_cache_block_bytes(m->kvc),
+                               (uint64_t)state_bytes(m)};
+    sha256_update(&c, layout, sizeof(layout));
+    if (gbase) sha256_update(&c, gbase, std::min(gsize, (size_t)4 << 20));
+    sha256_final(&c, m->store_root.b);
+    m->store_dir = dir;
+    m->store_dirfd = dfd;
+    m->store_snapshot_every = snapshot_every;
+    m->chain.clear();
+    m->published = 0;  // the current sequence's full blocks are published by the next forward pass
+    m->st_published = m->st_attached = m->st_snap_saved = m->st_snap_restored = m->st_tokens = 0;
+    return 0;
+}
+
+int inference_store_block_names(const inference_model_t* m, const int32_t* tokens, int n, char* out, int max_len) {
+    if (!m || m->store_dirfd < 0 || n < 0 || (n > 0 && !tokens) || max_len < 0 || (max_len > 0 && !out)) {
+        return INFERENCE_ERR_INVALID_ARG;
+    }
+    const int B = kv_B(m);
+    std::string names;
+    inference_model::Hash h = m->store_root;
+    for (int j = 0; (j + 1) * B <= n; ++j) {
+        h = block_hash(h, tokens + (size_t)j * B, B);
+        names += store_name(h, "kvb") + "\n";
+    }
+    if (max_len > 0) {
+        const size_t len = std::min(names.size(), (size_t)max_len - 1);
+        memcpy(out, names.data(), len);
+        out[len] = '\0';
+    }
+    return (int)names.size();
+}
+
+void inference_store_close(inference_model_t* m) {
+    if (!m || m->store_dirfd < 0) return;
+    close(m->store_dirfd);
+    m->store_dirfd = -1;
+    m->store_dir.clear();
+    m->chain.clear();
+    m->published = 0;
+}
+
+int inference_store_get_stats(const inference_model_t* m, inference_store_stats* st) {
+    if (!m || !st) return INFERENCE_ERR_INVALID_ARG;
+    st->blocks_published = m->st_published;
+    st->blocks_attached = m->st_attached;
+    st->snapshots_saved = m->st_snap_saved;
+    st->snapshots_restored = m->st_snap_restored;
+    st->tokens_from_store = m->st_tokens;
+    st->block_tokens = m->kvc ? kv_cache_block_tokens(m->kvc) : 0;
+    st->block_bytes = m->kvc ? (long long)kv_cache_block_bytes(m->kvc) : 0;
+    st->snapshot_bytes = m->qwen ? (long long)state_bytes(m) : 0;
+    return 0;
 }
 
 const char* inference_chat_template(inference_model_t* m, const char* name) {
@@ -755,6 +1069,13 @@ int inference_generate_stream(inference_model_t* m, const int32_t* prompt_ids, i
         return INFERENCE_ERR_INVALID_ARG;
     }
     const inference_gen_options o = options ? *options : inference_gen_default_options();
+    // Block store: also snapshot at the last block boundary of this prompt (a later request with the same prefix
+    // resumes there)
+    m->store_snapshot_at = ((o.reuse_prefix ? 0 : m->n_past) + n_prompt) / kv_B(m);
+    struct ResetSnapshotAt {
+        inference_model_t* m;
+        ~ResetSnapshotAt() { m->store_snapshot_at = -1; }
+    } reset_snapshot_at{m};
     if (o.reuse_prefix && n_prompt > 0) {
         const int rc = sync_prompt(m, prompt_ids, n_prompt, o.checkpoint_tail);
         if (rc != 0) return rc;

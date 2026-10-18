@@ -745,6 +745,13 @@ int qwen_model_is_recurrent(const qwen_model_t* model) {
     return model && model->rs.mem.base ? 1 : 0;
 }
 
+void* qwen_model_state_memory(qwen_model_t* model, size_t* bytes) {
+    if (bytes) *bytes = model && model->rs.mem.base ? model->rs.mem.total : 0;
+    return model ? model->rs.mem.base : nullptr;
+}
+
+int qwen_model_sync(qwen_model_t* model) { return model && model->sync() ? 0 : -1; }
+
 int qwen_model_state_save(qwen_model_t* model, int slot) {
     return model && model->check(model->rs.save(slot), "recurrent state checkpoint") ? 0 : -1;
 }
