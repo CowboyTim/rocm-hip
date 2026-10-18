@@ -213,6 +213,36 @@ struct RecurrentState {
     hipError_t reset() {
         return mem.base ? hipMemsetAsync(mem.base, 0, mem.total, 0) : hipSuccess;
     }
+
+    // Snapshots of the whole state (prefix reuse: the recurrent state cannot be rewound, so a sequence can only
+    // restart from a position where it was saved). GPU-side copies, queued in order with the forward passes.
+    std::vector<ShmRegion> ckpt;
+
+    hipError_t save(int slot) {
+        if (!mem.base) return hipSuccess;
+        if (slot < 0) return hipErrorInvalidValue;
+        if ((int)ckpt.size() <= slot) ckpt.resize((size_t)slot + 1);
+        if (!ckpt[slot].base) {
+            const size_t floats = mem.total / sizeof(float);
+            float* p = nullptr;
+            float** const pp[] = {&p};
+            if (!ckpt[slot].alloc("/dev/shm/qwen_recurrent_ckpt.bin", &floats, pp, 1, hipExtHostRegisterCoarseGrained))
+                return hipErrorOutOfMemory;
+        }
+        return hipMemcpyAsync(ckpt[slot].base, mem.base, mem.total, hipMemcpyDeviceToDevice, 0);
+    }
+
+    hipError_t restore(int slot) {
+        if (!mem.base) return hipSuccess;
+        if (slot < 0 || slot >= (int)ckpt.size() || !ckpt[slot].base) return hipErrorInvalidValue;
+        return hipMemcpyAsync(mem.base, ckpt[slot].base, mem.total, hipMemcpyDeviceToDevice, 0);
+    }
+
+    void free() {
+        for (ShmRegion& c : ckpt) c.free();
+        ckpt.clear();
+        mem.free();
+    }
 };
 
 // Wall-time breakdown of the forward pass (QWEN_PROFILE=1; see qwen_model_profile_print). A token is one GPU
@@ -267,7 +297,7 @@ struct QwenModel {
 
     ~QwenModel() {
         head_mem.free();
-        rs.mem.free();
+        rs.free();
         s.mem.free();
         gpu_ops_free();
         attention_free();
@@ -705,6 +735,18 @@ void qwen_model_profile_print(qwen_model_t* model, const char* title) {
 
 int qwen_model_set_lm_head_q8(qwen_model_t* model, int enable) {
     return model ? model->set_lm_head_q8(enable != 0) : -1;
+}
+
+int qwen_model_is_recurrent(const qwen_model_t* model) {
+    return model && model->rs.mem.base ? 1 : 0;
+}
+
+int qwen_model_state_save(qwen_model_t* model, int slot) {
+    return model && model->check(model->rs.save(slot), "recurrent state checkpoint") ? 0 : -1;
+}
+
+int qwen_model_state_restore(qwen_model_t* model, int slot) {
+    return model && model->check(model->rs.restore(slot), "recurrent state restore") ? 0 : -1;
 }
 
 void qwen_model_set_layer_callback(qwen_model_t* model, qwen_layer_cb cb, void* user) {

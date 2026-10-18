@@ -129,15 +129,24 @@ typedef struct inference_gen_options {
     const char* const* stop_strings;  // optional; generation stops before the first occurrence (not delivered)
     int n_stop_strings;
     int ignore_eog;                   // 1: do not stop at end-of-generation tokens (default 0)
+    int reuse_prefix;                 // 1: prompt_ids is the whole sequence (e.g. a re-rendered chat), not an
+                                      // addition: the common prefix with the current sequence is reused
+    int checkpoint_tail;              // recurrent models: save the state this many tokens (at most half the
+                                      // prefilled part) before the end of the prompt, where a re-rendered chat
+                                      // usually diverges (default 16; 0: none)
     inference_token_cb on_token;      // optional
     void* user;                       // passed to on_token
 } inference_gen_options;
 
-// Defaults: sampler_default_params(), max_new_tokens 256, no stop strings, stop at EOG, no callback.
+// Defaults: sampler_default_params(), max_new_tokens 256, no stop strings, stop at EOG, no callback, prompt
+// appended (reuse_prefix 0), checkpoint_tail 16.
 inference_gen_options inference_gen_default_options(void);
 
 // Continues the current sequence (inference_reset starts a new one): appends the n_prompt prompt tokens
-// (n_prompt may be 0 to continue from the last token), then generates. Every emitted token is decoded into the
+// (n_prompt may be 0 to continue from the last token), then generates. With options->reuse_prefix the prompt is
+// the whole sequence instead: the longest prefix it shares with the current sequence is kept and only the rest is
+// prefilled (attention-only models rewind anywhere; models with recurrent layers rewind to the latest saved
+// checkpoint inside the shared prefix, else start over). See inference_last_prompt_stats. Every emitted token is decoded into the
 // sequence, so a later call continues exactly after it; the end-of-generation token that stops it is neither
 // emitted nor decoded. out_ids (optional, max_out entries) receives the emitted tokens; *n_out counts them
 // (all of them, even beyond max_out); *reason why it stopped. Returns 0 on success (a full context during
@@ -145,6 +154,21 @@ inference_gen_options inference_gen_default_options(void);
 int inference_generate_stream(inference_model_t* model, const int32_t* prompt_ids, int n_prompt,
                               const inference_gen_options* options, int32_t* out_ids, int max_out, int* n_out,
                               inference_stop_reason* reason);
+
+// How the last inference_generate_stream prompt was handled: tokens reused from the sequence, tokens prefilled.
+int inference_last_prompt_stats(const inference_model_t* model, int* reused, int* prefilled);
+
+// ---- Chat. Templates are rendered outside this library (e.g. with a Jinja engine, as the Perl module does with
+// MiniJinja): render the conversation to text, tokenize it (special tokens in the text, such as <|im_start|>,
+// become their ids), then generate with reuse_prefix so each turn only prefills what changed.
+
+// The GGUF's chat template (tokenizer.chat_template), or a named one (tokenizer.chat_template.<name>) when name
+// is not NULL; NULL if absent. Valid while the model lives.
+const char* inference_chat_template(inference_model_t* model, const char* name);
+// BOS / EOS token ids (-1 if none); their text (the bos_token / eos_token template variables) is
+// inference_detokenize of the id.
+int inference_bos_id(const inference_model_t* model);
+int inference_eos_id(const inference_model_t* model);
 
 // 1 if the token ends generation (llama.cpp's rule: the GGUF's EOS / EOT / EOM ids and end-of-turn markers).
 int inference_token_is_eog(const inference_model_t* model, int32_t token);

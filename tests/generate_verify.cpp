@@ -323,6 +323,66 @@ int main(int argc, char** argv) {
               what);
     }
 
+    // Chat: the template comes from the GGUF (rendering is done outside the library); each turn's prompt is the
+    // whole re-rendered conversation, generated with reuse_prefix, so only the changed tail is prefilled
+    {
+        const char* tmpl = inference_chat_template(m, nullptr);
+        check(tmpl && strstr(tmpl, "<|im_start|>") && inference_chat_template(m, "no-such-name") == nullptr,
+              "inference_chat_template: the GGUF's template (and NULL for a missing named one)");
+        auto toks = [&](const std::string& text) {
+            int nt = 0;
+            int32_t* t = inference_tokenize(m, text.c_str(), &nt);
+            std::vector<int32_t> v(t, t + nt);
+            inference_free_tokens(t, nt);
+            return v;
+        };
+        auto chat_stream = [&](const std::vector<int32_t>& prompt_ids, bool reset, int* reused, int* prefilled) {
+            Stream st;
+            inference_gen_options o = inference_gen_default_options();
+            o.sampler = greedy;
+            o.max_new_tokens = 24;
+            o.reuse_prefix = 1;
+            o.on_token = on_token;
+            o.user = &st;
+            st.ids.resize(24);
+            if (reset) inference_reset(m);
+            st.rc = inference_generate_stream(m, prompt_ids.data(), (int)prompt_ids.size(), &o, st.ids.data(), 24,
+                                              &st.n, &st.reason);
+            st.ids.resize((size_t)std::min(st.n, 24));
+            inference_last_prompt_stats(m, reused, prefilled);
+            return st;
+        };
+        // Qwen's template with enable_thinking = false: earlier assistant turns are rendered without the think
+        // block, so turn 2 diverges from turn 1's sequence right after "<|im_start|>assistant\n"
+        const std::string sys = "<|im_start|>system\nYou are a helpful assistant. Answer briefly.<|im_end|>\n";
+        const std::string u1 = "<|im_start|>user\nName three primary colors.<|im_end|>\n";
+        const std::string gen_prompt = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        int r1 = 0, p1 = 0, r2 = 0, p2 = 0, r3 = 0, p3 = 0, r4 = 0, p4 = 0;
+        const std::vector<int32_t> t1 = toks(sys + u1 + gen_prompt);
+        const Stream a1 = chat_stream(t1, true, &r1, &p1);
+        const std::string turn2 = sys + u1 + "<|im_start|>assistant\n" + a1.text + "<|im_end|>\n" +
+                                  "<|im_start|>user\nAnd three secondary colors?<|im_end|>\n" + gen_prompt;
+        const std::vector<int32_t> t2 = toks(turn2);
+        const Stream a2 = chat_stream(t2, false, &r2, &p2);      // reuses turn 1's checkpoint
+        const Stream a3 = chat_stream(t2, false, &r3, &p3);      // the same turn again: regenerate
+        const Stream fresh = chat_stream(t2, true, &r4, &p4);    // from scratch
+        char what[300];
+        snprintf(what, sizeof(what), "chat turn 1: %d prompt tokens prefilled, reply \"%s\"", p1, a1.text.c_str());
+        check(a1.rc == 0 && r1 == 0 && p1 == (int)t1.size() && !a1.text.empty(), what);
+        const bool exact = getenv("QMATVEC_NO_WMMA") != nullptr;
+        const bool same2 = exact ? a2.ids == fresh.ids : !a2.ids.empty() && !fresh.ids.empty() && a2.ids[0] == fresh.ids[0];
+        snprintf(what, sizeof(what), "chat turn 2: reused %d of %d prompt tokens, prefilled %d; reply %s a fresh "
+                 "prefill's%s (\"%s\")", r2, (int)t2.size(), p2, same2 ? "matches" : "DIFFERS from",
+                 exact ? " exactly" : " (first token; WMMA chunking)", a2.text.c_str());
+        // turn 1 saved its checkpoint min(16, n / 2) tokens before the end of its prompt
+        const int ck1 = (int)t1.size() - std::min(16, (int)t1.size() / 2);
+        check(a2.rc == 0 && r2 == ck1 && r2 + p2 == (int)t2.size() && same2 && r4 == 0, what);
+        snprintf(what, sizeof(what), "chat: regenerating turn 2 reuses %d tokens (its own checkpoint), same reply: %s",
+                 r3, a3.ids == a2.ids || !exact ? "yes" : "NO");
+        // turn 2 prefilled from r2, so its checkpoint is min(16, p2 / 2) tokens before the end
+        check(a3.rc == 0 && r3 == (int)t2.size() - std::min(16, p2 / 2) && (!exact || a3.ids == a2.ids), what);
+    }
+
     sampler_params p = sampler_default_params();  // temperature 0.8, top_k 40, top_p 0.95, min_p 0.05
     p.seed = 1234;
     const std::vector<int> s1 = gen(m, prompt, N, p), s2 = gen(m, prompt, N, p);

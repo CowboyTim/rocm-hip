@@ -41,6 +41,8 @@ static void set_error(const char* fmt, ...) {
 
 static void clear_error() { g_last_error[0] = 0; }
 
+static void seq_reset(inference_model_t* m);
+
 // All internal types (QuantWeight, LayerWeights, inference_model) are
 // defined in inference_internal.h which is included above.
 
@@ -401,7 +403,7 @@ int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
     m->kvc = kv_cache_create("/dev/shm/inference_kvc.bin", &cfg);
     if (!m->kvc) { set_error("kv_cache_create failed"); return -1; }
     m->n_ctx = n_ctx;
-    m->n_past = 0;
+    seq_reset(m);
     // Create Qwen model for forward passes
     fprintf(stderr, "[KV_INIT] About to create qwen model\n"); fflush(stderr);
     m->qwen = qwen_model_create(m);
@@ -440,8 +442,15 @@ void inference_set_seed(inference_model_t* m, unsigned int seed) {
     if (m) m->seed = seed;
 }
 
+// A new, empty sequence: position 0, no history, no checkpoints (their states belong to the old sequence)
+static void seq_reset(inference_model_t* m) {
+    m->n_past = 0;
+    m->seq.clear();
+    m->ckpts.clear();
+}
+
 void inference_reset(inference_model_t* m) {
-    if (m) m->n_past = 0;
+    if (m) seq_reset(m);
 }
 
 int inference_n_past(const inference_model_t* m) {
@@ -454,6 +463,7 @@ static int forward_next(inference_model_t* m, int token_id) {
     if (m->n_past >= m->n_ctx) { set_error("context full (%d tokens)", m->n_ctx); return INFERENCE_ERR_CONTEXT_FULL; }
     if (qwen_model_forward(m->qwen, token_id, m->n_past, nullptr) != 0) { set_error("qwen_model_forward failed"); return -1; }
     ++m->n_past;
+    m->seq.push_back(token_id);
     return 0;
 }
 
@@ -463,6 +473,7 @@ int inference_prefill(inference_model_t* m, const int32_t* tokens, int n) {
     if (m->n_past + n > m->n_ctx) { set_error("context full (%d + %d > %d tokens)", m->n_past, n, m->n_ctx); return INFERENCE_ERR_CONTEXT_FULL; }
     if (qwen_model_prefill(m->qwen, (const int*)tokens, n, m->n_past, nullptr) != 0) { set_error("qwen_model_prefill failed"); return -1; }
     m->n_past += n;
+    m->seq.insert(m->seq.end(), tokens, tokens + n);
     return 0;
 }
 
@@ -573,7 +584,7 @@ int inference_generate_ex(inference_model_t* model, const int32_t* prompt_ids, i
     const int eos = model->tokenizer ? tokenizer_eos_id(model->tokenizer) : -1;
 
     // New sequence: prefill the prompt in batches, then sample from the logits in place (no copy)
-    model->n_past = 0;
+    seq_reset(model);
     int rc = inference_prefill(model, prompt_ids, prompt_len);
     for (int i = 0; i < prompt_len; ++i) sampler_accept(smp, prompt_ids[i]);
     for (int step = 0; step < max_new_tokens && rc == 0; ++step) {
@@ -594,6 +605,7 @@ inference_gen_options inference_gen_default_options(void) {
     memset(&o, 0, sizeof(o));
     o.sampler = sampler_default_params();
     o.max_new_tokens = 256;
+    o.checkpoint_tail = 16;
     return o;
 }
 
@@ -631,6 +643,105 @@ static size_t stop_prefix_tail(const std::string& s, const std::vector<std::stri
     return best;
 }
 
+// Save the recurrent state as the checkpoint at the current position (kInferenceCheckpoints slots, the oldest
+// one is replaced)
+static const int kInferenceCheckpoints = 4;
+
+static int save_checkpoint(inference_model_t* m) {
+    int slot = (int)m->ckpts.size();
+    if (slot >= kInferenceCheckpoints) {
+        size_t oldest = 0;
+        for (size_t i = 1; i < m->ckpts.size(); ++i)
+            if (m->ckpts[i].age < m->ckpts[oldest].age) oldest = i;
+        slot = m->ckpts[oldest].slot;
+        m->ckpts.erase(m->ckpts.begin() + (long)oldest);
+    }
+    if (qwen_model_state_save(m->qwen, slot) != 0) { set_error("recurrent state checkpoint failed"); return -1; }
+    m->ckpts.push_back({m->n_past, slot, ++m->ckpt_clock});
+    return 0;
+}
+
+// Prefill tokens [0, n) of the prompt on top of the current sequence; with a recurrent model and tail > 0, the
+// state is saved min(tail, n / 2) tokens before the end (where the next turn's prompt is likely to diverge: a chat template
+// re-renders the generation prompt and the reply differently)
+static int prefill_with_checkpoint(inference_model_t* m, const int32_t* tokens, int n, int tail) {
+    if (n <= 0) return 0;
+    tail = std::min(tail, n / 2);  // a short prompt still gets a checkpoint, half way
+    if (tail > 0 && qwen_model_is_recurrent(m->qwen)) {
+        int rc = inference_prefill(m, tokens, n - tail);
+        if (rc == 0) rc = save_checkpoint(m);
+        if (rc == 0) rc = inference_prefill(m, tokens + n - tail, tail);
+        return rc;
+    }
+    return inference_prefill(m, tokens, n);
+}
+
+// Make the sequence equal to prompt[0, n), reusing the longest common prefix with the current one: append when
+// the current sequence is a prefix of the prompt; otherwise rewind to the latest point at or before the
+// divergence (any position for attention-only models; a checkpoint for recurrent ones; else a new sequence).
+// At least the prompt's last token is always decoded, so the logits are its.
+static int sync_prompt(inference_model_t* m, const int32_t* p, int n, int tail) {
+    size_t L = 0;
+    while (L < m->seq.size() && L < (size_t)n && m->seq[L] == p[L]) ++L;
+    int start;
+    if (L == m->seq.size() && (L < (size_t)n || m->n_past > 0)) {
+        start = (int)L;  // the prompt extends the sequence (or equals it: its logits are current)
+    } else {
+        const int target = std::min((int)L, n - 1);
+        start = 0;
+        if (!qwen_model_is_recurrent(m->qwen)) {
+            start = target;
+        } else {
+            int best = -1;
+            for (size_t i = 0; i < m->ckpts.size(); ++i)
+                if (m->ckpts[i].pos <= target && (best < 0 || m->ckpts[i].pos > m->ckpts[best].pos)) best = (int)i;
+            if (best >= 0) {
+                if (qwen_model_state_restore(m->qwen, m->ckpts[best].slot) != 0) {
+                    set_error("recurrent state restore failed");
+                    return -1;
+                }
+                start = m->ckpts[best].pos;
+            }
+        }
+        if (start == 0) {
+            seq_reset(m);
+        } else {
+            m->n_past = start;
+            m->seq.resize((size_t)start);
+            std::vector<inference_model::Checkpoint> keep;  // later checkpoints belong to the discarded tokens
+            for (const auto& c : m->ckpts)
+                if (c.pos <= start) keep.push_back(c);
+            m->ckpts.swap(keep);
+        }
+    }
+    m->last_reused = start;
+    m->last_prefilled = n - start;
+    return prefill_with_checkpoint(m, p + start, n - start, tail);
+}
+
+const char* inference_chat_template(inference_model_t* m, const char* name) {
+    if (!m || !m->gguf) return nullptr;
+    const std::string key = name && name[0] ? std::string("tokenizer.chat_template.") + name : "tokenizer.chat_template";
+    auto it = m->chat_templates.find(key);
+    if (it == m->chat_templates.end()) {
+        const int64_t idx = gguf_find_kv(m->gguf, key.c_str());
+        const char* str = idx >= 0 ? gguf_kv_str_val(m->gguf, idx) : nullptr;
+        if (!str || !str[0]) return nullptr;
+        it = m->chat_templates.emplace(key, std::string(str)).first;
+    }
+    return it->second.c_str();
+}
+
+int inference_bos_id(const inference_model_t* m) { return m && m->tokenizer ? tokenizer_bos_id(m->tokenizer) : -1; }
+int inference_eos_id(const inference_model_t* m) { return m && m->tokenizer ? tokenizer_eos_id(m->tokenizer) : -1; }
+
+int inference_last_prompt_stats(const inference_model_t* m, int* reused, int* prefilled) {
+    if (!m) return INFERENCE_ERR_INVALID_ARG;
+    if (reused) *reused = m->last_reused;
+    if (prefilled) *prefilled = m->last_prefilled;
+    return 0;
+}
+
 int inference_generate_stream(inference_model_t* m, const int32_t* prompt_ids, int n_prompt,
                               const inference_gen_options* options, int32_t* out_ids, int max_out, int* n_out,
                               inference_stop_reason* reason) {
@@ -643,8 +754,13 @@ int inference_generate_stream(inference_model_t* m, const int32_t* prompt_ids, i
         return INFERENCE_ERR_INVALID_ARG;
     }
     const inference_gen_options o = options ? *options : inference_gen_default_options();
-    if (n_prompt > 0) {
-        const int rc = inference_prefill(m, prompt_ids, n_prompt);
+    if (o.reuse_prefix && n_prompt > 0) {
+        const int rc = sync_prompt(m, prompt_ids, n_prompt, o.checkpoint_tail);
+        if (rc != 0) return rc;
+    } else if (n_prompt > 0) {
+        m->last_reused = m->n_past;
+        m->last_prefilled = n_prompt;
+        const int rc = prefill_with_checkpoint(m, prompt_ids, n_prompt, o.checkpoint_tail);
         if (rc != 0) return rc;
     } else if (m->n_past == 0) {
         set_error("nothing to continue: empty prompt and an empty sequence");

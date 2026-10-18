@@ -49,6 +49,15 @@ const float* qwen_model_logits(qwen_model_t* model);
 typedef void (*qwen_layer_cb)(int layer, int pos, const float* x, int n, void* user);
 void qwen_model_set_layer_callback(qwen_model_t* model, qwen_layer_cb cb, void* user);
 
+// Prefix reuse support. A model with recurrent layers (DeltaNet) cannot rewind its state, so a sequence can only
+// be restarted from a saved position: qwen_model_state_save snapshots the whole recurrent state into slot
+// (allocated on first use, same size as the state), qwen_model_state_restore puts it back. Both are GPU copies
+// queued in order with the forward passes; the KV cache needs nothing (later positions are just overwritten).
+// Return 0 on success, -1 on error. qwen_model_is_recurrent: 1 if there is recurrent state at all.
+int qwen_model_is_recurrent(const qwen_model_t* model);
+int qwen_model_state_save(qwen_model_t* model, int slot);
+int qwen_model_state_restore(qwen_model_t* model, int slot);
+
 // Opt-in int8 (Q8_0) copy of a float LM head (F32 / F16 / BF16; the 35B's 1 GB BF16 one): built on the GPU on
 // first use, about half the bytes per token; logits differ slightly from the float head's. enable = 0
 // returns to the original head. Returns 0, 1 if the head is already quantized (nothing to do), -1 on error.

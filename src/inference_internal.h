@@ -8,6 +8,7 @@
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <cstddef>
 #include <cstdint>
@@ -122,6 +123,12 @@ struct inference_model {
     QwenModel* qwen = nullptr;                      // Qwen model handle (set during kv_init)
 
     int n_past = 0;                                     // tokens decoded in the current sequence (next position)
+    std::vector<int32_t> seq;                           // those tokens (seq.size() == n_past)
+    struct Checkpoint { int pos, slot; uint64_t age; };
+    std::vector<Checkpoint> ckpts;                      // saved recurrent states, by position in seq
+    uint64_t ckpt_clock = 0;
+    int last_reused = 0, last_prefilled = 0;            // inference_last_prompt_stats
+    std::unordered_map<std::string, std::string> chat_templates;  // inference_chat_template, by name
     int lm_head_q8 = 0;                                 // inference_set_lm_head_q8: use an int8 copy of the LM head
     uint64_t seed = 0;                                  // inference_generate sampler seed
 

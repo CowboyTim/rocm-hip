@@ -1873,7 +1873,23 @@ remounted larger; the reference oracle must also run each model on the CPU for `
   end-of-turn texts such as `<|im_end|>`). `generate_verify` tests: equals `generate_ex`, text equals the
   detokenized tokens, valid UTF-8 chunks on a Chinese prompt, a stop string cuts exactly, 10 + 10 tokens
   equal 20, callback stop, a chat turn ends at `<|im_end|>` (both models).
-- **Next:** step 2 (chat template + prefix reuse), then the XS module.
+- **Step 2 — DONE ✅: chat support, rendering outside the library** (user, 2026-10-18: templates are rendered
+  by their Perl XS CPAN module perl-minijinja-xs, git@github.com:aardbeiplantje/perl-minijinja-xs.git; the
+  `ROCm::Inference` XS module stitches the two together; this library only tokenizes and generates).
+  - `inference_chat_template(model, name)` (the GGUF's `tokenizer.chat_template[.<name>]`),
+    `inference_bos_id` / `inference_eos_id` (their text via `inference_detokenize`, for the template's
+    `bos_token` / `eos_token`).
+  - **Prefix reuse:** `reuse_prefix` makes the prompt the whole (re-rendered) sequence; the library keeps the
+    token history and reuses the longest common prefix. The DeltaNet state cannot be rewound, so it is
+    snapshotted (GPU copy, `qwen_model_state_save/restore`, 4 slots) `checkpoint_tail` = 16 tokens (at most
+    half the prefilled part) before the end of each prompt: a chat template re-renders the generation prompt
+    and the reply (Qwen drops the think block), so the next turn diverges just after
+    `<|im_start|>assistant\n`. `inference_last_prompt_stats` reports reused / prefilled tokens.
+  - Tests (`generate_verify`, both models): two chat turns re-rendered as Qwen's template does; turn 2
+    reuses turn 1's checkpoint, its reply equals a fresh prefill's (exactly with WMMA off), regenerating
+    reuses all but the last 16 tokens.
+- **Next:** step 3 (n_ctx at load, `libinference.so` with only the public API), then the XS module
+  `ROCm::Inference` using perl-minijinja-xs for the template.
 
 
 The C API (`inference.h`) works for one sequence but lacks what an application needs. Architecture-neutral,
