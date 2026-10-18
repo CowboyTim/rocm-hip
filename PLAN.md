@@ -1213,9 +1213,30 @@ for the symptoms above.
 > - **Done for the release GGUF:** split GGUF loading; the PLE table and an untied token_embd are not pinned
 >   (~63 GiB registered for the release instead of 98.5); a batched float matmul for rows the int8 kernels
 >   cannot take (the mixers' K = 320 up projections; bit-identical to token by token).
-> - **Next:** the real model needs ~106 GB of storage (/dev/shm has 38 GB free, the disk 44 GB): **user to free
->   space or say where the shards live**; then greedy text vs `llama-completion` and speed (the reference does
->   22.6 tok/s; the HC mixers add ~0.34 GB of weights and ~500 launches per token on top of the MoE).
+> - **Next: run the release model.** Agreed layout (2026-10-18): the user restarts the container with a bigger
+>   /dev/shm (`docker run --shm-size=80g`, compose `shm_size: "80gb"`; podman takes `--shm-size` too); shards 2
+>   and 3 (60.8 GB) go in /dev/shm, shard 1 (44.9 GB: the 35.8 GiB PLE table + ~9 GB of other weights) on disk
+>   (in the same directory as symlinks, since the loader derives the shard paths from the first file's name).
+>   The PLE table is only read by the CPU (16 rows, ~2 KB per token) and is not pinned, so it stays a
+>   demand-paged mmap on disk; ~63 GB is pinned (RAM via /dev/shm or the page cache). KV cache ~24 KB per token
+>   (3 GB at 128k), recurrent state + scratch ~0.6 GB: ~70 GB of RAM in all.
+>   1. check that pinning page-cache pages of a file on a real disk (shard 1) works (only /dev/shm so far);
+>   2. greedy text vs `llama-completion` (CPU reference), then speed (the reference does 22.6 tok/s; the HC
+>      mixers add ~0.34 GB of weights and ~500 launches per token on top of the MoE);
+>   3. if cold PLE pages show up in the token time, prefetch a prompt's PLE rows with parallel reads.
+> - **After a container restart /dev/shm is empty** (tmpfs). Restore it with:
+>   - `/dev/shm/models/Qwen3.5-4B-ROCMFP4.gguf`, `Qwen3.6-35B-A3B-ROCMFP4.gguf`: the user's copies;
+>   - the Qwen3.8 header: `curl -L -r 0-33554431 -o /dev/shm/models/Qwen3.8-Flash-Next-header-00001.bin
+>     https://huggingface.co/kingjones777/Qwen3.8-Flash-Next-ROCmFP4-STRIX_LEAN-GGUF/resolve/main/Qwen3.8-Flash-Next-Q4_0-ROCmFP4-STRIX_LEAN-00001-of-00003.gguf`;
+>   - the tiny model: `python3 -I tools/gen_qwen4exp_tiny.py /dev/shm/models/Qwen3.8-Flash-Next-header-00001.bin
+>     /dev/shm/models/qwen4exp-tiny.gguf` (random bytes: regenerate its reference dump with it);
+>   - reference dumps: `build/ref_dump acts <model> "<prompt>" /dev/shm/ref_<name> 8`; the prompts of
+>     `ref_qwen35_4b` / `ref_qwen36_35b` are in their `tokens.txt` (see Phase 20 Step 1 for the originals), the
+>     tiny one used `"def fibonacci(n):\n    if n < 2:\n        return n\n    return"`.
+>   - `make ref_dump` needs `llama.cpp/build-cpu`, whose cmake (an old session's scratchpad copy) is gone:
+>     the built libraries still link; reconfigure with /usr/bin/cmake only if they must be rebuilt.
+> - **Cleanup (2026-10-18):** /dev/shm holds only the 4B, 35B, Qwen3.8 header, tiny model and the three ref dumps;
+>   hf-qwen3-0.6b, embeddinggemma and the scratch .bin files were removed by the user.
 > - **Other open items:** `perl/ROCm-Inference/t/20-chat.t` with the user's Minijinja module (cargo is installed
 >   now); CPAN packaging; Phase 22b follow-ups (disk-tier timing, block size option, a Perl web service example);
 >   speed: long-context decode attention, the 35B expert matmuls in prefill.
@@ -1845,6 +1866,7 @@ workflow as qwen35: `ref_dump` activations, `forward_verify` per piece and per l
 | **Gemma 3 / 4** (`gemma3`, `gemma4`) | Gemma-3 4B–27B; Gemma-4 (incl. MoE) | attention, RMSNorm, MoE (gemma4) | GeGLU (GELU-tanh), (1 + w) norms, pre+post norms, embedding scale √E, **sliding-window layers** (iSWA KV cache with ring windows), per-layer inputs (gemma4/3n), final logit softcap |
 | **Kimi** (`kimi-linear`; Kimi-K2 is `deepseek2`) | Kimi-Linear 48B-A3B fits; Kimi-K2 (1T) does not | delta rule (KDA = per-channel-gated DeltaNet), MoE | **MLA** attention (latent KV cache, absorbed projections), KDA gates |
 | **DeepSeek** (`deepseek2`, `deepseek32`, `deepseek4`) | V3/R1 671B do not fit in 128 GB at any usable quant; DeepSeek-V2-Lite 16B / Moonlight 16B-A3B (`deepseek2`) do | MoE, MLA (from Kimi) | group-limited sigmoid routing, YaRN RoPE, DSA sparse attention (V3.2), V4: hyper-connections (Sinkhorn) — size to be checked when a GGUF is chosen |
+| **EmbeddingGemma** (`gemma-embedding`) | embeddinggemma-300M (Q8_0) — to support eventually (user, 2026-10-18) | Gemma 3 blocks | an embedding model: bidirectional attention, mean pooling + dense projections, an embeddings API (`inference_embed`) instead of generation |
 
 **Shared building blocks** (each written once, reused): MLA (Kimi, DeepSeek, GLM-DSA); sparse indexer
 attention (QSA, DSA); the delta-rule family (qwen35, qwen4exp, KDA); hyper-connections (qwen4exp,
