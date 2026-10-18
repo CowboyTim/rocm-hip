@@ -355,6 +355,19 @@ struct QwenModel {
         return true;
     }
 
+    // Two matrices on the same input x: one launch when generating (T = 1) on the int8 path and A, B share
+    // the type and K; otherwise two matvecs. Each output row has the same arithmetic either way.
+    bool matvec_pair(const QuantWeight& A, const QuantWeight& B, const float* x, float* ya, float* yb, int T,
+                     ProfCat c) {
+        if (T == 1 && q8_src == x && q8_k == A.K && q8_t == 1 && A.type == B.type && A.K == B.K &&
+            A.row_bytes == B.row_bytes && qmatvec_q8_supported(A.type, A.K)) {
+            prof.bytes[c] += (double)A.row_bytes * (A.N + B.N);
+            return check(qmatvec_launch_q8_pair(A.type, A.data, A.N, ya, B.data, B.N, yb, A.row_bytes, &s.q8, A.K, 0),
+                         "matvec pair");
+        }
+        return matvec(A, x, ya, T, c) && matvec(B, x, yb, T, c);
+    }
+
     bool check(hipError_t e, const char* what) {
         if (e != hipSuccess) qwen_set_error("%s: %s", what, hipGetErrorString(e));
         return e == hipSuccess;
@@ -373,8 +386,7 @@ struct QwenModel {
     // q/k norm, RoPE, the KV cache write, causal attention and the output gate are GPU kernels (attention.hip).
     bool full_attention(const LayerWeights& L, int pos0, int T) {
         const int HQ = eng->n_head, HKV = eng->n_head_kv, DQ = HQ * eng->head_dim;
-        if (!matvec(L.Wq, s.xn, s.qfull, T, P_ATTN) || !matvec(L.Wk, s.xn, s.k, T, P_ATTN) ||
-            !matvec(L.Wv, s.xn, s.v, T, P_ATTN))
+        if (!matvec(L.Wq, s.xn, s.qfull, T, P_ATTN) || !matvec_pair(L.Wk, L.Wv, s.xn, s.k, s.v, T, P_ATTN))
             return false;
         __half* K = kv_cache_k_row(eng->kvc, L.kv_slot, 0);
         __half* V = kv_cache_v_row(eng->kvc, L.kv_slot, 0);
@@ -394,17 +406,8 @@ struct QwenModel {
         const int NG = eng->ssm_n_group, NV = eng->ssm_dt_rank;
         const float eps = (float)eng->eps;
         if (!matvec(L.W_qkv, s.xn, s.qkv, T, P_LIN) || !matvec(L.W_z, s.xn, s.z, T, P_LIN)) return false;
-        // alpha and beta: two N = 32 matvecs on the same input, one launch on the single-token int8 path
-        const QuantWeight &A = L.W_alpha, &B = L.W_beta;
-        if (T == 1 && q8_src == s.xn && q8_k == A.K && q8_t == 1 && A.type == B.type && A.K == B.K &&
-            A.row_bytes == B.row_bytes && qmatvec_q8_supported(A.type, A.K)) {
-            prof.bytes[P_LIN] += (double)A.row_bytes * (A.N + B.N);
-            if (!check(qmatvec_launch_q8_pair(A.type, A.data, A.N, s.alpha, B.data, B.N, s.beta, A.row_bytes, &s.q8,
-                                              A.K, 0), "alpha/beta matvec"))
-                return false;
-        } else if (!matvec(A, s.xn, s.alpha, T, P_LIN) || !matvec(B, s.xn, s.beta, T, P_LIN)) {
-            return false;
-        }
+        // alpha and beta: two N = 32 matvecs on the same input
+        if (!matvec_pair(L.W_alpha, L.W_beta, s.xn, s.alpha, s.beta, T, P_LIN)) return false;
         // conv1d + SiLU + q/k L2 norm + gates, then the delta rule + gated norm; alpha/beta become
         // g / sigmoid(beta) in place
         if (!check(deltanet_pre(s.qkv, rs.conv[l], L.ssm_conv1d, eng->ssm_d_conv, s.conv, NG, NV, s.alpha, s.beta,
@@ -466,7 +469,7 @@ struct QwenModel {
                                              s.g_tile_e, s.g_tile_start, s.g_tile_n, 0), "moe_group")) ||
             !matvec_id(L.We_gate, s.xn, 0, s.moe_g, FE, T, grouped, P_FFN) ||
             !matvec_id(L.We_up, s.xn, 0, s.moe_u, FE, T, grouped, P_FFN) ||
-            !matvec(L.W_gate, s.xn, s.ffg, T, P_FFN) || !matvec(L.W_up, s.xn, s.ffu, T, P_FFN))
+            !matvec_pair(L.W_gate, L.W_up, s.xn, s.ffg, s.ffu, T, P_FFN))
             return false;
 
         const qmatvec_q8* qx = q8_for(FE, T * NU);
@@ -497,7 +500,7 @@ struct QwenModel {
             return false;
         std::swap(s.x, s.x_alt);
         mark(s.xn, E, T, qe);
-        if (!matvec(L.W_gate, s.xn, s.ffg, T, P_FFN) || !matvec(L.W_up, s.xn, s.ffu, T, P_FFN) ||
+        if (!matvec_pair(L.W_gate, L.W_up, s.xn, s.ffg, s.ffu, T, P_FFN) ||
             !check(gpu_swiglu(s.ffg, s.ffu, s.act, FF * T, qf, 0), "swiglu"))
             return false;
         mark(s.act, FF, T, qf);
