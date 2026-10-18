@@ -34,6 +34,62 @@ static std::vector<int> gen(inference_model_t* m, const std::vector<int32_t>& pr
     return std::vector<int>(out.begin(), out.begin() + len);
 }
 
+// Streaming generation from a new sequence; collects the callback's text chunks
+struct Stream {
+    std::vector<int32_t> ids;
+    std::vector<std::string> chunks;
+    std::string text;
+    int n = 0, rc = 0, stop_after = -1;  // stop_after: on_token returns 1 at that token count
+    inference_stop_reason reason = INFERENCE_STOP_NONE;
+};
+
+static int on_token(void* user, int32_t token, const char* text, int len) {
+    Stream* st = (Stream*)user;
+    st->chunks.emplace_back(text, (size_t)len);
+    st->text.append(text, (size_t)len);
+    const int tokens = (int)st->chunks.size() - (token < 0 ? 1 : 0);
+    return st->stop_after >= 0 && tokens >= st->stop_after;
+}
+
+static Stream stream(inference_model_t* m, const std::vector<int32_t>& prompt, int max_new, const sampler_params& sp,
+                     const std::vector<const char*>& stops = {}, int stop_after = -1, bool reset = true) {
+    Stream st;
+    st.stop_after = stop_after;
+    inference_gen_options o = inference_gen_default_options();
+    o.sampler = sp;
+    o.max_new_tokens = max_new;
+    o.stop_strings = stops.empty() ? nullptr : stops.data();
+    o.n_stop_strings = (int)stops.size();
+    o.on_token = on_token;
+    o.user = &st;
+    st.ids.resize((size_t)max_new);
+    if (reset) inference_reset(m);
+    st.rc = inference_generate_stream(m, prompt.data(), (int)prompt.size(), &o, st.ids.data(), max_new, &st.n,
+                                      &st.reason);
+    st.ids.resize((size_t)std::min(st.n, max_new));
+    return st;
+}
+
+static bool valid_utf8(const std::string& s) {
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = (unsigned char)s[i];
+        const size_t n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
+        if (n == 0 || i + n > s.size()) return false;
+        for (size_t k = 1; k < n; ++k)
+            if (((unsigned char)s[i + k] & 0xC0) != 0x80) return false;
+        i += n;
+    }
+    return true;
+}
+
+static std::string detok(inference_model_t* m, const std::vector<int32_t>& ids) {
+    const int len = inference_detokenize(m, ids.data(), (int)ids.size(), nullptr, 0);
+    std::string s((size_t)std::max(len, 0) + 1, '\0');
+    inference_detokenize(m, ids.data(), (int)ids.size(), &s[0], (int)s.size());
+    s.resize((size_t)std::max(len, 0));
+    return s;
+}
+
 static void print(const char* tag, const std::vector<int>& v) {
     printf("      %s:", tag);
     for (int t : v) printf(" %d", t);
@@ -193,6 +249,78 @@ int main(int argc, char** argv) {
                      "again: %s", cs, tq, tf, back ? "float logits restored exactly" : "logits DIFFER");
             check(rc == 0 && on == 0 && off == 0 && cs >= 0.9999 && tq == tf && back, what);
         }
+    }
+
+    // Streaming generation (inference_generate_stream)
+    {
+        const int SN = 48;
+        const Stream a = stream(m, prompt, SN, greedy);
+        const std::vector<int> ref = gen(m, prompt, SN, greedy);
+        const bool eog = a.reason == INFERENCE_STOP_EOG;
+        char what[256];
+        snprintf(what, sizeof(what), "stream: greedy tokens equal inference_generate_ex's (%d tokens, stop reason %d)",
+                 a.n, (int)a.reason);
+        check(a.rc == 0 && std::vector<int>(a.ids.begin(), a.ids.end()) == ref &&
+                  (a.reason == INFERENCE_STOP_MAX_TOKENS ? a.n == SN : eog),
+              what);
+        bool chunks_ok = true;
+        for (const std::string& c : a.chunks) chunks_ok &= valid_utf8(c);
+        check(a.text == detok(m, a.ids) && chunks_ok, "stream: callback text = detokenized tokens, every chunk valid UTF-8");
+
+        // Multi-byte text: chunks still valid UTF-8, nothing lost
+        int nz = 0;
+        int32_t* zt = inference_tokenize(m, "\xe8\xaf\xb7\xe7\x94\xa8\xe4\xb8\xad\xe6\x96\x87\xe5\x86\x99\xe4\xb8\x80\xe9\xa6\x96\xe5\x85\xb3\xe4\xba\x8e\xe6\x9c\x88\xe4\xba\xae\xe7\x9a\x84\xe8\xaf\x97\xef\xbc\x9a", &nz);  // a Chinese prompt
+        const std::vector<int32_t> zp(zt, zt + nz);
+        inference_free_tokens(zt, nz);
+        const Stream z = stream(m, zp, 32, greedy);
+        bool z_ok = true;
+        for (const std::string& c : z.chunks) z_ok &= valid_utf8(c);
+        snprintf(what, sizeof(what), "stream: Chinese prompt, %d tokens, %zu bytes, every chunk valid UTF-8", z.n,
+                 z.text.size());
+        check(z.rc == 0 && z_ok && z.text == detok(m, z.ids), what);
+
+        // A stop string from the middle of that greedy text: the output ends right before it
+        if (a.text.size() > 40) {
+            const std::string needle = a.text.substr(30, 6);
+            const std::vector<const char*> stops = {"no such text \x01", needle.c_str()};
+            const Stream b = stream(m, prompt, SN, greedy, stops);
+            const std::string want = a.text.substr(0, a.text.find(needle));
+            snprintf(what, sizeof(what), "stream: stop string \"%s\" ends the text before it (%zu of %zu bytes)",
+                     needle.c_str(), b.text.size(), a.text.size());
+            check(b.rc == 0 && b.reason == INFERENCE_STOP_STRING && b.text == want, what);
+        }
+
+        // Continuing: 10 tokens, then 10 more with no prompt, equal 20 in one call
+        const Stream c1 = stream(m, prompt, 10, greedy);
+        const Stream c2 = stream(m, {}, 10, greedy, {}, -1, false);
+        const Stream c3 = stream(m, prompt, 20, greedy);
+        std::vector<int32_t> joined = c1.ids;
+        joined.insert(joined.end(), c2.ids.begin(), c2.ids.end());
+        check(c1.rc == 0 && c2.rc == 0 && (c3.reason == INFERENCE_STOP_EOG || (joined == c3.ids && c1.text + c2.text == c3.text)),
+              "stream: 10 tokens, then 10 more continuing the sequence, equal 20 in one call");
+
+        // The callback stops it
+        const Stream d = stream(m, prompt, SN, greedy, {}, 5);
+        snprintf(what, sizeof(what), "stream: on_token returning 1 at token 5 stops it (%d tokens, reason %d)", d.n,
+                 (int)d.reason);
+        check(d.rc == 0 && d.n == 5 && d.reason == INFERENCE_STOP_CALLBACK, what);
+        check(inference_token_is_eog(m, inference_vocab_size(m) + 5) == 0, "inference_token_is_eog: out of range is not EOG");
+
+        // A chat turn ends at the end-of-turn token, which is neither emitted nor in the text
+        int ne = 0;
+        int32_t* et = inference_tokenize(m, "<|im_end|>", &ne);
+        const bool im_end = ne == 1 && inference_token_is_eog(m, et[0]);
+        inference_free_tokens(et, ne);
+        int nc = 0;
+        int32_t* ct = inference_tokenize(m, "<|im_start|>user\nReply with just the word OK.<|im_end|>\n"
+                                            "<|im_start|>assistant\n<think>\n\n</think>\n\n", &nc);
+        const std::vector<int32_t> cp(ct, ct + nc);
+        inference_free_tokens(ct, nc);
+        const Stream e = stream(m, cp, 64, greedy);
+        snprintf(what, sizeof(what), "stream: chat turn ends at <|im_end|> (EOG token: %s; %d tokens, reason %d, \"%s\")",
+                 im_end ? "yes" : "NO", e.n, (int)e.reason, e.text.c_str());
+        check(im_end && e.rc == 0 && e.reason == INFERENCE_STOP_EOG && e.text.find("<|im_end|>") == std::string::npos,
+              what);
     }
 
     sampler_params p = sampler_default_params();  // temperature 0.8, top_k 40, top_p 0.95, min_p 0.05

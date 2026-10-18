@@ -105,6 +105,54 @@ int inference_forward_batch(inference_model_t* model,
 int inference_generate_ex(inference_model_t* model, const int32_t* prompt_ids, int prompt_len, int max_new_tokens,
                           const sampler_params* params, int32_t* out_ids, int* out_len);
 
+// ---- Streaming generation (the API for applications and the Perl module)
+
+// Why inference_generate_stream stopped
+typedef enum {
+    INFERENCE_STOP_NONE = 0,
+    INFERENCE_STOP_EOG = 1,           // the model produced an end-of-generation token (EOS, end of turn, ...)
+    INFERENCE_STOP_MAX_TOKENS = 2,    // max_new_tokens reached
+    INFERENCE_STOP_STRING = 3,        // the text reached one of the stop strings
+    INFERENCE_STOP_CALLBACK = 4,      // on_token returned nonzero
+    INFERENCE_STOP_CONTEXT_FULL = 5,  // the sequence filled the context
+} inference_stop_reason;
+
+// Called once per generated token with the text that is ready: UTF-8, possibly empty, because a piece that
+// ends inside a multi-byte character or could still become a stop string is held back and delivered with a
+// later token. A final call with token = -1 delivers any held-back text when generation ends (not the text
+// from a stop string on). Return nonzero to stop after this token.
+typedef int (*inference_token_cb)(void* user, int32_t token, const char* text, int text_len);
+
+typedef struct inference_gen_options {
+    sampler_params sampler;           // sampler.h chain; sampler.temperature <= 0 is greedy
+    int max_new_tokens;               // default 256
+    const char* const* stop_strings;  // optional; generation stops before the first occurrence (not delivered)
+    int n_stop_strings;
+    int ignore_eog;                   // 1: do not stop at end-of-generation tokens (default 0)
+    inference_token_cb on_token;      // optional
+    void* user;                       // passed to on_token
+} inference_gen_options;
+
+// Defaults: sampler_default_params(), max_new_tokens 256, no stop strings, stop at EOG, no callback.
+inference_gen_options inference_gen_default_options(void);
+
+// Continues the current sequence (inference_reset starts a new one): appends the n_prompt prompt tokens
+// (n_prompt may be 0 to continue from the last token), then generates. Every emitted token is decoded into the
+// sequence, so a later call continues exactly after it; the end-of-generation token that stops it is neither
+// emitted nor decoded. out_ids (optional, max_out entries) receives the emitted tokens; *n_out counts them
+// (all of them, even beyond max_out); *reason why it stopped. Returns 0 on success (a full context during
+// generation is a stop reason), INFERENCE_ERR_CONTEXT_FULL if the prompt does not fit, negative on error.
+int inference_generate_stream(inference_model_t* model, const int32_t* prompt_ids, int n_prompt,
+                              const inference_gen_options* options, int32_t* out_ids, int max_out, int* n_out,
+                              inference_stop_reason* reason);
+
+// 1 if the token ends generation (llama.cpp's rule: the GGUF's EOS / EOT / EOM ids and end-of-turn markers).
+int inference_token_is_eog(const inference_model_t* model, int32_t token);
+
+// Text of n tokens (UTF-8; control tokens render as their text). Writes at most max_len - 1 bytes plus a NUL;
+// returns the full length (call again with a bigger buffer if it is >= max_len), negative on error.
+int inference_detokenize(const inference_model_t* model, const int32_t* ids, int n, char* out, int max_len);
+
 // Same with temperature / top_k / top_p only (min_p and repeat penalty off) and the inference_set_seed seed.
 // temperature <= 0 is greedy.
 int inference_generate(inference_model_t* model,

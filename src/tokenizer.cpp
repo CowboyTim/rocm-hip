@@ -215,6 +215,7 @@ struct tokenizer {
     PreType pre = PRE_QWEN2;
     int bos_id = -1, eos_id = -1, pad_id = -1, unk_id = -1;
     bool add_bos = false;
+    std::vector<int> eog;  // end-of-generation ids, sorted (build_eog)
 
     int lookup(const std::string& s) const {
         auto it = vocab_map.find(s);
@@ -228,6 +229,28 @@ struct tokenizer {
         std::stable_sort(specials.begin(), specials.end(),
                          [&](int a, int b) { return vocab[a].size() > vocab[b].size(); });
     }
+
+    // End-of-generation tokens, as llama.cpp's llama_vocab::impl::load (llama-vocab.cpp) builds them: the GGUF's
+    // EOS / EOT / EOM and FIM pad / rep / sep ids, plus every token whose text is one of the end-of-turn
+    // markers below (by text, as the reference does)
+    void build_eog(const std::vector<int>& ids) {
+        static const char* const kText[] = {
+            "<|eot_id|>", "<|im_end|>", "<|end|>", "<|return|>", "<|call|>", "<|flush|>", "<|calls|>",
+            "<end_of_turn>", "<|endoftext|>", "</s>", "<|eom_id|>", "<EOT>", "_<EOT>", "[EOT]", "[EOS]",
+            "<|end_of_text|>", "<end_of_utterance>", "<eos>", "<turn|>", "<|tool_response>",
+            "<\xef\xbd\x9c" "end\xe2\x96\x81" "of\xe2\x96\x81" "sentence\xef\xbd\x9c>"};  // DeepSeek, split: \x eats hex letters
+        eog.clear();
+        for (int id : ids)
+            if (id >= 0 && id < (int)vocab.size()) eog.push_back(id);
+        for (const char* t : kText) {
+            const int id = lookup(t);
+            if (id >= 0) eog.push_back(id);
+        }
+        std::sort(eog.begin(), eog.end());
+        eog.erase(std::unique(eog.begin(), eog.end()), eog.end());
+    }
+
+    bool is_eog(int id) const { return std::binary_search(eog.begin(), eog.end(), id); }
 
     // BPE over one byte-encoded word; appends the token ids
     void bpe_word(const std::string& word, std::vector<int>& out) const {
@@ -386,11 +409,24 @@ int tokenizer_decode(tokenizer_t* tok, const int* ids, int n_ids, char* out_str,
     return len;
 }
 
+int tokenizer_detokenize(tokenizer_t* tok, const int* ids, int n_ids, char* out_str, int max_len) {
+    if (!tok || (n_ids > 0 && !ids) || max_len < 0 || (max_len > 0 && !out_str)) return -1;
+    std::string s;
+    for (int i = 0; i < n_ids; ++i) tok->piece(ids[i], s);
+    if (max_len > 0) {
+        const size_t len = std::min(s.size(), (size_t)max_len - 1);
+        memcpy(out_str, s.data(), len);
+        out_str[len] = '\0';
+    }
+    return (int)s.size();
+}
+
 size_t tokenizer_vocab_size(tokenizer_t* tok) { return tok ? tok->vocab.size() : 0; }
 int tokenizer_bos_id(tokenizer_t* tok) { return tok ? tok->bos_id : -1; }
 int tokenizer_eos_id(tokenizer_t* tok) { return tok ? tok->eos_id : -1; }
 int tokenizer_pad_id(tokenizer_t* tok) { return tok ? tok->pad_id : -1; }
 int tokenizer_unk_id(tokenizer_t* tok) { return tok ? tok->unk_id : -1; }
+int tokenizer_is_eog(tokenizer_t* tok, int id) { return tok && tok->is_eog(id) ? 1 : 0; }
 
 // Integer KV by key (any integer GGUF type), or def
 static int64_t kv_int(const gguf_model_t* m, const char* key, int64_t def) {
@@ -457,6 +493,11 @@ tokenizer_t* tokenizer_load_from_gguf(void* gguf_model) {
     t->pad_id = (int)kv_int(m, "tokenizer.ggml.padding_token_id", -1);
     t->unk_id = (int)kv_int(m, "tokenizer.ggml.unknown_token_id", -1);
     t->add_bos = kv_bool(m, "tokenizer.ggml.add_bos_token", false);
+    std::vector<int> eog_ids = {t->eos_id};
+    for (const char* key : {"tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id", "tokenizer.ggml.fim_pad_token_id",
+                            "tokenizer.ggml.fim_rep_token_id", "tokenizer.ggml.fim_sep_token_id"})
+        eog_ids.push_back((int)kv_int(m, key, -1));
+    t->build_eog(eog_ids);
     return t;
 }
 

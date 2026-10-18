@@ -33,6 +33,10 @@ int tokenizer_encode(tokenizer_t* tok, const char* text, int* out_ids, int max_i
 // Returns length of written string (excluding null), or -1 on error.
 int tokenizer_decode(tokenizer_t* tok, const int* ids, int n_ids, char* out_str, int max_len);
 
+// The same, but returns the full text length (it wrote min(length, max_len - 1) bytes plus a NUL), so a
+// caller can retry with a bigger buffer; max_len 0 only measures. Returns -1 on error.
+int tokenizer_detokenize(tokenizer_t* tok, const int* ids, int n_ids, char* out_str, int max_len);
+
 // Get vocab size
 size_t tokenizer_vocab_size(tokenizer_t* tok);
 
@@ -41,6 +45,10 @@ int tokenizer_bos_id(tokenizer_t* tok);
 int tokenizer_eos_id(tokenizer_t* tok);
 int tokenizer_pad_id(tokenizer_t* tok);
 int tokenizer_unk_id(tokenizer_t* tok);
+
+// 1 if id ends generation: the GGUF's EOS / EOT / EOM and FIM pad / rep / sep ids, and tokens whose text is an
+// end-of-turn marker such as <|im_end|>, <|endoftext|> or <end_of_turn> (llama.cpp's rule)
+int tokenizer_is_eog(tokenizer_t* tok, int id);
 
 #ifdef __cplusplus
 }

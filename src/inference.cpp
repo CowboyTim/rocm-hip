@@ -587,6 +587,122 @@ int inference_generate_ex(inference_model_t* model, const int32_t* prompt_ids, i
     return rc == INFERENCE_ERR_CONTEXT_FULL ? INFERENCE_OK : rc;  // a full context just ends generation
 }
 
+// ---- Streaming generation
+
+inference_gen_options inference_gen_default_options(void) {
+    inference_gen_options o;
+    memset(&o, 0, sizeof(o));
+    o.sampler = sampler_default_params();
+    o.max_new_tokens = 256;
+    return o;
+}
+
+int inference_token_is_eog(const inference_model_t* m, int32_t token) {
+    return m && m->tokenizer ? tokenizer_is_eog(m->tokenizer, token) : 0;
+}
+
+int inference_detokenize(const inference_model_t* m, const int32_t* ids, int n, char* out, int max_len) {
+    if (!m || !m->tokenizer) { set_error("no tokenizer"); return INFERENCE_ERR_INVALID_STATE; }
+    const int len = tokenizer_detokenize(m->tokenizer, (const int*)ids, n, out, max_len);
+    if (len < 0) { set_error("Invalid arguments"); return INFERENCE_ERR_INVALID_ARG; }
+    return len;
+}
+
+// Bytes at the end of s that begin a UTF-8 character still missing continuation bytes
+static size_t utf8_incomplete_tail(const std::string& s) {
+    for (size_t k = 1; k <= 4 && k <= s.size(); ++k) {
+        const unsigned char c = (unsigned char)s[s.size() - k];
+        if ((c & 0xC0) == 0x80) continue;  // continuation byte: look further back for the lead byte
+        const size_t need = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 1;
+        return need > k ? k : 0;
+    }
+    return 0;
+}
+
+// Length of the longest suffix of s that is a proper prefix of one of the stop strings (it may still become one)
+static size_t stop_prefix_tail(const std::string& s, const std::vector<std::string>& stops) {
+    size_t best = 0;
+    for (const std::string& st : stops)
+        for (size_t len = std::min(st.size() - 1, s.size()); len > best; --len)
+            if (s.compare(s.size() - len, len, st, 0, len) == 0) {
+                best = len;
+                break;
+            }
+    return best;
+}
+
+int inference_generate_stream(inference_model_t* m, const int32_t* prompt_ids, int n_prompt,
+                              const inference_gen_options* options, int32_t* out_ids, int max_out, int* n_out,
+                              inference_stop_reason* reason) {
+    clear_error();
+    if (n_out) *n_out = 0;
+    if (reason) *reason = INFERENCE_STOP_NONE;
+    if (!m || !m->qwen || !m->tokenizer || n_prompt < 0 || (n_prompt > 0 && !prompt_ids) || max_out < 0 ||
+        (max_out > 0 && !out_ids)) {
+        set_error("Invalid state or arguments");
+        return INFERENCE_ERR_INVALID_ARG;
+    }
+    const inference_gen_options o = options ? *options : inference_gen_default_options();
+    if (n_prompt > 0) {
+        const int rc = inference_prefill(m, prompt_ids, n_prompt);
+        if (rc != 0) return rc;
+    } else if (m->n_past == 0) {
+        set_error("nothing to continue: empty prompt and an empty sequence");
+        return INFERENCE_ERR_INVALID_ARG;
+    }
+    std::vector<std::string> stops;
+    for (int i = 0; i < o.n_stop_strings; ++i)
+        if (o.stop_strings && o.stop_strings[i] && o.stop_strings[i][0]) stops.emplace_back(o.stop_strings[i]);
+
+    sampler_t* smp = sampler_create(&o.sampler);
+    for (int i = 0; i < n_prompt; ++i) sampler_accept(smp, prompt_ids[i]);
+    std::string pending;  // generated text not delivered yet
+    std::vector<char> buf(256);
+    inference_stop_reason stop = INFERENCE_STOP_NONE;
+    int emitted = 0, rc = 0;
+    while (stop == INFERENCE_STOP_NONE) {
+        if (emitted >= o.max_new_tokens) { stop = INFERENCE_STOP_MAX_TOKENS; break; }
+        const int next = sampler_sample(smp, qwen_model_logits(m->qwen), m->vocab_size);
+        if (!o.ignore_eog && tokenizer_is_eog(m->tokenizer, next)) { stop = INFERENCE_STOP_EOG; break; }
+        sampler_accept(smp, next);
+        if (emitted < max_out) out_ids[emitted] = next;
+        ++emitted;
+
+        int len = tokenizer_detokenize(m->tokenizer, &next, 1, buf.data(), (int)buf.size());
+        if (len >= (int)buf.size()) {
+            buf.resize((size_t)len + 1);
+            len = tokenizer_detokenize(m->tokenizer, &next, 1, buf.data(), (int)buf.size());
+        }
+        pending.append(buf.data(), (size_t)std::max(len, 0));
+
+        // Deliver what can no longer become part of a stop string or of a split UTF-8 character
+        size_t ready, cut = std::string::npos;
+        for (const std::string& st : stops) cut = std::min(cut, pending.find(st));
+        if (cut != std::string::npos) {
+            ready = cut;
+            stop = INFERENCE_STOP_STRING;
+        } else {
+            ready = pending.size() - std::max(utf8_incomplete_tail(pending), stop_prefix_tail(pending, stops));
+        }
+        if (o.on_token && o.on_token(o.user, next, pending.data(), (int)ready) != 0 && stop == INFERENCE_STOP_NONE)
+            stop = INFERENCE_STOP_CALLBACK;
+        pending.erase(0, stop == INFERENCE_STOP_STRING ? pending.size() : ready);
+
+        // Every emitted token joins the sequence, so a later call continues right after it
+        rc = forward_next(m, next);
+        if (rc == INFERENCE_ERR_CONTEXT_FULL) {
+            rc = 0;
+            if (stop == INFERENCE_STOP_NONE) stop = INFERENCE_STOP_CONTEXT_FULL;
+        }
+        if (rc != 0) break;
+    }
+    if (rc == 0 && o.on_token && !pending.empty()) (void)o.on_token(o.user, -1, pending.data(), (int)pending.size());
+    sampler_free(smp);
+    if (n_out) *n_out = emitted;
+    if (reason) *reason = stop;
+    return rc;
+}
+
 int inference_generate(inference_model_t* model, const int32_t* prompt_ids, int prompt_len, int max_new_tokens,
                        float temperature, int top_k, float top_p, int32_t* out_ids, int* out_len) {
     sampler_params prm = sampler_default_params();

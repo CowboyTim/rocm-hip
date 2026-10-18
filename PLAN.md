@@ -1860,7 +1860,21 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
 is a 63 GB tmpfs (38 GB free) and the disk has 48 GB free, so a ~50 GB model needs space freed or /dev/shm
 remounted larger; the reference oracle must also run each model on the CPU for `ref_dump`.
 
-## Phase 22 – Product C API + Perl XS module (Phase 14) — PLAN (2026-10-18)
+## Phase 22 – Product C API + Perl XS module (Phase 14) — IN PROGRESS 🔧 (2026-10-18)
+
+**Progress:**
+- **Step 1a — DONE ✅: streaming generation.** `inference_generate_stream` continues the current sequence
+  (prompt appended at n_past, or none to continue), calls `on_token` per token with UTF-8-safe text (pieces
+  ending inside a character, or that could still become a stop string, are held back), stops on EOG
+  tokens / stop strings / max tokens / the callback / a full context and reports which. Every emitted
+  token is decoded into the sequence, so calls chain exactly. `inference_gen_options` +
+  `inference_gen_default_options`, `inference_token_is_eog`, `inference_detokenize` (full length, for
+  retrying with a bigger buffer). The tokenizer builds llama.cpp's EOG set (GGUF EOS/EOT/EOM/FIM ids +
+  end-of-turn texts such as `<|im_end|>`). `generate_verify` tests: equals `generate_ex`, text equals the
+  detokenized tokens, valid UTF-8 chunks on a Chinese prompt, a stop string cuts exactly, 10 + 10 tokens
+  equal 20, callback stop, a chat turn ends at `<|im_end|>` (both models).
+- **Next:** step 2 (chat template + prefix reuse), then the XS module.
+
 
 The C API (`inference.h`) works for one sequence but lacks what an application needs. Architecture-neutral,
 so every Phase 21 model gets it unchanged:
