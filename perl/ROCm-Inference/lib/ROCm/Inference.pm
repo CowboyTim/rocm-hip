@@ -16,7 +16,7 @@ BEGIN {  # at compile time: the constants below call into the XS
 
 # The C library (libinference.so) mapped one function per C call; plus the plain-Perl chat helpers below
 our @EXPORT_OK = qw(
-    load_model free_model kv_cache_init set_lm_head_q8
+    load_model free_model kv_cache_init set_lm_head_q8 set_draft_model
     tokenize detokenize chat_template bos_id eos_id token_is_eog vocab_size
     n_ctx n_past reset prefill decode_token get_logits
     generate last_prompt_stats last_error
@@ -155,7 +155,7 @@ The store file names of the token list's full blocks, in order (e.g. to keep a s
 Render a conversation with the model's chat template / render it and generate the reply.
 
 =item chat_template($m [, $name]), bos_id, eos_id, token_is_eog, vocab_size, n_ctx, n_past, reset,
-prefill, decode_token, get_logits, last_prompt_stats, set_lm_head_q8, last_error
+prefill, decode_token, get_logits, last_prompt_stats, set_lm_head_q8, set_draft_model, last_error
 
 As the C functions of the same name (C<inference_*>). C<get_logits> returns packed floats
 (C<unpack 'f*'>).

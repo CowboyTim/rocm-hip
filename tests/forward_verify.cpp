@@ -366,7 +366,7 @@ int main(int argc, char** argv) {
             int* gids = (int*)b_ids.p;
             memcpy(b_lg.p, lg.data(), (size_t)T * NE * sizeof(float));
             memcpy(b_x.p, b.data(), (size_t)T * E * sizeof(float));
-            hipError_t e = gpu_moe_router(b_lg.p, b_x.p, L.shexp_gate, gids, b_w.p, b_sg.p, NE, NU, E, T, 0);
+            hipError_t e = gpu_moe_router(b_lg.p, b_x.p, L.shexp_gate, gids, b_w.p, b_sg.p, NE, NU, E, T, 0, 0);
             if (e == hipSuccess) e = hipDeviceSynchronize();
             if (e != hipSuccess) { fprintf(stderr, "moe_router: %s\n", hipGetErrorString(e)); return 1; }
             int id_bad = 0;
@@ -607,9 +607,9 @@ int main(int argc, char** argv) {
             memcpy(b_be.p, &beta[(size_t)t * NV], NV * sizeof(float));
             memcpy(b_z.p, &z[(size_t)t * DI], DI * sizeof(float));
             hipError_t e = deltanet_pre(b_qkv.p, b_cs.p, L.ssm_conv1d, DC, b_out.p, NG, NV, b_al.p, b_be.p, L.ssm_dt,
-                                        L.ssm_a, b_al.p, b_be.p, eps, 1, 0);
+                                        L.ssm_a, b_al.p, b_be.p, eps, 1, nullptr, 0);
             if (e == hipSuccess)
-                e = deltanet_rule(b_st.p, b_out.p, b_al.p, b_be.p, b_z.p, L.ssm_norm, b_lin.p, NG, NV, eps, 1, 0, nullptr, 0);
+                e = deltanet_rule(b_st.p, b_out.p, b_al.p, b_be.p, b_z.p, L.ssm_norm, b_lin.p, NG, NV, eps, 1, 0, nullptr, nullptr, 0);
             if (e == hipSuccess) e = hipDeviceSynchronize();
             if (e != hipSuccess) { fprintf(stderr, "deltanet kernels: %s\n", hipGetErrorString(e)); return 1; }
             gq.add(b_out.p, &qn[(size_t)t * KD], KD);
@@ -652,9 +652,9 @@ int main(int argc, char** argv) {
             memcpy(c_be.p, beta.data(), (size_t)T * NV * sizeof(float));
             memcpy(c_z.p, z.data(), (size_t)T * DI * sizeof(float));
             hipError_t e = deltanet_pre(c_qkv.p, b_cs.p, L.ssm_conv1d, DC, c_out.p, NG, NV, c_al.p, c_be.p, L.ssm_dt,
-                                        L.ssm_a, c_al.p, c_be.p, eps, T, 0);
+                                        L.ssm_a, c_al.p, c_be.p, eps, T, nullptr, 0);
             if (e == hipSuccess)
-                e = deltanet_rule(b_st.p, c_out.p, c_al.p, c_be.p, c_z.p, L.ssm_norm, c_lin.p, NG, NV, eps, T, 0, nullptr, 0);
+                e = deltanet_rule(b_st.p, c_out.p, c_al.p, c_be.p, c_z.p, L.ssm_norm, c_lin.p, NG, NV, eps, T, 0, nullptr, nullptr, 0);
             if (e == hipSuccess) e = hipDeviceSynchronize();
             if (e != hipSuccess) { fprintf(stderr, "batched deltanet kernels: %s\n", hipGetErrorString(e)); return 1; }
             Stat bq, bfo, bst;

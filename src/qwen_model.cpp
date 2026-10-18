@@ -346,17 +346,21 @@ struct QwenModel {
     std::unordered_map<const HcMix*, QuantWeight> hc_up_pad;
 
     bool pad_hc_up() {
-        const int R = eng->hc_rank, RP = (R + 127) / 128 * 128;
         std::vector<const HcMix*> mixes;
         for (const LayerWeights& L : eng->layers) mixes.push_back(&L.hc_attn), mixes.push_back(&L.hc_ffn);
         mixes.push_back(&eng->hc_head);
-        const QuantWeight& U = eng->hc_head.up;
+        return pad_hc_up(mixes, hc_pad_mem, "/dev/shm/qwen_hc_up_pad.bin");
+    }
+
+    bool pad_hc_up(const std::vector<const HcMix*>& mixes, ShmRegion& mem, const char* path) {
+        const int R = eng->hc_rank, RP = (R + 127) / 128 * 128;
+        const QuantWeight& U = mixes.back()->up;
         if (RP == R || (U.type != QT_Q4_0_ROCMFP4 && U.type != QT_Q4_0_ROCMFP4_FAST)) return true;
         const size_t prow = qt_row_size(U.type, RP), bytes = prow * U.N;
         size_t floats = (bytes * mixes.size() + 3) / 4;
         float* base = nullptr;
         float** const pp[] = {&base};
-        if (!hc_pad_mem.alloc("/dev/shm/qwen_hc_up_pad.bin", &floats, pp, 1, hipHostRegisterReadOnly)) return false;
+        if (!mem.alloc(path, &floats, pp, 1, hipHostRegisterReadOnly)) return false;
         char* p = (char*)base;
         for (const HcMix* M : mixes) {
             const QuantWeight& W = M->up;
@@ -376,6 +380,7 @@ struct QwenModel {
     }
 
     ~QwenModel() {
+        mtp_free();
         hc_pad_mem.free();
         head_mem.free();
         rs.free();
@@ -500,7 +505,7 @@ struct QwenModel {
         std::vector<MvOut> todo(list);
         while (!todo.empty()) {
             const QuantWeight& A = *todo[0].w;
-            if (T != 1 || q8_src != x || q8_k != A.K || q8_t != 1 || !qmatvec_q8_supported(A.type, A.K)) {
+            if (q8_src != x || q8_k != A.K || q8_t != T || !qmatvec_q8_few_supported(A.type, A.K, T)) {
                 if (!matvec(A, x, todo[0].y, T, c)) return false;
                 todo.erase(todo.begin());
                 continue;
@@ -519,7 +524,7 @@ struct QwenModel {
                     ++i;
                 }
             }
-            if (!check(qmatvec_launch_q8_multi(A.type, n, Ws, Ns, ys, A.row_bytes, &s.q8, A.K, 0), "matvec group"))
+            if (!check(qmatvec_launch_q8_multi_t(A.type, n, Ws, Ns, ys, A.row_bytes, &s.q8, A.K, T, 0), "matvec group"))
                 return false;
         }
         return true;
@@ -544,12 +549,13 @@ struct QwenModel {
     bool full_attention(const LayerWeights& L, int pos0, int T) {
         const int HQ = eng->n_head, HKV = eng->n_head_kv, DQ = HQ * eng->head_dim;
         if (!matvec_multi({{&L.Wq, s.qfull}, {&L.Wk, s.k}, {&L.Wv, s.v}}, s.xn, T, P_ATTN)) return false;
-        __half* K = kv_cache_k_row(eng->kvc, L.kv_slot, 0);
-        __half* V = kv_cache_v_row(eng->kvc, L.kv_slot, 0);
+        inference_kv_cache_t* kvc = kvc_cur ? kvc_cur : eng->kvc;
+        __half* K = kv_cache_k_row(kvc, L.kv_slot, 0);
+        __half* V = kv_cache_v_row(kvc, L.kv_slot, 0);
         if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
         const qmatvec_q8* q8 = q8_for(DQ, T);
-        if (!check(attention_forward(s.qfull, s.k, s.v, L.q_norm, L.k_norm, K, V, kv_cache_block_shift(eng->kvc),
-                                     kv_cache_block_stride(eng->kvc), HQ, HKV, eng->n_rot, pos0, T,
+        if (!check(attention_forward(s.qfull, s.k, s.v, L.q_norm, L.k_norm, K, V, kv_cache_block_shift(kvc),
+                                     kv_cache_block_stride(kvc), HQ, HKV, eng->n_rot, pos0, T,
                                      eng->rope_freq_base, (float)eng->eps, s.q, s.part_ml, s.part_acc, s.attn, q8, 0),
                    "attention kernels"))
             return false;
@@ -567,10 +573,14 @@ struct QwenModel {
             return false;
         // conv1d + SiLU + q/k L2 norm + gates, then the delta rule + gated norm; alpha/beta become
         // g / sigmoid(beta) in place
+        // a verify pass (spec_mid) also keeps the state after its first token in rs_mid
+        const bool mid = spec_mid && T >= 2;
         if (!check(deltanet_pre(s.qkv, rs.conv[l], L.ssm_conv1d, eng->ssm_d_conv, s.conv, NG, NV, s.alpha, s.beta,
-                                L.ssm_dt, L.ssm_a, s.alpha, s.beta, eps, T, 0), "deltanet_pre") ||
+                                L.ssm_dt, L.ssm_a, s.alpha, s.beta, eps, T, mid ? rs_mid.conv[l] : nullptr, 0),
+                   "deltanet_pre") ||
             !check(deltanet_rule(rs.ssm[l], s.conv, s.alpha, s.beta, s.z, L.ssm_norm, s.lin, NG, NV, eps, T,
-                                 eng->gdn_sigmoid_gate ? 1 : 0, q8_for(eng->ssm_d_inner, T), 0),
+                                 eng->gdn_sigmoid_gate ? 1 : 0, q8_for(eng->ssm_d_inner, T),
+                                 mid ? rs_mid.ssm[l] : nullptr, 0),
                    "deltanet_rule"))
             return false;
         mark(s.lin, eng->ssm_d_inner, T, q8_for(eng->ssm_d_inner, T));
@@ -682,8 +692,10 @@ struct QwenModel {
         const int E = eng->n_embd, NE = eng->n_expert, NU = eng->n_expert_used, FE = eng->n_ff_exp;
         const int FS = eng->n_ff_shexp;
         if (T == 1 && shared_as_slot(L)) return moe_core_one(L);
-        // A prefill batch groups its (token, slot) entries by expert for the expert-tiled matmuls
-        const bool grouped = T > 1;
+        // A prefill batch groups its (token, slot) entries by expert for the expert-tiled matmuls. A few tokens
+        // (a speculative verify pass) take the per-token kernels, which give exactly what decoding them one at a
+        // time gives
+        const bool grouped = T >= 8;
         if (!matvec(L.W_router, s.xn, s.r_logits, T, P_FFN) ||
             !check(gpu_moe_router(s.r_logits, s.xn, L.shexp_gate, s.ids, s.wts, s.sg, NE, NU, E, T, 0, 0),
                    "moe_router") ||
@@ -790,12 +802,42 @@ struct QwenModel {
     // The LM head on the last of T tokens of s.xn (its row of the quantized buffer when s.q8 holds them), then
     // the sync that ends the forward pass; the logits are copied to logits_out if given
     int lm_head(int T, float* logits_out) {
+        // a verify pass also needs the logits of its first token: one launch on both rows where there is a
+        // few-token kernel for the head's type (each row as the single-row launch gives it), else one per row
+        const QuantWeight& H = eng->output;
+        const int E = eng->n_embd, V = eng->vocab_size;
+        if (spec_mid && T >= 2 && !head_q8 && q8_src == s.xn && qmatvec_q8_few_supported(H.type, E, 2)) {
+            qmatvec_q8 two = s.q8;
+            const size_t r = (size_t)(T - 2) * E;
+            two.q0 += r, two.qK += r, two.d0 += r / 32, two.dK += r / 256, two.bsK += r / 16, two.max_k = 2 * E;
+            const void* Ws[] = {H.data};
+            const int Ns[] = {V};
+            float* ys[] = {spec_logits0};
+            prof.bytes[P_HEAD] += (double)H.row_bytes * H.N;
+            if (!check(qmatvec_launch_q8_multi_t(H.type, 1, Ws, Ns, ys, H.row_bytes, &two, E, 2, 0), "LM head (2 rows)") ||
+                !check(hipMemcpyAsync(s.logits, spec_logits0 + V, sizeof(float) * V, hipMemcpyDeviceToDevice, 0),
+                       "LM head (2 rows)") ||
+                !sync())
+                return -1;
+            if (logits_out) memcpy(logits_out, s.logits, sizeof(float) * V);
+            prof.lap(P_HEAD);
+            prof.tokens += T;
+            return 0;
+        }
+        if (spec_mid && T >= 2 && lm_head_with(H, spec_logits0, T, nullptr, true, T - 2) != 0) return -1;
+        return lm_head_with(H, s.logits, T, logits_out, true);
+    }
+
+    // The LM head H (the model's, or the MTP head's) on row `row` (default the last) of T rows of s.xn into
+    // logits, then the sync
+    int lm_head_with(const QuantWeight& H, float* logits, int T, float* logits_out, bool may_q8_copy, int row = -1) {
         const int E = eng->n_embd;
-        // LM head on the last token only: its row of s.xn, and its row of the quantized buffer
-        const float* xl = s.xn + (size_t)(T - 1) * E;
+        if (row < 0) row = T - 1;
+        // LM head on one token only: its row of s.xn, and its row of the quantized buffer
+        const float* xl = s.xn + (size_t)row * E;
         qmatvec_q8 last = s.q8;
         if (q8_src == s.xn) {
-            const size_t r = (size_t)(T - 1) * E;
+            const size_t r = (size_t)row * E;
             last.q0 += r;
             last.qK += r;
             last.d0 += r / 32;
@@ -803,19 +845,18 @@ struct QwenModel {
             last.bsK += r / 16;
             last.max_k = E;
         }
-        const QuantWeight& H = eng->output;
         hipError_t e;
-        if (head_q8 && q8_src == s.xn) {  // opt-in Q8_0 copy
+        if (may_q8_copy && head_q8 && q8_src == s.xn) {  // opt-in Q8_0 copy
             prof.bytes[P_HEAD] += (double)H.N * H.K * (1.0 + 2.0 / 32);
-            e = qmatvec_launch_q8_0s(head_q, head_d, &last, s.logits, H.N, E, 0);
+            e = qmatvec_launch_q8_0s(head_q, head_d, &last, logits, H.N, E, 0);
         } else {
             prof.bytes[P_HEAD] += (double)H.row_bytes * H.N;
             e = q8_src == s.xn && qmatvec_q8_supported(H.type, E)
-                    ? qmatvec_launch_q8(H.type, H.data, H.row_bytes, &last, s.logits, H.N, E, 0)
-                    : qmatvec_launch(H.type, H.data, H.row_bytes, xl, s.logits, H.N, E, 0);
+                    ? qmatvec_launch_q8(H.type, H.data, H.row_bytes, &last, logits, H.N, E, 0)
+                    : qmatvec_launch(H.type, H.data, H.row_bytes, xl, logits, H.N, E, 0);
         }
         if (!check(e, "LM head") || !sync()) return -1;
-        if (logits_out) memcpy(logits_out, s.logits, (size_t)eng->vocab_size * sizeof(float));
+        if (logits_out) memcpy(logits_out, logits, (size_t)eng->vocab_size * sizeof(float));
         prof.lap(P_HEAD);
         prof.tokens += T;
         return 0;
@@ -894,9 +935,10 @@ struct QwenModel {
                 }
             }
         }
-        // the last NG - 1 tokens of (history, batch)
+        // the last NG - 1 tokens of (history, batch); a verify pass also keeps them after its first token
         std::vector<int32_t> all(hist, hist + NG - 1);
         all.insert(all.end(), tokens, tokens + T);
+        if (spec_mid && T >= 2 && rs_mid.ple_hist) memcpy(rs_mid.ple_hist, all.data() + 1, sizeof(int32_t) * (NG - 1));
         memcpy(hist, all.data() + all.size() - (NG - 1), sizeof(int32_t) * (NG - 1));
         return true;
     }
@@ -910,7 +952,7 @@ struct QwenModel {
                                   s.ple_gated, s.ple_normed, E, HC, T, (float)eng->eps, 0),
                      "ple_gate") &&
                check(gpu_ple_conv(s.ple_normed, s.ple_gated, s.res, rs.ple[l], L.ple_conv1d, HC * E, T, eng->ple_conv,
-                                  eng->ple_ngram, 0),
+                                  eng->ple_ngram, spec_mid && T >= 2 ? rs_mid.ple[l] : nullptr, 0),
                      "ple_conv");
     }
 
@@ -924,6 +966,7 @@ struct QwenModel {
     int forward_hc(const int* tokens, int T, int pos0, float* logits_out) {
         const int E = eng->n_embd, HC = eng->n_hc, HCD = HC * E;
         const int l0 = dbg_res_in ? dbg_l0 : 0, l1 = dbg_res_in ? dbg_l1 : eng->n_layer;
+        kvc_cur = eng->kvc;
         prof.start();
         if (eng->ple_table.data && pos0 > 0 && !sync()) return -1;  // a queued state restore may set ple_hist
         for (int t = 0; t < T; ++t) {
@@ -971,8 +1014,174 @@ struct QwenModel {
             }
         }
         if (dbg_res_in) return sync() ? 0 : -1;
-        if (!hc_mix(eng->hc_head, T, P_HEAD)) return -1;
-        return lm_head(T, logits_out);
+        const bool track = eng->mtp && mtp_track(pos0, T);
+        if (!hc_mix(eng->hc_head, T, P_HEAD) || lm_head(T, logits_out) != 0) return -1;
+        return track && !mtp_process(tokens, T, pos0) ? -1 : 0;
+    }
+
+    // ------------------------------------------------------------ MTP draft head (qwen4exp nextn sidecar)
+    //
+    // The head's row at position p is (token p, the main model's residual streams at p - 1). Every main forward
+    // keeps its streams (mtp_h: row 0 = position pos0 - 1, carried from the previous forward; rows 1 .. T = this
+    // batch) and runs the head on its rows from mtp_pos on (no LM head), so the head's KV cache follows the
+    // sequence; mtp_draft adds the row of the next, not yet decoded token and returns the head's argmax.
+    inference_kv_cache_t* kvc_cur = nullptr;     // the KV cache full_attention uses (the model's or the head's)
+    ShmRegion mtp_mem, mtp_pad_mem;
+    float *mtp_h = nullptr, *mtp_carry = nullptr, *mtp_cat = nullptr, *mtp_logits = nullptr, *spec_logits0 = nullptr;
+    bool spec_mid = false;                      // a verify pass: keep the state after its first token in rs_mid
+    RecurrentState rs_mid;
+    int mtp_carry_pos = -1;                     // position of the streams in mtp_carry (-1: none)
+    int mtp_pos = 0;                            // the head's KV cache holds rows 0 .. mtp_pos - 1
+    int mtp_h_pos0 = -1, mtp_h_n = 0;           // mtp_h: positions mtp_h_pos0 - 1 .. mtp_h_pos0 + mtp_h_n - 1
+    const MtpHead* mtp_ready = nullptr;          // the head the buffers / padded copies were made for
+
+    void mtp_free() {
+        mtp_mem.free();
+        mtp_pad_mem.free();
+        if (mtp_ready) {
+            hc_up_pad.erase(&mtp_ready->L.hc_attn);
+            hc_up_pad.erase(&mtp_ready->L.hc_ffn);
+            hc_up_pad.erase(&mtp_ready->hc_head);
+        }
+        mtp_ready = nullptr;
+        mtp_h = mtp_carry = mtp_cat = mtp_logits = spec_logits0 = nullptr;
+        rs_mid.free();
+        mtp_carry_pos = -1;
+        mtp_pos = 0;
+        mtp_h_n = 0;
+    }
+
+    bool mtp_setup() {
+        if (mtp_ready == eng->mtp) return true;
+        mtp_free();
+        const MtpHead* h = eng->mtp;
+        const int E = eng->n_embd, HCD = eng->n_hc * E;
+        const size_t b = (size_t)s.B;
+        const size_t sizes[] = {(b + 1) * HCD, (size_t)HCD, b * HCD * 2, (size_t)eng->vocab_size,
+                                2 * (size_t)eng->vocab_size};
+        float** const ptrs[] = {&mtp_h, &mtp_carry, &mtp_cat, &mtp_logits, &spec_logits0};
+        if (!mtp_mem.alloc("/dev/shm/qwen_mtp.bin", sizes, ptrs, 5, hipExtHostRegisterCoarseGrained) ||
+            (!rs_mid.mem.base && rs.mem.base && !rs_mid.alloc(eng)) ||
+            !pad_hc_up({&h->L.hc_attn, &h->L.hc_ffn, &h->hc_head}, mtp_pad_mem, "/dev/shm/qwen_mtp_hc_up_pad.bin")) {
+            qwen_set_error("MTP head: buffers");
+            mtp_free();
+            return false;
+        }
+        mtp_ready = h;
+        return true;
+    }
+
+    // Before the head of a main forward of T tokens at pos0: keep its streams after the last layer for the head
+    bool mtp_track(int pos0, int T) {
+        if (!mtp_setup()) return false;
+        const int HCD = eng->n_hc * eng->n_embd;
+        const size_t row = sizeof(float) * HCD;
+        // row 0: the streams of position pos0 - 1 (zeros at the start, or when they are not known)
+        if (pos0 > 0 && mtp_carry_pos == pos0 - 1) {
+            if (!check(hipMemcpyAsync(mtp_h, mtp_carry, row, hipMemcpyDeviceToDevice, 0), "MTP streams")) return false;
+        } else if (!check(hipMemsetAsync(mtp_h, 0, row, 0), "MTP streams")) {
+            return false;
+        }
+        if (!check(hipMemcpyAsync(mtp_h + HCD, s.res, row * T, hipMemcpyDeviceToDevice, 0), "MTP streams") ||
+            !check(hipMemcpyAsync(mtp_carry, s.res + (size_t)(T - 1) * HCD, row, hipMemcpyDeviceToDevice, 0),
+                   "MTP streams"))
+            return false;
+        mtp_h_pos0 = pos0;
+        mtp_h_n = T;
+        mtp_carry_pos = pos0 + T - 1;
+        if (mtp_pos > pos0) mtp_pos = std::max(pos0, std::min(mtp_pos, pos0 + T));  // rows from pos0 on change
+        return true;
+    }
+
+    // After a main forward: the head's rows mtp_pos .. pos0 + T - 1 (all of them that this batch covers)
+    bool mtp_process(const int* tokens, int T, int pos0) {
+        const int p0 = std::max(mtp_pos, pos0), n = pos0 + T - p0;
+        if (n <= 0) return true;
+        // the sync: the next forward's CPU work writes buffers these kernels read
+        if (!mtp_forward(tokens + (p0 - pos0), mtp_h + (size_t)(p0 - pos0) * eng->n_hc * eng->n_embd, n, p0, false) ||
+            !sync())
+            return false;
+        mtp_pos = pos0 + T;
+        return true;
+    }
+
+    // The head on T rows (tokens, streams of the positions before them) at positions pos0 ..; with logits, its LM
+    // head on the last row into mtp_logits (and a sync). The rows must not exceed s.B.
+    bool mtp_forward(const int* tokens, const float* h, int T, int pos0, bool logits) {
+        const MtpHead& M = *eng->mtp;
+        const int E = eng->n_embd, HC = eng->n_hc;
+        const float eps = (float)eng->eps;
+        if (T > s.B) { qwen_set_error("MTP head: %d rows (max %d)", T, s.B); return false; }
+        if (!M.kvc) { qwen_set_error("MTP head: no KV cache"); return false; }
+        if (pos0 + T > kv_cache_n_ctx(M.kvc)) { qwen_set_error("MTP head: position %d out of range", pos0 + T - 1); return false; }
+        // e: RMSNorm(embedding) * enorm (rows decoded on the CPU into s.x; the GPU is done with s.x here)
+        for (int t = 0; t < T; ++t)
+            if (tokens[t] < 0 || tokens[t] >= eng->vocab_size ||
+                qt_to_float(M.token_embd.type, M.token_embd.row(tokens[t]), s.x + (size_t)t * E, E) != 0) {
+                qwen_set_error("MTP head: token %d", tokens[t]);
+                return false;
+            }
+        kvc_cur = M.kvc;
+        const bool ok =
+            check(gpu_add_rmsnorm(s.x, nullptr, s.x, M.enorm, s.xn, E, T, eps, nullptr, 0), "MTP enorm") &&
+            // h: per-stream RMSNorm * hnorm, then [e | h] per stream through eh_proj: the block's residual streams
+            check(gpu_hc_norm(h, nullptr, nullptr, nullptr, M.hnorm, s.hxn, E, HC, T, eps, nullptr, 0), "MTP hnorm") &&
+            check(gpu_mtp_concat(s.xn, s.hxn, mtp_cat, E, HC, T, 0), "MTP concat") &&
+            matvec(M.eh_proj, mtp_cat, s.res, T * HC, P_HEAD) &&  // Q8_0: the float path
+            // the block, as in forward_hc
+            hc_norm(nullptr, M.L.hc_attn.norm, T) && hc_mix(M.L.hc_attn, T, P_HEAD) &&
+            full_attention(M.L, pos0, T) && hc_norm(s.proj, M.L.hc_ffn.norm, T) && hc_mix(M.L.hc_ffn, T, P_HEAD) &&
+            ffn_core(M.L, T) && hc_norm(s.proj, M.hc_head.norm, T) &&
+            (!logits || (hc_mix(M.hc_head, T, P_HEAD) && lm_head_with(M.output, mtp_logits, T, nullptr, false) == 0));
+        kvc_cur = eng->kvc;
+        return ok;
+    }
+
+    // Speculative verify pass: tokens[0] at pos and the draft tokens[1] at pos + 1 in one forward, the logits of
+    // both (logits0, logits1; [vocab] each), and the state after tokens[0] kept for rollback()
+    int forward_verify(const int* tokens, int pos, float* logits0, float* logits1) {
+        if (!eng->mtp || !mtp_setup()) { qwen_set_error("no MTP head"); return -1; }
+        if (rs.mem.base && !rs_mid.mem.base) { qwen_set_error("no rollback state"); return -1; }
+        spec_mid = true;
+        const int r = forward(tokens, 2, pos, logits1);
+        spec_mid = false;
+        if (r != 0) return r;
+        if (logits0) memcpy(logits0, spec_logits0, sizeof(float) * (size_t)eng->vocab_size);
+        spec_pos = pos;
+        return 0;
+    }
+    int spec_pos = -1;
+
+    // After forward_verify at pos rejected its draft: back to the state after the token at pos (the KV cache needs
+    // nothing: the draft's row is overwritten by the next token)
+    int rollback() {
+        if (spec_pos < 0) { qwen_set_error("rollback without a verify pass"); return -1; }
+        if (rs.mem.base && !check(hipMemcpyAsync(rs.mem.base, rs_mid.mem.base, rs.mem.total, hipMemcpyDeviceToDevice, 0),
+                                  "rollback"))
+            return -1;
+        const int HCD = eng->n_hc * eng->n_embd;
+        if (!check(hipMemcpyAsync(mtp_carry, mtp_h + HCD, sizeof(float) * HCD, hipMemcpyDeviceToDevice, 0), "rollback"))
+            return -1;
+        mtp_carry_pos = spec_pos;
+        mtp_pos = std::min(mtp_pos, spec_pos + 1);
+        mtp_h_n = 1;
+        spec_pos = -1;
+        return sync() ? 0 : -1;
+    }
+
+    // The head's draft for position pos + 1, given the token at pos (not decoded yet): the argmax of its logits,
+    // or -1 when there is no draft (no head, or the streams of pos - 1 are not known)
+    int mtp_draft(int token, int pos) {
+        if (!eng->mtp || !mtp_setup() || mtp_carry_pos != pos - 1 || pos < 1) return -1;
+        // rows before pos the head has not seen (after a jump in the sequence) stay as they are: older rows only
+        // make its drafts worse, never the output
+        mtp_pos = pos;
+        if (!mtp_forward(&token, mtp_carry, 1, pos, true)) return -1;
+        mtp_pos = pos + 1;
+        int best = 0;
+        for (int v = 1; v < eng->vocab_size; ++v)
+            if (mtp_logits[v] > mtp_logits[best]) best = v;
+        return best;
     }
 
     // The FFN of a hyper-connection block, from s.xn to s.proj: MoE, or a dense SwiGLU
@@ -1127,6 +1336,22 @@ int qwen_model_run_layers(qwen_model_t* model, const int* tokens, int n, const f
     const int r = model->forward(tokens, n, 0, nullptr);
     model->dbg_res_in = nullptr;
     return r;
+}
+
+void qwen_model_mtp_reset(qwen_model_t* model) {
+    if (model) model->mtp_free();
+}
+
+int qwen_model_mtp_draft(qwen_model_t* model, int token, int pos) {
+    return model ? model->mtp_draft(token, pos) : -1;
+}
+
+int qwen_model_forward_verify(qwen_model_t* model, const int tokens[2], int pos, float* logits0, float* logits1) {
+    return model && tokens ? model->forward_verify(tokens, pos, logits0, logits1) : -1;
+}
+
+int qwen_model_rollback(qwen_model_t* model) {
+    return model ? model->rollback() : -1;
 }
 
 int qwen_model_max_batch(const qwen_model_t* model) {

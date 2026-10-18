@@ -135,6 +135,16 @@ set_lm_head_q8(h, enable)
   OUTPUT:
     RETVAL
 
+int
+set_draft_model(h, path)
+    SV* h
+    SV* path
+  CODE:
+    RETVAL = inference_set_draft_model(handle_ptr(aTHX_ h, 0), SvOK(path) ? SvPV_nolen(path) : NULL);
+    if (RETVAL < 0) croak_last(aTHX_ "set_draft_model", RETVAL);
+  OUTPUT:
+    RETVAL
+
 SV*
 tokenize(h, text)
     SV* h

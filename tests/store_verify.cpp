@@ -91,7 +91,10 @@ int main(int argc, char** argv) {
     const int phase = atoi(argv[3]);
     const bool exact = getenv("QMATVEC_NO_WMMA") != nullptr;
     inference_model_t* m = inference_load_model(argv[1]);
-    if (!m || inference_kv_cache_init(m, 4096) != 0 || inference_store_open(m, dir.c_str(), 2) != 0) {
+    // STORE_VERIFY_DRAFT=<mtp head>: with speculative decoding (snapshots must never hold a draft)
+    const char* draft = getenv("STORE_VERIFY_DRAFT");
+    if (!m || (draft && inference_set_draft_model(m, draft) != 0) || inference_kv_cache_init(m, 4096) != 0 ||
+        inference_store_open(m, dir.c_str(), 2) != 0) {
         fprintf(stderr, "setup failed: %s\n", inference_get_last_error());
         return 1;
     }

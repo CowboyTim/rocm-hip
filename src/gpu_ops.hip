@@ -357,6 +357,14 @@ hc_mix(const float* xn, const float* gate, float* out, int n, int hc, Q8Out o) {
     if (o.qK) q8_block_value(v, i < n, t * (n / 256) + blockIdx.x, threadIdx.x, sh, o);  // uniform
 }
 
+// mtp_concat  grid (ceil(2n / 256), T * hc): out[t][c] = [e[t] | h[t][c]] (n values each), the MTP head's
+//             eh_proj input per stream
+extern "C" __global__ void __launch_bounds__(256)
+mtp_concat(const float* e, const float* h, float* out, int n, int hc) {
+    const int r = blockIdx.y, t = r / hc, i = blockIdx.x * 256 + threadIdx.x;
+    if (i < 2 * n) out[(size_t)r * 2 * n + i] = i < n ? e[(size_t)t * n + i] : h[(size_t)r * n + i - n];
+}
+
 // ple_gate  grid T, block 256: per stream c, s = (RMSNorm(key[r]) * wk) . (RMSNorm(res[r]) * wq) / sqrt(n),
 //           gate = sigmoid(sgn(s) * sqrt(max(|s|, 1e-6))); gated[r] = value[t] * gate,
 //           normed[r] = RMSNorm(gated[r]) * wc. key, res, gated, normed: [T][hc][n]; value [T][n].
@@ -416,7 +424,7 @@ ple_gate(const float* key, const float* value, const float* res, const float* wk
 //           (K - 1) * dil inputs become the new state. w: F16 [m][K].
 extern "C" __global__ void __launch_bounds__(256)
 ple_conv(const float* normed, const float* gated, float* res, float* state, const __half* w, int m, int T, int K,
-         int dil) {
+         int dil, float* state_mid) {
     const int ch = blockIdx.x * 256 + threadIdx.x;
     if (ch >= m) return;
     const int H = (K - 1) * dil;
@@ -431,6 +439,12 @@ ple_conv(const float* normed, const float* gated, float* res, float* state, cons
         const size_t i = (size_t)t * m + ch;
         res[i] += gated[i] + acc / (1.0f + __expf(-acc));
     }
+    // state_mid (optional): the state after the first token, combined[1 + i]
+    if (state_mid)
+        for (int i = 0; i < H; ++i) {
+            const int src = 1 + i;
+            state_mid[(size_t)i * m + ch] = src < H ? state[(size_t)src * m + ch] : normed[(size_t)(src - H) * m + ch];
+        }
     // new state row i = combined[T + i], combined = state ++ normed; ascending i only reads rows > i of state
     for (int i = 0; i < H; ++i) {
         const int src = T + i;

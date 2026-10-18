@@ -101,6 +101,11 @@ hipError_t qmatvec_launch_q8_pair(int type, const void *W, int N, float *y, cons
 int qmatvec_q8_lr_supported(int type, int K);
 hipError_t qmatvec_launch_q8_lr(int type, const void *W, size_t row_bytes, const float *lo, int n, int K, float scale,
                                 float *y, int N, hipStream_t stream);
+// The same for T tokens (T = 1, or 2..4 where qmatvec_q8_few_supported): input rows t of q, output rows
+// ys[i] + t * Ns[i]; the weights are read once and every token gets the single-token result bit for bit
+int qmatvec_q8_few_supported(int type, int K, int T);
+hipError_t qmatvec_launch_q8_multi_t(int type, int n, const void *const *Ws, const int *Ns, float *const *ys,
+                                     size_t row_bytes, const qmatvec_q8 *q, int K, int T, hipStream_t stream);
 // n (1..4) matvecs of the same type and K on the same input in one launch: ys[i] = Ws[i] x (Ns[i] rows)
 hipError_t qmatvec_launch_q8_multi(int type, int n, const void *const *Ws, const int *Ns, float *const *ys,
                                    size_t row_bytes, const qmatvec_q8 *q, int K, hipStream_t stream);

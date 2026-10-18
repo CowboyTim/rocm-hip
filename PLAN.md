@@ -1218,11 +1218,14 @@ for the symptoms above.
 >   **38.1 tok/s** (was 31.4; see "generation speed" and "kernel fusions" in Phase 21), prefill **436 tok/s**
 >   (2,427 tokens) vs the reference's ~24 / ~345. 35B 65.3 tok/s, 4B 63.7.
 > - **Next:**
->   1. **now: MTP speculative decoding** (user, 2026-10-18: fusions first — done — then MTP). The reference:
->      +11–34%. The head: `kingjones777/Qwen3.8-Flash-Next-MTP-Heads-GGUF` (`mtp-...-Q4_0_ROCMFP4_FAST.gguf`
->      2.1 GB; Q8_0 4.1 GB is the one the card measured); its graph: the repo's `qwen4exp-mtp-graph.patch`. A
->      rejected draft needs the DeltaNet state of the position before it (118 MB here). Profile:
->      `rocprofv3 --kernel-trace -d <dir> -o run -- <cmd>`, then `tools/prof_summary.py <dir>`;
+>   1. **MTP speculative decoding — DONE ✅** (see "MTP" in Phase 21): `inference_set_draft_model(model,
+>      "/data/mtp/mtp-Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST.gguf")`, `qwen_demo --draft`, Perl `set_draft_model`.
+>      Output identical to plain decoding (greedy and sampled); ~2 tokens per pass; 38 → ~50 tok/s (bare loop,
+>      chat prompts), ~45 through `inference_generate_stream` incl. the prompt. Left: the experts of a verify
+>      pass (12.3 ms of ~40: the 2 tokens' experts are read separately; share the overlap), fusing the 2-token
+>      pass (shared expert slot, multi-matvec are done for T <= 4 only partly), the head's 338 MB LM head per
+>      draft, more drafts per pass. Profile: `rocprofv3 --kernel-trace -d <dir> -o run -- <cmd>`, then
+>      `tools/prof_summary.py <dir>`;
 >   2. greedy text vs `llama-completion` diverges at the 2nd token on that prompt (a near-tie, see the results);
 >      compare longer greedy runs on prompts without near-ties, or by teacher forcing;
 >   3. MTP draft heads (the model card's MTP-Heads GGUF) for speculative decoding: +11–34% in the reference;
@@ -1963,7 +1966,40 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
   - Left: moe_router 48 x 14 us, hc_norm 98 x 7.6 us, deltanet_rule 36 x 19 us, hc_mix 97 x 2.9 us; ~930
     launches x ~1.7 us of gaps. Per token ~26 ms, of which the matvecs ~20.5 ms.
 
-**Needed from the user:** nothing for now (the model is in `/models`). Constraints here: /dev/shm
+- **MTP speculative decoding — DONE ✅ (2026-10-18).** The head: `kingjones777/Qwen3.8-Flash-Next-MTP-Heads-GGUF`,
+  `mtp-Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST.gguf` (2.1 GB, sha256 checked) in `/data/mtp/` with the repo's
+  `qwen4exp-mtp-graph.patch` (the reference graph, `graph_mtp`) and its README.
+  - **The head** (`MtpHead`, `inference_set_draft_model`): blk.48 of the sidecar (full attention + MoE + HC
+    mixers, bound by the shared `load_layer`), its own token_embd (CPU rows), LM head (FAST), final mixer, and
+    `nextn.eh_proj` (Q8_0 [2E -> E]), `enorm`, `hnorm`. Its row at position p: [RMSNorm(embed(token p)) * enorm |
+    per-stream RMSNorm(main streams at p - 1) * hnorm] per stream through eh_proj = the block's residual streams;
+    then the block with its own one-layer KV cache, its final mixer and LM head (llama.cpp's draft-mtp driver:
+    pair (h_{p-1}, x_p) at position p; dense attention).
+  - **Feeding it** (`QwenModel::mtp_track` / `mtp_process`): every main forward keeps its residual streams
+    (before the final mixer) and runs the head on its rows (no LM head), so the head's KV cache follows the
+    sequence; `qwen_model_mtp_draft(token, pos)` adds the row of the next token and returns the head's argmax.
+    Greedy drafts match the model's next token 0.98 (code) / 0.94 (reasoning) on chat prompts.
+  - **Verify pass** (`qwen_model_forward_verify`): [token, draft] as one 2-token forward, exactly what two
+    single-token forwards give: the MoE groups by expert only from 8 tokens (fewer take the per-token expert
+    kernels), new few-token int8 kernels `matvec_q8t_<type>` (ROCmFP4_FAST, Q6_K; 2..4 tokens, weights decoded
+    once, each token's sums as in the single-token kernel) for the projections and the LM head, attention is
+    on its exact path below 16 tokens. `deltanet_rule` / `deltanet_conv_state` / `ple_conv` also write the state
+    after the first token into `rs_mid` (and the PLE token history); `qwen_model_rollback` copies it back when
+    the draft is rejected (118 MB, ~2-6% of passes).
+  - **Library** (`inference_generate_stream`): the emitted token is decoded together with the head's draft; the
+    next token is sampled from the first row's logits as always; equal to the draft → already decoded, the
+    next sample uses the second row's logits; else rollback. So the output is that of plain decoding for any
+    sampler. No speculation on a step whose next block boundary takes a store snapshot (it must not hold a
+    draft); stops with a draft decoded roll it back.
+  - **Tests** (`tests/mtp_verify.cpp <model> <head>`): acceptance, speculative greedy = plain greedy (129
+    tokens, 2 prompts), `inference_generate_stream` with = without the head (greedy and temperature 0.8,
+    stopping at the end of the turn); `STORE_VERIFY_DRAFT=<head> tests/store_verify.sh` (reply identical across
+    processes with QMATVEC_NO_WMMA). All other checks unchanged.
+  - **Speed:** plain 38.1 tok/s; speculative 42.7 (first) → 49.5 (few-token kernels) → 52.0 / 49.9 (2-row LM
+    head in one read) on the code / reasoning prompts, ~2 tokens per pass. Through the library ~45 tok/s incl.
+    the prompt. Per pass (~40 ms): projections 13.5 ms, experts 12.3, LM head 2.3, the head ~2.5.
+
+**Needed from the user:** nothing for now (the model is in `/models`, the head in `/data/mtp`). Constraints here: /dev/shm
 is a 63 GB tmpfs (38 GB free) and the disk has 48 GB free, so a ~50 GB model needs space freed or /dev/shm
 remounted larger; the reference oracle must also run each model on the CPU for `ref_dump`.
 

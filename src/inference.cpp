@@ -55,22 +55,21 @@ static void seq_reset(inference_model_t* m);
 // lives inside them, and on UMA the registered host pointer is the device pointer, so nothing is copied. Tensors
 // only the CPU reads are left out: the token embeddings (when the LM head is not tied to them) and the PLE table
 // (qwen4exp: 35.8 GiB, 16 rows per token), so a model bigger than what may be pinned can still run.
-static bool pin_model_memory(inference_model* m) {
+static bool pin_gguf(gguf_model_t* gguf, std::vector<const QuantWeight*> cpu_only_w,
+                     std::vector<std::pair<void*, size_t>>& pinned, size_t& pinned_bytes, size_t& unpinned_bytes) {
     const size_t page = (size_t)sysconf(_SC_PAGESIZE);
     std::vector<std::pair<const char*, const char*>> skip;  // whole pages inside CPU-only tensors
-    auto cpu_only = [&](const QuantWeight& w) {
-        if (!w.data) return;
-        const uintptr_t b = ((uintptr_t)w.data + page - 1) / page * page;
-        const uintptr_t e = ((uintptr_t)w.data + w.row_bytes * (size_t)w.N) / page * page;
+    for (const QuantWeight* w : cpu_only_w) {
+        if (!w || !w->data) continue;
+        const uintptr_t b = ((uintptr_t)w->data + page - 1) / page * page;
+        const uintptr_t e = ((uintptr_t)w->data + w->row_bytes * (size_t)w->N) / page * page;
         if (e > b) skip.push_back({(const char*)b, (const char*)e});
-    };
-    if (m->output.data != m->token_embd.data) cpu_only(m->token_embd);
-    cpu_only(m->ple_table);
+    }
     std::sort(skip.begin(), skip.end());
-    m->pinned_bytes = m->unpinned_bytes = 0;
-    for (int i = 0; i < gguf_n_maps(m->gguf); ++i) {
+    pinned_bytes = unpinned_bytes = 0;
+    for (int i = 0; i < gguf_n_maps(gguf); ++i) {
         size_t size = 0;
-        const char* base = (const char*)gguf_map_at(m->gguf, i, &size);
+        const char* base = (const char*)gguf_map_at(gguf, i, &size);
         const char* cur = base;
         auto pin = [&](const char* end) {
             if (end <= cur) return true;
@@ -80,26 +79,36 @@ static bool pin_model_memory(inference_model* m) {
                           (size_t)(end - cur), hipGetErrorString(e));
                 return false;
             }
-            m->pinned.push_back({(void*)cur, (size_t)(end - cur)});
-            m->pinned_bytes += (size_t)(end - cur);
+            pinned.push_back({(void*)cur, (size_t)(end - cur)});
+            pinned_bytes += (size_t)(end - cur);
             return true;
         };
         for (const auto& r : skip) {
             if (r.first < base || r.second > base + size) continue;
             if (!pin(r.first)) return false;
-            m->unpinned_bytes += (size_t)(r.second - r.first);
+            unpinned_bytes += (size_t)(r.second - r.first);
             cur = r.second;
         }
         if (!pin(base + size)) return false;
     }
-    INFER_LOG("[pin_model] %d file(s): %zu MB registered, %zu MB left to the CPU\n", gguf_n_maps(m->gguf),
-              m->pinned_bytes >> 20, m->unpinned_bytes >> 20);
+    INFER_LOG("[pin_model] %d file(s): %zu MB registered, %zu MB left to the CPU\n", gguf_n_maps(gguf),
+              pinned_bytes >> 20, unpinned_bytes >> 20);
     return true;
 }
 
+static void unpin(std::vector<std::pair<void*, size_t>>& pinned) {
+    for (const auto& r : pinned) (void)hipHostUnregister(r.first);
+    pinned.clear();
+}
+
+static bool pin_model_memory(inference_model* m) {
+    std::vector<const QuantWeight*> cpu_only = {&m->ple_table};
+    if (m->output.data != m->token_embd.data) cpu_only.push_back(&m->token_embd);
+    return pin_gguf(m->gguf, cpu_only, m->pinned, m->pinned_bytes, m->unpinned_bytes);
+}
+
 static void unpin_model_memory(inference_model* m) {
-    for (const auto& r : m->pinned) (void)hipHostUnregister(r.first);
-    m->pinned.clear();
+    unpin(m->pinned);
 }
 
 // Helper: find tensor index by name
@@ -188,13 +197,13 @@ static bool check_shape(const char* what, int layer, const QuantWeight& w, int N
 }
 
 // Bind a hyper-connection mixer <prefix>_{norm,down,up,inject}.weight (inject only with_inject)
-static bool bind_hc_mix(inference_model* m, const char* prefix, HcMix& h, bool with_inject) {
+static bool bind_hc_mix(inference_model* m, gguf_model_t* g, const char* prefix, HcMix& h, bool with_inject) {
     const int HCD = m->n_hc * m->n_embd, R = m->hc_rank;
     char name[160];
     auto nm = [&](const char* t) { snprintf(name, sizeof(name), "%s_%s.weight", prefix, t); return name; };
-    if (!bind_norm(m->gguf, nm("norm"), HCD, h.norm, true) || !bind_weight(m->gguf, nm("down"), h.down, true) ||
-        !bind_weight(m->gguf, nm("up"), h.up, true) ||
-        (with_inject && !bind_weight(m->gguf, nm("inject"), h.inject, true)))
+    if (!bind_norm(g, nm("norm"), HCD, h.norm, true) || !bind_weight(g, nm("down"), h.down, true) ||
+        !bind_weight(g, nm("up"), h.up, true) ||
+        (with_inject && !bind_weight(g, nm("inject"), h.inject, true)))
         return false;
     if (h.down.N != R || h.down.K != HCD || h.up.N != HCD || h.up.K != R ||
         (with_inject && (h.inject.N != m->n_hc || h.inject.K != HCD))) {
@@ -231,7 +240,7 @@ static bool load_qwen4exp(inference_model* m, std::vector<int>& ple_layers) {
     m->hc_rank = (int)gguf_arch_int(m->gguf, "hyper_connection.low_rank", 0);
     m->gdn_sigmoid_gate = true;
     if (m->hc_rank <= 0) { set_error("hyper_connection.low_rank missing"); return false; }
-    if (!bind_hc_mix(m, "output_hc", m->hc_head, false)) return false;
+    if (!bind_hc_mix(m, m->gguf, "output_hc", m->hc_head, false)) return false;
     // QSA sparse attention is not implemented: only dense attention (every compress ratio 0, as released)
     std::vector<uint64_t> ratios;
     if (kv_u64_array(m->gguf, (a + "attention.compress_ratios").c_str(), ratios))
@@ -266,126 +275,131 @@ static bool load_qwen4exp(inference_model* m, std::vector<int>& ple_layers) {
     return true;
 }
 
-// Bind every per-layer tensor, classify each block, and check shapes against the hyperparameters
-static bool load_model_weights(inference_model* m, const std::vector<int>& ple_layers) {
+// Bind block i of GGUF g (the model's own file, or an MTP sidecar) into L: classify it, bind its tensors and
+// check their shapes against the hyperparameters. A full-attention block takes the next KV cache layer.
+static bool load_layer(inference_model* m, gguf_model_t* g, int i, LayerWeights& L, const std::vector<int>& ple_layers) {
     const int E = m->n_embd, HD = m->head_dim, HQ = m->n_head, HKV = m->n_head_kv, FF = m->n_ff;
-    m->layers.resize(m->n_layer);
     char name[128];
     auto nm = [&](int i, const char* t) { snprintf(name, sizeof(name), "blk.%d.%s", i, t); return name; };
 
-    for (int i = 0; i < m->n_layer; ++i) {
-        LayerWeights& L = m->layers[i];
 
-        // --- Classify the block by the tensors it carries (Phase 20 Step 2) ---
-        // ssm_alpha.weight => Gated DeltaNet linear attention; attn_q.weight => full attention. MTP (nextn) blocks
-        // sit past n_layer and are never loaded here.
-        const bool linear = find_tensor_index(m->gguf, nm(i, "ssm_alpha.weight")) >= 0;
-        const bool full = find_tensor_index(m->gguf, nm(i, "attn_q.weight")) >= 0;
-        if (linear == full) {
-            set_error("blk.%d: cannot classify (ssm_alpha=%d attn_q=%d)", i, linear, full);
+    // --- Classify the block by the tensors it carries (Phase 20 Step 2) ---
+    // ssm_alpha.weight => Gated DeltaNet linear attention; attn_q.weight => full attention. MTP (nextn) blocks
+    // sit past n_layer and are never loaded here.
+    const bool linear = find_tensor_index(g, nm(i, "ssm_alpha.weight")) >= 0;
+    const bool full = find_tensor_index(g, nm(i, "attn_q.weight")) >= 0;
+    if (linear == full) {
+        set_error("blk.%d: cannot classify (ssm_alpha=%d attn_q=%d)", i, linear, full);
+        return false;
+    }
+    L.kind = linear ? LAYER_LINEAR_ATTN : LAYER_FULL_ATTN;
+    if (full) L.kv_slot = m->n_kv_layers++;  // only attention layers get KV cache space
+
+    if (m->n_hc > 0) {  // hyper-connection mixers in place of the norms
+        if (!bind_hc_mix(m, g, nm(i, "hc_attn"), L.hc_attn, true) || !bind_hc_mix(m, g, nm(i, "hc_ffn"), L.hc_ffn, true))
+            return false;
+    } else {
+        if (!bind_norm(g, nm(i, "attn_norm.weight"), E, L.attn_norm, true)) return false;
+        if (!bind_norm(g, nm(i, "post_attention_norm.weight"), E, L.ffn_norm, true)) return false;
+    }
+    L.ple = std::find(ple_layers.begin(), ple_layers.end(), i) != ple_layers.end();
+    if (L.ple) {
+        const int HCD = m->n_hc * E;
+        if (!bind_weight(g, nm(i, "ple_key.weight"), L.ple_key, true) ||
+            !bind_weight(g, nm(i, "ple_value.weight"), L.ple_value, true) ||
+            !bind_norm(g, nm(i, "ple_norm_key.weight"), HCD, L.ple_norm_key, true) ||
+            !bind_norm(g, nm(i, "ple_norm_query.weight"), HCD, L.ple_norm_query, true) ||
+            !bind_norm(g, nm(i, "ple_norm_conv.weight"), HCD, L.ple_norm_conv, true) ||
+            !check_shape("ple_key", i, L.ple_key, HCD, E) || !check_shape("ple_value", i, L.ple_value, E, E))
+            return false;
+        const int idx = find_tensor_index(g, nm(i, "ple_conv1d.weight"));
+        const int64_t* ne = idx >= 0 ? gguf_tensor_ne(g, idx) : nullptr;
+        size_t bytes = 0;
+        const void* p = idx >= 0 ? gguf_get_tensor_ptr(g, name, &bytes) : nullptr;
+        if (!p || gguf_tensor_type(g, idx) != QT_F16 || ne[0] != m->ple_conv || ne[1] != HCD ||
+            bytes != (size_t)m->ple_conv * HCD * 2) {
+            set_error("blk.%d.ple_conv1d: expected F16[%d x %d]", i, m->ple_conv, HCD);
             return false;
         }
-        L.kind = linear ? LAYER_LINEAR_ATTN : LAYER_FULL_ATTN;
-        if (full) L.kv_slot = m->n_kv_layers++;  // only attention layers get KV cache space
-
-        if (m->n_hc > 0) {  // hyper-connection mixers in place of the norms
-            if (!bind_hc_mix(m, nm(i, "hc_attn"), L.hc_attn, true) || !bind_hc_mix(m, nm(i, "hc_ffn"), L.hc_ffn, true))
-                return false;
-        } else {
-            if (!bind_norm(m->gguf, nm(i, "attn_norm.weight"), E, L.attn_norm, true)) return false;
-            if (!bind_norm(m->gguf, nm(i, "post_attention_norm.weight"), E, L.ffn_norm, true)) return false;
-        }
-        L.ple = std::find(ple_layers.begin(), ple_layers.end(), i) != ple_layers.end();
-        if (L.ple) {
-            const int HCD = m->n_hc * E;
-            if (!bind_weight(m->gguf, nm(i, "ple_key.weight"), L.ple_key, true) ||
-                !bind_weight(m->gguf, nm(i, "ple_value.weight"), L.ple_value, true) ||
-                !bind_norm(m->gguf, nm(i, "ple_norm_key.weight"), HCD, L.ple_norm_key, true) ||
-                !bind_norm(m->gguf, nm(i, "ple_norm_query.weight"), HCD, L.ple_norm_query, true) ||
-                !bind_norm(m->gguf, nm(i, "ple_norm_conv.weight"), HCD, L.ple_norm_conv, true) ||
-                !check_shape("ple_key", i, L.ple_key, HCD, E) || !check_shape("ple_value", i, L.ple_value, E, E))
-                return false;
-            const int idx = find_tensor_index(m->gguf, nm(i, "ple_conv1d.weight"));
-            const int64_t* ne = idx >= 0 ? gguf_tensor_ne(m->gguf, idx) : nullptr;
-            size_t bytes = 0;
-            const void* p = idx >= 0 ? gguf_get_tensor_ptr(m->gguf, name, &bytes) : nullptr;
-            if (!p || gguf_tensor_type(m->gguf, idx) != QT_F16 || ne[0] != m->ple_conv || ne[1] != HCD ||
-                bytes != (size_t)m->ple_conv * HCD * 2) {
-                set_error("blk.%d.ple_conv1d: expected F16[%d x %d]", i, m->ple_conv, HCD);
-                return false;
-            }
-            L.ple_conv1d = (const uint16_t*)p;
-        }
-
-        if (L.kind == LAYER_LINEAR_ATTN) {
-            const int DS = m->ssm_d_state, NG = m->ssm_n_group, NV = m->ssm_dt_rank, DI = m->ssm_d_inner;
-            const int conv_dim = 2 * NG * DS + DI;
-            if (m->ssm_d_conv < 2 || DS <= 0 || NG <= 0 || NV <= 0 || NV % NG != 0 || DI != NV * DS) {
-                set_error("blk.%d: bad ssm hparams (d_conv %d d_state %d n_group %d dt_rank %d d_inner %d)", i,
-                          m->ssm_d_conv, DS, NG, NV, DI);
-                return false;
-            }
-            if (!bind_weight(m->gguf, nm(i, "attn_qkv.weight"), L.W_qkv, true)) return false;
-            if (!bind_weight(m->gguf, nm(i, "attn_gate.weight"), L.W_z, true)) return false;
-            if (!bind_weight(m->gguf, nm(i, "ssm_alpha.weight"), L.W_alpha, true)) return false;
-            if (!bind_weight(m->gguf, nm(i, "ssm_beta.weight"), L.W_beta, true)) return false;
-            if (!bind_weight(m->gguf, nm(i, "ssm_out.weight"), L.W_ssm_out, true)) return false;
-            if (!bind_f32(m->gguf, nm(i, "ssm_conv1d.weight"), m->ssm_d_conv, conv_dim, L.ssm_conv1d)) return false;
-            if (!bind_norm(m->gguf, nm(i, "ssm_dt.bias"), NV, L.ssm_dt, true)) return false;
-            if (!bind_norm(m->gguf, nm(i, "ssm_a"), NV, L.ssm_a, true)) return false;
-            if (!bind_norm(m->gguf, nm(i, "ssm_norm.weight"), DS, L.ssm_norm, true)) return false;
-            if (!check_shape("attn_qkv", i, L.W_qkv, conv_dim, E) ||
-                !check_shape("attn_gate", i, L.W_z, DI, E) ||
-                !check_shape("ssm_alpha", i, L.W_alpha, NV, E) ||
-                !check_shape("ssm_beta", i, L.W_beta, NV, E) ||
-                !check_shape("ssm_out", i, L.W_ssm_out, E, DI)) return false;
-        } else {
-            if (!bind_weight(m->gguf, nm(i, "attn_q.weight"), L.Wq, true)) return false;
-            if (!bind_weight(m->gguf, nm(i, "attn_k.weight"), L.Wk, true)) return false;
-            if (!bind_weight(m->gguf, nm(i, "attn_v.weight"), L.Wv, true)) return false;
-            if (!bind_weight(m->gguf, nm(i, "attn_output.weight"), L.Wo, true)) return false;
-            if (!bind_norm(m->gguf, nm(i, "attn_q_norm.weight"), HD, L.q_norm, true)) return false;
-            if (!bind_norm(m->gguf, nm(i, "attn_k_norm.weight"), HD, L.k_norm, true)) return false;
-            // Gated attention: attn_q holds Q and the output gate, head_dim each, interleaved per head
-            if (!check_shape("attn_q", i, L.Wq, 2 * HQ * HD, E) ||
-                !check_shape("attn_k", i, L.Wk, HKV * HD, E) ||
-                !check_shape("attn_v", i, L.Wv, HKV * HD, E) ||
-                !check_shape("attn_output", i, L.Wo, E, HQ * HD)) return false;
-        }
-
-        // FFN: MoE (router ffn_gate_inp + 3-D expert tensors + a sigmoid-gated shared expert) or dense SwiGLU
-        L.moe = find_tensor_index(m->gguf, nm(i, "ffn_gate_inp.weight")) >= 0;
-        if (L.moe) {
-            const int NE = m->n_expert, FE = m->n_ff_exp, FS = m->n_ff_shexp;
-            if (NE <= 0 || m->n_expert_used <= 0 || m->n_expert_used > NE || FE <= 0 || FS <= 0) {
-                set_error("blk.%d: bad MoE hparams (experts %d used %d ff_exp %d ff_shexp %d)", i, NE,
-                          m->n_expert_used, FE, FS);
-                return false;
-            }
-            if (!bind_weight(m->gguf, nm(i, "ffn_gate_inp.weight"), L.W_router, true)) return false;
-            if (!bind_weight(m->gguf, nm(i, "ffn_gate_exps.weight"), L.We_gate, true)) return false;
-            if (!bind_weight(m->gguf, nm(i, "ffn_up_exps.weight"), L.We_up, true)) return false;
-            if (!bind_weight(m->gguf, nm(i, "ffn_down_exps.weight"), L.We_down, true)) return false;
-            if (!bind_weight(m->gguf, nm(i, "ffn_gate_shexp.weight"), L.W_gate, true)) return false;
-            if (!bind_weight(m->gguf, nm(i, "ffn_up_shexp.weight"), L.W_up, true)) return false;
-            if (!bind_weight(m->gguf, nm(i, "ffn_down_shexp.weight"), L.W_down, true)) return false;
-            if (!bind_norm(m->gguf, nm(i, "ffn_gate_inp_shexp.weight"), E, L.shexp_gate, true)) return false;
-            if (!check_shape("ffn_gate_inp", i, L.W_router, NE, E) ||
-                !check_shape("ffn_gate_exps", i, L.We_gate, NE * FE, E) ||
-                !check_shape("ffn_up_exps", i, L.We_up, NE * FE, E) ||
-                !check_shape("ffn_down_exps", i, L.We_down, NE * E, FE) ||
-                !check_shape("ffn_gate_shexp", i, L.W_gate, FS, E) ||
-                !check_shape("ffn_up_shexp", i, L.W_up, FS, E) ||
-                !check_shape("ffn_down_shexp", i, L.W_down, E, FS)) return false;
-        } else {
-            if (!bind_weight(m->gguf, nm(i, "ffn_gate.weight"), L.W_gate, true)) return false;
-            if (!bind_weight(m->gguf, nm(i, "ffn_up.weight"), L.W_up, true)) return false;
-            if (!bind_weight(m->gguf, nm(i, "ffn_down.weight"), L.W_down, true)) return false;
-            if (!check_shape("ffn_gate", i, L.W_gate, FF, E) ||
-                !check_shape("ffn_up", i, L.W_up, FF, E) ||
-                !check_shape("ffn_down", i, L.W_down, E, FF)) return false;
-        }
+        L.ple_conv1d = (const uint16_t*)p;
     }
+
+    if (L.kind == LAYER_LINEAR_ATTN) {
+        const int DS = m->ssm_d_state, NG = m->ssm_n_group, NV = m->ssm_dt_rank, DI = m->ssm_d_inner;
+        const int conv_dim = 2 * NG * DS + DI;
+        if (m->ssm_d_conv < 2 || DS <= 0 || NG <= 0 || NV <= 0 || NV % NG != 0 || DI != NV * DS) {
+            set_error("blk.%d: bad ssm hparams (d_conv %d d_state %d n_group %d dt_rank %d d_inner %d)", i,
+                      m->ssm_d_conv, DS, NG, NV, DI);
+            return false;
+        }
+        if (!bind_weight(g, nm(i, "attn_qkv.weight"), L.W_qkv, true)) return false;
+        if (!bind_weight(g, nm(i, "attn_gate.weight"), L.W_z, true)) return false;
+        if (!bind_weight(g, nm(i, "ssm_alpha.weight"), L.W_alpha, true)) return false;
+        if (!bind_weight(g, nm(i, "ssm_beta.weight"), L.W_beta, true)) return false;
+        if (!bind_weight(g, nm(i, "ssm_out.weight"), L.W_ssm_out, true)) return false;
+        if (!bind_f32(g, nm(i, "ssm_conv1d.weight"), m->ssm_d_conv, conv_dim, L.ssm_conv1d)) return false;
+        if (!bind_norm(g, nm(i, "ssm_dt.bias"), NV, L.ssm_dt, true)) return false;
+        if (!bind_norm(g, nm(i, "ssm_a"), NV, L.ssm_a, true)) return false;
+        if (!bind_norm(g, nm(i, "ssm_norm.weight"), DS, L.ssm_norm, true)) return false;
+        if (!check_shape("attn_qkv", i, L.W_qkv, conv_dim, E) ||
+            !check_shape("attn_gate", i, L.W_z, DI, E) ||
+            !check_shape("ssm_alpha", i, L.W_alpha, NV, E) ||
+            !check_shape("ssm_beta", i, L.W_beta, NV, E) ||
+            !check_shape("ssm_out", i, L.W_ssm_out, E, DI)) return false;
+    } else {
+        if (!bind_weight(g, nm(i, "attn_q.weight"), L.Wq, true)) return false;
+        if (!bind_weight(g, nm(i, "attn_k.weight"), L.Wk, true)) return false;
+        if (!bind_weight(g, nm(i, "attn_v.weight"), L.Wv, true)) return false;
+        if (!bind_weight(g, nm(i, "attn_output.weight"), L.Wo, true)) return false;
+        if (!bind_norm(g, nm(i, "attn_q_norm.weight"), HD, L.q_norm, true)) return false;
+        if (!bind_norm(g, nm(i, "attn_k_norm.weight"), HD, L.k_norm, true)) return false;
+        // Gated attention: attn_q holds Q and the output gate, head_dim each, interleaved per head
+        if (!check_shape("attn_q", i, L.Wq, 2 * HQ * HD, E) ||
+            !check_shape("attn_k", i, L.Wk, HKV * HD, E) ||
+            !check_shape("attn_v", i, L.Wv, HKV * HD, E) ||
+            !check_shape("attn_output", i, L.Wo, E, HQ * HD)) return false;
+    }
+
+    // FFN: MoE (router ffn_gate_inp + 3-D expert tensors + a sigmoid-gated shared expert) or dense SwiGLU
+    L.moe = find_tensor_index(g, nm(i, "ffn_gate_inp.weight")) >= 0;
+    if (L.moe) {
+        const int NE = m->n_expert, FE = m->n_ff_exp, FS = m->n_ff_shexp;
+        if (NE <= 0 || m->n_expert_used <= 0 || m->n_expert_used > NE || FE <= 0 || FS <= 0) {
+            set_error("blk.%d: bad MoE hparams (experts %d used %d ff_exp %d ff_shexp %d)", i, NE,
+                      m->n_expert_used, FE, FS);
+            return false;
+        }
+        if (!bind_weight(g, nm(i, "ffn_gate_inp.weight"), L.W_router, true)) return false;
+        if (!bind_weight(g, nm(i, "ffn_gate_exps.weight"), L.We_gate, true)) return false;
+        if (!bind_weight(g, nm(i, "ffn_up_exps.weight"), L.We_up, true)) return false;
+        if (!bind_weight(g, nm(i, "ffn_down_exps.weight"), L.We_down, true)) return false;
+        if (!bind_weight(g, nm(i, "ffn_gate_shexp.weight"), L.W_gate, true)) return false;
+        if (!bind_weight(g, nm(i, "ffn_up_shexp.weight"), L.W_up, true)) return false;
+        if (!bind_weight(g, nm(i, "ffn_down_shexp.weight"), L.W_down, true)) return false;
+        if (!bind_norm(g, nm(i, "ffn_gate_inp_shexp.weight"), E, L.shexp_gate, true)) return false;
+        if (!check_shape("ffn_gate_inp", i, L.W_router, NE, E) ||
+            !check_shape("ffn_gate_exps", i, L.We_gate, NE * FE, E) ||
+            !check_shape("ffn_up_exps", i, L.We_up, NE * FE, E) ||
+            !check_shape("ffn_down_exps", i, L.We_down, NE * E, FE) ||
+            !check_shape("ffn_gate_shexp", i, L.W_gate, FS, E) ||
+            !check_shape("ffn_up_shexp", i, L.W_up, FS, E) ||
+            !check_shape("ffn_down_shexp", i, L.W_down, E, FS)) return false;
+    } else {
+        if (!bind_weight(g, nm(i, "ffn_gate.weight"), L.W_gate, true)) return false;
+        if (!bind_weight(g, nm(i, "ffn_up.weight"), L.W_up, true)) return false;
+        if (!bind_weight(g, nm(i, "ffn_down.weight"), L.W_down, true)) return false;
+        if (!check_shape("ffn_gate", i, L.W_gate, FF, E) ||
+            !check_shape("ffn_up", i, L.W_up, FF, E) ||
+            !check_shape("ffn_down", i, L.W_down, E, FF)) return false;
+    }
+    return true;
+}
+
+// Bind every per-layer tensor, classify each block, and check shapes against the hyperparameters
+static bool load_model_weights(inference_model* m, const std::vector<int>& ple_layers) {
+    m->layers.resize(m->n_layer);
+    for (int i = 0; i < m->n_layer; ++i)
+        if (!load_layer(m, m->gguf, i, m->layers[i], ple_layers)) return false;
     return true;
 }
 
@@ -499,8 +513,83 @@ inference_model_t* inference_load_model(const char* gguf_path) {
     return m;
 }
 
+static kv_cache_config_t mtp_kv_config(const inference_model* m, int n_ctx) {
+    return kv_cache_config_t{1, n_ctx, m->n_embd, m->head_dim, m->n_head, m->n_head_kv, 0};
+}
+
+static void free_mtp(inference_model* m) {
+    if (!m->mtp) return;
+    unpin(m->mtp->pinned);
+    if (m->mtp->kvc) kv_cache_free(m->mtp->kvc);
+    if (m->mtp->gguf) gguf_mmap_close(m->mtp->gguf);
+    delete m->mtp;
+    m->mtp = nullptr;
+}
+
+int inference_set_draft_model(inference_model_t* m, const char* path) {
+    clear_error();
+    if (!m) { set_error("NULL model"); return -1; }
+    if (m->qwen) qwen_model_sync(m->qwen);
+    free_mtp(m);
+    if (!path) return 0;
+    if (m->n_hc <= 0) { set_error("draft heads are supported for qwen4exp models only"); return -1; }
+    MtpHead* h = new MtpHead();
+    m->mtp = h;
+    h->gguf = gguf_mmap_open(path);
+    if (!h->gguf) { set_error("cannot open draft model %s", path); free_mtp(m); return -1; }
+    const char* arch = gguf_arch(h->gguf);
+    const int blocks = (int)gguf_block_count(h->gguf), nextn = (int)gguf_arch_int(h->gguf, "nextn_predict_layers", 0);
+    if (!arch || m->model_name != arch || nextn != 1 || gguf_embedding_length(h->gguf) != m->n_embd ||
+        gguf_arch_int(h->gguf, "hyper_connection.count", 0) != m->n_hc ||
+        gguf_arch_int(h->gguf, "hyper_connection.low_rank", 0) != m->hc_rank ||
+        gguf_head_count(h->gguf) != m->n_head || gguf_head_count_kv(h->gguf) != m->n_head_kv ||
+        gguf_arch_int(h->gguf, "expert_count", 0) != m->n_expert ||
+        gguf_arch_int(h->gguf, "expert_used_count", 0) != m->n_expert_used) {
+        set_error("%s is not an MTP head for this model (arch %s, %d nextn layers)", path, arch ? arch : "?", nextn);
+        free_mtp(m);
+        return -1;
+    }
+    const int il = blocks - 1, HCD = m->n_hc * m->n_embd;
+    char name[128];
+    auto nm = [&](const char* t) { snprintf(name, sizeof(name), "blk.%d.%s", il, t); return name; };
+    const int n_kv = m->n_kv_layers;
+    const bool ok = load_layer(m, h->gguf, il, h->L, {});
+    m->n_kv_layers = n_kv;  // the head's attention has its own cache
+    h->L.kv_slot = 0;
+    if (!ok || h->L.kind != LAYER_FULL_ATTN || !h->L.moe ||
+        !bind_weight(h->gguf, "token_embd.weight", h->token_embd, true) ||
+        !bind_weight(h->gguf, "output.weight", h->output, true) ||
+        !bind_weight(h->gguf, nm("nextn.eh_proj.weight"), h->eh_proj, true) ||
+        !bind_norm(h->gguf, nm("nextn.enorm.weight"), m->n_embd, h->enorm, true) ||
+        !bind_norm(h->gguf, nm("nextn.hnorm.weight"), HCD, h->hnorm, true) ||
+        !bind_hc_mix(m, h->gguf, "output_hc", h->hc_head, false)) {
+        free_mtp(m);  // the binding that failed set the error
+        return -1;
+    }
+    if (h->eh_proj.N != m->n_embd || h->eh_proj.K != 2 * m->n_embd || h->token_embd.K != m->n_embd ||
+        h->output.K != m->n_embd || h->output.N != m->vocab_size || h->token_embd.N != m->vocab_size) {
+        set_error("draft model: eh_proj / token_embd / output shapes do not match the model");
+        free_mtp(m);
+        return -1;
+    }
+    size_t pb = 0, ub = 0;
+    if (!pin_gguf(h->gguf, {&h->token_embd}, h->pinned, pb, ub)) {
+        set_error("draft model: hipHostRegister failed");
+        free_mtp(m);
+        return -1;
+    }
+    if (m->kvc) {
+        const kv_cache_config_t cfg = mtp_kv_config(m, kv_cache_n_ctx(m->kvc));
+        h->kvc = kv_cache_create("/dev/shm", &cfg);
+        if (!h->kvc) { set_error("draft model: KV cache"); free_mtp(m); return -1; }
+    }
+    if (m->qwen) qwen_model_mtp_reset(m->qwen);
+    return 0;
+}
+
 void inference_free_model(inference_model_t* m) {
     if (!m) return;
+    free_mtp(m);
     INFER_LOG("[CLEANUP] Starting model free...\n");
     if (m->tokenizer) { INFER_LOG("[CLEANUP] Freeing tokenizer\n"); tokenizer_free(m->tokenizer); }
     // IMPORTANT: unpin must happen BEFORE qwen_model_free since unpin walks layer weights
@@ -544,6 +633,12 @@ int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
                           m->n_head_kv};
     m->kvc = kv_cache_create("/dev/shm", &cfg);
     if (!m->kvc) { set_error("kv_cache_create failed"); return -1; }
+    if (m->mtp) {
+        if (m->mtp->kvc) kv_cache_free(m->mtp->kvc);
+        const kv_cache_config_t mcfg = mtp_kv_config(m, kv_cache_n_ctx(m->kvc));
+        m->mtp->kvc = kv_cache_create("/dev/shm", &mcfg);
+        if (!m->mtp->kvc) { set_error("draft model: KV cache"); return -1; }
+    }
     m->n_ctx = n_ctx;
     seq_reset(m);
     // Create Qwen model for forward passes
@@ -740,6 +835,38 @@ static int forward_next(inference_model_t* m, int token_id) {
     if (qwen_model_forward(m->qwen, token_id, m->n_past, nullptr) != 0) { set_error("forward pass failed: %s", qwen_model_last_error()); return -1; }
     ++m->n_past;
     m->seq.push_back(token_id);
+    return store_after_forward(m);
+}
+
+// Speculative decoding (an MTP draft head is loaded): decode token_id like forward_next, but verify the head's
+// draft of the token after it in the same pass. On success *draft is that draft and l0 the logits after
+// token_id (the draft sits decoded at position n_past, not yet counted: the caller accepts it with
+// accept_draft or undoes it with qwen_model_rollback); *draft = -1 when the step decoded token_id alone.
+static int forward_next_spec(inference_model_t* m, int token_id, int* draft, std::vector<float>& l0) {
+    *draft = -1;
+    const int B = kv_B(m);
+    // the state snapshot of a block boundary right after token_id must not contain the draft
+    const bool snap_next = m->store_dirfd >= 0 && (m->n_past + 1) % B == 0 && snapshot_boundary(m, (m->n_past + 1) / B);
+    if (!m->mtp || !m->kvc || !m->qwen || m->n_past + 2 > m->n_ctx || snap_next) return forward_next(m, token_id);
+    const int d = qwen_model_mtp_draft(m->qwen, token_id, m->n_past);
+    if (d < 0) return forward_next(m, token_id);
+    if (ensure_writable(m, m->n_past, 2) != 0) return -1;
+    l0.resize((size_t)m->vocab_size);
+    const int pair[2] = {token_id, d};
+    if (qwen_model_forward_verify(m->qwen, pair, m->n_past, l0.data(), nullptr) != 0) {
+        set_error("forward pass failed: %s", qwen_model_last_error());
+        return -1;
+    }
+    ++m->n_past;
+    m->seq.push_back(token_id);
+    *draft = d;
+    return store_after_forward(m);
+}
+
+// The verified draft is the token that follows: count it as decoded (its logits are the model's current ones)
+static int accept_draft(inference_model_t* m, int draft) {
+    ++m->n_past;
+    m->seq.push_back(draft);
     return store_after_forward(m);
 }
 
@@ -1241,10 +1368,29 @@ int inference_generate_stream(inference_model_t* m, const int32_t* prompt_ids, i
     std::vector<char> buf(256);
     inference_stop_reason stop = INFERENCE_STOP_NONE;
     int emitted = 0, rc = 0;
+    // Speculative decoding (a draft head loaded): `draft` was decoded right after the last emitted token, which
+    // l0 holds the logits after. The next token is sampled from l0 as always; if it is the draft, the draft is
+    // already decoded and the model's logits are the ones after it; if not, the model rolls back. Either way the
+    // tokens are those of plain decoding, sampled from the same logits in the same order.
+    int draft = -1;
+    std::vector<float> l0;
     while (stop == INFERENCE_STOP_NONE) {
         if (emitted >= o.max_new_tokens) { stop = INFERENCE_STOP_MAX_TOKENS; break; }
-        const int next = sampler_sample(smp, qwen_model_logits(m->qwen), m->vocab_size);
-        if (!o.ignore_eog && tokenizer_is_eog(m->tokenizer, next)) { stop = INFERENCE_STOP_EOG; break; }
+        const int next = sampler_sample(smp, draft >= 0 ? l0.data() : qwen_model_logits(m->qwen), m->vocab_size);
+        const bool eog = !o.ignore_eog && tokenizer_is_eog(m->tokenizer, next);
+        bool decoded = false;
+        if (draft >= 0) {
+            if (next == draft && !eog) {
+                rc = accept_draft(m, draft);
+                decoded = true;
+            } else if (qwen_model_rollback(m->qwen) != 0) {
+                set_error("rollback failed: %s", qwen_model_last_error());
+                rc = -1;
+            }
+            draft = -1;
+            if (rc != 0) break;
+        }
+        if (eog) { stop = INFERENCE_STOP_EOG; break; }
         sampler_accept(smp, next);
         if (emitted < max_out) out_ids[emitted] = next;
         ++emitted;
@@ -1269,13 +1415,20 @@ int inference_generate_stream(inference_model_t* m, const int32_t* prompt_ids, i
             stop = INFERENCE_STOP_CALLBACK;
         pending.erase(0, stop == INFERENCE_STOP_STRING ? pending.size() : ready);
 
-        // Every emitted token joins the sequence, so a later call continues right after it
-        rc = forward_next(m, next);
+        // Every emitted token joins the sequence, so a later call continues right after it (with a draft head,
+        // also verifying the head's draft of the token after it, unless generation stops here)
+        if (decoded) continue;
+        rc = stop == INFERENCE_STOP_NONE && emitted < o.max_new_tokens ? forward_next_spec(m, next, &draft, l0)
+                                                                      : forward_next(m, next);
         if (rc == INFERENCE_ERR_CONTEXT_FULL) {
             rc = 0;
             if (stop == INFERENCE_STOP_NONE) stop = INFERENCE_STOP_CONTEXT_FULL;
         }
         if (rc != 0) break;
+    }
+    if (draft >= 0 && qwen_model_rollback(m->qwen) != 0 && rc == 0) {  // stopped with a draft decoded
+        set_error("rollback failed: %s", qwen_model_last_error());
+        rc = -1;
     }
     if (rc == 0 && o.on_token && !pending.empty()) (void)o.on_token(o.user, -1, pending.data(), (int)pending.size());
     sampler_free(smp);

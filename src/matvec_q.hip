@@ -911,6 +911,136 @@ __device__ __forceinline__ float mv_q5_K(const uint8_t *wr, const int8_t *q8, co
         if (gl == 0) (m2 ? y2 : y)[((long long)t * n_used + slot) * N + row] = acc;                      \
     }
 
+// The same for NT tokens (2..4): each lane decodes its quads once and applies them to every token's Q8_0 input
+// (rows t * K / blocks t * K / 32 of q8 / d8), keeping each token's sums exactly as mv_rocmfp4_fast does, so the
+// results are those of NT single-token launches (speculative decoding's verify pass) while the weights are
+// read once.
+template <int NT>
+__device__ __forceinline__ void mv_rocmfp4_fast_t(const uint8_t *wr, const int8_t *q8, const float *d8, int K,
+                                                  int lane, int L, float out[NT]) {
+    const int nquad = K / 128, V = 32 / L;
+    float a[NT][8];
+#pragma unroll
+    for (int t = 0; t < NT; ++t)
+#pragma unroll
+        for (int k = 0; k < 8; ++k) a[t][k] = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        if (k >= V) continue;
+        for (int p = lane + k * L; p < nquad; p += 32) {
+            uint32_t qs[4][4];
+            float e[4];
+            rocmfp4_fast_quad(wr + (long long)p * 68, qs, e);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int ib = 4 * p + j;
+#pragma unroll
+                for (int t = 0; t < NT; ++t)
+                    a[t][k] += rocmfp4_fast_q8_block(qs[j], e[j], q8 + (long long)t * K + ib * 32,
+                                                     d8[(long long)t * (K / 32) + ib]);
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+#pragma unroll
+        for (int d = 4; d >= 1; d >>= 1)
+            if (d < V)
+#pragma unroll
+                for (int k = 0; k < 4; ++k)
+                    if (k < d) a[t][k] += a[t][k + d];
+        out[t] = a[t][0];
+    }
+}
+
+template <int NT>
+__device__ __forceinline__ void matvec_q8t_fast_body(Q8_ARGS) {
+    Q8_ROW_SETUP
+    const int nm = mat == 0 ? N1 : mat == 1 ? N2 - N1 : mat == 2 ? N3 - N2 : N - N3;  // this matrix's rows
+    float acc[NT];
+    mv_rocmfp4_fast_t<NT>(wr, q8, d8, K, gl, L, acc);
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        float v = acc[t];
+        Q8_REDUCE(v)
+        if (gl == 0) yr[(long long)t * nm] = v;
+    }
+}
+
+// Q6_K for NT tokens: mv_q6_K with every token's sums kept as there (Q8_K inputs: rows t * K of q8, t * K / 256
+// of d8, t * K / 16 of bs)
+template <int NT>
+__device__ __forceinline__ void mv_q6_K_t(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
+                                          int lane, int L, float out[NT]) {
+    const int sub = lane >> 3, s = lane & 7;
+    const int h = s >> 2, r = (s & 3) * 16, l = r & 31;
+    const bool second = r >= 32;
+    const int sh_lo = second ? 2 : 0;
+    const int v_lo = 128 * h + (second ? 32 : 0) + l, v_hi = v_lo + 64;
+    const int g_lo = 8 * h + l / 16 + (second ? 2 : 0), g_hi = g_lo + 4;
+    const int nb = K / 256;
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0.0f;
+    for (int ib = sub; ib < nb; ib += L / 8) {
+        const uint8_t *b = wr + (long long)ib * 210;  // 2-aligned
+        const int8_t *sc = (const int8_t *)(b + 192);
+        int vlo[4], vhi[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t ql = ld32_a2(b + 64 * h + r + 4 * k);
+            const uint32_t qh = ld32_a2(b + 128 + 32 * h + l + 4 * k);
+            vlo[k] = (int)((ql & 0x0F0F0F0Fu) | (((qh >> sh_lo) & 0x03030303u) << 4));
+            vhi[k] = (int)(((ql >> 4) & 0x0F0F0F0Fu) | (((qh >> (sh_lo + 4)) & 0x03030303u) << 4));
+        }
+        const float dw = fp16(b + 208);
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            const int8_t *xb = q8 + (long long)t * K + (long long)ib * 256;
+            const int *bst = bs + (long long)t * (K / 16);
+            int slo = 0, shi = 0;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                slo = dot4(vlo[k], *(const int *)(xb + v_lo + 4 * k), slo);
+                shi = dot4(vhi[k], *(const int *)(xb + v_hi + 4 * k), shi);
+            }
+            int isum = sc[g_lo] * slo + sc[g_hi] * shi;
+            isum -= 32 * (sc[2 * s] * bst[ib * 16 + 2 * s] + sc[2 * s + 1] * bst[ib * 16 + 2 * s + 1]);
+            acc[t] += dw * d8[(long long)t * (K / 256) + ib] * (float)isum;
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) out[t] = acc[t];
+}
+
+template <int NT>
+__device__ __forceinline__ void matvec_q8t_q6_K_body(Q8_ARGS) {
+    Q8_ROW_SETUP
+    const int nm = mat == 0 ? N1 : mat == 1 ? N2 - N1 : mat == 2 ? N3 - N2 : N - N3;
+    float acc[NT];
+    mv_q6_K_t<NT>(wr, q8, d8, bs, K, gl, L, acc);
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        float v = acc[t];
+        Q8_REDUCE(v)
+        if (gl == 0) yr[(long long)t * nm] = v;
+    }
+}
+
+// matvec_q8t_<type>(Q8_ARGS, T): matvec_q8_<type> for T = 2..4 tokens (input rows t of q8; output row t of each
+// matrix's y at y + t * its rows)
+#define Q8T_ARGS W, W2, W3, W4, N1, N2, N3, row_bytes, q8, d8, bs, y, y2, y3, y4, N, K, L
+extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matvec_q8t_q4_0_rocmfp4_fast(Q8_ARGS, int T) {
+    if (T == 2) matvec_q8t_fast_body<2>(Q8T_ARGS);
+    else if (T == 3) matvec_q8t_fast_body<3>(Q8T_ARGS);
+    else matvec_q8t_fast_body<4>(Q8T_ARGS);
+}
+extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matvec_q8t_q6_K(Q8_ARGS, int T) {
+    if (T == 2) matvec_q8t_q6_K_body<2>(Q8T_ARGS);
+    else if (T == 3) matvec_q8t_q6_K_body<3>(Q8T_ARGS);
+    else matvec_q8t_q6_K_body<4>(Q8T_ARGS);
+}
+
 // matvec_q8_lr_q4_0_rocmfp4_fast(W, row_bytes, lo, n, K, scale, y, N, L): y = W x for one token, where x is
 // SiLU(lo * scale) zero-padded from n to K values and quantized to Q8_0 by every workgroup into LDS first, with
 // hc_lowrank's and q8_block_value's arithmetic (so the same bits as those two kernels and matvec_q8 after them).

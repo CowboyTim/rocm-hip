@@ -97,6 +97,24 @@ struct LayerWeights {
     const uint16_t* ple_conv1d = nullptr;             // F16 [n_hc * n_embd][ple_conv_kernel], taps contiguous
 };
 
+// MTP draft head (a qwen4exp nextn sidecar GGUF, inference_set_draft_model): one more full-attention MoE block
+// with hyper-connections. Its input at position p is the token there and the main model's residual streams at
+// p - 1 (before the final mixer): RMSNorm(embedding) * enorm and per-stream RMSNorm(streams) * hnorm,
+// concatenated per stream and projected by eh_proj to the block's residual streams. Its own final mixer and LM
+// head give the draft for p + 1; its own KV cache (one layer). llama.cpp qwen4exp graph_mtp.
+struct MtpHead {
+    gguf_model_t* gguf = nullptr;
+    std::vector<std::pair<void*, size_t>> pinned;      // registered ranges of its mapping
+    QuantWeight token_embd;                            // rows decoded on the CPU
+    QuantWeight output;                                // its LM head
+    QuantWeight eh_proj;                               // [n_embd x 2 n_embd]: [embedding | stream] -> stream
+    const float* enorm = nullptr;                      // [n_embd]
+    const float* hnorm = nullptr;                      // [n_hc * n_embd]
+    HcMix hc_head;                                     // its final mixer
+    LayerWeights L;                                    // the block (kv_slot 0 of kvc)
+    inference_kv_cache_t* kvc = nullptr;               // one layer, created with the model's KV cache
+};
+
 // The complete inference_model struct - MUST match exactly between all TUs.
 // This replaces the old local definition in inference.cpp and qwen_model.cpp.
 // It is aliased as `inference_model` to maintain backward compatibility with
@@ -152,6 +170,7 @@ struct inference_model {
     QuantWeight ple_table;                              // per_layer_token_embd [rows x ple_dim], rows read on the CPU
 
     inference_kv_cache_t* kvc = nullptr;               // KV cache manager handle
+    MtpHead* mtp = nullptr;                            // MTP draft head, if loaded (inference_set_draft_model)
     void* scratch_base = nullptr;                      // temporary scratch buffer base
     size_t scratch_bytes = 0;                          // scratch buffer size in bytes
 

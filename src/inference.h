@@ -68,6 +68,14 @@ void inference_set_seed(inference_model_t* model, unsigned int seed);
 // Returns 0, 1 if the head is already quantized (nothing changes), negative on error.
 int inference_set_lm_head_q8(inference_model_t* model, int enable);
 
+// Opt-in: an MTP draft head for speculative decoding (Qwen3.8-Flash-Next / qwen4exp: a nextn sidecar GGUF such as
+// mtp-Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST.gguf). The head proposes the next token, the model verifies it in the
+// same pass as the current one, so an accepted draft gives two tokens per pass; the output is what generation
+// without it gives (a draft is only kept when it is the token sampled anyway). path NULL unloads it. May be
+// called before or after inference_kv_cache_init. Returns 0, negative on error (the file is not a matching
+// head).
+int inference_set_draft_model(inference_model_t* model, const char* path);
+
 // The model holds one sequence: tokens are decoded at positions 0, 1, 2, ... (n_past counts them).
 // inference_reset starts a new sequence (position 0, which also clears the DeltaNet recurrent state).
 void inference_reset(inference_model_t* model);
