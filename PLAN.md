@@ -1206,7 +1206,11 @@ for the symptoms above.
 
 ### 20.3 Plan
 
-> **▶ NEXT STEP (as of 2026-10-17): make the 4B fast, then batched prefill, then Step 6 (35B MoE).**
+> **▶ NEXT STEP (as of 2026-10-18): Phase 22 (product C API, then the Perl XS module), and Phase 21 (more
+> architectures, Qwen3.8-Flash-Next first) once the user has the GGUFs. Both plans are at the end of this
+> file. The speed work below is done for now.**
+>
+> **Earlier NEXT STEP (2026-10-17): make the 4B fast, then batched prefill, then Step 6 (35B MoE).**
 >
 > Agreed order (2026-10-17): usable 4B inference before the 35B. Ground rules for gfx1151 (UMA, 128 GB
 > shared by CPU/GPU/NPU):
@@ -1814,3 +1818,61 @@ single `QuantWeight` definition, removal of stale files.
 | O-projection scale bug | Same; covered by Step 4. |
 | TYPE13/TYPE100 scale extraction | Folded into Step 3, verified against the reference dequant. |
 | "Weights need calibration" (Phase 19) | Incorrect; the weights are fine, the decode and architecture mapping are not. |
+
+## Phase 21 – More architectures — PLAN (2026-10-18)
+
+User's list: **Qwen3.8-Flash-Next (most important: coding)**, Nemotron, Gemma, DeepSeek, Kimi, GLM. The
+llama.cpp reference here (ROCmFPX, `llama.cpp/`) implements all of them, so each gets the same oracle
+workflow as qwen35: `ref_dump` activations, `forward_verify` per piece and per layer, greedy text equal to
+`llama-completion`. What each needs, from the reference's graph code (`llama.cpp/src/models/*.cpp`):
+
+| Family (GGUF arch) | Example model, size | Reuses | New pieces |
+|---|---|---|---|
+| **Qwen3.8-Flash-Next** (`qwen4exp`) | ROCmFP4 STRIX_LEAN GGUF (reference: 345 tok/s prefill, 22.6 tok/s generation on this machine) | Gated DeltaNet (output gate sigmoid instead of SiLU), gated attention, MoE, interleaved MRoPE | **Hyper-connections** (hc parallel residual streams, low-rank mix/inject in place of every norm, final mixer = output norm); **QSA sparse attention** (indexer keys mean-pooled per block of `compress_ratio` tokens, top-k blocks + tail; exactly dense below `top_k + ratio - 1` tokens); **PLE n-gram hash embeddings** on one layer; possibly new quant types (ROCMI4) |
+| **GLM-4.5/4.6** (`glm4moe`) | GLM-4.5-Air 106B-A12B fits at ~4 bits; GLM-4.6 (355B) does not | GQA attention, MoE, shared expert | Partial RoPE, sigmoid router with expert bias and groups (noaux_tc), QK-norm option, MTP layer to skip. `glm-dsa` adds DSA sparse attention (shares with QSA / DeepSeek-V3.2) |
+| **Nemotron-H** (`nemotron_h`, `nemotron_h_moe`) | Nemotron-Nano 9B/12B; Nemotron-3-Nano 30B-A3B (MoE) | conv1d + gated RMSNorm (DeltaNet's), attention, MoE | **Mamba-2 SSD** recurrent mixer (new scan kernel, grouped heads), squared-ReLU MLP |
+| **Gemma 3 / 4** (`gemma3`, `gemma4`) | Gemma-3 4B–27B; Gemma-4 (incl. MoE) | attention, RMSNorm, MoE (gemma4) | GeGLU (GELU-tanh), (1 + w) norms, pre+post norms, embedding scale √E, **sliding-window layers** (iSWA KV cache with ring windows), per-layer inputs (gemma4/3n), final logit softcap |
+| **Kimi** (`kimi-linear`; Kimi-K2 is `deepseek2`) | Kimi-Linear 48B-A3B fits; Kimi-K2 (1T) does not | delta rule (KDA = per-channel-gated DeltaNet), MoE | **MLA** attention (latent KV cache, absorbed projections), KDA gates |
+| **DeepSeek** (`deepseek2`, `deepseek32`, `deepseek4`) | V3/R1 671B do not fit in 128 GB at any usable quant; DeepSeek-V2-Lite 16B / Moonlight 16B-A3B (`deepseek2`) do | MoE, MLA (from Kimi) | group-limited sigmoid routing, YaRN RoPE, DSA sparse attention (V3.2), V4: hyper-connections (Sinkhorn) — size to be checked when a GGUF is chosen |
+
+**Shared building blocks** (each written once, reused): MLA (Kimi, DeepSeek, GLM-DSA); sparse indexer
+attention (QSA, DSA); the delta-rule family (qwen35, qwen4exp, KDA); hyper-connections (qwen4exp,
+DeepSeek-V4); MoE routing variants (softmax top-k; sigmoid + bias + groups); sliding-window KV (Gemma).
+
+**Order of attack:**
+0. **Engine refactor (prerequisite).** `qwen_model.cpp` is qwen35-specific. Split it into an
+   architecture descriptor (GGUF names → weights, per-layer kinds, hparams) and the blocks above, so a
+   new architecture is a descriptor plus its new blocks. Keep qwen35/qwen35moe bit-identical through
+   the refactor (the existing tests are the guard).
+1. **Qwen3.8-Flash-Next** — top priority, and the closest to what exists. Stage 1: hyper-connections + PLE
+   with *dense* attention (exact below the QSA threshold, so short-context output must already match the
+   reference). Stage 2: QSA (indexer cache, block top-k) for long contexts — the coding use case. Stage 3:
+   speed (it is MoE like the 35B; the reference's 22.6 tok/s leaves a lot of room).
+2. **GLM-4.5-Air** — least new code (partial RoPE + sigmoid/bias routing); a second strong coding model.
+3. **Nemotron-H** — Mamba-2 SSD kernel.
+4. **Gemma 3/4** — GeGLU, norms, sliding-window KV.
+5. **Kimi-Linear** — MLA + KDA (MLA then also serves DeepSeek).
+6. **DeepSeek** (`deepseek2` small models; V3.2 DSA after QSA exists).
+Every new GGUF can bring new quant types (e.g. ROCMI4, Q4_K_M, Q8_0, IQ*): each is added with its int8 and
+WMMA kernels, checked against the reference dequantizer (the "all quant types" goal).
+
+**Needed from the user:** the GGUF files (start with Qwen3.8-Flash-Next ROCmFP4). Constraints here: /dev/shm
+is a 63 GB tmpfs (38 GB free) and the disk has 48 GB free, so a ~50 GB model needs space freed or /dev/shm
+remounted larger; the reference oracle must also run each model on the CPU for `ref_dump`.
+
+## Phase 22 – Product C API + Perl XS module (Phase 14) — PLAN (2026-10-18)
+
+The C API (`inference.h`) works for one sequence but lacks what an application needs. Architecture-neutral,
+so every Phase 21 model gets it unchanged:
+1. **Generation API:** a streaming callback per token (text piece + token id, return nonzero to stop);
+   stop on EOS / end-of-turn tokens from the GGUF and on stop strings; options struct (sampler, max
+   tokens, stop strings, LM head mode) instead of growing argument lists; incremental UTF-8-safe detokenize.
+2. **Chat:** the GGUF's chat template (Jinja subset that Qwen/GLM/Gemma templates use, or a per-family
+   formatter verified against the reference's `llama-chat` output), multi-turn messages, prefix reuse
+   (keep the KV cache / recurrent state for an unchanged prefix instead of re-prefilling).
+3. **Configuration:** n_ctx at load (tested at long contexts against the reference), shared library
+   `libinference.so` with only the public API exported, versioned.
+4. **Perl XS (`ROCm::Inference`):** thin XS over the C API (model, tokenize/detokenize, generate with a
+   Perl callback, chat, options hash, errors as exceptions), `Makefile.PL` (ExtUtils::MakeMaker; Perl 5.38,
+   ParseXS and headers are installed here), tests with Test::More against the 4B, POD. Packaging for CPAN
+   (kernel .co files installed with the module, ROCm found at build time) last.
