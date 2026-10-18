@@ -223,6 +223,13 @@ hipError_t qmatvec_launch_q8_batch(int type, const void *W, size_t row_bytes, co
 
 hipError_t qmatvec_launch_q8_id(int type, const void *W, size_t row_bytes, const int32_t *ids, int n_used,
                                 int x_per_slot, const qmatvec_q8 *q, float *y, int N, int K, int T, hipStream_t stream) {
+    return qmatvec_launch_q8_id_pair(type, W, nullptr, row_bytes, ids, n_used, x_per_slot, q, y, nullptr, N, K, T,
+                                     stream);
+}
+
+hipError_t qmatvec_launch_q8_id_pair(int type, const void *W, const void *W2, size_t row_bytes, const int32_t *ids,
+                                     int n_used, int x_per_slot, const qmatvec_q8 *q, float *y, float *y2, int N, int K,
+                                     int T, hipStream_t stream) {
     if (!qmatvec_q8_supported(type, K) || !g_fn_q8_id[type]) return hipErrorInvalidDeviceFunction;
     const long long in_rows = (long long)T * (x_per_slot ? n_used : 1);
     if (T <= 0 || n_used <= 0 || row_bytes != qt_row_size(type, K) || row_bytes % 4 != 0 || ((uintptr_t)W & 3) != 0 ||
@@ -234,12 +241,13 @@ hipError_t qmatvec_launch_q8_id(int type, const void *W, size_t row_bytes, const
     const int32_t *bs = q->bsK;
     long long rb = (long long)row_bytes;
     int L = q8_lanes_per_row(type, K);
-    void *args[] = {(void *)&W, &rb, (void *)&ids, &n_used, &x_per_slot, (void *)&q8, (void *)&d8, (void *)&bs,
-                    (void *)&y, &N, &K, &L};
+    if (W2 && ((uintptr_t)W2 & 3) != 0) return hipErrorInvalidValue;
+    void *args[] = {(void *)&W, (void *)&W2, &rb, (void *)&ids, &n_used, &x_per_slot, (void *)&q8, (void *)&d8,
+                    (void *)&bs, (void *)&y, (void *)&y2, &N, &K, &L};
     const int rows = QMV_ROWS_PER_BLOCK * 32 / L;
     const unsigned gx = (unsigned)((N + rows - 1) / rows);
-    return hipModuleLaunchKernel(g_fn_q8_id[type], gx, (unsigned)n_used, (unsigned)T, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0,
-                                 stream, args, nullptr);
+    return hipModuleLaunchKernel(g_fn_q8_id[type], gx, (unsigned)(n_used * (W2 ? 2 : 1)), (unsigned)T,
+                                 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream, args, nullptr);
 }
 
 hipError_t qmatvec_launch_id(int type, const void *W, size_t row_bytes, const int32_t *ids, int n_used, int x_per_slot,

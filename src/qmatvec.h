@@ -99,6 +99,10 @@ hipError_t qmatvec_launch_q8_batch(int type, const void *W, size_t row_bytes, co
 // vector of all input rows); the float version reads x.
 hipError_t qmatvec_launch_q8_id(int type, const void *W, size_t row_bytes, const int32_t *ids, int n_used,
                                 int x_per_slot, const qmatvec_q8 *q, float *y, int N, int K, int T, hipStream_t stream);
+// The same for two stacked matrices of one shape and type on the same input (W -> y, W2 -> y2) in one launch
+hipError_t qmatvec_launch_q8_id_pair(int type, const void *W, const void *W2, size_t row_bytes, const int32_t *ids,
+                                     int n_used, int x_per_slot, const qmatvec_q8 *q, float *y, float *y2, int N, int K,
+                                     int T, hipStream_t stream);
 hipError_t qmatvec_launch_id(int type, const void *W, size_t row_bytes, const int32_t *ids, int n_used, int x_per_slot,
                              const float *x, float *y, int N, int K, int T, hipStream_t stream);
 

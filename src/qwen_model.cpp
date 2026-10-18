@@ -447,6 +447,20 @@ struct QwenModel {
         return true;
     }
 
+    // The experts' gate and up projections (same input): one launch when generating on the int8 path
+    bool matvec_id_gate_up(const QuantWeight& G, const QuantWeight& U, const float* x, float* yg, float* yu, int N,
+                           int T, bool grouped, ProfCat c) {
+        if (!grouped && q8_src == x && q8_k == G.K && q8_t == T && G.type == U.type && G.K == U.K &&
+            G.row_bytes == U.row_bytes && qmatvec_q8_supported(G.type, G.K)) {
+            const int NU = eng->n_expert_used;
+            prof.bytes[c] += 2.0 * G.row_bytes * N * NU;
+            return check(qmatvec_launch_q8_id_pair(G.type, G.data, U.data, G.row_bytes, s.ids, NU, 0, &s.q8, yg, yu, N,
+                                                   G.K, T, 0),
+                         "expert gate/up matvec");
+        }
+        return matvec_id(G, x, 0, yg, N, T, grouped, c) && matvec_id(U, x, 0, yu, N, T, grouped, c);
+    }
+
     // Mixture-of-experts FFN (qwen35moe; llama.cpp build_moe_ffn + the gated shared expert), all on the GPU:
     // router logits -> softmax / top-k / renormalized weights + shared gate (moe_router) -> the selected experts'
     // gate/up, SwiGLU, down (expert-indexed matvecs reading s.ids) -> weighted sum + gated shared expert
@@ -467,8 +481,7 @@ struct QwenModel {
             !check(gpu_moe_router(s.r_logits, s.xn, L.shexp_gate, s.ids, s.wts, s.sg, NE, NU, E, T, 0), "moe_router") ||
             (grouped && !check(gpu_moe_group(s.ids, T, NU, NE, qmatvec_mm_tile(), s.g_tok, s.g_pair, s.g_ntiles,
                                              s.g_tile_e, s.g_tile_start, s.g_tile_n, 0), "moe_group")) ||
-            !matvec_id(L.We_gate, s.xn, 0, s.moe_g, FE, T, grouped, P_FFN) ||
-            !matvec_id(L.We_up, s.xn, 0, s.moe_u, FE, T, grouped, P_FFN) ||
+            !matvec_id_gate_up(L.We_gate, L.We_up, s.xn, s.moe_g, s.moe_u, FE, T, grouped, P_FFN) ||
             !matvec_pair(L.W_gate, L.W_up, s.xn, s.ffg, s.ffu, T, P_FFN))
             return false;
 

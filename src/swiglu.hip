@@ -14,7 +14,7 @@ using namespace rocmfp4;
 
 typedef _Float16 half16 __attribute__((ext_vector_type(16)));
 
-extern "C" __global__ void swiglu_fp4(const __half* A, 
+extern "C" __global__ void swiglu_fp4(const __half* A,
                                         const unsigned char* W_gate,
                                         const unsigned char* W_gate_scale_b,
                                         const unsigned char* W_up,

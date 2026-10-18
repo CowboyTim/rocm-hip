@@ -840,10 +840,12 @@ __device__ __forceinline__ float mv_q5_K(const uint8_t *wr, const int8_t *q8, co
 // e = ids[t * n_used + j], i.e. rows e * N .. e * N + N - 1 of W (all experts' rows stacked), and writes row
 // t * n_used + j of y. Its input is row t of the quantized activations (x_per_slot = 0: every expert of a token
 // reads the token's vector) or row t * n_used + j (x_per_slot = 1: each expert reads its own, e.g. the
-// SwiGLU output going into ffn_down). The selected experts never leave the GPU.
+// SwiGLU output going into ffn_down). The selected experts never leave the GPU. With grid (.., 2 n_used, T),
+// slots n_used .. 2 n_used - 1 apply a second matrix of the same shape and type, W2 -> y2, to the same input
+// (the experts' gate and up projections in one launch).
 #define Q8ID_ARGS                                                                                       \
-    const uint8_t *W, long long row_bytes, const int *ids, int n_used, int x_per_slot, const int8_t *q8, \
-        const float *d8, const int *bs, float *y, int N, int K, int L
+    const uint8_t *W, const uint8_t *W2, long long row_bytes, const int *ids, int n_used, int x_per_slot,     \
+        const int8_t *q8, const float *d8, const int *bs, float *y, float *y2, int N, int K, int L
 
 #define MATVEC_Q8_KERNELS(name, FN, KQ)                                                                  \
     extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matvec_q8_##name(Q8_ARGS) {        \
@@ -855,13 +857,14 @@ __device__ __forceinline__ float mv_q5_K(const uint8_t *wr, const int8_t *q8, co
     extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matvec_q8_id_##name(Q8ID_ARGS) {   \
         Q8_ROW_INDEX                                                                                     \
         if (row >= N) return;                                                                            \
-        const int slot = blockIdx.y, t = blockIdx.z, e = ids[t * n_used + slot];                         \
-        const uint8_t *wr = W + ((long long)e * N + row) * row_bytes;                                    \
+        const bool m2 = (int)blockIdx.y >= n_used; /* grid y = 2 n_used: the second matrix (W2 -> y2) */  \
+        const int slot = blockIdx.y - (m2 ? n_used : 0), t = blockIdx.z, e = ids[t * n_used + slot];       \
+        const uint8_t *wr = (m2 ? W2 : W) + ((long long)e * N + row) * row_bytes;                        \
         const long long in_row = x_per_slot ? (long long)t * n_used + slot : t;                          \
         float acc = FN(wr, q8 + in_row * K, d8 + in_row * (K / ((KQ) ? 256 : 32)), bs + in_row * (K / 16), \
                        K, gl, L);                                                                        \
         Q8_REDUCE(acc)                                                                                   \
-        if (gl == 0) y[((long long)t * n_used + slot) * N + row] = acc;                                  \
+        if (gl == 0) (m2 ? y2 : y)[((long long)t * n_used + slot) * N + row] = acc;                      \
     }
 
 MATVEC_Q8_KERNELS(q4_0_rocmfp4, mv_rocmfp4, 0)
