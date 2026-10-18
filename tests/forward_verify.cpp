@@ -582,7 +582,7 @@ int main(int argc, char** argv) {
         snprintf(what, sizeof(what), "blk.%d ssm_out (qmatvec)", ll); report(what, sout);
 
         // The engine's GPU kernels (deltanet.hip) on the same reference inputs, state carried across
-        // tokens from the reference's initial state. The kernels keep S row-major, the transpose of ggml's.
+        // tokens from the reference's initial state, mapped to the kernels' layout (deltanet_state_index).
         if (DS != DELTANET_HEAD_SIZE || deltanet_init("deltanet.co") != 0) {
             fprintf(stderr, "deltanet kernels unavailable\n");
             return 1;
@@ -599,7 +599,7 @@ int main(int argc, char** argv) {
         for (int hh = 0; hh < NV; ++hh)
             for (int i = 0; i < DS; ++i)
                 for (int j = 0; j < DS; ++j)
-                    b_st.p[((size_t)hh * DS + i) * DS + j] = st0[((size_t)hh * DS + j) * DS + i];
+                    b_st.p[deltanet_state_index(hh, i, j)] = st0[((size_t)hh * DS + j) * DS + i];
         Stat gq, gk, gv, gg, gb, gfo, gst;
         for (int t = 0; t < T; ++t) {
             memcpy(b_qkv.p, &qkv[(size_t)t * CD], CD * sizeof(float));
@@ -623,7 +623,7 @@ int main(int argc, char** argv) {
         for (int hh = 0; hh < NV; ++hh)
             for (int i = 0; i < DS; ++i)
                 for (int j = 0; j < DS; ++j)
-                    st_t[((size_t)hh * DS + j) * DS + i] = b_st.p[((size_t)hh * DS + i) * DS + j];
+                    st_t[((size_t)hh * DS + j) * DS + i] = b_st.p[deltanet_state_index(hh, i, j)];
         gst.add(st_t.data(), st1.data(), NV * DS * DS);
         snprintf(what, sizeof(what), "blk.%d GPU conv + SiLU + L2: q", ll); report(what, gq);
         snprintf(what, sizeof(what), "blk.%d GPU conv + SiLU + L2: k", ll); report(what, gk);
@@ -646,7 +646,7 @@ int main(int argc, char** argv) {
             for (int hh = 0; hh < NV; ++hh)
                 for (int i = 0; i < DS; ++i)
                     for (int j = 0; j < DS; ++j)
-                        b_st.p[((size_t)hh * DS + i) * DS + j] = st0[((size_t)hh * DS + j) * DS + i];
+                        b_st.p[deltanet_state_index(hh, i, j)] = st0[((size_t)hh * DS + j) * DS + i];
             memcpy(c_qkv.p, qkv.data(), (size_t)T * CD * sizeof(float));
             memcpy(c_al.p, alpha.data(), (size_t)T * NV * sizeof(float));
             memcpy(c_be.p, beta.data(), (size_t)T * NV * sizeof(float));
@@ -665,7 +665,7 @@ int main(int argc, char** argv) {
             for (int hh = 0; hh < NV; ++hh)
                 for (int i = 0; i < DS; ++i)
                     for (int j = 0; j < DS; ++j)
-                        st_t[((size_t)hh * DS + j) * DS + i] = b_st.p[((size_t)hh * DS + i) * DS + j];
+                        st_t[((size_t)hh * DS + j) * DS + i] = b_st.p[deltanet_state_index(hh, i, j)];
             bst.add(st_t.data(), st1.data(), NV * DS * DS);
             snprintf(what, sizeof(what), "blk.%d GPU batched (%d tok) conv+L2: q", ll, T); report(what, bq);
             snprintf(what, sizeof(what), "blk.%d GPU batched (%d tok) output", ll, T); report(what, bfo);

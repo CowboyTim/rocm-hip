@@ -30,7 +30,16 @@ hipError_t deltanet_pre(const float* qkv, float* conv_state, const float* conv_w
                         int n_k, int n_v, const float* alpha, const float* beta_in, const float* dt_bias,
                         const float* ssm_a, float* g_out, float* beta_out, float eps, int T, hipStream_t stream);
 
-// Delta rule + gated RMSNorm for every V head. state: [n_v][128][128], S[i][j] at i * 128 + j.
+// Where element S[i][j] (row i, column j) of V head h's 128 x 128 delta-rule state lives in the state buffer
+// (n_v * 128 * 128 floats). The layout follows deltanet_rule's threads: workgroup (h, j / 16) has thread
+// t = (j % 16) * 8 + i / 16 hold rows i / 16 * 16 .. + 15 of column j, and its r-th value is at
+// ((h * 8 + j / 16) * 16 + r) * 128 + t, so each of the wave's state loads is 128 contiguous bytes.
+// (8 lanes per column, 16 columns per workgroup: RULE_RP and RULE_CW in deltanet.hip.)
+static inline size_t deltanet_state_index(int h, int i, int j) {
+    return ((size_t)(h * 8 + j / 16) * 16 + (size_t)(i % 16)) * 128 + (size_t)((j % 16) * 8 + i / 16);
+}
+
+// Delta rule + gated RMSNorm for every V head. state: [n_v][128 * 128], laid out by deltanet_state_index.
 // conv_out from deltanet_pre; z, out: [T][n_v * 128]; norm_w: ssm_norm [128]. T * n_v * 128 must be a
 // multiple of 256. q8 != NULL: also quantize out for the int8 matvecs (all T rows, as one flattened vector).
 hipError_t deltanet_rule(float* state, const float* conv_out, const float* g, const float* beta, const float* z,

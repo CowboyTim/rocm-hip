@@ -14,7 +14,7 @@
 //                state), so the arithmetic is the same as deltanet_pre's, bit for bit. The conv state is
 //                then advanced by deltanet_conv_state (a separate launch: deltanet_conv still reads it).
 // deltanet_rule  grid (n_v_heads, DS / CW), block 128: each workgroup owns CW = 128 / RP columns of its
-//                head's DS x DS state S, stored row-major (S[i][j] at i*DS + j). RP adjacent lanes share
+//                head's DS x DS state S. RP adjacent lanes share
 //                column j, each holding R = DS / RP of its rows in registers; the column's two dot products
 //                are reduced across those lanes with shuffles, so the waves never wait on each other:
 //                  S[:, j] *= exp(g);  delta_j = (v_j - S[:, j] . k) * beta;  S[:, j] += k * delta_j;
@@ -24,8 +24,8 @@
 //                grid T * n_v * DS / 256 (two heads per workgroup). Also quantizes the result for the int8
 //                ssm_out matmul (q8_device.h) when o.qK != NULL.
 //
-// The state layout is the transpose of ggml's (and of qwen_gated_delta_step's), chosen for coalescing;
-// tests transpose when they compare with the reference new_state.
+// The state is stored in deltanet_rule's thread order (deltanet_state_index in deltanet.h), chosen for
+// coalescing; tests map it when they compare with the reference new_state.
 
 #include <hip/hip_runtime.h>
 
@@ -146,10 +146,12 @@ deltanet_rule(float* state, const float* conv_out, const float* g, const float* 
     const int h = blockIdx.x, n_v = gridDim.x, hk = h % n_k;
     const int p = threadIdx.x % RULE_RP, j = blockIdx.y * RULE_CW + threadIdx.x / RULE_RP;
     const int conv_dim = 2 * n_k * DS + n_v * DS;
-    float* S = state + (size_t)h * DS * DS + (size_t)p * R * DS + j;  // rows p*R .. p*R + R - 1 of column j
+    // Rows p*R .. p*R + R - 1 of column j, stored in this thread order (deltanet_state_index in deltanet.h):
+    // value r of thread t at ((h * (DS / RULE_CW) + blockIdx.y) * R + r) * 128 + t, coalesced over the wave
+    float* S = state + ((size_t)h * (DS / RULE_CW) + blockIdx.y) * R * 128 + threadIdx.x;
     float col[R];
 #pragma unroll
-    for (int r = 0; r < R; ++r) col[r] = S[r * DS];
+    for (int r = 0; r < R; ++r) col[r] = S[r * 128];
     const float scale = 1.0f / sqrtf((float)DS);
 
     for (int t = 0; t < T; ++t) {
@@ -186,7 +188,7 @@ deltanet_rule(float* state, const float* conv_out, const float* g, const float* 
         if (p == 0) out[(size_t)t * n_v * DS + h * DS + j] = o * scale;
     }
 #pragma unroll
-    for (int r = 0; r < R; ++r) S[r * DS] = col[r];
+    for (int r = 0; r < R; ++r) S[r * 128] = col[r];
 }
 
 // Two heads per 256-thread workgroup: waves 0-3 hold head 2 b, waves 4-7 head 2 b + 1

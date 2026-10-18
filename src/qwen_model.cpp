@@ -185,8 +185,8 @@ struct Scratch {
 };
 
 // Recurrent state of the Gated DeltaNet layers, persisted across tokens like the KV cache: per linear
-// layer a conv state [conv_dim][d_conv - 1] and a delta-rule state [dt_rank][d_state][d_state] (row-major
-// S per head, the layout of deltanet.hip). One sequence; zeroed when a sequence starts at pos 0. Only the
+// layer a conv state [conv_dim][d_conv - 1] and a delta-rule state of dt_rank heads x d_state^2 floats (laid out
+// by deltanet_state_index, deltanet.h). One sequence; zeroed when a sequence starts at pos 0. Only the
 // GPU touches it (the kernels, and hipMemsetAsync for the reset), so it is registered coarse-grained.
 struct RecurrentState {
     std::vector<float*> conv, ssm;   // indexed by layer; nullptr for full-attention layers

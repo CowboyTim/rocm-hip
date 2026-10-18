@@ -1247,9 +1247,12 @@ for the symptoms above.
 >      second matrix (experts' gate + up). 35B ~59.7 → **~61.6 tok/s**, 4B ~62.3 → ~62.8.
 >    - Dead end: `moe_combine` fused into the next `add_rmsnorm` was slower (61.5 → 60.8): every workgroup
 >      recomputes the row's expert sum, a chain of dependent loads that costs more than the launch saved.
+>    - **Delta-rule state in thread order** (`deltanet_state_index`, deltanet.h): each wave's state loads and
+>      stores are 128 contiguous bytes (they were 8 rows × 16 bytes). `deltanet_rule` at T = 1: 27.7 →
+>      13.8 µs per layer. 35B ~61.6 → **~63.3 tok/s**, 4B ~62.8 → **~64.1 tok/s**. Prefill unchanged.
 >    - **Next:** large matvecs are at 185–205 GB/s of a 256 GB/s theoretical peak; little is left there.
->      Remaining per token on the 35B: LM head 5.0 ms (see the open decision), `deltanet_rule` 0.83 ms
->      (T = 1: 30 × 28 µs, the 2 MB state per layer read and written), launches.
+>      Remaining per token on the 35B (~14.4 ms GPU): LM head 5.0 ms (see the open decision), ~800
+>      launches at ~2 µs each.
 >    - **Open decision (user):** the 1 GB BF16 LM head is 5.0 ms of ~16.8 ms per token. An int8 (Q8_0) copy
 >      would be ~0.5 GB and ~2.7 ms (~+15% tok/s), but its logits would no longer match llama.cpp's BF16
 >      ones exactly.
