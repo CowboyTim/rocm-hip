@@ -429,7 +429,8 @@ struct QwenModel {
         __half* V = kv_cache_v_row(eng->kvc, L.kv_slot, 0);
         if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
         const qmatvec_q8* q8 = q8_for(DQ, T);
-        if (!check(attention_forward(s.qfull, s.k, s.v, L.q_norm, L.k_norm, K, V, HQ, HKV, eng->n_rot, pos0, T,
+        if (!check(attention_forward(s.qfull, s.k, s.v, L.q_norm, L.k_norm, K, V, kv_cache_block_shift(eng->kvc),
+                                     kv_cache_block_stride(eng->kvc), HQ, HKV, eng->n_rot, pos0, T,
                                      eng->rope_freq_base, (float)eng->eps, s.q, s.part_ml, s.part_acc, s.attn, q8, 0),
                    "attention kernels"))
             return false;

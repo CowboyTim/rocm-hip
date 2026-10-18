@@ -797,7 +797,7 @@ int main(int argc, char** argv) {
         for (int h = 0; h < HQ; ++h)
             for (int d = 0; d < HD; ++d) ref_out[(size_t)h * HD + d] *= qwen_sigmoid(b_qf.p[(size_t)h * 2 * HD + HD + d]);
 
-        hipError_t e = attention_forward(b_qf.p, b_k.p, b_v.p, L.q_norm, L.k_norm, K, Vc, HQ, HKV, m->n_rot, pos, 1,
+        hipError_t e = attention_forward(b_qf.p, b_k.p, b_v.p, L.q_norm, L.k_norm, K, Vc, 30, 0, HQ, HKV, m->n_rot, pos, 1,
                                          m->rope_freq_base, eps, b_q.p, b_ml.p, b_acc.p, b_out.p, nullptr, 0);
         if (e == hipSuccess) e = hipDeviceSynchronize();
         if (e != hipSuccess) { fprintf(stderr, "attention kernels: %s\n", hipGetErrorString(e)); return 1; }
@@ -871,7 +871,7 @@ int main(int argc, char** argv) {
             }
             qmatvec_q8_bind(&q8a, qa.p, nq8);
             qmatvec_q8_bind(&q8b, qb.p, nq8);
-            e = attention_forward(c_qf.p, c_k.p, c_v.p, L.q_norm, L.k_norm, K, Vc, HQ, HKV, m->n_rot, pos0, TB,
+            e = attention_forward(c_qf.p, c_k.p, c_v.p, L.q_norm, L.k_norm, K, Vc, 30, 0, HQ, HKV, m->n_rot, pos0, TB,
                                   m->rope_freq_base, eps, c_q.p, c_ml.p, c_acc.p, c_out.p, &q8a, 0);
             if (e == hipSuccess) e = qmatvec_quantize(c_out.p, nq8, &q8b, 0);
             if (e == hipSuccess) e = hipDeviceSynchronize();
@@ -884,6 +884,38 @@ int main(int argc, char** argv) {
             for (int t = 0; t < TB; ++t) sb.add(c_out.p + (size_t)t * DQ, &refb[(size_t)t * DQ], DQ);
             snprintf(what, sizeof(what), "GPU attention batched, %d tok at pos %d..%d", TB, pos0, P - 1);
             report(what, sb, 2e-3);
+
+            // The same with the KV cache's block layout (kv_cache.h; 64-position blocks here, each a K segment then
+            // a V segment): only the addressing differs, so the output and the rows attn_prep writes must be the
+            // same bits as with the contiguous buffers
+            {
+                const int BS = 6, BT = 1 << BS, nblk = (P + BT - 1) / BT;
+                const long long bstride = 2LL * BT * DKV;
+                ShmBuf blk, outb;
+                if (!blk.alloc("fwdv_atb_blk.bin", (size_t)nblk * bstride / 2 + 1) ||
+                    !outb.alloc("fwdv_atb_outb.bin", (size_t)TB * DQ)) {
+                    fprintf(stderr, "alloc failed\n");
+                    return 1;
+                }
+                __half* Kb = (__half*)blk.p;
+                __half* Vb = Kb + (size_t)BT * DKV;
+                auto at = [&](int p) { return (size_t)(p >> BS) * (size_t)bstride + (size_t)(p & (BT - 1)) * DKV; };
+                for (int p = 0; p < pos0; ++p) {
+                    memcpy(Kb + at(p), K + (size_t)p * DKV, DKV * sizeof(__half));
+                    memcpy(Vb + at(p), Vc + (size_t)p * DKV, DKV * sizeof(__half));
+                }
+                e = attention_forward(c_qf.p, c_k.p, c_v.p, L.q_norm, L.k_norm, Kb, Vb, BS, bstride, HQ, HKV, m->n_rot,
+                                      pos0, TB, m->rope_freq_base, eps, c_q.p, c_ml.p, c_acc.p, outb.p, nullptr, 0);
+                if (e == hipSuccess) e = hipDeviceSynchronize();
+                if (e != hipSuccess) { fprintf(stderr, "blocked attention: %s\n", hipGetErrorString(e)); return 1; }
+                bool same = memcmp(outb.p, c_out.p, (size_t)TB * DQ * sizeof(float)) == 0;
+                for (int p = pos0; p < P && same; ++p)
+                    same = memcmp(Kb + at(p), K + (size_t)p * DKV, DKV * sizeof(__half)) == 0 &&
+                           memcmp(Vb + at(p), Vc + (size_t)p * DKV, DKV * sizeof(__half)) == 0;
+                if (!same) ++g_fail;
+                printf("  [%s] GPU attention batched, %d tok, KV in 64-position blocks: output and cache rows %s\n",
+                       same ? "PASS" : "FAIL", TB, same ? "identical to the contiguous layout" : "DIFFER");
+            }
         }
         attention_free();
     }

@@ -23,44 +23,27 @@ struct inference_kv_cache {
     void* base = nullptr;       // host mapping base
     void* dev_base = nullptr;   // device pointer of the same buffer
     bool zero_copy_ok = false;  // true when dev_base == base (UMA identity)
-    size_t total_bytes = 0;     // whole mapped size incl. alignment padding
-    size_t k_region = 0;        // bytes per K layer region (aligned)
-    size_t v_region = 0;        // bytes per V layer region (aligned)
+    size_t total_bytes = 0;     // whole mapped size
+    int block_tokens = 0;       // positions per block (power of two)
+    int block_shift = 0;        // log2(block_tokens)
+    size_t row_bytes = 0;       // one position's K (or V) row of one layer
+    size_t block_bytes = 0;     // every layer's K and V for block_tokens positions
     kv_cache_config_t cfg{};
     int n_stored = 0;           // tokens stored so far (positions [0, n_stored))
 };
 
 namespace {
 
-constexpr size_t REGION_ALIGN = 256;   // keep every layer region comfortably aligned for vector loads
-
-size_t align_up(size_t x, size_t a = REGION_ALIGN) { return (x + a - 1) & ~(a - 1); }
-
 __half* row_raw(inference_kv_cache_t* c, bool is_v, int layer, int pos) {
-    // DEBUG: check why we might return NULL
-    static int call_count = 0;
-    call_count++;
-
-    if (!c || !c->base) {
-        INFER_LOG("[KV_CACHE] row_raw #%d FAIL: c=%p base=%p (is_v=%d)\n",
-                call_count, (void*)c, (void*)c ? c->base : nullptr, is_v); fflush(stderr);
-        return nullptr;
-    }
+    if (!c || !c->base) return nullptr;
     if (layer < 0 || layer >= c->cfg.n_layers || pos < 0 || pos >= c->cfg.n_ctx) {
-        INFER_LOG("[KV_CACHE] row_raw #%d FAIL: layer=%d n_layers=%d pos=%d n_ctx=%d (is_v=%d)\n",
-                call_count, layer, c->cfg.n_layers, pos, c->cfg.n_ctx, is_v); fflush(stderr);
+        INFER_LOG("[KV_CACHE] row out of range: layer=%d n_layers=%d pos=%d n_ctx=%d (is_v=%d)\n", layer,
+                  c->cfg.n_layers, pos, c->cfg.n_ctx, is_v);
         return nullptr;
     }
-
-    const int d = c->cfg.n_heads_kv * c->cfg.head_dim;
-    const size_t row_bytes = (size_t)d * sizeof(__half);
-    size_t off;
-    if (is_v) {
-        off = (size_t)c->cfg.n_layers * c->k_region + (size_t)layer * c->v_region;
-    } else {
-        off = (size_t)layer * c->k_region;
-    }
-    off += (size_t)pos * row_bytes;   // always inside the mapped file: regions are aligned super-sets of raw rows
+    const size_t B = (size_t)c->block_tokens;
+    const size_t off = (size_t)(pos >> c->block_shift) * c->block_bytes + (2 * (size_t)layer + is_v) * B * c->row_bytes +
+                       (size_t)(pos & (c->block_tokens - 1)) * c->row_bytes;
     return (__half*)((char*)c->base + off);
 }
 
@@ -76,13 +59,20 @@ inference_kv_cache_t *kv_cache_create(const char *shm_path, const kv_cache_confi
         return nullptr;
     }
 
+    const int B = f.block_tokens > 0 ? f.block_tokens : KV_CACHE_DEFAULT_BLOCK;
+    if ((B & (B - 1)) != 0) {
+        INFER_LOG("kv_cache: block_tokens %d is not a power of two\n", B);
+        return nullptr;
+    }
     inference_kv_cache_t* c = new inference_kv_cache();
     c->cfg = f;
-
-    const size_t region_raw = (size_t)f.n_heads_kv * f.head_dim * sizeof(__half) * (size_t)f.n_ctx;
-    c->k_region = align_up(region_raw);
-    c->v_region = align_up(region_raw);
-    c->total_bytes = c->k_region * f.n_layers + c->v_region * f.n_layers;   // n_layers > 0 validated above
+    c->cfg.block_tokens = B;
+    c->cfg.n_ctx = (f.n_ctx + B - 1) / B * B;  // whole blocks
+    c->block_tokens = B;
+    while ((1 << c->block_shift) < B) ++c->block_shift;
+    c->row_bytes = (size_t)f.n_heads_kv * f.head_dim * sizeof(__half);
+    c->block_bytes = 2 * (size_t)f.n_layers * B * c->row_bytes;
+    c->total_bytes = c->block_bytes * (size_t)(c->cfg.n_ctx / B);
 
     c->fd = open(shm_path, O_RDWR | O_CREAT, 0666);
     if (c->fd < 0) { perror("kv_cache: open"); delete c; return nullptr; }
@@ -128,8 +118,10 @@ int kv_cache_n_layers(const inference_kv_cache_t *c) { return c ? c->cfg.n_layer
 int kv_cache_n_ctx(const inference_kv_cache_t *c)    { return c ? c->cfg.n_ctx : 0; }
 int kv_cache_d_kv(const inference_kv_cache_t *c)     { return c ? c->cfg.n_heads_kv * c->cfg.head_dim : 0; }
 size_t kv_cache_total_bytes(const inference_kv_cache_t *c) { return c ? c->total_bytes : 0; }
-size_t kv_cache_k_region_bytes(const inference_kv_cache_t *c) { return c ? c->k_region : 0; }
-size_t kv_cache_v_region_bytes(const inference_kv_cache_t *c) { return c ? c->v_region : 0; }
+int kv_cache_block_tokens(const inference_kv_cache_t *c) { return c ? c->block_tokens : 0; }
+int kv_cache_block_shift(const inference_kv_cache_t *c) { return c ? c->block_shift : 0; }
+size_t kv_cache_block_bytes(const inference_kv_cache_t *c) { return c ? c->block_bytes : 0; }
+long long kv_cache_block_stride(const inference_kv_cache_t *c) { return c ? (long long)(c->block_bytes / sizeof(__half)) : 0; }
 
 void *kv_cache_host_base(const inference_kv_cache_t *c)       { return c ? c->base : nullptr; }
 void *kv_cache_device_ptr(const inference_kv_cache_t *c)      { return c ? c->dev_base : nullptr; }

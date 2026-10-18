@@ -4,9 +4,13 @@
 // mmap(MAP_SHARED) + hipHostRegister'ed so GPU kernels read/write these pages in place -- no copy.
 // On Strix Halo's UMA fabric the device pointer equals the host pointer (verified at runtime).
 //
-// Layout inside the file (all offsets rounded to a 256-byte alignment):
-//   [ K_0 | K_1 | ... | K_{L-1} | V_0 | V_1 | ... | V_{L-1} ]
-// Each region holds n_ctx rows of d_kv = n_heads_kv * head_dim __half values; row p is token position p.
+// Layout inside the file: blocks of B = block_tokens positions (a power of two; Phase 22b: one block can become
+// one file of a block store). Block b holds every layer's K and V rows for positions [b B, (b + 1) B):
+//   block b: [ K_0 | V_0 | K_1 | V_1 | ... | K_{L-1} | V_{L-1} ]   each segment B rows of d_kv __half values
+// with d_kv = n_heads_kv * head_dim. So row p of layer l is at
+//   base + (p / B) * block_bytes + (2 l + is_v) * B * row_bytes + (p % B) * row_bytes
+// and kernels address it from the layer's K (or V) row 0 as (p >> log2 B) * block_stride + (p & (B - 1)) * d_kv
+// (in __half units; kv_cache_block_shift / kv_cache_block_stride). n_ctx is rounded up to whole blocks.
 
 #ifndef KV_CACHE_H
 #define KV_CACHE_H
@@ -32,7 +36,10 @@ typedef struct {
     int head_dim;      /* embedding dim per attention head */
     int n_heads_q;     /* query heads */
     int n_heads_kv;    /* key/value heads (GQA: may be < n_heads_q) */
+    int block_tokens;  /* positions per block, a power of two; 0: KV_CACHE_DEFAULT_BLOCK */
 } kv_cache_config_t;
+
+#define KV_CACHE_DEFAULT_BLOCK 256
 
 /* Create + map + pin the cache in shm_path. Returns NULL on error (logs to stderr). */
 inference_kv_cache_t *kv_cache_create(const char *shm_path, const kv_cache_config_t *cfg);
@@ -45,11 +52,13 @@ int    kv_cache_n_ctx(const inference_kv_cache_t *c);
 int    kv_cache_d_kv(const inference_kv_cache_t *c);   /* __half values per token row = n_heads_kv*head_dim */
 size_t kv_cache_total_bytes(const inference_kv_cache_t *c);
 
-/* Aligned per-layer region sizes in bytes; K regions are laid out first, then V regions (see top-of-file layout comment). */
-size_t kv_cache_k_region_bytes(const inference_kv_cache_t *c);
-size_t kv_cache_v_region_bytes(const inference_kv_cache_t *c);
-
-/* Host pointer to the whole mapping (K regions then V regions, see file-top comment). */
+/* Block geometry (see the layout comment): positions per block, its log2, bytes per block (all layers' K and V), and
+   the block stride in __half units for kernels (block_bytes / 2) */
+int    kv_cache_block_tokens(const inference_kv_cache_t *c);
+int    kv_cache_block_shift(const inference_kv_cache_t *c);
+size_t kv_cache_block_bytes(const inference_kv_cache_t *c);
+long long kv_cache_block_stride(const inference_kv_cache_t *c);
+/* Host pointer to the whole mapping (blocks in position order, see file-top comment). */
 void  *kv_cache_host_base(const inference_kv_cache_t *c);
 
 /* Device pointer of the same buffer; equals the host base when zero-copy pinning succeeded. */

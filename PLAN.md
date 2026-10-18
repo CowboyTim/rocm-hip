@@ -2026,6 +2026,15 @@ block-chain style cache managed in Perl.
 
 **Order:**
 1. Block-major layout behind the current API (tests unchanged; prefill and generation stay bit-identical).
+   **DONE ✅ (2026-10-18).**
+   - `kv_cache`: blocks of `block_tokens` (default 256) positions, `[K_0 | V_0 | ... | K_{L-1} | V_{L-1}]`
+     per block; n_ctx rounded up to whole blocks; `kv_cache_block_{tokens,shift,bytes,stride}`.
+   - Attention kernels address row p as `(p >> shift) * block_stride + (p & (B - 1)) * row_stride` (`kv_row`);
+     `attention_forward` takes `kv_shift, kv_bstride` (contiguous test buffers: 30, 0).
+   - Tests: `forward_verify` runs the batched attention (attn_partial and attn_flash) on 64-position blocks
+     too, with output and cache rows bit-identical to the contiguous layout. `kv_verify` uses one block.
+   - Greedy tokens on a 2,456-token prompt are identical to the previous build on both models; speed is
+     unchanged.
 2. The C block store: hashing, mapping, snapshots at the chosen boundaries, publishing, lookup.
 3. Perl policy helpers: budget/LRU eviction, disk tier, session names.
 4. Tests:

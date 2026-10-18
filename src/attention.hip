@@ -30,6 +30,12 @@
 #define HD 256
 #define CH HD
 
+// KV cache row of position p, in __half units from the layer's row 0: blocks of 2^kv_shift positions, kv_bstride
+// apart, rows kv_stride apart inside a block (kv_cache.h). A contiguous cache is kv_shift = 30.
+__device__ __forceinline__ size_t kv_row(int p, int kv_stride, int kv_shift, long long kv_bstride) {
+    return (size_t)(p >> kv_shift) * (size_t)kv_bstride + (size_t)(p & ((1 << kv_shift) - 1)) * (size_t)kv_stride;
+}
+
 __device__ __forceinline__ float wave_sum(float v) {
     for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, 32);
     return v;
@@ -88,14 +94,15 @@ __device__ float norm_rope(float x, const float* w, int n_rot, int pos, float fr
 
 extern "C" __global__ void __launch_bounds__(HD)
 attn_prep(const float* qfull, const float* k, const float* v, const float* q_norm, const float* k_norm, float* q_out,
-          __half* K, __half* V, int kv_stride, int n_q, int n_kv, int n_rot, int pos0, float freq_base, float eps) {
+          __half* K, __half* V, int kv_stride, int kv_shift, long long kv_bstride, int n_q, int n_kv, int n_rot, int pos0,
+          float freq_base, float eps) {
     const int b = blockIdx.x, d = threadIdx.x, z = blockIdx.y, pos = pos0 + z;
     qfull += (size_t)z * 2 * n_q * HD;
     q_out += (size_t)z * n_q * HD;
     k += (size_t)z * n_kv * HD;
     v += (size_t)z * n_kv * HD;
-    __half* k_row = K + (size_t)pos * kv_stride;
-    __half* v_row = V + (size_t)pos * kv_stride;
+    __half* k_row = K + kv_row(pos, kv_stride, kv_shift, kv_bstride);
+    __half* v_row = V + kv_row(pos, kv_stride, kv_shift, kv_bstride);
     if (b < n_q) {
         const float x = qfull[(size_t)b * 2 * HD + d];
         q_out[b * HD + d] = norm_rope(x, q_norm, n_rot, pos, freq_base, eps);
@@ -108,7 +115,8 @@ attn_prep(const float* qfull, const float* k, const float* v, const float* q_nor
 }
 
 extern "C" __global__ void __launch_bounds__(HD)
-attn_partial(const float* q, const __half* K, const __half* V, int kv_stride, int pos0, int n_q, int n_kv_heads,
+attn_partial(const float* q, const __half* K, const __half* V, int kv_stride, int kv_shift, long long kv_bstride, int pos0,
+             int n_q, int n_kv_heads,
              float scale, float* part_ml, float* part_acc) {
     __shared__ float sq[HD], sw[CH];
     const int h = blockIdx.x, c = blockIdx.y, t = threadIdx.x, n_chunks = gridDim.y, z = blockIdx.z;
@@ -124,7 +132,7 @@ attn_partial(const float* q, const __half* K, const __half* V, int kv_stride, in
     const int p = c * CH + t;
     float score = -INFINITY;
     if (p < n_kv) {
-        const uint4* kr = (const uint4*)(K + (size_t)p * kv_stride + (size_t)g * HD);
+        const uint4* kr = (const uint4*)(K + kv_row(p, kv_stride, kv_shift, kv_bstride) + (size_t)g * HD);
         float s = 0.0f;
 #pragma unroll 4
         for (int i = 0; i < HD / 8; ++i) {
@@ -146,9 +154,9 @@ attn_partial(const float* q, const __half* K, const __half* V, int kv_stride, in
 
     // acc[d] over this chunk's positions (thread per dim)
     const int p0 = c * CH, np = max(0, min(CH, n_kv - p0));
-    const __half* vb = V + (size_t)p0 * kv_stride + (size_t)g * HD + t;
+    const __half* vb = V + (size_t)g * HD + t;
     float acc = 0.0f;
-    for (int i = 0; i < np; ++i) acc += sw[i] * __half2float(vb[(size_t)i * kv_stride]);
+    for (int i = 0; i < np; ++i) acc += sw[i] * __half2float(vb[kv_row(p0 + i, kv_stride, kv_shift, kv_bstride)]);
 
     const size_t pc = (size_t)h * n_chunks + c;
     part_acc[pc * HD + t] = acc;
@@ -204,7 +212,8 @@ typedef float v8f __attribute__((ext_vector_type(8)));
 #define QP (HD + 8)    // padded LDS row of Q / K (halves)
 
 extern "C" __global__ void __launch_bounds__(128)
-attn_flash(const float* q, const __half* K, const __half* V, int kv_stride, int pos0, int T, int n_q, int n_kv_heads,
+attn_flash(const float* q, const __half* K, const __half* V, int kv_stride, int kv_shift, long long kv_bstride, int pos0,
+           int T, int n_q, int n_kv_heads,
            int chunk, float scale, float* part_ml, float* part_acc) {
     __shared__ __attribute__((aligned(16))) _Float16 sQ[4][FT][QP];
     __shared__ __attribute__((aligned(16))) _Float16 sK[FB][QP];
@@ -244,7 +253,7 @@ attn_flash(const float* q, const __half* K, const __half* V, int kv_stride, int 
             const int idx = tid + 128 * k, p = idx / (HD / 8), d = 8 * (idx % (HD / 8));
             uint4 ku = make_uint4(0, 0, 0, 0), vu = ku;
             if (P0 + p <= pos0 + zmax) {
-                const size_t off = (size_t)(P0 + p) * kv_stride + (size_t)g * HD + d;
+                const size_t off = kv_row(P0 + p, kv_stride, kv_shift, kv_bstride) + (size_t)g * HD + d;
                 ku = *(const uint4*)(K + off);
                 vu = *(const uint4*)(V + off);
             }

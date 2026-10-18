@@ -81,15 +81,20 @@ int main(int argc, char* argv[]) {
     printf("  layers=%d ctx=%d embd=%d head_dim=%d heads_q=%d heads_kv=%d -> d_kv=%d\n",
            c.n_layers, c.n_ctx, c.n_embd, c.head_dim, c.n_heads_q, c.n_heads_kv, d_kv);
 
-    kv_cache_config_t cfg{c.n_layers, c.n_ctx, c.n_embd, c.head_dim, c.n_heads_q, c.n_heads_kv};
+    // One block covering the whole context (block_tokens = the next power of two >= n_ctx): every layer's K and V
+    // segments are then contiguous runs of rows, as kv_cache_selftest addresses them
+    int kv_block = 1;
+    while (kv_block < c.n_ctx) kv_block *= 2;
+    kv_cache_config_t cfg{c.n_layers, c.n_ctx, c.n_embd, c.head_dim, c.n_heads_q, c.n_heads_kv, kv_block};
     inference_kv_cache_t* cache = kv_cache_create("/dev/shm/kv_cache_verify.bin", &cfg);
     if (!cache) { fprintf(stderr, "kv_cache_create failed\n"); return 1; }
 
-    printf("  Mapping: %zu bytes in /dev/shm (%zu K-region + %zu V-region per layer)\n",
-           kv_cache_total_bytes(cache), kv_cache_k_region_bytes(cache), kv_cache_v_region_bytes(cache));
+    printf("  Mapping: %zu bytes in /dev/shm (%d-position blocks of %zu bytes)\n", kv_cache_total_bytes(cache),
+           kv_cache_block_tokens(cache), kv_cache_block_bytes(cache));
     report("zero-copy pin identity (device ptr == host base)", kv_cache_zero_copy_ok(cache));
     report("config round-trip (n_layers/n_ctx/d_kv)",
-           kv_cache_n_layers(cache) == c.n_layers && kv_cache_n_ctx(cache) == c.n_ctx && kv_cache_d_kv(cache) == d_kv);
+           kv_cache_n_layers(cache) == c.n_layers && kv_cache_n_ctx(cache) >= c.n_ctx && kv_cache_d_kv(cache) == d_kv);
+    c.n_ctx = kv_cache_n_ctx(cache);  // rounded up to whole blocks: the checks below use the cache's context
 
     // --- bounds safety on row accessors ---
     report("row accessors reject out-of-range layer/pos",
@@ -145,14 +150,15 @@ int main(int argc, char* argv[]) {
     HIP_CHECK(hipHostGetDevicePointer((void**)&dev_check, check_host, 0), "scratch dev ptr");
 
     void* kv_dev_base = kv_cache_device_ptr(cache);
-    __half* k_dev = (__half*)kv_dev_base;   // K regions start at the mapping base
-    __half* v_dev = (__half*)((char*)kv_dev_base + (size_t)c.n_layers * kv_cache_k_region_bytes(cache));
+    // Layer l's K rows start at base + 2 l * B rows, its V rows B rows later (kv_cache.h, one block)
+    __half* k_dev = (__half*)kv_dev_base;
+    __half* v_dev = (__half*)kv_dev_base + (size_t)kv_block * d_kv;
 
     hipModule_t mod; hipFunction_t func;
     if (!load_kernel("kv_cache_kernel.co", "kv_cache_selftest", mod, func)) return 1;
 
-    const size_t k_halfs = kv_cache_k_region_bytes(cache) / sizeof(__half);
-    const size_t v_halfs = kv_cache_v_region_bytes(cache) / sizeof(__half);
+    const size_t k_halfs = 2 * (size_t)kv_block * d_kv;  // per-layer stride of the K (and V) runs
+    const size_t v_halfs = k_halfs;
 
     void* args[] = { &k_dev, &v_dev, &dev_check,
                      (void*)&c.n_layers, (void*)&c.n_ctx, (void*)&d_kv,

@@ -44,18 +44,19 @@ void attention_free(void) {
 }
 
 hipError_t attention_forward(const float* qfull, const float* k, const float* v, const float* q_norm,
-                             const float* k_norm, __half* K, __half* V, int n_q, int n_kv, int n_rot, int pos0, int T,
+                             const float* k_norm, __half* K, __half* V, int kv_shift, long long kv_bstride, int n_q,
+                             int n_kv, int n_rot, int pos0, int T,
                              float freq_base, float eps, float* q, float* part_ml, float* part_acc, float* out,
                              const qmatvec_q8* q8, hipStream_t stream) {
     if (!g_prep) return hipErrorInvalidDeviceFunction;
-    if (n_kv <= 0 || n_q % n_kv != 0 || n_rot > ATTN_HEAD_DIM || n_rot % 2 != 0 || pos0 < 0 || T <= 0)
+    if (kv_shift < 0 || kv_shift > 30 || n_kv <= 0 || n_q % n_kv != 0 || n_rot > ATTN_HEAD_DIM || n_rot % 2 != 0 || pos0 < 0 || T <= 0)
         return hipErrorInvalidValue;
     if (q8 && (long long)T * n_q * ATTN_HEAD_DIM > q8->max_k) return hipErrorInvalidValue;
     int kv_stride = n_kv * ATTN_HEAD_DIM;
     const int n_last = pos0 + T;  // positions the last token attends to
 
     void* a_prep[] = {(void*)&qfull, (void*)&k, (void*)&v, (void*)&q_norm, (void*)&k_norm, &q, &K, &V, &kv_stride,
-                      &n_q, &n_kv, &n_rot, &pos0, &freq_base, &eps};
+                      &kv_shift, &kv_bstride, &n_q, &n_kv, &n_rot, &pos0, &freq_base, &eps};
     hipError_t e = hipModuleLaunchKernel(g_prep, (unsigned)(n_q + n_kv), (unsigned)T, 1, ATTN_HEAD_DIM, 1, 1, 0, stream,
                                          a_prep, nullptr);
     if (e != hipSuccess) return e;
@@ -72,7 +73,7 @@ hipError_t attention_forward(const float* qfull, const float* k, const float* v,
         int n_split = std::min(nc, ATTN_MAX_SPLITS);
         int chunk = ((n_last + n_split - 1) / n_split + 15) / 16 * 16;
         n_split = (n_last + chunk - 1) / chunk;
-        void* a_flash[] = {(void*)&qc, &K, &V, &kv_stride, &pos0, &T, &n_q, &n_kv, &chunk, &scale, &part_ml, &part_acc};
+        void* a_flash[] = {(void*)&qc, &K, &V, &kv_stride, &kv_shift, &kv_bstride, &pos0, &T, &n_q, &n_kv, &chunk, &scale, &part_ml, &part_acc};
         e = hipModuleLaunchKernel(g_flash, (unsigned)(n_q / 4), (unsigned)((T + 15) / 16), (unsigned)n_split, 128, 1,
                                   1, 0, stream, a_flash, nullptr);
         if (e != hipSuccess) return e;
@@ -98,7 +99,7 @@ hipError_t attention_forward(const float* qfull, const float* k, const float* v,
             oz.dK += blk;
             oz.bsK += blk * 16;
         }
-        void* a_part[] = {(void*)&qz, &K, &V, &kv_stride, (void*)&p0, &n_q, &n_kv, &scale, &part_ml, &part_acc};
+        void* a_part[] = {(void*)&qz, &K, &V, &kv_stride, &kv_shift, &kv_bstride, (void*)&p0, &n_q, &n_kv, &scale, &part_ml, &part_acc};
         e = hipModuleLaunchKernel(g_partial, (unsigned)n_q, (unsigned)n_chunks, (unsigned)tg, ATTN_HEAD_DIM, 1, 1, 0,
                                   stream, a_part, nullptr);
         if (e != hipSuccess) return e;
