@@ -1206,9 +1206,19 @@ for the symptoms above.
 
 ### 20.3 Plan
 
-> **▶ NEXT STEP (as of 2026-10-18): Phase 22 (product C API, then the Perl XS module), and Phase 21 (more
-> architectures, Qwen3.8-Flash-Next first) once the user has the GGUFs. Both plans are at the end of this
-> file. The speed work below is done for now.**
+> **▶ NEXT STEP (as of 2026-10-18, HEAD ae4c968):**
+> - **Done:** Phase 22 (streaming C API, chat template access + prefix reuse, self-contained `libinference.so`,
+>   Perl XS module `ROCm::Inference`) and Phase 22b (KV block store: block-major layout, slots as files, store
+>   in C, Perl policy `ROCm::Inference::Store`). Both are at the end of this file.
+> - **Open, small:**
+>   - run `perl/ROCm-Inference/t/20-chat.t` where the user's `Minijinja` module is installed (no cargo here);
+>   - CPAN packaging (`Makefile.PL` building or locating libinference);
+>   - Phase 22b follow-ups: a disk-tier timing, a configurable block size, a Perl web service example.
+> - **Waiting on the user:** Phase 21, more architectures, Qwen3.8-Flash-Next (`qwen4exp`) first. It needs the
+>   GGUF, and room in /dev/shm or on disk.
+> - **Possible speed items:** long-context decode attention (generation 63 → 42 tok/s at 30k tokens), the 35B
+>   expert matmuls in prefill.
+> - The speed work below (Phase 20) is done for now.
 >
 > **Earlier NEXT STEP (2026-10-17): make the 4B fast, then batched prefill, then Step 6 (35B MoE).**
 >
@@ -1860,7 +1870,7 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
 is a 63 GB tmpfs (38 GB free) and the disk has 48 GB free, so a ~50 GB model needs space freed or /dev/shm
 remounted larger; the reference oracle must also run each model on the CPU for `ref_dump`.
 
-## Phase 22 – Product C API + Perl XS module (Phase 14) — IN PROGRESS 🔧 (2026-10-18)
+## Phase 22 – Product C API + Perl XS module (Phase 14) — DONE ✅ (2026-10-18; open: t/20-chat.t with Minijinja, CPAN packaging)
 
 **Progress:**
 - **Step 1a — DONE ✅: streaming generation.** `inference_generate_stream` continues the current sequence
@@ -1922,9 +1932,9 @@ remounted larger; the reference oracle must also run each model on the CPU for `
     logits, freed handle), `t/20-chat.t` (MiniJinja chat; skipped here: Minijinja needs the Rust
     minijinja-cabi library and there is no cargo on this machine). All pass on both models.
 - **Next:** run `t/20-chat.t` with Minijinja installed (the Qwen template uses `.startswith` / `.split` /
-  `namespace` / `raise_exception`: check the module supports them); session save/load (KV cache + recurrent
-  state + token history to a file) for the Perl side's KV cache handling; CPAN packaging (build or locate
-  libinference). Later: long-context decode attention.
+  `namespace` / `raise_exception`: check the module supports them); CPAN packaging (build or locate
+  libinference). Session save/load became Phase 22b (the KV block store), done. Later: long-context decode
+  attention.
 
 
 The C API (`inference.h`) works for one sequence but lacks what an application needs. Architecture-neutral,
@@ -1942,7 +1952,7 @@ so every Phase 21 model gets it unchanged:
    ParseXS and headers are installed here), tests with Test::More against the 4B, POD. Packaging for CPAN
    (kernel .co files installed with the module, ROCm found at build time) last.
 
-## Phase 22b – KV cache as files: sessions and shared prefix blocks — PLAN (2026-10-18)
+## Phase 22b – KV cache as files: sessions and shared prefix blocks — DONE ✅ (2026-10-18; steps 1–4 below)
 
 User's idea: "saving" the KV cache means keeping it as files and mmap()ing them back in, not copying. /dev/shm
 (RAM) by default, a regular filesystem possible; with smaller models a 128 GB machine has room for a
