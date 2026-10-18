@@ -60,7 +60,7 @@ hipError_t gpu_add_rmsnorm(const float* x_in, const float* add, float* x_out, co
 
 hipError_t gpu_swiglu(const float* g, const float* u, float* out, int n, const qmatvec_q8* q8, hipStream_t stream) {
     if (!g_swiglu) return hipErrorInvalidDeviceFunction;
-    if (q8 && (n % 256 != 0 || n > q8->max_k)) return hipErrorInvalidValue;
+    if (q8 && (n % 32 != 0 || n > q8->max_k)) return hipErrorInvalidValue;
     qmatvec_q8_out o = qmatvec_q8_outputs(q8);
     void* args[] = {(void*)&g, (void*)&u, &out, &n, &o};
     return hipModuleLaunchKernel(g_swiglu, (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1, 0, stream, args, nullptr);
@@ -102,11 +102,16 @@ hipError_t gpu_hc_norm(float* res, const float* cur, const float* inject, const 
     return hipModuleLaunchKernel(g_hc_norm, (unsigned)(T * hc), 1, 1, 256, 1, 1, 0, stream, args, nullptr);
 }
 
-hipError_t gpu_hc_lowrank(float* lo, int n, int hc, hipStream_t stream) {
+hipError_t gpu_hc_lowrank(const float* lo, float* out, int n, int np, int T, int hc, const qmatvec_q8* q8,
+                          hipStream_t stream) {
     if (!g_hc_lowrank) return hipErrorInvalidDeviceFunction;
+    if (T <= 0 || np < n || (q8 && (np % 32 != 0 || (long long)np * T > q8->max_k))) return hipErrorInvalidValue;
     float scale = 1.0f / (float)hc;
-    void* args[] = {&lo, &n, &scale};
-    return hipModuleLaunchKernel(g_hc_lowrank, (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1, 0, stream, args, nullptr);
+    qmatvec_q8_out o = qmatvec_q8_outputs(q8);
+    void* args[] = {(void*)&lo, &out, &n, &np, &T, &scale, &o};
+    const long long total = (long long)np * T;
+    return hipModuleLaunchKernel(g_hc_lowrank, (unsigned)((total + 255) / 256), 1, 1, 256, 1, 1, 0, stream, args,
+                                 nullptr);
 }
 
 hipError_t gpu_hc_mix(const float* xn, const float* gate, float* out, int n, int hc, int T, const qmatvec_q8* q8,

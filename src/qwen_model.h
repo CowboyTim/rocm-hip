@@ -40,6 +40,11 @@ int qwen_model_forward(qwen_model_t* model, int token_id, int pos, float* logits
 // the last token's logits; qwen_model_logits() has them too. Returns 0 on success.
 int qwen_model_prefill(qwen_model_t* model, const int* tokens, int n, int pos0, float* logits);
 
+// Tests, hyper-connection models only: run layers [l0, l1) on n tokens from position 0 (fresh state), starting from
+// the residual streams res_in [n][n_hc * n_embd] instead of the embeddings; the layer callback sees each layer's
+// output. No LM head. n <= qwen_model_max_batch. Returns 0 on success.
+int qwen_model_run_layers(qwen_model_t* model, const int* tokens, int n, const float* res_in, int l0, int l1);
+
 // Tokens per prefill micro-batch (scratch rows)
 int qwen_model_max_batch(const qwen_model_t* model);
 

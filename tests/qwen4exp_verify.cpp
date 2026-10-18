@@ -6,12 +6,21 @@
 // on this machine, so the model is normally tools/gen_qwen4exp_tiny.py's small random-weight GGUF: the release's
 // tensor names, layer pattern, quant types and tokenizer at small widths.
 //
-// Checks: the engine's residual streams after every layer (l_last-N, all n_hc streams) and the last token's
-// logits against the reference (cosine > 0.99, as forward_verify's whole-engine section: the reference quantizes
-// activations to Q8 for every matmul, so errors compound), the next-token argmax; then the engine against itself:
-// token-by-token decoding and a prefill split in two (PLE n-gram history and conv state carried across calls)
-// give the prompt-at-once logits (exactly with QMATVEC_NO_WMMA=1; else cosine > 0.9999: prefill attention and
-// matmuls use WMMA, which sums in another order).
+// Checks against the reference:
+//  - each layer alone, from the reference's input to it (teacher forcing, qwen_model_run_layers): the cosine of
+//    the layer's update to the streams, per position. At least 95% of them >= 0.999 and none < 0.95. This is the
+//    strict check: a wrong formula shows at every position of every layer of its kind.
+//  - the whole model: the residual streams after every layer (l_last-N, all n_hc streams; worst cosine > 0.9) and
+//    the last token's logits (cosine > 0.98, the same argmax or a near-tie). Errors compound here: the reference
+//    quantizes activations to Q8 with other rounding, and with 512 experts (the release, top 10) many tokens
+//    have a near-tie between the 10th and 11th expert, which that noise can swap. On the release model 559 of
+//    564 single-layer updates match; the 5 others are at positions with the smallest router gaps, and the
+//    streams carry such a swap on: worst residual cosine ~0.95, logits 0.99 (2026-10-18). (Matmuls on the
+//    float path, which does not quantize its input like the reference, made 70 of them differ.)
+// Then the engine against itself: token-by-token decoding and a prefill split in two (PLE n-gram history and
+// conv state carried across calls) give the prompt-at-once logits: exactly with QMATVEC_NO_WMMA=1; else
+// cosine > 0.99 (prefill attention and matmuls use WMMA, which sums in another order, and routing near-ties
+// amplify that the same way).
 
 #include "inference.h"
 #include "qwen_model.h"
@@ -139,11 +148,56 @@ int main(int argc, char** argv) {
         for (int p = 0; p < n; ++p)
             lw = fmin(lw, cosine(cap.layer[l].data() + (size_t)p * cap.hcd, r.data() + (size_t)p * cap.hcd, cap.hcd));
         printf("    layer %2zu: worst cosine over %d positions %.6f\n", l, n, lw);
+        if (getenv("QWEN4EXP_VERIFY_POS")) {  // per position, and the largest |value| (ours, reference)
+            for (int p = 0; p < n; ++p) {
+                const float* a = cap.layer[l].data() + (size_t)p * cap.hcd;
+                const float* b = r.data() + (size_t)p * cap.hcd;
+                float ma = 0, mb = 0;
+                for (int i = 0; i < cap.hcd; ++i) ma = fmaxf(ma, fabsf(a[i])), mb = fmaxf(mb, fabsf(b[i]));
+                printf("      pos %2d: cosine %.6f, max |x| %.4g / %.4g\n", p, cosine(a, b, cap.hcd), ma, mb);
+            }
+        }
         if (lw < worst) worst = lw, worst_l = (int)l;
     }
     snprintf(what, sizeof(what), "residual streams after every layer vs l_last-N: worst cosine %.6f (layer %d)", worst,
              worst_l);
-    check(!cap.layer.empty() && worst > 0.99, what);
+    check(!cap.layer.empty() && worst > 0.9, what);
+    // Each layer alone, from the reference's input to it (teacher forcing): errors do not compound, so a layer
+    // that is wrong stands out. The cosine is over the layer's change to the streams (output - input), which
+    // is what the layer computes.
+    {
+        double iso = 1.0;
+        int iso_l = -1, n_upd = 0, n_close = 0;
+        for (size_t l = 0; l < cap.layer.size(); ++l) {
+            std::vector<float> in, out;
+            if (l == 0 || !ref("l_last-" + std::to_string(l - 1), in) || !ref("l_last-" + std::to_string(l), out))
+                continue;
+            Capture one;
+            qwen_model_set_layer_callback(q, on_layer, &one);
+            const int rc = qwen_model_run_layers(q, toks.data(), n, in.data(), (int)l, (int)l + 1);
+            qwen_model_set_layer_callback(q, nullptr, nullptr);
+            if (rc != 0 || one.layer.size() <= l) { check(false, qwen_model_last_error()); break; }
+            double lw = 1.0;
+            for (int p = 0; p < n; ++p) {
+                std::vector<float> da(cap.hcd), db(cap.hcd);
+                for (int i = 0; i < cap.hcd; ++i) {
+                    const size_t k = (size_t)p * cap.hcd + i;
+                    da[i] = one.layer[l][k] - in[k];
+                    db[i] = out[k] - in[k];
+                }
+                const double c = cosine(da.data(), db.data(), cap.hcd);
+                ++n_upd;
+                n_close += c >= 0.999;
+                if (getenv("QWEN4EXP_VERIFY_POS") && c < 0.999) printf("      layer %2zu pos %2d: cosine %.6f\n", l, p, c);
+                lw = fmin(lw, c);
+            }
+            if (getenv("QWEN4EXP_VERIFY_POS")) printf("    layer %2zu alone: worst cosine of its update %.6f\n", l, lw);
+            if (lw < iso) iso = lw, iso_l = (int)l;
+        }
+        snprintf(what, sizeof(what), "each layer alone from the reference input: %d of %d updates (layer, position) at "
+                 "cosine >= 0.999, worst %.6f (layer %d)", n_close, n_upd, iso, iso_l);
+        check(n_upd > 0 && n_close >= 0.95 * n_upd && iso > 0.95, what);
+    }
     std::vector<float> rl;
     if (ref("result_output", rl) && rl.size() >= (size_t)V) {
         const float* last = rl.data() + rl.size() - V;
@@ -151,7 +205,7 @@ int main(int argc, char** argv) {
         const int a = argmax(logits.data(), V);
         snprintf(what, sizeof(what), "last-token logits vs result_output: cosine %.6f, argmax %d (reference %d, its "
                  "logit there %.4f vs max %.4f)", c, a, ref_next, last[a], last[argmax(last, V)]);
-        check(c > 0.99 && (a == ref_next || last[argmax(last, V)] - last[a] < 0.5f), what);
+        check(c > 0.98 && (a == ref_next || last[argmax(last, V)] - last[a] < 0.5f), what);
     } else {
         check(false, "reference result_output");
     }
@@ -160,7 +214,7 @@ int main(int argc, char** argv) {
     auto same = [&](const std::vector<float>& a, const std::string how) {
         const double r = max_rel(a.data(), logits.data(), (size_t)V), c = cosine(a.data(), logits.data(), (size_t)V);
         snprintf(what, sizeof(what), "%s: max relative difference %.3g, cosine %.7f", how.c_str(), r, c);
-        check(exact ? r == 0.0 : c > 0.9999, what);
+        check(exact ? r == 0.0 : c > 0.99, what);
     };
     std::vector<float> l2((size_t)V);
     bool ok = true;

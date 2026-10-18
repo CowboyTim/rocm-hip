@@ -645,13 +645,14 @@ __device__ __forceinline__ uint32_t ld32_a2(const uint8_t *p) {                 
     return (uint32_t)h[0] | ((uint32_t)h[1] << 16);
 }
 
-// grid K / 256, block 256: one Q8_K block and its eight Q8_0 blocks (see q8_device.h). Producers of matvec
-// inputs that can (add_rmsnorm, swiglu, attn_combine) quantize their own output instead.
+// grid ceil(n / 256), block 256: one Q8_K block and its eight Q8_0 blocks (see q8_device.h); n % 32 == 0. A
+// partial last block has whole Q8_0 blocks (its Q8_K side is only read when every row is whole Q8_K blocks).
+// Producers of matvec inputs that can (add_rmsnorm, swiglu, attn_combine) quantize their own output instead.
 extern "C" __global__ void __launch_bounds__(256)
-quantize_q8(const float *x, Q8Out o) {
+quantize_q8(const float *x, int n, Q8Out o) {
     __shared__ Q8Shared sh;
-    const int t = threadIdx.x, b = blockIdx.x;
-    q8_block_value(x[b * 256 + t], true, b, t, sh, o);
+    const int t = threadIdx.x, b = blockIdx.x, i = b * 256 + t;
+    q8_block_value(i < n ? x[i] : 0.0f, i < n, b, t, sh, o);
 }
 
 // Four ROCmFP4 nibbles (one per byte, 0..15) -> four int8 codebook values {0,1,2,3,4,6,8,10} with sign bit 3,

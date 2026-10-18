@@ -35,6 +35,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 // Thread-local error buffer for qwen_model errors
@@ -142,7 +143,8 @@ struct Scratch {
     // Hyper-connections (qwen4exp; n_hc streams of n_embd, HCD = n_hc * n_embd per token; empty otherwise)
     float* res = nullptr;     // the residual streams [HCD]
     float* hxn = nullptr;     // a mixer's normed streams [HCD], input to its down / inject projections
-    float* hlo = nullptr;     // down projection, then SiLU(. / n_hc) [hc_rank]
+    float* hlo = nullptr;     // down projection [hc_rank]
+    float* hlo_pad = nullptr; // SiLU(hlo / n_hc), zero-padded to hc_rank_pad: the up projection's input
     float* hgate = nullptr;   // up projection: the streams' gate logits [HCD]
     float* inj = nullptr;     // inject projection: the stream weights' logits [n_hc]
     // PLE (qwen4exp)
@@ -165,6 +167,7 @@ struct Scratch {
         const int conv_dim = 2 * m->ssm_n_group * m->ssm_d_state + m->ssm_d_inner, DI = m->ssm_d_inner;
         const int NV = m->ssm_dt_rank, NE = m->n_expert, NU = m->n_expert_used, FE = m->n_ff_exp;
         const int HCD = m->n_hc * E, NHC = m->n_hc, R = m->hc_rank, PE = m->ple_table.data ? E : 0;
+        const int RP = (R + 127) / 128 * 128;  // QwenModel::hc_up_pad
         const int PHCD = m->ple_table.data ? HCD : 0;
         B = rows;
         const size_t b = (size_t)rows;
@@ -176,7 +179,7 @@ struct Scratch {
                                 b * NE, b * NU, b * NU, b, b * NU * FE, b * NU * FE, b * NU * FE, b * NU * E, b * E,
                                 b * NU, b * NU, 1, b * NU, b * NU, b * NU,
                                 attention_part_ml_floats(HQ, n_ctx, rows), attention_part_acc_floats(HQ, n_ctx, rows),
-                                b * HCD, b * HCD, b * R, b * HCD, b * NHC,
+                                b * HCD, b * HCD, b * R, b * RP, b * HCD, b * NHC,
                                 b * PE, b * PHCD, b * PE, b * PHCD, b * PHCD,
                                 (qmatvec_q8_bytes(q8_max_k) + 3) / 4};
         float *ids_f = nullptr, *gt = nullptr, *gp = nullptr, *gn = nullptr, *ge = nullptr, *gs = nullptr, *gc = nullptr;
@@ -185,7 +188,7 @@ struct Scratch {
                                 &r_logits, &ids_f, &wts, &sg, &moe_g, &moe_u, &moe_act, &moe_down, &sh_out,
                                 &gt, &gp, &gn, &ge, &gs, &gc,
                                 &part_ml, &part_acc,
-                                &res, &hxn, &hlo, &hgate, &inj,
+                                &res, &hxn, &hlo, &hlo_pad, &hgate, &inj,
                                 &ple_emb, &ple_key, &ple_val, &ple_gated, &ple_normed,
                                 &q8mem};
         static_assert(sizeof(sizes) / sizeof(sizes[0]) == sizeof(ptrs) / sizeof(ptrs[0]), "scratch table");
@@ -333,7 +336,45 @@ struct QwenModel {
     uint16_t* head_d = nullptr;
     bool head_q8 = false;
 
+    // The mixers' up projections (K = hc_rank) zero-padded to a multiple of 128 values, so they run on the int8 /
+    // WMMA kernels (ROCmFP4: K % 64 / % 128; the release's rank is 320): one copy of all of them, built at init.
+    // Padding blocks are all zero bytes, which decode to 0. Empty when the rank needs no padding or the type
+    // has no int8 kernel (then the original weights run on the float path).
+    ShmRegion hc_pad_mem;
+    std::unordered_map<const HcMix*, QuantWeight> hc_up_pad;
+
+    bool pad_hc_up() {
+        const int R = eng->hc_rank, RP = (R + 127) / 128 * 128;
+        std::vector<const HcMix*> mixes;
+        for (const LayerWeights& L : eng->layers) mixes.push_back(&L.hc_attn), mixes.push_back(&L.hc_ffn);
+        mixes.push_back(&eng->hc_head);
+        const QuantWeight& U = eng->hc_head.up;
+        if (RP == R || (U.type != QT_Q4_0_ROCMFP4 && U.type != QT_Q4_0_ROCMFP4_FAST)) return true;
+        const size_t prow = qt_row_size(U.type, RP), bytes = prow * U.N;
+        size_t floats = (bytes * mixes.size() + 3) / 4;
+        float* base = nullptr;
+        float** const pp[] = {&base};
+        if (!hc_pad_mem.alloc("/dev/shm/qwen_hc_up_pad.bin", &floats, pp, 1, hipHostRegisterReadOnly)) return false;
+        char* p = (char*)base;
+        for (const HcMix* M : mixes) {
+            const QuantWeight& W = M->up;
+            if (W.type != U.type || W.K != R || W.N != U.N) return false;
+            for (int n = 0; n < W.N; ++n) {
+                memcpy(p + (size_t)n * prow, W.row(n), W.row_bytes);
+                memset(p + (size_t)n * prow + W.row_bytes, 0, prow - W.row_bytes);
+            }
+            QuantWeight P = W;
+            P.K = RP;
+            P.row_bytes = prow;
+            P.data = p;
+            hc_up_pad[M] = P;
+            p += bytes;
+        }
+        return true;
+    }
+
     ~QwenModel() {
+        hc_pad_mem.free();
         head_mem.free();
         rs.free();
         s.mem.free();
@@ -388,12 +429,19 @@ struct QwenModel {
             qwen_set_error("recurrent state allocation failed");
             return false;
         }
+        if (eng->n_hc > 0 && !pad_hc_up()) {
+            qwen_set_error("hyper-connection up projections: padded copy failed");
+            return false;
+        }
         return true;
     }
 
-    // The int8 buffer for a producer kernel to quantize its T rows of K values into, or NULL (float path)
-    const qmatvec_q8* q8_for(int K, int T) const {
-        return use_q8 && K % 256 == 0 && (long long)K * T <= s.q8_max_k ? &s.q8 : nullptr;
+    // The int8 buffer for a producer kernel to quantize its T rows of K values into, or NULL (float path).
+    // K % 256 == 0: both formats. q8_0_rows: also rows of K % 32 == 0 (only Q8_0 is complete per row, which
+    // is all the ROCmFP4 kernels read; qmatvec_q8_supported keeps K-quants to K % 256), for the producers that
+    // handle them (swiglu, qmatvec_quantize).
+    const qmatvec_q8* q8_for(int K, int T, bool q8_0_rows = false) const {
+        return use_q8 && K % (q8_0_rows ? 32 : 256) == 0 && (long long)K * T <= s.q8_max_k ? &s.q8 : nullptr;
     }
 
     // A producer kernel just wrote T rows of x[K], quantized into q (NULL: not quantized); the next matmuls
@@ -406,7 +454,7 @@ struct QwenModel {
 
     // T rows of x[K] were written by a kernel that cannot quantize its output: quantize them in a separate launch
     bool produced(const float* x, int K, int T) {
-        const qmatvec_q8* q = q8_for(K, T);
+        const qmatvec_q8* q = q8_for(K, T, true);
         if (q && !check(qmatvec_quantize(x, K * T, q, 0), "quantize_q8")) return false;
         mark(x, K, T, q);
         return true;
@@ -570,12 +618,12 @@ struct QwenModel {
             !matvec_pair(L.W_gate, L.W_up, s.xn, s.ffg, s.ffu, T, P_FFN))
             return false;
 
-        const qmatvec_q8* qx = q8_for(FE, T * NU);
+        const qmatvec_q8* qx = q8_for(FE, T * NU, true);
         if (!check(gpu_swiglu(s.moe_g, s.moe_u, s.moe_act, T * NU * FE, qx, 0), "swiglu (experts)")) return false;
         mark(s.moe_act, FE, T * NU, qx);
         if (!matvec_id(L.We_down, s.moe_act, 1, s.moe_down, E, T, grouped, P_FFN)) return false;
 
-        const qmatvec_q8* qs = q8_for(FS, T);
+        const qmatvec_q8* qs = q8_for(FS, T, true);
         if (!check(gpu_swiglu(s.ffg, s.ffu, s.act, T * FS, qs, 0), "swiglu (shared expert)")) return false;
         mark(s.act, FS, T, qs);
         return matvec(L.W_down, s.act, s.sh_out, T, P_FFN) &&
@@ -588,7 +636,7 @@ struct QwenModel {
         if (L.moe) return moe_ffn(L, next_norm, T);
         const int E = eng->n_embd, FF = eng->n_ff;
         const float eps = (float)eng->eps;
-        const qmatvec_q8 *qe = q8_for(E, T), *qf = q8_for(FF, T);
+        const qmatvec_q8 *qe = q8_for(E, T), *qf = q8_for(FF, T, true);
         if (!check(gpu_add_rmsnorm(s.x, s.proj, s.x_alt, L.ffn_norm, s.xn, E, T, eps, qe, 0), "add_rmsnorm"))
             return false;
         std::swap(s.x, s.x_alt);
@@ -715,11 +763,15 @@ struct QwenModel {
     // The rest of a mixer, from s.hxn: the block input in s.xn (quantized), and s.inj when M has an inject
     bool hc_mix(const HcMix& M, int T, ProfCat c) {
         const int E = eng->n_embd, HC = eng->n_hc, R = eng->hc_rank;
+        const auto pad = hc_up_pad.find(&M);
+        const QuantWeight& U = pad != hc_up_pad.end() ? pad->second : M.up;
+        const qmatvec_q8* ql = q8_for(U.K, T, true);
         if (!(M.inject.data ? matvec_pair(M.down, M.inject, s.hxn, s.hlo, s.inj, T, c)
                             : matvec(M.down, s.hxn, s.hlo, T, c)) ||
-            !check(gpu_hc_lowrank(s.hlo, T * R, HC, 0), "hc_lowrank") || !produced(s.hlo, R, T) ||
-            !matvec(M.up, s.hlo, s.hgate, T, c))
+            !check(gpu_hc_lowrank(s.hlo, s.hlo_pad, R, U.K, T, HC, ql, 0), "hc_lowrank"))
             return false;
+        mark(s.hlo_pad, U.K, T, ql);
+        if (!matvec(U, s.hlo_pad, s.hgate, T, c)) return false;
         const qmatvec_q8* q = q8_for(E, T);
         if (!check(gpu_hc_mix(s.hxn, s.hgate, s.xn, E, HC, T, q, 0), "hc_mix")) return false;
         mark(s.xn, E, T, q);
@@ -780,8 +832,14 @@ struct QwenModel {
 
     // forward() for hyper-connection models: the residual is n_hc streams; each block reads a mixer's output and
     // its result is combined back into every stream (llama.cpp qwen4exp graph)
+    // Tests (qwen_model_run_layers): start from res_in instead of the embeddings, run layers [l0, l1) only, no
+    // LM head
+    const float* dbg_res_in = nullptr;
+    int dbg_l0 = 0, dbg_l1 = -1;
+
     int forward_hc(const int* tokens, int T, int pos0, float* logits_out) {
         const int E = eng->n_embd, HC = eng->n_hc, HCD = HC * E;
+        const int l0 = dbg_res_in ? dbg_l0 : 0, l1 = dbg_res_in ? dbg_l1 : eng->n_layer;
         prof.start();
         if (eng->ple_table.data && pos0 > 0 && !sync()) return -1;  // a queued state restore may set ple_hist
         for (int t = 0; t < T; ++t) {
@@ -793,18 +851,19 @@ struct QwenModel {
             }
             for (int c = 1; c < HC; ++c) memcpy(r + (size_t)c * E, r, sizeof(float) * E);
         }
+        if (dbg_res_in) memcpy(s.res, dbg_res_in, sizeof(float) * (size_t)T * HCD);
         // The reset (a GPU memset) also clears ple_hist, which the CPU writes next: wait for it
         if (pos0 == 0 && (!check(rs.reset(), "recurrent state reset") || (eng->ple_table.data && !sync()))) return -1;
         if (eng->ple_table.data && !ple_rows(tokens, T, pos0)) return -1;
         prof.lap(P_EMBED);
 
         const bool per_layer = layer_cb || qwen_debug();
-        for (int l = 0; l < eng->n_layer; ++l) {
+        for (int l = l0; l < l1; ++l) {
             const LayerWeights& L = eng->layers[l];
             const bool attn = L.kind == LAYER_FULL_ATTN;
             const ProfCat pc = attn ? P_ATTN : P_LIN;
             if (L.ple && !ple(l, L, T)) return -1;
-            if ((l == 0 || L.ple) && !hc_norm(nullptr, L.hc_attn.norm, T)) return -1;
+            if ((l == l0 || L.ple) && !hc_norm(nullptr, L.hc_attn.norm, T)) return -1;
             if (!hc_mix(L.hc_attn, T, pc) || !(attn ? full_attention(L, pos0, T) : linear_attention(l, L, T)) ||
                 !section(pc))
                 return -1;
@@ -827,6 +886,7 @@ struct QwenModel {
                 prof.start();
             }
         }
+        if (dbg_res_in) return sync() ? 0 : -1;
         if (!hc_mix(eng->hc_head, T, P_HEAD)) return -1;
         return lm_head(T, logits_out);
     }
@@ -835,7 +895,7 @@ struct QwenModel {
     bool ffn_core(const LayerWeights& L, int T) {
         if (L.moe) return moe_core(L, T);
         const int FF = eng->n_ff;
-        const qmatvec_q8* qf = q8_for(FF, T);
+        const qmatvec_q8* qf = q8_for(FF, T, true);
         if (!matvec_pair(L.W_gate, L.W_up, s.xn, s.ffg, s.ffu, T, P_FFN) ||
             !check(gpu_swiglu(s.ffg, s.ffu, s.act, FF * T, qf, 0), "swiglu"))
             return false;
@@ -969,6 +1029,20 @@ int qwen_model_forward(qwen_model_t* model, int token_id, int pos, float* logits
 int qwen_model_prefill(qwen_model_t* model, const int* tokens, int n, int pos0, float* logits) {
     if (!model || !tokens) return -1;
     return model->prefill(tokens, n, pos0, logits);
+}
+
+int qwen_model_run_layers(qwen_model_t* model, const int* tokens, int n, const float* res_in, int l0, int l1) {
+    if (!model || !tokens || !res_in || model->eng->n_hc <= 0 || l0 < 0 || l1 > model->eng->n_layer || l0 >= l1 ||
+        n > model->s.B) {
+        qwen_set_error("qwen_model_run_layers: bad arguments");
+        return -1;
+    }
+    model->dbg_res_in = res_in;
+    model->dbg_l0 = l0;
+    model->dbg_l1 = l1;
+    const int r = model->forward(tokens, n, 0, nullptr);
+    model->dbg_res_in = nullptr;
+    return r;
 }
 
 int qwen_model_max_batch(const qwen_model_t* model) {

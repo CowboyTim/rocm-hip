@@ -187,19 +187,21 @@ void qmatvec_q8_bind(qmatvec_q8 *q, void *mem, int max_k) {
     q->max_k = max_k;
 }
 
+// ROCmFP4 weights read only the Q8_0 side of the quantized input (32-value blocks), so their rows need not be
+// whole 256-value Q8_K blocks: e.g. the qwen4exp experts' K = 640. K-quants read Q8_K and need K % 256 == 0.
 int qmatvec_q8_supported(int type, int K) {
-    if (type < 0 || type >= QMV_MAX_TYPE || !g_fn_q8[type] || !g_quant || K % 256 != 0) return 0;
+    if (type < 0 || type >= QMV_MAX_TYPE || !g_fn_q8[type] || !g_quant) return 0;
     if (type == QT_Q4_0_ROCMFP4) return K % 64 == 0;        // lanes take 36-byte block pairs
     if (type == QT_Q4_0_ROCMFP4_FAST) return K % 128 == 0;  // lanes take 68-byte block quads
-    return 1;
+    return K % 256 == 0;
 }
 
 hipError_t qmatvec_quantize(const float *x, int K, const qmatvec_q8 *q, hipStream_t stream) {
     if (!g_quant) return hipErrorInvalidDeviceFunction;
-    if (K <= 0 || K % 256 != 0 || K > q->max_k) return hipErrorInvalidValue;
+    if (K <= 0 || K % 32 != 0 || K > q->max_k) return hipErrorInvalidValue;
     qmatvec_q8_out o = qmatvec_q8_outputs(q);
-    void *args[] = {(void *)&x, &o};
-    return hipModuleLaunchKernel(g_quant, (unsigned)(K / 256), 1, 1, 256, 1, 1, 0, stream, args, nullptr);
+    void *args[] = {(void *)&x, &K, &o};
+    return hipModuleLaunchKernel(g_quant, (unsigned)((K + 255) / 256), 1, 1, 256, 1, 1, 0, stream, args, nullptr);
 }
 
 // Lanes per row for the int8 matvec kernels: the smallest power of two (>= 4, >= 8 for K-quants, which use 8

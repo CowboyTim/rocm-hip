@@ -1206,37 +1206,24 @@ for the symptoms above.
 
 ### 20.3 Plan
 
-> **▶ NEXT STEP (as of 2026-10-18): Phase 21, Qwen3.8-Flash-Next (`qwen4exp`), stage 1 continues.**
-> - **Done (stage 1 core):** hyper-connections, PLE n-gram hash embeddings, the DeltaNet sigmoid output gate, the
->   dense attention / MoE reused. Verified against the reference on a small random-weight qwen4exp GGUF built
->   from the release's header (`tools/gen_qwen4exp_tiny.py`, `tests/qwen4exp_verify.cpp`). See Phase 21 below.
-> - **Done for the release GGUF:** split GGUF loading; the PLE table and an untied token_embd are not pinned
->   (~63 GiB registered for the release instead of 98.5); a batched float matmul for rows the int8 kernels
->   cannot take (the mixers' K = 320 up projections; bit-identical to token by token).
-> - **Next: run the release model.** Agreed layout (2026-10-18): the user restarts the container with a bigger
->   /dev/shm (`docker run --shm-size=80g`, compose `shm_size: "80gb"`; podman takes `--shm-size` too); shards 2
->   and 3 (60.8 GB) go in /dev/shm, shard 1 (44.9 GB: the 35.8 GiB PLE table + ~9 GB of other weights) on disk
->   (in the same directory as symlinks, since the loader derives the shard paths from the first file's name).
->   The PLE table is only read by the CPU (16 rows, ~2 KB per token) and is not pinned, so it stays a
->   demand-paged mmap on disk; ~63 GB is pinned (RAM via /dev/shm or the page cache). KV cache ~24 KB per token
->   (3 GB at 128k), recurrent state + scratch ~0.6 GB: ~70 GB of RAM in all.
->   1. check that pinning page-cache pages of a file on a real disk (shard 1) works (only /dev/shm so far);
->   2. greedy text vs `llama-completion` (CPU reference), then speed (the reference does 22.6 tok/s; the HC
->      mixers add ~0.34 GB of weights and ~500 launches per token on top of the MoE);
->   3. if cold PLE pages show up in the token time, prefetch a prompt's PLE rows with parallel reads.
-> - **After a container restart /dev/shm is empty** (tmpfs). Restore it with:
->   - `/dev/shm/models/Qwen3.5-4B-ROCMFP4.gguf`, `Qwen3.6-35B-A3B-ROCMFP4.gguf`: the user's copies;
->   - the Qwen3.8 header: `curl -L -r 0-33554431 -o /dev/shm/models/Qwen3.8-Flash-Next-header-00001.bin
->     https://huggingface.co/kingjones777/Qwen3.8-Flash-Next-ROCmFP4-STRIX_LEAN-GGUF/resolve/main/Qwen3.8-Flash-Next-Q4_0-ROCmFP4-STRIX_LEAN-00001-of-00003.gguf`;
->   - the tiny model: `python3 -I tools/gen_qwen4exp_tiny.py /dev/shm/models/Qwen3.8-Flash-Next-header-00001.bin
->     /dev/shm/models/qwen4exp-tiny.gguf` (random bytes: regenerate its reference dump with it);
->   - reference dumps: `build/ref_dump acts <model> "<prompt>" /dev/shm/ref_<name> 8`; the prompts of
->     `ref_qwen35_4b` / `ref_qwen36_35b` are in their `tokens.txt` (see Phase 20 Step 1 for the originals), the
->     tiny one used `"def fibonacci(n):\n    if n < 2:\n        return n\n    return"`.
->   - `make ref_dump` needs `llama.cpp/build-cpu`, whose cmake (an old session's scratchpad copy) is gone:
->     the built libraries still link; reconfigure with /usr/bin/cmake only if they must be rebuilt.
-> - **Cleanup (2026-10-18):** /dev/shm holds only the 4B, 35B, Qwen3.8 header, tiny model and the three ref dumps;
->   hf-qwen3-0.6b, embeddinggemma and the scratch .bin files were removed by the user.
+> **▶ NEXT STEP (as of 2026-10-18): Phase 21, Qwen3.8-Flash-Next (`qwen4exp`) runs on the real model.**
+> - **Setup (container, 2026-10-18):** `/models` = the user's model stash (read-only, NVMe), `/data` = writable on
+>   the same disk (557 GB free), /dev/shm = 90 GB tmpfs, the host's (survives docker restarts, not host reboots).
+>   Model: `/models/Qwen3.8-Flash-Next-Uncensored-Q4_0-ROCmFP4-FAST-00001-of-00003.gguf` (3 files, 94 GB, all
+>   ROCmFP4_FAST, PLE table FAST 27 GB, compress ratios 0), loaded straight from disk: 63.8 GB pinned in the
+>   page cache, 26.3 GB (PLE table, token_embd) left to the CPU; first load ~50 s (disk), later ~5 s.
+>   Reference dump: `/data/ref_q38_fast` (prompt "Write a Python function that checks whether a number is prime.").
+> - **Results:** coherent text; `qwen4exp_verify` passes on it (559 of 564 single-layer updates at cosine >= 0.999,
+>   the rest at routing near-ties of the 512-expert router; logits cosine 0.99, same argmax). Generation
+>   **31.4 tok/s**, prefill **436 tok/s** (2,427 tokens) vs the reference's ~24 / ~345. 4B / 35B unchanged.
+> - **Next:**
+>   1. speed: generation streams ~3.9 GB per token (dense DeltaNet / attention projections 1.4 GB, experts 1.25 GB,
+>      HC mixers 0.34 GB, head 0.52 GB) at ~120 GB/s; FFN section 18.6 ms of 36 ms per token. Profile with
+>      rocprofv3 (`rocprofv3 --kernel-trace --stats -d <dir> -- <cmd>`, results in a SQLite db: table `kernels`);
+>   2. greedy text vs `llama-completion` diverges at the 2nd token on that prompt (a near-tie, see the results);
+>      compare longer greedy runs on prompts without near-ties, or by teacher forcing;
+>   3. MTP draft heads (the model card's MTP-Heads GGUF) for speculative decoding: +11–34% in the reference;
+>   4. the STRIX_LEAN release (Q5_K token_embd, Q5_1 PLE table, Q6_K head) if the user wants it.
 > - **Other open items:** `perl/ROCm-Inference/t/20-chat.t` with the user's Minijinja module (cargo is installed
 >   now); CPAN packaging; Phase 22b follow-ups (disk-tier timing, block size option, a Perl web service example);
 >   speed: long-context decode attention, the 35B expert matmuls in prefill.
@@ -1851,7 +1838,7 @@ single `QuantWeight` definition, removal of stale files.
 | TYPE13/TYPE100 scale extraction | Folded into Step 3, verified against the reference dequant. |
 | "Weights need calibration" (Phase 19) | Incorrect; the weights are fine, the decode and architecture mapping are not. |
 
-## Phase 21 – More architectures — IN PROGRESS (Qwen3.8-Flash-Next stage 1 core done, 2026-10-18)
+## Phase 21 – More architectures — IN PROGRESS (Qwen3.8-Flash-Next runs on the real model, 2026-10-18)
 
 User's list: **Qwen3.8-Flash-Next (most important: coding)**, Nemotron, Gemma, DeepSeek, Kimi, GLM. The
 llama.cpp reference here (ROCmFPX, `llama.cpp/`) implements all of them, so each gets the same oracle
@@ -1931,7 +1918,25 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
     summed exactly as `matvec_<type>` (so prefill stays bit-identical); `qmatvec_launch_batch` uses it for the
     non-cooperative types. It replaces one launch per token for the K = 320 mixer up projections.
 
-**Needed from the user:** room for the GGUF files (start with Qwen3.8-Flash-Next ROCmFP4). Constraints here: /dev/shm
+- **On the real model — DONE ✅ (2026-10-18):** the user's `Qwen3.8-Flash-Next-Uncensored-Q4_0-ROCmFP4-FAST` (3 files,
+  94 GB) from `/models`, loaded from disk (pinning page-cache pages of a disk file works).
+  - First run: coherent text, 9.6 tok/s cold (PLE / weights paged in), 27.9 warm; prefill 168 tok/s.
+  - `qwen4exp_verify` against `ref_dump acts` of it: the residual streams drifted to cosine 0.93 by layer 35. Teacher
+    forcing (`qwen_model_run_layers`: each layer alone from the reference's input) showed 70 of 564 (layer,
+    position) updates below 0.999, at positions with small router gaps (10th vs 11th expert of 512).
+  - Cause, mostly: two matmuls on the float path, whose input is not quantized like the reference's (Q8_0):
+    - the experts' and shared expert's down projections (K = 640): the int8 path required K % 256 for every
+      type. Now ROCmFP4 types only need their own K % 64 / % 128 (they read only the Q8_0 side, whose 32-value
+      blocks line up with any K % 32 rows; K-quants still need K % 256), and `swiglu` / `quantize_q8` quantize
+      rows of K % 32;
+    - the mixers' up projections (K = hc_rank = 320): a zero-padded copy to K = 384 (`QwenModel::hc_up_pad`,
+      ~200 MB, built at init; zero blocks decode to 0), fed by `hc_lowrank`, which now writes the padded rows
+      and quantizes them.
+  - After: 559 of 564 updates >= 0.999 (the 5 others at the smallest router gaps), worst residual cosine 0.95,
+    logits 0.99. Prefill 168 → 292 → **436 tok/s**, generation **31.4 tok/s** (reference ~345 / ~24).
+  - `store_verify` passes on it (snapshots 118 MB). `tools/gguf_info.py` prints a GGUF's header.
+
+**Needed from the user:** nothing for now (the model is in `/models`). Constraints here: /dev/shm
 is a 63 GB tmpfs (38 GB free) and the disk has 48 GB free, so a ~50 GB model needs space freed or /dev/shm
 remounted larger; the reference oracle must also run each model on the CPU for `ref_dump`.
 

@@ -23,7 +23,8 @@ void gpu_ops_free(void);
 hipError_t gpu_add_rmsnorm(const float* x_in, const float* add, float* x_out, const float* w, float* y, int n, int T,
                            float eps, const qmatvec_q8* q8, hipStream_t stream);
 
-// out = SiLU(g) * u, quantized into q8 as well when it is not NULL (n % 256 == 0)
+// out = SiLU(g) * u, quantized into q8 as well when it is not NULL (n % 32 == 0: whole Q8_0 blocks; the Q8_K
+// side is complete only for rows of whole 256-value blocks)
 hipError_t gpu_swiglu(const float* g, const float* u, float* out, int n, const qmatvec_q8* q8, hipStream_t stream);
 
 // MoE router for T tokens: logits [T][n_expert] (ffn_gate_inp output), x [T][n] (the FFN input) and the shared
@@ -51,8 +52,10 @@ hipError_t gpu_moe_group(const int* ids, int T, int n_used, int n_expert, int ti
 // n % 256 == 0, n <= 4096.
 hipError_t gpu_hc_norm(float* res, const float* cur, const float* inject, const float* w, float* y, int n, int hc, int T,
                        float eps, const qmatvec_q8* q8, hipStream_t stream);
-// lo = SiLU(lo / hc) for n values
-hipError_t gpu_hc_lowrank(float* lo, int n, int hc, hipStream_t stream);
+// out[t] = SiLU(lo[t] / hc) for T rows of n values (lo [T][n]), zero-padded to rows of np >= n (out [T][np]);
+// quantized into q8 if set (np % 32 == 0)
+hipError_t gpu_hc_lowrank(const float* lo, float* out, int n, int np, int T, int hc, const qmatvec_q8* q8,
+                          hipStream_t stream);
 // out[t] = mean over the streams c of xn[t][c] * sigmoid(gate[t][c]), quantized into q8 if set
 hipError_t gpu_hc_mix(const float* xn, const float* gate, float* out, int n, int hc, int T, const qmatvec_q8* q8,
                       hipStream_t stream);

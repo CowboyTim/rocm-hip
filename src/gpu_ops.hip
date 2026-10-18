@@ -109,7 +109,7 @@ swiglu(const float* g, const float* u, float* out, int n, Q8Out o) {
         v = a / (1.0f + __expf(-a)) * u[i];
         out[i] = v;
     }
-    if (o.qK) q8_block_value(v, i < n, blockIdx.x, threadIdx.x, sh, o);  // uniform; n % 256 == 0 when set
+    if (o.qK) q8_block_value(v, i < n, blockIdx.x, threadIdx.x, sh, o);  // uniform; n % 32 == 0 when set
 }
 
 // ---------------------------------------------------------------- mixture of experts (qwen35moe)
@@ -262,7 +262,8 @@ moe_group(const int* ids, int T, int n_used, int n_expert, int tile, int* tok_ro
 // hc_norm     grid T * hc, block 256: with cur, first the combine res[r] += cur[t] * 2 * sigmoid(inject[t][c] /
 //             hc); then y[r] = RMSNorm(res[r]) * w[c * n ..] (per stream, gamma over all hc * n values), quantized
 //             as one flattened vector. n % 256 == 0, n <= 256 * NORM_MAXV.
-// hc_lowrank  lo = SiLU(lo / hc), element-wise
+// hc_lowrank  out[t] = SiLU(lo[t] / hc) for rows of n values, zero-padded to rows of np (the up projection's
+//             padded K), quantized as one flattened vector (np % 32 == 0 when set)
 // hc_mix      grid (ceil(n / 256), T): out[t] = (sum over c of xn[r] * sigmoid(gate[r])) / hc, streams added in
 //             order; quantized (n % 256 == 0 when set)
 
@@ -302,12 +303,19 @@ hc_norm(float* res, const float* cur, const float* inject, const float* w, float
 }
 
 extern "C" __global__ void __launch_bounds__(256)
-hc_lowrank(float* lo, int n, float scale) {
-    const int i = blockIdx.x * 256 + threadIdx.x;
-    if (i < n) {
-        const float a = lo[i] * scale;
-        lo[i] = a / (1.0f + __expf(-a));
+hc_lowrank(const float* lo, float* out, int n, int np, int T, float scale, Q8Out o) {
+    __shared__ Q8Shared sh;
+    const int i = blockIdx.x * 256 + threadIdx.x, t = i / np, k = i - t * np;
+    const bool active = i < np * T;
+    float v = 0.0f;
+    if (active) {
+        if (k < n) {
+            const float a = lo[(size_t)t * n + k] * scale;
+            v = a / (1.0f + __expf(-a));
+        }
+        out[i] = v;
     }
+    if (o.qK) q8_block_value(v, active, blockIdx.x, threadIdx.x, sh, o);  // uniform
 }
 
 extern "C" __global__ void __launch_bounds__(256)
