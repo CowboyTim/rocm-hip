@@ -1941,3 +1941,64 @@ so every Phase 21 model gets it unchanged:
    Perl callback, chat, options hash, errors as exceptions), `Makefile.PL` (ExtUtils::MakeMaker; Perl 5.38,
    ParseXS and headers are installed here), tests with Test::More against the 4B, POD. Packaging for CPAN
    (kernel .co files installed with the module, ROCm found at build time) last.
+
+## Phase 22b – KV cache as files: sessions and shared prefix blocks — PLAN (2026-10-18)
+
+User's idea: "saving" the KV cache means keeping it as files and mmap()ing them back in, not copying. /dev/shm
+(RAM) by default, a regular filesystem possible; with smaller models a 128 GB machine has room for a
+block-chain style cache managed in Perl.
+
+**Measured (2026-10-18, `scratchpad/kvmap.hip`):**
+- Block files stitched into one contiguous address range (reserve with `mmap(PROT_NONE)`, then each file
+  `MAP_SHARED | MAP_FIXED` over its slot) can be registered with one `hipHostRegister` (coarse-grained, as
+  the engine does). The device pointer equals the host pointer, a kernel reads and writes across every
+  block boundary, and its writes land in the files: **zero copy both ways**.
+- Registration cost: 64 MB in 13 ms, 2 GB (64 × 32 MB) in 70 ms (~31 GB/s). Loading a session is
+  mmap + register, no data movement.
+- A file on a disk-backed filesystem (this machine's overlayfs) also registers writable and works. But
+  dirty KV pages are written back to disk continuously, and evicted pages fault back from disk. So
+  /dev/shm holds the hot cache, and disk is cold storage: copying a file between them is the only copy.
+
+**Design:**
+1. **Block-major KV layout.** Today the cache is layer-major (`[K_0..K_L | V_0..V_L]`, n_ctx rows each), so a
+   block of positions is 2 × L separate ranges. New layout: blocks of B positions (e.g. 256), each holding
+   every attention layer's K and V rows for those positions; one block = one file. KV per token: 4B 32 KB
+   (8 attention layers × K,V × 4 heads × 256 × FP16) → 8 MB per 256-token block; 35B 20 KB → 5 MB.
+   - `attn_prep` / `attn_partial` / `attn_flash` address row p of layer l as
+     `base + (p / B) * block_bytes + l * layer_bytes + (p % B) * row_bytes` instead of one stride.
+2. **Block identity = chained hash.** K/V rows at positions [iB, (i+1)B) depend only on tokens [0, (i+1)B):
+   causal attention, and RoPE at absolute positions. So block i is named
+   H_i = hash(H_{i-1}, tokens of block i), with H_0 = hash(model file id, layout version, B). The Perl side:
+   - keeps the files under /dev/shm by hash;
+   - shares a common prefix (system prompt, tool definitions, a code repository's context) between
+     sessions and conversations;
+   - evicts LRU;
+   - moves cold blocks to disk.
+3. **Sharing rule: blocks are immutable once full.** A session only appends: the library maps full shared
+   blocks and one private, writable tail block. Rewinding into a shared block gives the session its own
+   copy of that block first, so other sessions' files never change.
+4. **Recurrent state (hybrid models: qwen35, qwen35moe, Qwen3.8-Flash-Next, Nemotron-H, Kimi-Linear).**
+   - The DeltaNet / Mamba state is not per position: one snapshot (~50 MB 4B, ~63 MB 35B) summarizes the
+     whole prefix.
+   - A block chain is therefore only resumable where a state snapshot exists. Perl decides where: at the end
+     of a session, and at turn or document boundaries. A snapshot costs about as much as 6–12 KV blocks.
+   - A snapshot is also a file, but it is restored with a GPU copy into the live state (~0.3 ms). The
+     kernels update the state in place, so mapping the file directly would overwrite the snapshot, and
+     MAP_PRIVATE does not help (registration pins the pages).
+   - Pure-attention models (Gemma, GLM, DeepSeek/MLA) resume at any block boundary.
+5. **C API sketch** (thin, the policy stays in Perl):
+   - `inference_kv_layout(model, &block_tokens, &block_bytes, &state_bytes)`;
+   - `inference_session_attach(model, block_paths[], n_blocks, tail_path, tokens, n_tokens, state_path)`:
+     maps and registers the blocks (n_tokens of history; state optional for attention-only models);
+   - `inference_session_blocks(model, ...)`: lists the current full blocks (with their token ranges), so
+     Perl can name new ones by hash and link them into its store;
+   - `inference_state_save(model, path)` / restore.
+   - Files are created by the library in a directory Perl names (`O_EXCL`, then renamed to the hash).
+6. **Capacity.** /dev/shm is a tmpfs, by default limited to half of RAM (63 GB here, 23 GB already used by
+   the models); its pages are the same RAM the GPU computes from. Remount it larger if the cache needs it
+   (`mount -o remount,size=96G /dev/shm`). Example: the 4B at 32 KB/token keeps 1M tokens of prefix cache in
+   32 GB.
+
+**Order:** block-major layout behind the current API (tests unchanged; prefill and generation must be
+bit-identical) → attach / save / state files → Perl block store (hashing, LRU, disk tier) and tests: a
+shared system prompt across two sessions, a resumed conversation, a rewind into a shared block.
