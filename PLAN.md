@@ -1137,9 +1137,9 @@ for the symptoms above.
 >   drafts, WMMA prefill (64-entry expert tiles, FAST staging, int32 blocks, 128-row tiles), parallel
 >   `moe_group`, router `matmul_f32` with shared activations.
 > - **Next (2026-10-19; user: generation speed now, prefill later), in order:**
->   1. **Adaptive draft count** (small): pick 1–3 drafts per pass from the recent acceptance of each draft
->      position (3 pays on code / chat, 2 on prose, 1–2 on CJK; see "MTP: chained drafts"). Output unchanged by
->      construction; measure on the code / Chinese / prose prompts with `qwen_demo --draft`.
+>   1. **Adaptive draft count — DONE ✅** (see "MTP: adaptive draft count" in Phase 21): the default
+>      (`inference_set_draft_tokens(m, 0)`) picks 2 or 3 drafts per pass; within ~1% of the best fixed count on
+>      code / Chinese / prose / chat prompts, +9% over fixed 2 on chat.
 >   2. **Verify-pass launches**: a pass launches ~490 small 2–4-token matvecs (4–25 µs each, ~6.6 ms) vs ~143 per
 >      plain token, because the T = 1 fusions are missing for T <= 4: the low-rank HC mix (`matvec_q8_lr`), the
 >      shared expert as an extra expert slot (`moe_core_one`, id -1), grouped matrices. The big 2-token matvecs
@@ -1978,6 +1978,20 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
   - Note: `qwen_demo` without `--draft` prefills the prompt in one call, the library in two (a checkpoint
     before its tail), so their greedy texts can differ (WMMA prefill vs per-token kernels on a router
     near-tie); the library with and without the head is identical.
+
+- **MTP: adaptive draft count (2026-10-19).** Default `inference_set_draft_tokens(m, 0)` (and `qwen_demo
+  --drafts 0`, Perl `set_draft_tokens($m, 0)`): per pass, of 2 and 3 drafts the one with the most expected tokens
+  per ms: tokens 1 + a1 + a1 a2 (+ a1 a2 a3), a_j moving averages (rate 0.1) of the acceptance of draft j given
+  the ones before it accepted; ms a moving average of the measured draft + verify time per draft count (a count
+  not timed yet scaled from one that is by 1 + 0.33 k). Every 16th pass drafts 3 to keep measuring it. Estimates
+  restart with each head.
+  - Results (tok/s, qwen_demo, 256 tokens; fixed 2 / fixed 3 / adaptive x2): quicksort 48.5 / 49.7 / 49.2, 50.3;
+    Chinese 42.2 / 40.4 / 41.9, 41.6; prose 44.3 / 43.1 / 44.3, 44.1; chat (code) 56.5 / 61.7 / 61.5, 61.5.
+    mtp_verify library: 62.7 / 55.9 tok/s (code / reasoning, greedy), output identical to no head.
+  - Tried first: (a) the same with 1..3 and a fixed cost model: picked 1 draft on Chinese (a2's estimate stays
+    stale while it drafts 1) and lost 9% there; with measured costs still -9%. One draft was never the best
+    fixed count on any prompt, hence 2..3. (b) a bandit on measured tokens per second per count (exploring every
+    8th pass): noisier, 5-8% below on quicksort and Chinese.
 
 - **WMMA prefill speed (2026-10-19).** Qwen3.8 prefill (2,427 tokens) 414 → ~700 tok/s (667–731 over runs; GPU
   5.0 → 3.27 s), 35B 1,193 → 1,807 tok/s, 4B unchanged (1,800–1,838; a regression on the way was caught, below).

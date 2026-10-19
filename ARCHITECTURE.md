@@ -153,7 +153,9 @@ on the last token and one sync. Prefill runs this in micro-batches of up to 1,02
 A nextn sidecar GGUF (`inference_set_draft_model`) holds one more full-attention MoE block with its own
 embeddings, final mixer and LM head. Its row at position p combines the token at p and the main model's residual
 streams at p − 1 (`eh_proj` per stream); every main forward runs it on its rows, so its one-layer KV cache
-follows the sequence. The head drafts k tokens (`inference_set_draft_tokens`, 1–3, default 2): its argmax,
+follows the sequence. The head drafts k tokens (`inference_set_draft_tokens`: 1–3, or by default 2 or 3 per
+pass, whichever gives the most tokens per second by the recent acceptance of each draft position and the
+measured pass times): its argmax,
 then the head again on that draft with its own output streams in place of the model's (`qwen_model_mtp_drafts`).
 Generation decodes `[token, drafts]` in one pass of k + 1 tokens (`qwen_model_forward_verify`), exactly as
 single-token passes, keeping the recurrent state after each of the first k tokens (DeltaNet conv / delta-rule
@@ -161,8 +163,8 @@ state, PLE conv state and history; `deltanet_mid_states`). Each next token is sa
 always: while it equals the next draft, that draft is already decoded; at the first that differs
 `qwen_model_rollback(keep)` restores the state after the kept tokens. A pass never spans a KV-store snapshot
 boundary. Output equals plain decoding for any sampler. On chat replies (acceptance ~0.97): 2.0 / 2.9 / 3.8
-tokens per pass with 1 / 2 / 3 drafts (51 / 60 / 65 tok/s vs 34 plain); on text the head guesses less well, 2
-drafts is the best or near-best setting.
+tokens per pass with 1 / 2 / 3 drafts (51 / 60 / 65 tok/s vs 34 plain); on prose and Chinese the head guesses
+less well and 2 is best; the adaptive default is within ~1% of the best fixed count on each.
 
 ## 8. The library layer
 
@@ -203,6 +205,6 @@ layout (`tools/gen_qwen4exp_tiny.py`).
 |---|---|---|
 | Qwen3.5-4B (ROCmFP4) | 64 tok/s | 1,826 tok/s (2,455 tokens) |
 | Qwen3.6-35B-A3B (ROCmFP4, BF16 head) | 65.7 tok/s (more with the int8 head option) | ~1,940 tok/s (2,427 tokens) |
-| Qwen3.8-Flash-Next (ROCmFP4_FAST, 94 GB) | 38.1 tok/s; 40–60 with the MTP head (2 drafts per pass) | ~790 tok/s (2,427 tokens) |
+| Qwen3.8-Flash-Next (ROCmFP4_FAST, 94 GB) | 38.1 tok/s; 42–62 with the MTP head | ~790 tok/s (2,427 tokens) |
 
 Profiling: `QWEN_PROFILE=1` (per-section times), `rocprofv3 --kernel-trace` + `tools/prof_summary.py` (per kernel).

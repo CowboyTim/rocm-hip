@@ -171,7 +171,10 @@ struct inference_model {
 
     inference_kv_cache_t* kvc = nullptr;               // KV cache manager handle
     MtpHead* mtp = nullptr;                            // MTP draft head, if loaded (inference_set_draft_model)
-    int spec_drafts = 2;                               // drafts per verify pass (inference_set_draft_tokens)
+    int spec_drafts = 0;                               // drafts per verify pass (inference_set_draft_tokens; 0: adaptive)
+    float spec_acc[3] = {0.8f, 0.8f, 0.8f};            // adaptive: acceptance of draft j given drafts < j accepted
+    float spec_ms[3] = {0.0f, 0.0f, 0.0f};             // adaptive: time of a pass with j + 1 drafts, ms (0: not yet)
+    int spec_passes = 0;                               // adaptive: verify passes so far (exploration schedule)
     void* scratch_base = nullptr;                      // temporary scratch buffer base
     size_t scratch_bytes = 0;                          // scratch buffer size in bytes
 

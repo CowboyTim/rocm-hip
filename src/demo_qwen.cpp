@@ -1,10 +1,11 @@
 // demo_qwen.cpp -- text generation with the Qwen3.5 forward pass.
 // Usage: ./qwen_demo <model.gguf> "prompt text" | @prompt_file [n_gen] [--temp T] [--top-k K] [--top-p P] [--min-p P]
 //                    [--repeat-penalty R] [--seed S] [--lm-head-q8] [--ctx N (default 4096)]
-//                    [--draft mtp.gguf [--drafts 1..3]]
+//                    [--draft mtp.gguf [--drafts 0..3]]
 //
 // --draft: an MTP draft head for speculative decoding; generation then runs through inference_generate_stream
-// (ignoring end-of-generation tokens, as this demo does not stop at them either); --drafts: drafts per pass.
+// (ignoring end-of-generation tokens, as this demo does not stop at them either); --drafts: drafts per pass
+// (0: adaptive, the default).
 // Greedy by default (--temp 0). QWEN_PROFILE=1 prints the time breakdown.
 
 #include "qwen_model.h"
@@ -21,7 +22,7 @@
 int main(int argc, char** argv) {
     if (argc < 3) {
         printf("Usage: %s <model.gguf> \"prompt text\" [n_gen] [--temp T] [--top-k K] [--top-p P] [--min-p P] "
-               "[--repeat-penalty R] [--seed S] [--lm-head-q8] [--ctx N] [--draft mtp.gguf [--drafts 1..3]]\n",
+               "[--repeat-penalty R] [--seed S] [--lm-head-q8] [--ctx N] [--draft mtp.gguf [--drafts 0..3]]\n",
                argv[0]);
         return 1;
     }
@@ -47,7 +48,7 @@ int main(int argc, char** argv) {
     bool head_q8 = false;
     int n_ctx = 4096;
     const char* draft = nullptr;
-    int drafts = 0;  // drafts per pass (0: the library's default)
+    int drafts = -1;  // drafts per pass (0: adaptive; -1: the library's default)
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         const char* v = i + 1 < argc ? argv[i + 1] : "0";
@@ -96,7 +97,7 @@ int main(int argc, char** argv) {
             inference_free_model(engine);
             return 1;
         }
-        if (drafts > 0 && inference_set_draft_tokens(engine, drafts) != 0) {
+        if (drafts >= 0 && inference_set_draft_tokens(engine, drafts) != 0) {
             fprintf(stderr, "--drafts: %s\n", inference_get_last_error());
             return 1;
         }

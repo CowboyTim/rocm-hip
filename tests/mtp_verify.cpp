@@ -9,7 +9,8 @@
 // 2. Speculative greedy decoding with 1, 2 and 3 chained drafts per pass (qwen_model_mtp_drafts,
 //    qwen_model_forward_verify, qwen_model_rollback) gives exactly the tokens plain greedy decoding gives, and how
 //    much faster. MTP_VERIFY_SPEC_ONLY=1: the speculative runs alone (profiling), against nothing.
-// 3. The library: inference_generate_stream with the head loaded (1, 2 and 3 drafts per pass) gives the tokens
+// 3. The library: inference_generate_stream with the head loaded (1, 2, 3 and an adaptive number of drafts per
+//    pass) gives the tokens
 //    it gives without (greedy, and sampling at temperature 0.8 with a fixed seed), ending at the end of the turn.
 // Prompts: a coding and a reasoning one, chat-formatted.
 
@@ -152,14 +153,15 @@ int main(int argc, char** argv) {
             int32_t* t = inference_tokenize(m, text, &n);
             std::vector<int32_t> toks(t, t + n);
             inference_free_tokens(t, n);
-            // with = 0: no head; 1 .. SPEC_MAX_DRAFTS: the head with that many drafts per pass
-            std::vector<int32_t> out[SPEC_MAX_DRAFTS + 1];
-            double secs[SPEC_MAX_DRAFTS + 1];
-            int nout[SPEC_MAX_DRAFTS + 1];
-            for (int with = SPEC_MAX_DRAFTS; with >= 0; --with) {
+            // with = 0: no head; 1 .. SPEC_MAX_DRAFTS: the head with that many drafts per pass; A: adaptive
+            const int A = SPEC_MAX_DRAFTS + 1;
+            std::vector<int32_t> out[A + 1];
+            double secs[A + 1];
+            int nout[A + 1];
+            for (int with = A; with >= 0; --with) {
                 if (with == 0 && inference_set_draft_model(m, nullptr) != 0) return 1;
-                if (with == SPEC_MAX_DRAFTS && inference_set_draft_model(m, argv[2]) != 0) return 1;
-                if (with > 0 && inference_set_draft_tokens(m, with) != 0) return 1;
+                if (with == A && inference_set_draft_model(m, argv[2]) != 0) return 1;
+                if (with > 0 && inference_set_draft_tokens(m, with == A ? 0 : with) != 0) return 1;
                 inference_reset(m);
                 inference_gen_options o = inference_gen_default_options();
                 o.sampler.temperature = temp;
@@ -175,10 +177,13 @@ int main(int argc, char** argv) {
                 secs[with] = now() - t0;
                 out[with].resize((size_t)nout[with]);
             }
-            for (int k = 1; k <= SPEC_MAX_DRAFTS; ++k) {
-                snprintf(what, sizeof(what), "inference_generate_stream, temperature %.1f, %d drafts per pass: %d "
-                         "tokens with the head = %d without%s (%.1f vs %.1f tok/s incl. the prompt)", temp, k, nout[k],
-                         nout[0], out[0] == out[k] ? "" : " -- DIFFER", nout[k] / secs[k], nout[0] / secs[0]);
+            for (int k = 1; k <= A; ++k) {
+                char how[32];
+                if (k == A) snprintf(how, sizeof(how), "adaptive drafts");
+                else snprintf(how, sizeof(how), "%d drafts per pass", k);
+                snprintf(what, sizeof(what), "inference_generate_stream, temperature %.1f, %s: %d tokens with the head "
+                         "= %d without%s (%.1f vs %.1f tok/s incl. the prompt)", temp, how, nout[k], nout[0],
+                         out[0] == out[k] ? "" : " -- DIFFER", nout[k] / secs[k], nout[0] / secs[0]);
                 check(out[0] == out[k] && nout[0] > 16, what);
             }
         }

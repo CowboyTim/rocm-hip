@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <mutex>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -528,7 +529,7 @@ static void free_mtp(inference_model* m) {
 
 int inference_set_draft_tokens(inference_model_t* m, int n) {
     clear_error();
-    if (!m || n < 1 || n > SPEC_MAX_DRAFTS) { set_error("draft tokens: 1 .. %d", SPEC_MAX_DRAFTS); return -1; }
+    if (!m || n < 0 || n > SPEC_MAX_DRAFTS) { set_error("draft tokens: 0 (adaptive) .. %d", SPEC_MAX_DRAFTS); return -1; }
     m->spec_drafts = n;
     return 0;
 }
@@ -538,6 +539,8 @@ int inference_set_draft_model(inference_model_t* m, const char* path) {
     if (!m) { set_error("NULL model"); return -1; }
     if (m->qwen) qwen_model_sync(m->qwen);
     free_mtp(m);
+    for (int k = 0; k < SPEC_MAX_DRAFTS; ++k) m->spec_acc[k] = 0.8f, m->spec_ms[k] = 0.0f;  // the adaptive count anew
+    m->spec_passes = 0;
     if (!path) return 0;
     if (m->n_hc <= 0) { set_error("draft heads are supported for qwen4exp models only"); return -1; }
     MtpHead* h = new MtpHead();
@@ -852,6 +855,44 @@ struct SpecPass {
     int k = 0, i = 0;
 };
 
+// Adaptive draft count. A pass with k drafts yields 1 + a1 + a1 a2 + ... tokens, a_j the acceptance of draft j
+// given the ones before it accepted, and takes the time of the head's drafts and the k + 1-token verify pass;
+// both are moving averages (SPEC_RATE per observed pass). Of SPEC_MIN_DRAFTS .. SPEC_MAX_DRAFTS, the k with the
+// most tokens per second is used (one draft was never the best: measured on code, chat, prose and Chinese, it is
+// below two). A k not timed yet is estimated from a timed one with a pass of k drafts costing (1 +
+// SPEC_COST_PER_DRAFT k) one-token passes (Qwen3.8: 39 / 49 / 58 ms for k = 1 / 2 / 3). Every SPEC_EXPLORE-th pass
+// drafts the maximum, so that the last position and its cost keep being measured.
+#define SPEC_MIN_DRAFTS 2
+#define SPEC_COST_PER_DRAFT 0.33f
+#define SPEC_RATE 0.1f
+#define SPEC_EXPLORE 16
+static int spec_drafts_for_pass(inference_model_t* m) {
+    if (m->spec_drafts > 0) return m->spec_drafts;
+    if (++m->spec_passes % SPEC_EXPLORE == 0) return SPEC_MAX_DRAFTS;
+    int ref = 0;  // a timed draft count to scale the cost model by (0: none yet)
+    for (int k = 1; k <= SPEC_MAX_DRAFTS && !ref; ++k)
+        if (m->spec_ms[k - 1] > 0.0f) ref = k;
+    int best = SPEC_MIN_DRAFTS;
+    float best_rate = 0.0f, tokens = 1.0f, p = 1.0f;
+    for (int k = 1; k <= SPEC_MAX_DRAFTS; ++k) {
+        p *= m->spec_acc[k - 1];
+        tokens += p;
+        if (k < SPEC_MIN_DRAFTS) continue;
+        const float model = 1.0f + SPEC_COST_PER_DRAFT * k;
+        const float cost = m->spec_ms[k - 1] > 0.0f ? m->spec_ms[k - 1]
+                           : ref         ? m->spec_ms[ref - 1] * model / (1.0f + SPEC_COST_PER_DRAFT * ref)
+                                         : model;
+        if (tokens / cost > best_rate) best_rate = tokens / cost, best = k;
+    }
+    return best;
+}
+
+// A pass of k drafts kept `accepted` of them: drafts 1 .. accepted were accepted, draft accepted + 1 (if any) not
+static void spec_observe(inference_model_t* m, int k, int accepted) {
+    for (int j = 0; j < k && j <= accepted; ++j)
+        m->spec_acc[j] += SPEC_RATE * ((j < accepted ? 1.0f : 0.0f) - m->spec_acc[j]);
+}
+
 // Speculative decoding (an MTP draft head is loaded): decode token_id like forward_next, but verify the head's
 // drafts of the tokens after it in the same pass (sp.k of them; 0: the step decoded token_id alone). The drafts
 // sit decoded after n_past, not counted yet: the caller accepts them one by one with accept_draft, or keeps a
@@ -862,7 +903,7 @@ static int forward_next_spec(inference_model_t* m, int token_id, SpecPass& sp) {
     const int B = kv_B(m);
     // the state snapshot of a block boundary inside the pass must not contain drafts after it: only drafts up to
     // the first snapshot boundary (one right after token_id: none)
-    int k = std::min(m->spec_drafts, m->n_ctx - m->n_past - 1);
+    int k = std::min(spec_drafts_for_pass(m), m->n_ctx - m->n_past - 1);
     for (int j = 0; j < k; ++j)
         if (m->store_dirfd >= 0 && (m->n_past + 1 + j) % B == 0 && snapshot_boundary(m, (m->n_past + 1 + j) / B)) {
             k = j;
@@ -870,12 +911,18 @@ static int forward_next_spec(inference_model_t* m, int token_id, SpecPass& sp) {
         }
     if (k <= 0) return forward_next(m, token_id);
     int toks[SPEC_MAX_DRAFTS + 1] = {token_id};
+    const auto t0 = std::chrono::steady_clock::now();
     const int n = qwen_model_mtp_drafts(m->qwen, token_id, m->n_past, toks + 1, k);
     if (n <= 0) return forward_next(m, token_id);
     if (ensure_writable(m, m->n_past, n + 1) != 0) return -1;
     if (qwen_model_forward_verify(m->qwen, toks, n + 1, m->n_past) != 0) {
         set_error("forward pass failed: %s", qwen_model_last_error());
         return -1;
+    }
+    if (m->spec_drafts == 0) {  // adaptive: the time of a pass with n drafts
+        const float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        float& avg = m->spec_ms[n - 1];
+        avg = avg > 0.0f ? avg + SPEC_RATE * (ms - avg) : ms;
     }
     ++m->n_past;
     m->seq.push_back(token_id);
@@ -1407,6 +1454,7 @@ int inference_generate_stream(inference_model_t* m, const int32_t* prompt_ids, i
                 ++sp.i;
                 decoded = true;
             } else {
+                if (!eog) spec_observe(m, sp.k, sp.i);  // (an end of generation says nothing about the head)
                 if (sp.i < sp.k && qwen_model_rollback(m->qwen, sp.i + 1) != 0) {
                     set_error("rollback failed: %s", qwen_model_last_error());
                     rc = -1;

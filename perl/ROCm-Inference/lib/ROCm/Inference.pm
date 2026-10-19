@@ -160,8 +160,8 @@ guesses well. Dies when the file is not a head for this model. Before or after C
 
 =item set_draft_tokens($m, $n)
 
-Guesses per pass with a draft head, 1 to 3 (default 2). More pay off when the head guesses well (code, chat
-replies); dies outside that range.
+Guesses per pass with a draft head: 1 to 3, or 0 (the default) to choose 2 or 3 per pass from how well the
+head has been guessing (3 pays off on code and chat replies). Dies outside that range.
 
 =item chat_render($m, \@messages, %vars) / chat($m, \@messages, \%options)
 

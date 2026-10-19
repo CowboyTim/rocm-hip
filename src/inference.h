@@ -75,9 +75,11 @@ int inference_set_lm_head_q8(inference_model_t* model, int enable);
 // called before or after inference_kv_cache_init. Returns 0, negative on error (the file is not a matching
 // head).
 int inference_set_draft_model(inference_model_t* model, const char* path);
-// Drafts per pass with a draft head (1..3, default 2): the head chains them (each from its own output), the model
-// verifies them with the current token in one pass. More drafts give more tokens per pass when they are
-// accepted, at the cost of a longer pass. Returns 0, negative on error.
+// Drafts per pass with a draft head: the head chains them (each from its own output), the model verifies them
+// with the current token in one pass. More drafts give more tokens per pass when they are accepted, at the cost
+// of a longer pass. 1..3: that many; 0 (default): 2 or 3, chosen per pass from the recent acceptance of each
+// draft position and the measured pass times (3 on code and chat replies, typically 2 on prose). Returns 0,
+// negative on error.
 int inference_set_draft_tokens(inference_model_t* model, int n);
 
 // The model holds one sequence: tokens are decoded at positions 0, 1, 2, ... (n_past counts them).

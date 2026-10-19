@@ -29,7 +29,7 @@ ROCm at `/opt/rocm` (hipcc); kernels are built for `--offload-arch=gfx1151`, wav
 make -j            # the library (build/libinference.so.1), qwen_demo, tests and demos
 ./build/qwen_demo /path/model.gguf "The capital of France is" 64 --temp 0
 ./build/qwen_demo /path/Qwen3.8-Flash-Next-...-00001-of-00003.gguf "Write a sort in C." 256 \
-    --draft /path/mtp-Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST.gguf [--drafts 1..3]
+    --draft /path/mtp-Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST.gguf [--drafts 0..3]
 make install PREFIX=/usr/local   # lib, headers, rocm-inference.pc
 ```
 
