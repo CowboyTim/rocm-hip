@@ -1152,7 +1152,7 @@ for the symptoms above.
 >      **Next for prefill** (Qwen3.8 GPU 3.27 s per 2,427 tokens): experts 1.02 s (~130 GB/s, latency-bound:
 >      deeper prefetch / a K-chunk of 256?), dense WMMA 0.72 s (~28 TOPS of ~55), the router's `matmul_f32`
 >      0.26 s (float, kept for the 512-way near-ties), `hc_norm` 0.25 s, `moe_group` 0.10 s (one thread: easy
->      to parallelize).
+>      to parallelize: done, 1.4 ms).
 > - **Perl module (2026-10-18):** `Makefile.PL` finds libinference via ROCM_INFERENCE_PREFIX, pkg-config
 >   (`rocm-inference`) or the rocm-hip checkout (building `libinference.so` there if missing); tests:
 >   `t/00-load.t` without GPU (exports, error paths), the rest with ROCM_INFERENCE_TEST_MODEL /
@@ -1969,6 +1969,14 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
     store_verify pass. The A/B used a scratch program (WMMA outputs hashed and timed on random weights, linked
     to build/libqwen.a): run such programs with `INFERENCE_KERNEL_DIR=build/co`, else they use the kernels
     embedded when they were linked.
+  - **Follow-ups (2026-10-19):** `moe_group` in parallel (one 1,024-thread workgroup: LDS histogram, wave scans,
+    atomic slots; tiles in expert order, entry order within an expert not deterministic, which no kernel's
+    values depend on): 728 → 10 µs per call (0.10 s → 1.4 ms per prompt; verify numbers unchanged).
+    `matmul_f32` (the router) stages the 8 tokens' activations in LDS for 16 rows per workgroup (was one row
+    each: ~5 GB of activation reads per call); each wave computes the 4 quarters in turn, so it stays
+    bit-identical to `matvec_f32` (checked on ragged N / T / K): 1.81 → 1.38 ms per call. A transposed wave
+    reduction (31 shuffles instead of 160) was slower (184 VGPRs); the limit is L2 traffic (~960 MB per call
+    at 16 x 8 tiles): a 2D tile (32 rows x 32 tokens, both in LDS) would cut it ~3x. Prefill ~745–765 tok/s.
 
 **Needed from the user:** nothing for now (the model is in `/models`, the head in `/data/mtp`). Constraints here: /dev/shm
 is a 63 GB tmpfs (38 GB free) and the disk has 48 GB free, so a ~50 GB model needs space freed or /dev/shm

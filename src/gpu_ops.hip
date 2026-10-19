@@ -233,36 +233,57 @@ moe_combine(const float* down, const float* wts, const float* shared, const floa
     out[(size_t)t * n + i] = acc + shared[(size_t)t * n + i] * sg[t];
 }
 
-// moe_group  grid 1, block 256: group a prefill batch's (token, slot) entries by expert, for the expert-tiled
-//            matmuls (matmul_q8_id_* in matvec_q.hip). Entries sorted by expert (stable): tok_rows[i] = token,
-//            pair_rows[i] = token * n_used + slot. Each expert's run is cut into tiles of up to `tile` entries:
-//            tile_e / tile_start / tile_n, *n_tiles of them. Serial in one thread: <= T * n_used + n_expert steps,
-//            deterministic.
-extern "C" __global__ void __launch_bounds__(256)
+// moe_group  grid 1, block 1024: group a prefill batch's (token, slot) entries by expert, for the expert-tiled
+//            matmuls (matmul_q8_id_* / matmul_wmma_id_* in matvec_q.hip). Entries sorted by expert:
+//            tok_rows[i] = token, pair_rows[i] = token * n_used + slot. Each expert's run is cut into tiles of up
+//            to `tile` entries: tile_e / tile_start / tile_n, *n_tiles of them, in expert order. Counts and
+//            tiles are deterministic; the order of the entries within an expert's run is not (atomic slots).
+//            Nothing depends on it: the kernels compute each entry's value with the same sum wherever it sits
+//            in a tile.
+extern "C" __global__ void __launch_bounds__(1024)
 moe_group(const int* ids, int T, int n_used, int n_expert, int tile, int* tok_rows, int* pair_rows, int* n_tiles,
           int* tile_e, int* tile_start, int* tile_n) {
-    __shared__ int cnt[MOE_MAX_EXPERTS], off[MOE_MAX_EXPERTS];
-    for (int e = threadIdx.x; e < n_expert; e += 256) cnt[e] = 0;
-    __syncthreads();
-    if (threadIdx.x != 0) return;
+    __shared__ int cnt[MOE_MAX_EXPERTS], slot[MOE_MAX_EXPERTS], wsum[2][32];
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     const int n = T * n_used;
-    for (int i = 0; i < n; ++i) cnt[ids[i]]++;
-    int acc = 0;
-    for (int e = 0; e < n_expert; ++e) {
-        off[e] = acc;
-        acc += cnt[e];
+    cnt[tid] = 0;  // n_expert <= MOE_MAX_EXPERTS == blockDim.x
+    __syncthreads();
+    for (int i = tid; i < n; i += 1024) atomicAdd(&cnt[ids[i]], 1);
+    __syncthreads();
+    // exclusive scans over the experts (thread e): entry offsets and tile offsets
+    const int c = tid < n_expert ? cnt[tid] : 0, nt = (c + tile - 1) / tile;
+    int a = c, b = nt;
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+        const int ua = __shfl_up(a, d), ub = __shfl_up(b, d);
+        if (lane >= d) a += ua, b += ub;
     }
-    int nt = 0;
-    for (int e = 0; e < n_expert; ++e)
-        for (int st = off[e]; st < off[e] + cnt[e]; st += tile) {
-            tile_e[nt] = e;
-            tile_start[nt] = st;
-            tile_n[nt] = min(tile, off[e] + cnt[e] - st);
-            ++nt;
+    if (lane == 31) wsum[0][w] = a, wsum[1][w] = b;
+    __syncthreads();
+    if (w == 0) {
+        int x = wsum[0][lane], y = wsum[1][lane];
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            const int ux = __shfl_up(x, d), uy = __shfl_up(y, d);
+            if (lane >= d) x += ux, y += uy;
         }
-    *n_tiles = nt;
-    for (int i = 0; i < n; ++i) {
-        const int p = off[ids[i]]++;
+        wsum[0][lane] = x - wsum[0][lane];  // exclusive per-wave bases
+        wsum[1][lane] = y - wsum[1][lane];
+    }
+    __syncthreads();
+    const int eo = wsum[0][w] + a - c, to = wsum[1][w] + b - nt;
+    slot[tid] = eo;  // the next free entry of expert tid
+    if (tid < n_expert) {
+        for (int k = 0; k < nt; ++k) {
+            tile_e[to + k] = tid;
+            tile_start[to + k] = eo + k * tile;
+            tile_n[to + k] = min(tile, c - k * tile);
+        }
+        if (tid == n_expert - 1) *n_tiles = to + nt;
+    }
+    __syncthreads();
+    for (int i = tid; i < n; i += 1024) {
+        const int p = atomicAdd(&slot[ids[i]], 1);
         tok_rows[p] = i / n_used;
         pair_rows[p] = i;
     }

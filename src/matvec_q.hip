@@ -500,42 +500,70 @@ matvec_f32(const uint8_t *W, long long row_bytes, const float *x, float *y, int 
     }
 }
 
-// F32 for MF32_TT tokens at a time (prefill: the MoE router ran one launch per token). grid (N, ceil(T /
-// MF32_TT)), block 128; each weight float4 is loaded once for the tile's tokens. Every token's sum has
-// matvec_f32's vector-path partition, expression and order: bit-identical to it. The host guarantees
-// 16-byte-aligned rows and x, and K % 16 == 0.
+// F32 for MF32_TT tokens and MF32_ROWS rows at a time (prefill: the MoE router). grid (ceil(N / MF32_ROWS),
+// ceil(T / MF32_TT)), block 128: wave w takes rows 4w..4w+3 of the workgroup's 16, the tokens' activations are
+// staged in LDS in chunks (read once per 16 rows instead of once per row). Every (row, token) sum has
+// matvec_f32's vector-path partition, expression and order: a wave computes the 4 quarters one after another,
+// each lane over i = quarter start + lane + 32 m, reduced over the wave the same way, and adds them in order;
+// bit-identical to it. The host guarantees 16-byte-aligned rows and x, and K % 16 == 0.
 #define MF32_TT 8
+#define MF32_RW 4                      // rows per wave
+#define MF32_ROWS (MF32_RW * F32_PARTS)  // rows per workgroup (4 waves)
+#define MF32_CH 256                    // float4 per token per LDS chunk (a multiple of 32)
 extern "C" __global__ void __launch_bounds__(32 * F32_PARTS)
 matmul_f32(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K, int T) {
-    __shared__ float part[F32_PARTS][MF32_TT];
-    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, row = blockIdx.x;
-    if (row >= N) return;
+    __shared__ float4 sx[MF32_TT][MF32_CH];
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int row0 = blockIdx.x * MF32_ROWS + w * MF32_RW;
     const int t0 = blockIdx.y * MF32_TT, nt = min(MF32_TT, T - t0);
-    const float4 *wr = (const float4 *)(W + (long long)row * row_bytes);
-    const float4 *xt = (const float4 *)(x + (size_t)t0 * K);
     const int n4 = K / 4, q = n4 / F32_PARTS;
-    float acc[MF32_TT];
+    const float4 *x4 = (const float4 *)x;
+    const float4 *wr[MF32_RW];
 #pragma unroll
-    for (int j = 0; j < MF32_TT; ++j) acc[j] = 0.0f;
-    for (int i = w * q + lane; i < (w + 1) * q; i += 32) {
-        const float4 wv = wr[i];
+    for (int r = 0; r < MF32_RW; ++r)
+        wr[r] = (const float4 *)(W + (long long)min(row0 + r, N - 1) * row_bytes);  // rows >= N: not stored
+    float res[MF32_RW][MF32_TT];
+    for (int p = 0; p < F32_PARTS; ++p) {
+        float acc[MF32_RW][MF32_TT];
 #pragma unroll
-        for (int j = 0; j < MF32_TT; ++j)
-            if (j < nt) acc[j] += dot4f(wv, xt[(size_t)j * n4 + i]);
+        for (int r = 0; r < MF32_RW; ++r)
+#pragma unroll
+            for (int t = 0; t < MF32_TT; ++t) acc[r][t] = 0.0f;
+        for (int c0 = p * q; c0 < (p + 1) * q; c0 += MF32_CH) {
+            const int cn = min(MF32_CH, (p + 1) * q - c0);
+            __syncthreads();  // the previous chunk is consumed
+            for (int idx = tid; idx < MF32_TT * MF32_CH; idx += 32 * F32_PARTS) {
+                const int t = idx / MF32_CH, k = idx % MF32_CH;
+                sx[t][k] = t < nt && k < cn ? x4[(size_t)(t0 + t) * n4 + c0 + k] : float4{0, 0, 0, 0};
+            }
+            __syncthreads();
+            for (int k = lane; k < cn; k += 32) {
+                float4 wv[MF32_RW];
+#pragma unroll
+                for (int r = 0; r < MF32_RW; ++r) wv[r] = wr[r][c0 + k];
+#pragma unroll
+                for (int t = 0; t < MF32_TT; ++t) {
+                    const float4 xv = sx[t][k];
+#pragma unroll
+                    for (int r = 0; r < MF32_RW; ++r) acc[r][t] += dot4f(wv[r], xv);
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < MF32_RW; ++r)
+#pragma unroll
+            for (int t = 0; t < MF32_TT; ++t) {
+                float a = acc[r][t];
+                for (int off = 16; off > 0; off >>= 1) a += __shfl_xor(a, off, 32);
+                res[r][t] = p == 0 ? a : res[r][t] + a;
+            }
     }
+    if (lane != 0) return;
 #pragma unroll
-    for (int j = 0; j < MF32_TT; ++j) {
-        float a = acc[j];
-        for (int off = 16; off > 0; off >>= 1) a += __shfl_xor(a, off, 32);
-        if (lane == 0) part[w][j] = a;
-    }
-    __syncthreads();
-    if (threadIdx.x < nt) {
-        float s = part[0][threadIdx.x];
+    for (int r = 0; r < MF32_RW; ++r)
 #pragma unroll
-        for (int k = 1; k < F32_PARTS; ++k) s += part[k][threadIdx.x];
-        y[(size_t)(t0 + threadIdx.x) * N + row] = s;
-    }
+        for (int t = 0; t < MF32_TT; ++t)
+            if (row0 + r < N && t < nt) y[(size_t)(t0 + t) * N + row0 + r] = res[r][t];
 }
 
 extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)

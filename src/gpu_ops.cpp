@@ -92,7 +92,7 @@ hipError_t gpu_moe_group(const int* ids, int T, int n_used, int n_expert, int ti
     if (T <= 0 || n_used <= 0 || n_expert <= 0 || n_expert > 1024 || tile <= 0) return hipErrorInvalidValue;
     void* args[] = {(void*)&ids, &T, &n_used, &n_expert, &tile, &tok_rows, &pair_rows, &n_tiles, &tile_e, &tile_start,
                     &tile_n};
-    return hipModuleLaunchKernel(g_group, 1, 1, 1, 256, 1, 1, 0, stream, args, nullptr);
+    return hipModuleLaunchKernel(g_group, 1, 1, 1, 1024, 1, 1, 0, stream, args, nullptr);
 }
 
 hipError_t gpu_hc_norm(const float* res_in, float* res_out, const float* cur, const float* inject, const float* w,

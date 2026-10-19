@@ -120,7 +120,8 @@ hipError_t qmatvec_launch(int type, const void *W, size_t row_bytes, const float
     return hipModuleLaunchKernel(g_fn[type], grid, 1, 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream, args, nullptr);
 }
 
-#define QMV_MF32_TT 8  // must match MF32_TT in matvec_q.hip
+#define QMV_MF32_TT 8     // must match MF32_TT in matvec_q.hip
+#define QMV_MF32_ROWS 16  // must match MF32_ROWS in matvec_q.hip
 #define QMV_MMF_TT 8   // must match MMF_TT in matvec_q.hip
 
 hipError_t qmatvec_launch_batch(int type, const void *W, size_t row_bytes, const float *x, float *y, int N, int K,
@@ -129,7 +130,8 @@ hipError_t qmatvec_launch_batch(int type, const void *W, size_t row_bytes, const
         (((uintptr_t)W | (uintptr_t)x) & 15) == 0) {
         long long rb = (long long)row_bytes;
         void *args[] = {(void *)&W, &rb, (void *)&x, (void *)&y, &N, &K, &T};
-        return hipModuleLaunchKernel(g_mm_f32, (unsigned)N, (unsigned)((T + QMV_MF32_TT - 1) / QMV_MF32_TT), 1,
+        return hipModuleLaunchKernel(g_mm_f32, (unsigned)((N + QMV_MF32_ROWS - 1) / QMV_MF32_ROWS),
+                                     (unsigned)((T + QMV_MF32_TT - 1) / QMV_MF32_TT), 1,
                                      32 * QMV_F32_PARTS, 1, 1, 0, stream, args, nullptr);
     }
     if (T > 1 && type >= 0 && type < QMV_MAX_TYPE && g_fn_mmf[type]) {  // same sums as T launches of matvec_<type>
