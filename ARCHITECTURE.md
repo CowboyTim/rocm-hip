@@ -95,9 +95,12 @@ measured, PLAN.md) and multiply them with `v_dot4` against the Q8_0 activation, 
 ggml's CPU does, so each block's integer sum equals the reference's. Large ROCmFP4 / FAST matvecs run at
 185–230 GB/s (peak ~256).
 
-gfx1151 has no FP8, FP6 or FP4 conversion instructions (those are on CDNA3 / RDNA4 and gfx950 / gfx1250), so
-OCP FP4 / FP6 / FP8 weights would need software decodes; `v_perm` takes 3-bit indices, so the table lookup used
-for ROCmFP4 does not extend to 6-bit codes. No model used here needs them.
+gfx1151 has no FP8 / BF8 / FP6 / BF6 / FP4 instructions at all: AMD's RDNA 3.5 ISA (the machine-readable spec
+from GPUOpen, 1,517 instructions) has none, and the ROCm assembler (`llvm-mc -mcpu=gfx1151`) rejects them
+(checked 2026-10-19). FP8 / BF8 conversions exist on CDNA 3 (gfx942), RDNA 4 (gfx1200), CDNA 4 (gfx950) and
+gfx1250; FP4 / FP6 scaled conversions only on CDNA 4 (gfx950) and gfx1250. So OCP FP4 / FP6 / FP8 weights would
+need software decodes here; `v_perm` takes 3-bit indices, so the table lookup used for ROCmFP4 does not extend
+to 6-bit codes. No model used here needs them.
 
 ## 5. Exactness and WMMA
 
