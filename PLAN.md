@@ -1130,45 +1130,44 @@ for the symptoms above.
 >   page cache, 26.3 GB (PLE table, token_embd) left to the CPU; first load ~50 s (disk), later ~5 s.
 >   Reference dump: `/data/ref_q38_fast` (prompt "Write a Python function that checks whether a number is prime.").
 > - **Results:** coherent text; `qwen4exp_verify` passes on it (559 of 564 single-layer updates at cosine >= 0.999,
->   the rest at routing near-ties of the 512-expert router; logits cosine 0.99, same argmax). Generation
->   **38.1 tok/s** (was 31.4; see "generation speed" and "kernel fusions" in Phase 21), prefill **~700 tok/s**
->   (2,427 tokens; was 436, see "WMMA prefill speed") vs the reference's ~24 / ~345. 35B 65.3 tok/s, 4B 63.7.
-> - **Next:**
->   0. **Generation speed with the draft head (2026-10-19, user: "do generation speed next, keep prefill in mind
->      for later")** — **chained drafts DONE ✅**, see "MTP: chained drafts" in Phase 21: 1–3 drafts per pass
->      (`inference_set_draft_tokens`, default 2, `qwen_demo --drafts`), output identical; chat replies 51 → 60
->      (2) / 65 (3) tok/s, text prompts +5–12% over 1 draft. **Next:** an adaptive draft count (from recent
->      acceptance: 3 pays on code / chat, 1–2 on prose / CJK); the verify pass's small-kernel launches (~490
->      2-token matvecs per pass vs ~143 per plain token: port the T=1 fusions — low-rank HC mix, shared expert
->      as a slot, grouped matrices — to T <= 4); prefill items below stay open.
->   1. **MTP speculative decoding — DONE ✅** (see "MTP" in Phase 21): `inference_set_draft_model(model,
->      "/data/mtp/mtp-Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST.gguf")`, `qwen_demo --draft`, Perl `set_draft_model`.
->      Output identical to plain decoding (greedy and sampled); ~2 tokens per pass; 38 → ~50 tok/s (bare loop,
->      chat prompts), ~45 through `inference_generate_stream` incl. the prompt. Left: the experts of a verify
->      pass (12.3 ms of ~40: the 2 tokens' experts are read separately; share the overlap), fusing the 2-token
->      pass (shared expert slot, multi-matvec are done for T <= 4 only partly), the head's 338 MB LM head per
->      draft, more drafts per pass. Profile: `rocprofv3 --kernel-trace -d <dir> -o run -- <cmd>`, then
->      `tools/prof_summary.py <dir>`;
->   2. greedy text vs `llama-completion` diverges at the 2nd token on that prompt (a near-tie, see the results);
->      compare longer greedy runs on prompts without near-ties, or by teacher forcing;
->   3. MTP draft heads (the model card's MTP-Heads GGUF) for speculative decoding: +11–34% in the reference;
->   4. the STRIX_LEAN release (Q5_K token_embd, Q5_1 PLE table, Q6_K head) if the user wants it.
->   2. **WMMA prefill — DONE ✅ (2026-10-19)**, see "WMMA prefill speed" in Phase 21: Qwen3.8 prefill 414 →
->      ~700 tok/s (667–731), 35B 1,193 → 1,807, 4B unchanged (~1,800); then ~790 / ~1,940 (moe_group, router,
->      128-row tiles). Expert tiles of up to 64 entries; the
->      FAST staging loaded each 68-byte quad twice (2x for the FAST WMMA kernels); FAST blocks summed in int32.
->      **Next for prefill** (Qwen3.8 GPU 3.27 s per 2,427 tokens): experts 1.02 s (~130 GB/s, latency-bound:
->      deeper prefetch / a K-chunk of 256?), dense WMMA 0.72 s (~28 TOPS of ~55), the router's `matmul_f32`
->      0.26 s (float, kept for the 512-way near-ties), `hc_norm` 0.25 s, `moe_group` 0.10 s (one thread: easy
->      to parallelize: done, 1.4 ms).
+>   the rest at routing near-ties of the 512-expert router; logits cosine 0.995, same argmax). Generation
+>   **38 tok/s** plain, **40–65 tok/s** with the MTP head (2 chained drafts per pass by default; depends on how
+>   well the head guesses), prefill **~790 tok/s** (2,427 tokens) vs the reference's ~24 / ~345. 35B 65 tok/s /
+>   ~1,940 prefill, 4B 64 / ~1,820. Done on this track (details in Phase 21): MTP speculative decoding, chained
+>   drafts, WMMA prefill (64-entry expert tiles, FAST staging, int32 blocks, 128-row tiles), parallel
+>   `moe_group`, router `matmul_f32` with shared activations.
+> - **Next (2026-10-19; user: generation speed now, prefill later), in order:**
+>   1. **Adaptive draft count** (small): pick 1–3 drafts per pass from the recent acceptance of each draft
+>      position (3 pays on code / chat, 2 on prose, 1–2 on CJK; see "MTP: chained drafts"). Output unchanged by
+>      construction; measure on the code / Chinese / prose prompts with `qwen_demo --draft`.
+>   2. **Verify-pass launches**: a pass launches ~490 small 2–4-token matvecs (4–25 µs each, ~6.6 ms) vs ~143 per
+>      plain token, because the T = 1 fusions are missing for T <= 4: the low-rank HC mix (`matvec_q8_lr`), the
+>      shared expert as an extra expert slot (`moe_core_one`, id -1), grouped matrices. The big 2-token matvecs
+>      are fine (+6–8% over one token).
+>   3. **Plain decode efficiency** (helps both modes): 26.6 ms per token streams 3.97 GB = ~150 GB/s against
+>      ~215 achievable; ~925 launches per token, many tiny kernels (`hc_mix`, `hc_lowrank`, `swiglu`, ...) and
+>      launch gaps. Options: more fusion, HIP graphs for the fixed per-token sequence. The expert matvec
+>      kernels use ~154 VGPRs (the 2-token one 255): check occupancy against a leaner virtual-lane loop.
+>   4. **Draft cost**: 2.7 ms per draft, mostly the head's 338 MB LM head. A vocabulary cut hurts other scripts
+>      (tried); options: a shortlist from the main model's top logits of the previous row, or an int8 copy.
+>   5. **Prefill, later** (Qwen3.8 GPU ~3.0 s per 2,427 tokens): experts 0.94 s, dense WMMA 0.73 s (~28 of ~55
+>      TOPS), `hc_norm` 0.25 s, DeltaNet 0.22 s, router `matmul_f32` 0.20 s (a 2D 32 x 32 tile would cut its L2
+>      traffic ~3x), attention 0.17 s; a bigger prefill batch as an opt-in (+1 GB scratch for +2–7%).
+>   6. **Accuracy checks**: greedy text vs `llama-completion` diverges at the 2nd token of the reference prompt
+>      (a near-tie): compare longer greedy runs on prompts without near-ties, or by teacher forcing; the FP16
+>      flash attention at long contexts (only a 30k needle test so far).
+>   7. **Library / packaging**: `perl/ROCm-Inference/t/20-chat.t` with the user's Minijinja module (cargo is
+>      installed now); CPAN packaging; Phase 22b follow-ups (disk-tier timing, block size option, a Perl web
+>      service example); long-context decode attention.
+>   8. **More models** (see the target list): EmbeddingGemma-300M, Nemotron-3, Gemma-4, Qwen3.5-122B; the
+>      STRIX_LEAN Qwen3.8 release (Q5_K token_embd, Q5_1 PLE table, Q6_K head) if the user wants it.
+>   Profiling: `rocprofv3 --kernel-trace -d <dir> -o run -- <cmd>`, then `tools/prof_summary.py <dir>`;
+>   `QWEN_PROFILE=1` for per-section times.
 > - **Perl module (2026-10-18):** `Makefile.PL` finds libinference via ROCM_INFERENCE_PREFIX, pkg-config
 >   (`rocm-inference`) or the rocm-hip checkout (building `libinference.so` there if missing); tests:
 >   `t/00-load.t` without GPU (exports, error paths), the rest with ROCM_INFERENCE_TEST_MODEL /
 >   ROCM_INFERENCE_TEST_QWEN38 + ROCM_INFERENCE_TEST_DRAFT (`t/50-draft.t`: speculative = plain). `make dist` /
 >   `disttest` and an install-prefix build of the tarball pass (75 / 83 tests with models).
-> - **Other open items:** `perl/ROCm-Inference/t/20-chat.t` with the user's Minijinja module (cargo is installed
->   now); CPAN packaging; Phase 22b follow-ups (disk-tier timing, block size option, a Perl web service example);
->   speed: long-context decode attention, the 35B expert matmuls in prefill.
 > - The speed work below (Phase 20) is done for now.
 >
 > **Earlier NEXT STEP (2026-10-17): make the 4B fast, then batched prefill, then Step 6 (35B MoE).**
