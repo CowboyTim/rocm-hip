@@ -1,5 +1,11 @@
 # ROCmFP4 and FP6 Implementation Analysis
 
+> A study of how the **reference** (the ROCmFPX llama.cpp fork in `llama.cpp/`) implements ROCmFP4, and of FP6 /
+> FP8 on gfx1151; file paths in sections 1–6 are in that tree. How this repository's own engine uses the formats
+> is in section 7 and [ARCHITECTURE.md](ARCHITECTURE.md). Revised 2026-10-19: bits-per-weight figures corrected
+> (they were bytes per weight), the engine's integer path and the newer ROCmFPX types added; cycle counts are
+> estimates, not measurements.
+
 ## 1. ROCmGPU FP4 Implementation (Current State)
 
 ### 1.1 FP4 Data Format
@@ -16,7 +22,8 @@ ROCmFP4: E2M1-derived with Codebook10 (tuned from standard MXFP4's Codebook12)
 | Block size | 32 values |
 | Packed bytes | 16 (2 nibbles per byte) |
 | Scale bytes | 2 (UE4M3, per 16-element half-block) |
-| Block total | 18 bytes → 0.5625 BPW |
+| Block total | 18 bytes per 32 values → 4.5 bits per weight (0.5625 bytes) |
+| ROCmFP4_FAST (type 101) | 16 nibble bytes + **one** UE4M3 scale = 17 bytes → 4.25 bits per weight |
 
 **Codebook10 (ROCmFP4):**
 ```c
@@ -151,7 +158,10 @@ FP8 is used **only for UE4M3 scales**, not as a weight format:
 - ROCmFP4: UE4M3 scale → FP8 e4m3 bits → FP32 multiply
 - NVFP4: UE4M3 scale → FP8 e4m3 bits → FP32 multiply
 
-FP8 is **not** a weight quantization type in llama.cpp. No `GGML_TYPE_FP8_*` exists.
+FP8 was **not** a weight quantization type in llama.cpp when this was written: no `GGML_TYPE_FP8_*` exists. The
+ROCmFPX fork has since added experimental UE4M3-scaled reference layouts: `Q6_0_ROCMFPX` (102), `Q8_0_ROCMFPX`
+(103), `Q3_0_ROCMFPX` (104), `Q2_0_ROCMFPX` (107, an S40 codebook) and `Q4_0_ROCMI4` (108). No model used here
+carries them, and this repository's engine does not decode them yet.
 
 ### 2.3 FP8 Decode on gfx1151 (Software)
 
@@ -227,7 +237,7 @@ gfx1151 (RDNA3.5) → **software fcbx fallback**. No hardware acceleration.
 | `__builtin_amdgcn_perm` | ✅ Works (4-bit index) | ❌ Won't work (6-bit index) |
 | GPU dequant | DP4A table lookup | Software table lookup |
 | gfx1151 hardware | ✅ `__builtin_amdgcn_perm` | ❌ fcbx software |
-| BFW | 0.5625 BPW | **~1.0 BPW** |
+| Bits per weight | 4.5 (FAST: 4.25) | **6.5** (26-byte block, section 3.6) |
 | Max magnitude (Codebook10) | 10.0 | 3.5 (E2M3) / 8.0 (E3M2) |
 
 ### 3.4 Why FP6 Can't Use DP4A
@@ -268,7 +278,7 @@ Bits: 6
 typedef struct {
     uint8_t qs[24];  // 32 FP6 values packed: 4 values per 3 bytes = 24 bytes
     uint8_t e[2];    // 2 UE4M3 scale bytes (per 16-element half-block)
-} block_fp6;         // 26 bytes total → 0.8125 BPW (E2M3)
+} block_fp6;         // 26 bytes per 32 values → 6.5 bits per weight (E2M3)
 ```
 
 ---
@@ -282,7 +292,7 @@ typedef struct {
 | Codebook expand | `__builtin_amdgcn_perm` (~1 instr) | Software LUT (~3-5 instr) | N/A |
 | DP4A dot product | `__builtin_amdgcn_sudot4` (1 instr) | N/A | N/A |
 | Scale decode | Bit manip (~6 instr) | Bit manip (~6 instr) | Software (~25-40 instr) |
-| Total dequant | ~15 cycles | ~25 cycles | N/A |
+| Total dequant (estimate) | ~15 cycles | ~25 cycles | N/A |
 
 ### 4.2 Hardware Support Matrix
 
@@ -342,15 +352,15 @@ FP4 weights × Q8_0 activations → FP32 output
 
 2. **FP6 cannot use DP4A** because 6-bit codes don't fit the 4-bit-perm pattern. Would need software table lookup or fcbx.
 
-3. **FP8 is not a weight quantization** in llama.cpp. It's used solely for UE4M3 scale encoding. FP8 hardware on gfx1151 is limited to CDNA/RDNA4.
+3. **FP8 is used for UE4M3 scale encoding**, not (yet) as a common weight format (section 2.2 lists the fork's newer experimental types). FP8 conversion hardware is CDNA / RDNA4 only, not gfx1151.
 
-4. **FP4 dequant to FP32 is fast** (~15 cycles on gfx1151) via DP4A. The matmul itself is FP32, which is fully hardware-accelerated.
+4. **FP4 decode is cheap** via `v_perm` (estimated ~15 cycles per block). The products themselves are integer: FP4 codes × int8 activations (Q8_0) with `v_dot4`, the float scales applied once per block; WMMA int8 tiles for many tokens. Only the per-block scaling and the accumulation are FP32.
 
-5. **cuBLAS is used for dense FP32/FP16/BF16** only. All quantized matmul is handwritten HIP kernels using DP4A/MFMA.
+5. **hipBLAS (cuBLAS in the CUDA sources) is used for dense FP32/FP16/BF16** only. All quantized matmul is handwritten HIP kernels using DP4A (`v_dot4`) and, on RDNA3.5, WMMA (MFMA exists only on CDNA).
 
 6. **FP4 memory bandwidth savings (8x)** are the primary motivation, not compute speed. FP4 enables larger models in the same VRAM.
 
-7. **FP6 would be ~1.0 BPW** (vs FP4 at 0.56 BPW) and would have worse accuracy per bit due to wider codebook. Not a clear improvement over existing formats.
+7. **FP6 would be ~6.5 bits per weight** (vs ROCmFP4 at 4.5 / 4.25) without a `v_perm` decode; not a clear improvement over the existing formats (Q5_K / Q6_K already cover that range with integer decodes).
 
 ---
 
@@ -389,3 +399,23 @@ FP4 weights × Q8_0 activations → FP32 output
 - `/opt/rocm/include/hip/amd_detail/amd_hip_fp4.h` - FP4 types
 - `/opt/rocm/include/hip/amd_detail/amd_hip_fp6.h` - FP6 types
 - `/opt/rocm/include/hip/amd_detail/amd_hip_fp8.h` - FP8 types
+
+---
+
+## 7. In This Repository's Engine (measured)
+
+The standalone engine (`src/`, see ARCHITECTURE.md) implements the formats directly, without llama.cpp code:
+
+- **Types**: `Q4_0_ROCMFP4` (100: 18-byte blocks `qs[16] e[2]`, a UE4M3 scale per 16 values) and
+  `Q4_0_ROCMFP4_FAST` (101: 17 bytes `qs[16] e`, one scale). Values 0..15 of a block are the low nibbles, 16..31
+  the high nibbles; codebook `{0,1,2,3,4,6,8,10}` with a sign bit, scales decoded at half scale
+  (`ue4m3_half`, 0x7f and above → 0). The CPU decoders (`src/quant_types.cpp`) are bit-exact against the
+  reference's `to_float` on real tensors (`tests/dequant_verify`).
+- **Integer path** (`src/matvec_q.hip`): four nibbles → four int8 codes with two `v_perm` lookups (a positive
+  and a negative 8-entry table, the sign bit choosing between them; mask bytes kept ≤ 7, see PLAN.md for the
+  measured `perm` semantics), then `v_dot4` (`__builtin_amdgcn_sudot4`) against the activation quantized to
+  Q8_0 exactly as ggml's CPU does (`src/q8_device.h`), so each block's integer sum equals the reference's.
+  Prefill: 64×64 int8 WMMA tiles. K-quants (Q4_K / Q5_K / Q6_K) use the same scheme against Q8_K.
+- **Measured** (single-token matvecs, gfx1151, ~256 GB/s peak): ROCmFP4 / FAST matvecs 185–230 GB/s on large
+  matrices, so generation is bandwidth-bound as section 4.4 expects. Most of Qwen3.6-35B-A3B and all of
+  Qwen3.8-Flash-Next's large tensors are ROCmFP4_FAST; their LM heads are BF16 / Q6_K.

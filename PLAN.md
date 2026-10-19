@@ -1,5 +1,8 @@
 # Project Plan & Analysis: rocm-hip (Strix Halo HIP POC)
 
+> Plan, status and history. How the engine is built: [ARCHITECTURE.md](ARCHITECTURE.md). The current next step:
+> the "▶ NEXT STEP" block in Phase 20.3 below.
+
 ## What It Is
 
 A HIP/ROCm proof-of-concept for **AMD Strix Halo (gfx1151, RDNA3.5 APU)** proving out two ideas:
@@ -29,7 +32,7 @@ A HIP/ROCm proof-of-concept for **AMD Strix Halo (gfx1151, RDNA3.5 APU)** provin
 
 ## Analysis Doc & Second Branch
 
-- **FP4_FP6_FP8_Analysis.md** -- deep llama.cpp source study: why ROCmFP4 beats native FP4 on gfx1151 (`perm` is HW on all RDNA; native FP4 cvt needs gfx950), why FP6 can't use DP4A (6-bit codes > 4-bit perm mask), FP8 exists only as UE4M3 scale encoding, ~cycle-count estimates per dequant path.
+- **FP4_FP6_FP8_Analysis.md** -- llama.cpp (reference) source study: why ROCmFP4 beats native FP4 on gfx1151 (`perm` is HW on all RDNA; native FP4 cvt needs gfx950), why FP6 can't use DP4A (6-bit codes > 4-bit perm mask), FP8 exists only as UE4M3 scale encoding, ~cycle-count estimates per dequant path.
 
 - **Branch `q4_0_rocmfp4_q8_1`** -- the "real" project: llama.cpp submodule (pinned to a fork carrying ROCmFP4 ftype 107/108 integration, 53 commits ahead of upstream at the time), `INTEGRATION_STATUS.md` (incl. an analysis concluding the local Qwen3.8-27B build is a dense Qwen3.5-lineage model, not the official Flash-DGX MoE+n-gram one), `build_llama.cpp.sh` for Strix Halo + rocWMMA headers, mmap zero-copy GGUF loading, 13-week roadmap toward MFMA/WMMA/FP4 + KV-cache fast path.
 
@@ -71,100 +74,11 @@ This drove the final Codebook10 dequant design (see Phase 2): magnitude via one 
 
 # Inference Engine Roadmap -- New Phase
 
-This section outlines the forward-looking plan: building a minimalist inference engine that leverages ROCmFP4 FP4 quantization and zero-copy mmap() GGUF loading on AMD Strix Halo (gfx1151) with 128GB UMA.
-
-## Design Principles
-
-- **Zero-copy everywhere**: GGUF tensors live in file-backed mapped memory (either `/dev/shm` or directly from the .gguf file), GPU reads/writes them through `hipHostRegister`. No `hipMemcpy` ever.
-- **No host-to-device conversion**: weights stay in their quantized format on the GPU. Dequant happens inline via hardware-accelerated DP4A (`__builtin_amdgcn_perm` + `__builtin_amdgcn_sudot4`). FP4->WMMA path uses LDS LUT for nibble-to-FP16 conversion before tensor core compute.
-- **Qwen 3.5 model family**: originally scoped as dense Qwen3. The actual targets are **hybrid**: Gated DeltaNet linear-attention layers, with gated full attention every 4th layer, partial-rotary M-RoPE, and an MTP block (`qwen35`, e.g. Qwen3.5-4B). `qwen35moe` (Qwen3.6-35B-A3B) adds a 256-expert MoE. See Phase 20.
-- **128GB UMA advantage**: no need to partition between "VRAM" and system RAM. Everything is shared physical memory accessible by both CPU and GPU at identical addresses. The constraint becomes memory bandwidth, not capacity -- hence why FP4 matters more than FP16.
-- **C API surface**: all public interfaces exported as `extern "C"` functions. C++ HIP implementation hidden behind opaque handles. Designed for eventual Perl XS CPAN module consumption.
-
-## Quantization Strategy Decision Matrix
-
-| Format | BPW | HW dequant on gfx1151? | Path | FLOPs/val | Verdict |
-|--------|-----|----------------------|------|-----------|---------|
-| ROCmFP4 (Codebook10) | 0.5625 | Yes -- DP4A perm | `perm` -> `sudot4` -> UE4M3 scale mul | ~15 cycles | **Primary: fastest path** |
-| NVFP4 | 0.5625 | No -- fcbx software | Software fallback | ~25 cycles | Keep available but slower |
-| MXFP4 | 0.5625 | No -- fcbx software | Software fallback | ~25 cycles | Same as NVFP4 |
-| Q8_0 | 1.0 | Yes -- int8 SDOT4 | DP4A dot product only, no dequant needed | ~8 cycles | **Fallback for head/output layers** |
-| Q4_K / Q5_K | ~0.6-0.78 | Yes -- DP4A pattern | Similar to FP4 but different block layout | ~12-15 cycles | Viable alternative, more complex blocks |
-| FP16/BF16 WMMA | 2.0/2.0 | Native tensor core | Direct WMMA intrinsic call | ~8 cycles (no dequant) | For KV-cache, RoPE positions, bias terms |
-
-Key conclusions from FP4_FP6_FP8_Analysis.md applied to inference engine:
-
-1. **ROCmFP4 is the weight format of choice**. `__builtin_amdgcn_perm` works on all RDNA architectures with a single hardware instruction. It expands nibbles into int8 codes via a 32-byte constant table lookup in one instruction, then feeds directly into `__builtin_amdgcn_sudot4` for the dot-product accumulation. This is the fastest known dequant+matmul path on gfx1151 at 0.56 BPW.
-
-2. **Qwen3 benefits most from ROCmFP4 over native FP4**. The analysis doc shows native ROCm FP4 requires gfx950-only intrinsics (Blackwell). On Strix Halo it falls back to fcbx software which compiles to ~25 instructions per value vs DP4A's ~15.
-
-3. **FP8 has no role as a weight format**. In llama.cpp it exists only as UE4M3 scale encoding for FP4 blocks. FP8 hardware intrinsics are only available on CDNA/RDNA4 -- not on RDNA3.5 Strix Halo.
-
-4. **FP6 is not viable on this GPU**. Six-bit codes don't fit `__builtin_amdgcn_perm`'s 4-bit-per-index pattern. Software dequant would be slower than even native FP4. Skip entirely for now.
-
-5. **Mixed precision layout**: Use ROCmFP4 for all attention and MLP weight matrices (the bulk of params). Use Q8_0 for LM-head output projection (needs full dynamic range for vocabulary sampling). Use FP16/BF16 only for KV-cache storage (no quantization needed, fast WMMA access) and RoPE position tensors (small, computed on host).
-
-## Target Architecture
-
-```
-CPU (x86):                          GPU (gfx1151 RDNA3.5):
-+---------------------+            +--------------------+
-| GGUF .file         |  mmap()    | hipHostRegister    |
-|  [Qwen3 model]     |+---------->|  (zero-copy pin)   |
-|                    |  +share    |                    |
-| tokenizer          |  memory    | DP4A dequant:      |
-| (int32 IDs)        |<----------+  __builtin_perm     |
-|                    |  mmap()    |  __builtin_sudot4   |
-| host dispatch      |  reads CPU | FP4->FP16 LUT       |
-| (C API calls)      |  visible data | WMMA matmul       |
-|                    |  in shared RAM | LDS LUT expand    |
-+---------------------+            +--------------------+
-        ^                                    |
-        |                                      v
-+-------------------------------+      +--------------------+
-| KV Cache (GPU-side)           |<-----| attention kernel   |
-| mapped from /dev/shm          |   register pointers    | FP4 weights +            |
-| ~shared with GPU via          |                   FP16 KV values   |
-| hipHostRegisterMapped         |             RoPE + softmax   |
-+-------------------------------+            +--------------------+
-```
-
-The critical insight: on Strix Halo's UMA architecture, a single `mmap()` of the GGUF file or `/dev/shm` buffer gives both CPU and GPU access to the same physical pages. No copy path exists because there is no separate VRAM -- the GPU's memory controller accesses unified memory directly.
-
-## API Design Overview
-
-### C API Header (`inference.h`)
-
-All functions exported as `extern "C"`. Opaque handles for all state.
-
-```c
-// Model loading
-inference_model_t* inference_load_model(const char* gguf_path);       // mmap() loads GGUF header + tensors index
-void               inference_free_model(inference_model_t* model);      // unregisters and unmmaps
-
-// Tokenization (CPU side)
-int*              inference_tokenize(inference_model_t* model, const char* text, int* out_len);
-void              inference_free_tokens(int* tokens, int len);
-
-// Inference
-int    inference_kv_cache_init(inference_model_t* model, int n_ctx);  // allocates KV cache in /dev/shm
-void   inference_kv_cache_free(inference_model_t* model);
-void   inference_set_seed(inference_model_t* model, unsigned int seed);
-int    inference_decode_token(inference_model_t* model, int token_id, int* next_token_out);
-float  inference_sample_logits(inference_model_t* model, float temperature, int* vocab_ids, float* logits);
-
-// Control
-int    inference_n_ctx(const inference_model_t* model);
-int    inference_batch_size(const inference_model_t* model);
-const char* inference_model_name(const inference_model_t* model);
-
-// Direct weight access for debugging/analysis
-const void* inference_get_tensor_ptr(const inference_model_t* model, const char* tensor_name, size_t* out_bytes);
-```
-
-### C++ HIP Implementation (`inference.cpp`, `kernels/*.hip`)
-
-All implementation lives in C++ with HIP device code. The C API is a thin FFI wrapper.
+The engine's design (principles, memory, kernels, models, speculative decoding, library, verification) is in
+[ARCHITECTURE.md](ARCHITECTURE.md); this file keeps the plan, the status and the history. The original design
+notes of this section (2026-10, before Phase 20: a dense-Qwen3 target, a CPU/GPU diagram, a first API sketch and
+a quantization matrix) were superseded and moved there in updated form; the format comparison is in
+[FP4_FP6_FP8_Analysis.md](FP4_FP6_FP8_Analysis.md).
 
 ## Phased Approach
 
@@ -265,7 +179,7 @@ Deliverables:
 
 Key design decisions:
 - Model parallelism is not needed on 128GB UMA -- the entire model fits in unified memory even at FP4 quantization. A single GPU thread-block grid handles everything.
-- For a ~7B parameter model at ROCmFP4 (~0.56 BPW), weights consume approximately 4GB. At Q8_0 it would be ~7GB. With KV cache at 128K context length, total memory footprint stays well under 128GB.
+- For a ~7B parameter model at ROCmFP4 (4.5 bits per weight), weights consume approximately 4GB. At Q8_0 it would be ~7GB. With KV cache at 128K context length, total memory footprint stays well under 128GB.
 
 #### Phase 4 Status (current) — COMPLETED
 
