@@ -3,8 +3,7 @@
 How the inference engine in this repository is built: a standalone, zero-copy LLM engine for **AMD Strix Halo
 (gfx1151, RDNA3.5 APU, 128 GB unified memory)**, a C library (`libinference.so`) with a Perl XS binding
 (`ROCm::Inference`). This file describes the design as it is; [PLAN.md](PLAN.md) holds the status, the
-measurements behind each decision and the history (phases). ([FP4_FP6_FP8_Analysis.md](FP4_FP6_FP8_Analysis.md)
-is an early, unverified study kept for history only.)
+measurements behind each decision and the history (phases).
 
 ## 1. Principles
 
@@ -95,6 +94,10 @@ a sign bit and an index into `{0, 1, 2, 3, 4, 6, 8, 10}`; a scale byte is UE4M3 
 measured, PLAN.md) and multiply them with `v_dot4` against the Q8_0 activation, which is quantized exactly as
 ggml's CPU does, so each block's integer sum equals the reference's. Large ROCmFP4 / FAST matvecs run at
 185–230 GB/s (peak ~256).
+
+gfx1151 has no FP8, FP6 or FP4 conversion instructions (those are on CDNA3 / RDNA4 and gfx950 / gfx1250), so
+OCP FP4 / FP6 / FP8 weights would need software decodes; `v_perm` takes 3-bit indices, so the table lookup used
+for ROCmFP4 does not extend to 6-bit codes. No model used here needs them.
 
 ## 5. Exactness and WMMA
 
