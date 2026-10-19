@@ -32,7 +32,8 @@ A HIP/ROCm proof-of-concept for **AMD Strix Halo (gfx1151, RDNA3.5 APU)** provin
 
 ## Analysis Doc & Second Branch
 
-- **FP4_FP6_FP8_Analysis.md** -- llama.cpp (reference) source study: why ROCmFP4 beats native FP4 on gfx1151 (`perm` is HW on all RDNA; native FP4 cvt needs gfx950), why FP6 can't use DP4A (6-bit codes > 4-bit perm mask), FP8 exists only as UE4M3 scale encoding, ~cycle-count estimates per dequant path.
+- **FP4_FP6_FP8_Analysis.md** -- historical, unverified early study of the reference's sources (not a design
+  reference; see ARCHITECTURE.md): why ROCmFP4 beats native FP4 on gfx1151 (`perm` is HW on all RDNA; native FP4 cvt needs gfx950), why FP6 can't use DP4A (6-bit codes > 4-bit perm mask), FP8 exists only as UE4M3 scale encoding, ~cycle-count estimates per dequant path.
 
 - **Branch `q4_0_rocmfp4_q8_1`** -- the "real" project: llama.cpp submodule (pinned to a fork carrying ROCmFP4 ftype 107/108 integration, 53 commits ahead of upstream at the time), `INTEGRATION_STATUS.md` (incl. an analysis concluding the local Qwen3.8-27B build is a dense Qwen3.5-lineage model, not the official Flash-DGX MoE+n-gram one), `build_llama.cpp.sh` for Strix Halo + rocWMMA headers, mmap zero-copy GGUF loading, 13-week roadmap toward MFMA/WMMA/FP4 + KV-cache fast path.
 
@@ -77,8 +78,8 @@ This drove the final Codebook10 dequant design (see Phase 2): magnitude via one 
 The engine's design (principles, memory, kernels, models, speculative decoding, library, verification) is in
 [ARCHITECTURE.md](ARCHITECTURE.md); this file keeps the plan, the status and the history. The original design
 notes of this section (2026-10, before Phase 20: a dense-Qwen3 target, a CPU/GPU diagram, a first API sketch and
-a quantization matrix) were superseded and moved there in updated form; the format comparison is in
-[FP4_FP6_FP8_Analysis.md](FP4_FP6_FP8_Analysis.md).
+a quantization matrix) were superseded and moved there in updated form. ([FP4_FP6_FP8_Analysis.md](FP4_FP6_FP8_Analysis.md)
+is an early, unverified format study, kept for history only; its conclusions are not plan inputs.)
 
 ## Phased Approach
 

@@ -3,8 +3,8 @@
 How the inference engine in this repository is built: a standalone, zero-copy LLM engine for **AMD Strix Halo
 (gfx1151, RDNA3.5 APU, 128 GB unified memory)**, a C library (`libinference.so`) with a Perl XS binding
 (`ROCm::Inference`). This file describes the design as it is; [PLAN.md](PLAN.md) holds the status, the
-measurements behind each decision and the history (phases); [FP4_FP6_FP8_Analysis.md](FP4_FP6_FP8_Analysis.md)
-the low-precision formats.
+measurements behind each decision and the history (phases). ([FP4_FP6_FP8_Analysis.md](FP4_FP6_FP8_Analysis.md)
+is an early, unverified study kept for history only.)
 
 ## 1. Principles
 
@@ -82,9 +82,19 @@ Weights stay in their GGUF blocks; each type has a CPU decoder (tests) and GPU k
 - **LM head**: on the last row only (two rows in a verify pass); opt-in int8 copy of a float head
   (`inference_set_lm_head_q8`).
 
-Supported weight types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K–Q6_K, ROCmFP4 (`Q4_0_ROCMFP4`, 18-byte
-blocks, two UE4M3 scales, 4.5 bpw) and ROCmFP4_FAST (17 bytes, one scale, 4.25 bpw); int8 kernels for ROCmFP4,
-ROCmFP4_FAST, Q4_K, Q5_K, Q6_K.
+Supported weight types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K–Q6_K, ROCmFP4 and ROCmFP4_FAST; int8
+kernels for ROCmFP4, ROCmFP4_FAST, Q4_K, Q5_K, Q6_K. The CPU decoders are bit-exact against the reference's on
+real tensors (`tests/dequant_verify`).
+
+**ROCmFP4** (as the reference's `rocmfp4.h` defines it): `Q4_0_ROCMFP4` (type 100) blocks of 32 values in 18
+bytes, `qs[16] e[2]`: values 0..15 are the low nibbles (scale `e[0]`), 16..31 the high nibbles (`e[1]`); 4.5
+bits per weight. `Q4_0_ROCMFP4_FAST` (101): 17 bytes, `qs[16] e`, one scale; 4.25 bits per weight. A nibble is
+a sign bit and an index into `{0, 1, 2, 3, 4, 6, 8, 10}`; a scale byte is UE4M3 at half scale (`ue4m3_half`;
+0x7f and above decode to 0). The int8 kernels turn four nibbles into four int8 codes with two `v_perm` lookups
+(a positive and a negative 8-entry table, the sign choosing; mask bytes kept ≤ 7, whose behaviour on gfx1151 was
+measured, PLAN.md) and multiply them with `v_dot4` against the Q8_0 activation, which is quantized exactly as
+ggml's CPU does, so each block's integer sum equals the reference's. Large ROCmFP4 / FAST matvecs run at
+185–230 GB/s (peak ~256).
 
 ## 5. Exactness and WMMA
 

@@ -18,7 +18,8 @@ forked-llama.cpp snapshot).
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — how the engine is built
 - [PLAN.md](PLAN.md) — plan, status, measurements and history (the current next step is at "▶ NEXT STEP")
-- [FP4_FP6_FP8_Analysis.md](FP4_FP6_FP8_Analysis.md) — the low-precision formats on gfx1151
+- [FP4_FP6_FP8_Analysis.md](FP4_FP6_FP8_Analysis.md) — historical: an early, unverified study of FP4 / FP6 / FP8
+  on gfx1151, not a design reference
 - [AGENTS.md](AGENTS.md) — working conventions
 - [perl/ROCm-Inference/README](perl/ROCm-Inference/README) — the Perl module
 

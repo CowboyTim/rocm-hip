@@ -1,10 +1,10 @@
 # ROCmFP4 and FP6 Implementation Analysis
 
-> A study of how the **reference** (the ROCmFPX llama.cpp fork in `llama.cpp/`) implements ROCmFP4, and of FP6 /
-> FP8 on gfx1151; file paths in sections 1–6 are in that tree. How this repository's own engine uses the formats
-> is in section 7 and [ARCHITECTURE.md](ARCHITECTURE.md). Revised 2026-10-19: bits-per-weight figures corrected
-> (they were bytes per weight), the engine's integer path and the newer ROCmFPX types added; cycle counts are
-> estimates, not measurements.
+> **Historical, not authoritative.** An early (pre-engine) study of the reference llama.cpp fork's ROCmFP4
+> code and of FP6 / FP8 on gfx1151, kept for the record. It was not verified, some of its conclusions and
+> estimates may be wrong, and it is not a design guide for this repository: see [ARCHITECTURE.md](ARCHITECTURE.md)
+> for what the engine actually does and PLAN.md for what was measured. (2026-10-19: obvious errors were marked
+> — bits per weight, the integer products, the fork's newer types — but the rest was not re-checked.)
 
 ## 1. ROCmGPU FP4 Implementation (Current State)
 
@@ -399,23 +399,3 @@ FP4 weights × Q8_0 activations → FP32 output
 - `/opt/rocm/include/hip/amd_detail/amd_hip_fp4.h` - FP4 types
 - `/opt/rocm/include/hip/amd_detail/amd_hip_fp6.h` - FP6 types
 - `/opt/rocm/include/hip/amd_detail/amd_hip_fp8.h` - FP8 types
-
----
-
-## 7. In This Repository's Engine (measured)
-
-The standalone engine (`src/`, see ARCHITECTURE.md) implements the formats directly, without llama.cpp code:
-
-- **Types**: `Q4_0_ROCMFP4` (100: 18-byte blocks `qs[16] e[2]`, a UE4M3 scale per 16 values) and
-  `Q4_0_ROCMFP4_FAST` (101: 17 bytes `qs[16] e`, one scale). Values 0..15 of a block are the low nibbles, 16..31
-  the high nibbles; codebook `{0,1,2,3,4,6,8,10}` with a sign bit, scales decoded at half scale
-  (`ue4m3_half`, 0x7f and above → 0). The CPU decoders (`src/quant_types.cpp`) are bit-exact against the
-  reference's `to_float` on real tensors (`tests/dequant_verify`).
-- **Integer path** (`src/matvec_q.hip`): four nibbles → four int8 codes with two `v_perm` lookups (a positive
-  and a negative 8-entry table, the sign bit choosing between them; mask bytes kept ≤ 7, see PLAN.md for the
-  measured `perm` semantics), then `v_dot4` (`__builtin_amdgcn_sudot4`) against the activation quantized to
-  Q8_0 exactly as ggml's CPU does (`src/q8_device.h`), so each block's integer sum equals the reference's.
-  Prefill: 64×64 int8 WMMA tiles. K-quants (Q4_K / Q5_K / Q6_K) use the same scheme against Q8_K.
-- **Measured** (single-token matvecs, gfx1151, ~256 GB/s peak): ROCmFP4 / FAST matvecs 185–230 GB/s on large
-  matrices, so generation is bandwidth-bound as section 4.4 expects. Most of Qwen3.6-35B-A3B and all of
-  Qwen3.8-Flash-Next's large tensors are ROCmFP4_FAST; their LM heads are BF16 / Q6_K.
