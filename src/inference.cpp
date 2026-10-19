@@ -529,7 +529,10 @@ static void free_mtp(inference_model* m) {
 
 int inference_set_draft_tokens(inference_model_t* m, int n) {
     clear_error();
-    if (!m || n < 0 || n > SPEC_MAX_DRAFTS) { set_error("draft tokens: 0 (adaptive) .. %d", SPEC_MAX_DRAFTS); return -1; }
+    if (!m || n < 0 || n > SPEC_MAX_DRAFTS) {
+        set_error("draft tokens: 0 (adaptive) .. %d", SPEC_MAX_DRAFTS);
+        return -1;
+    }
     m->spec_drafts = n;
     return 0;
 }
