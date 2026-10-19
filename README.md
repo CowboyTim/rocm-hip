@@ -8,8 +8,8 @@ products, WMMA prefill, a KV cache of shareable files and MTP speculative decodi
 | Model | Generation | Prefill |
 |---|---|---|
 | Qwen3.5-4B (ROCmFP4) | 64 tok/s | 1,826 tok/s |
-| Qwen3.6-35B-A3B (ROCmFP4) | 65.7 tok/s | 1,193 tok/s |
-| Qwen3.8-Flash-Next (177B, ROCmFP4_FAST) | 38 tok/s, ~50 with its MTP head | 434 tok/s |
+| Qwen3.6-35B-A3B (ROCmFP4) | 65.7 tok/s | 1,807 tok/s |
+| Qwen3.8-Flash-Next (177B, ROCmFP4_FAST) | 38 tok/s, ~50 with its MTP head | ~700 tok/s |
 
 All development happens on **`main`**. The `q4_0_rocmfp4_q8_1` branch is an archived reference (an earlier
 forked-llama.cpp snapshot).

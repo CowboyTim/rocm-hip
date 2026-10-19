@@ -136,12 +136,14 @@ hipError_t qmatvec_launch_id(int type, const void *W, size_t row_bytes, const in
                              const float *x, float *y, int N, int K, int T, hipStream_t stream);
 
 // MoE prefill: the experts' rows for a batch grouped by expert (gpu_moe_group). Tile k < *n_tiles covers up to
-// qmatvec_mm_tile() entries with expert tile_e[k]: entries tile_start[k] .. + tile_n[k] - 1 of in_rows (rows of
-// the quantized input q) / out_rows (rows of y, N values each). max_tiles bounds *n_tiles (grid size).
-int qmatvec_mm_tile(void);
+// `tile` entries with expert tile_e[k]: entries tile_start[k] .. + tile_n[k] - 1 of in_rows (rows of the quantized
+// input q) / out_rows (rows of y, N values each). max_tiles bounds *n_tiles (grid size). qmatvec_id_batch_tile: the
+// largest tile the kernel for this matrix takes (64 on the WMMA path, so each expert is read once per 64 entries;
+// else 16); group with the smallest over the matrices that share the grouping.
+int qmatvec_id_batch_tile(int type, int N, int K);
 int qmatvec_q8_id_batch_supported(int type, int K);
 hipError_t qmatvec_launch_q8_id_batch(int type, const void *W, size_t row_bytes, const qmatvec_q8 *q, float *y, int N,
-                                      int K, int max_tiles, const int32_t *n_tiles, const int32_t *tile_e,
+                                      int K, int max_tiles, int tile, const int32_t *n_tiles, const int32_t *tile_e,
                                       const int32_t *tile_start, const int32_t *tile_n, const int32_t *in_rows,
                                       const int32_t *out_rows, hipStream_t stream);
 

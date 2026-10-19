@@ -1122,7 +1122,7 @@ for the symptoms above.
 
 ### 20.3 Plan
 
-> **▶ NEXT STEP (as of 2026-10-18): Phase 21, Qwen3.8-Flash-Next (`qwen4exp`) runs on the real model.**
+> **▶ NEXT STEP (as of 2026-10-19): Phase 21, Qwen3.8-Flash-Next (`qwen4exp`) runs on the real model.**
 > - **Setup (container, 2026-10-18):** `/models` = the user's model stash (read-only, NVMe), `/data` = writable on
 >   the same disk (557 GB free), /dev/shm = 90 GB tmpfs, the host's (survives docker restarts, not host reboots).
 >   Model: `/models/Qwen3.8-Flash-Next-Uncensored-Q4_0-ROCmFP4-FAST-00001-of-00003.gguf` (3 files, 94 GB, all
@@ -1131,8 +1131,8 @@ for the symptoms above.
 >   Reference dump: `/data/ref_q38_fast` (prompt "Write a Python function that checks whether a number is prime.").
 > - **Results:** coherent text; `qwen4exp_verify` passes on it (559 of 564 single-layer updates at cosine >= 0.999,
 >   the rest at routing near-ties of the 512-expert router; logits cosine 0.99, same argmax). Generation
->   **38.1 tok/s** (was 31.4; see "generation speed" and "kernel fusions" in Phase 21), prefill **436 tok/s**
->   (2,427 tokens) vs the reference's ~24 / ~345. 35B 65.3 tok/s, 4B 63.7.
+>   **38.1 tok/s** (was 31.4; see "generation speed" and "kernel fusions" in Phase 21), prefill **~700 tok/s**
+>   (2,427 tokens; was 436, see "WMMA prefill speed") vs the reference's ~24 / ~345. 35B 65.3 tok/s, 4B 63.7.
 > - **Next:**
 >   1. **MTP speculative decoding — DONE ✅** (see "MTP" in Phase 21): `inference_set_draft_model(model,
 >      "/data/mtp/mtp-Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST.gguf")`, `qwen_demo --draft`, Perl `set_draft_model`.
@@ -1146,10 +1146,13 @@ for the symptoms above.
 >      compare longer greedy runs on prompts without near-ties, or by teacher forcing;
 >   3. MTP draft heads (the model card's MTP-Heads GGUF) for speculative decoding: +11–34% in the reference;
 >   4. the STRIX_LEAN release (Q5_K token_embd, Q5_1 PLE table, Q6_K head) if the user wants it.
->   2. **WMMA (user, 2026-10-18: investigate WMMA)** — findings and next steps in Phase 21 "WMMA". Most
->      promising: the MoE expert WMMA kernel is 51% of Qwen3.8 prefill at ~4–5 TOPS: tiles of 16 entries read
->      each expert ~2x per 1,024-token batch (~20 entries per expert with 512 experts); 32–64-entry tiles or
->      larger prefill batches should read them once (prefill 434 → ~600 tok/s?).
+>   2. **WMMA prefill — DONE ✅ (2026-10-19)**, see "WMMA prefill speed" in Phase 21: Qwen3.8 prefill 414 →
+>      ~700 tok/s (667–731), 35B 1,193 → 1,807, 4B unchanged (~1,800). Expert tiles of up to 64 entries; the
+>      FAST staging loaded each 68-byte quad twice (2x for the FAST WMMA kernels); FAST blocks summed in int32.
+>      **Next for prefill** (Qwen3.8 GPU 3.27 s per 2,427 tokens): experts 1.02 s (~130 GB/s, latency-bound:
+>      deeper prefetch / a K-chunk of 256?), dense WMMA 0.72 s (~28 TOPS of ~55), the router's `matmul_f32`
+>      0.26 s (float, kept for the 512-way near-ties), `hc_norm` 0.25 s, `moe_group` 0.10 s (one thread: easy
+>      to parallelize).
 > - **Perl module (2026-10-18):** `Makefile.PL` finds libinference via ROCM_INFERENCE_PREFIX, pkg-config
 >   (`rocm-inference`) or the rocm-hip checkout (building `libinference.so` there if missing); tests:
 >   `t/00-load.t` without GPU (exports, error paths), the rest with ROCM_INFERENCE_TEST_MODEL /
@@ -1941,6 +1944,31 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
     **Next:** tiles of 32 / 64 entries (or 2,048-token batches when the attention partials allow) so each
     expert is read once; measure the dense `matmul_wmma` against the roofline the same way (20480-row
     tiles at 1.4 ms); FP16 flash attention precision on long contexts (only a 30k needle test so far).
+
+- **WMMA prefill speed (2026-10-19).** Qwen3.8 prefill (2,427 tokens) 414 → ~700 tok/s (667–731 over runs; GPU
+  5.0 → 3.27 s), 35B 1,193 → 1,807 tok/s, 4B unchanged (1,800–1,838; a regression on the way was caught, below).
+  - **Expert tiles of up to 64 entries** (`QMV_WMMA_ID_TB`, `qmatvec_id_batch_tile(type, N, K)`: 64 where all
+    three expert matrices take the WMMA kernel, else 16; `qmatvec_launch_q8_id_batch` takes the tile): each
+    expert is read ~once per 1,024-token batch. `matmul_wmma_id_*` picks 1..4 sub-tiles of 16 per tile at
+    compile time (one shared LDS struct, `WmmaSmem`). Per-sub-tile *runtime* skips (uniform branches between
+    the WMMAs) cost the dense WMMA kernel 17% on the 4B: none inside the kernel body. 414 → 480 tok/s.
+  - **FAST staging read every 68-byte quad twice:** both threads of a row loaded all 17 dwords and decoded half.
+    Now 9 dwords each (from byte 16 wb, v_alignbyte with a per-thread shift): FAST expert WMMA 7.2 → 3.6 ms,
+    dense 3.7 → 2.5 ms per call (harness, 1,024 tokens). FP4 was not affected.
+  - **FAST blocks in int32:** a block's two 16-value WMMAs chained through the int32 accumulator, scaled once:
+    `(e_w * d_x) * (float)dot`, the dot4 kernels' per-block term (closer to them: rms difference 2.6e-4 vs
+    3.5e-4 on values ~1.5e3), half the float epilogue. For it the tokens are WMMA operand A (a lane's results
+    share its weight row's scale; stores are 16 consecutive floats per token); token scales stored permuted so
+    a lane's 8 are two 16-byte LDS reads. Dense FAST 2.5 → 1.7–1.9 ms (~28 TOPS). FP4 keeps one WMMA + scale
+    per half-block in the original orientation (bit-identical to before).
+  - Tested: FP4 WMMA bit-identical to the previous kernel; all WMMA outputs within 5.5e-6 relative of the dot4
+    kernels (dense and 1..4-sub-tile expert tiles); qwen4exp_verify vs the reference improved (worst residual
+    cosine 0.966 vs 0.953, logits 0.995 vs 0.991), exact with `QMATVEC_NO_WMMA=1`; its WMMA self-consistency
+    bar (split prefill / token by token vs one prefill) is now the reference bar 0.98 (was 0.99; 0.989 now:
+    a router near-tie on the 12-token prompt); forward_verify (4B, 35B), mtp_verify, generate_verify,
+    store_verify pass. The A/B used a scratch program (WMMA outputs hashed and timed on random weights, linked
+    to build/libqwen.a): run such programs with `INFERENCE_KERNEL_DIR=build/co`, else they use the kernels
+    embedded when they were linked.
 
 **Needed from the user:** nothing for now (the model is in `/models`, the head in `/data/mtp`). Constraints here: /dev/shm
 is a 63 GB tmpfs (38 GB free) and the disk has 48 GB free, so a ~50 GB model needs space freed or /dev/shm

@@ -33,6 +33,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <initializer_list>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -408,7 +409,10 @@ int main(int argc, char** argv) {
             // (gpu_moe_group), then the expert-tiled batched kernels (WMMA where the type has one)
             Stat sbg, sbu, sbd;
             {
-                const int tile = qmatvec_mm_tile(), mt = gpu_moe_max_tiles(T, NU, NE, tile);
+                const int tile = std::min({qmatvec_id_batch_tile(W3[0]->type, FE, E),
+                                           qmatvec_id_batch_tile(W3[1]->type, FE, E),
+                                           qmatvec_id_batch_tile(L.We_down.type, E, FE)});
+                const int mt = gpu_moe_max_tiles(T, NU, NE, tile);
                 ShmBuf b_gt, b_gp, b_gn, b_ge, b_gs, b_gc;
                 if (!b_gt.alloc("fwdv_moe_gt.bin", (size_t)T * NU) || !b_gp.alloc("fwdv_moe_gp.bin", (size_t)T * NU) ||
                     !b_gn.alloc("fwdv_moe_gn.bin", 1) || !b_ge.alloc("fwdv_moe_ge.bin", mt) ||
@@ -424,7 +428,7 @@ int main(int argc, char** argv) {
                     e = qmatvec_quantize(g_x, T * E, &g_q8, 0);
                     if (e == hipSuccess)
                         e = qmatvec_launch_q8_id_batch(W3[k]->type, W3[k]->data, W3[k]->row_bytes, &g_q8, g_y, FE, E, mt,
-                                                       gn, ge, gs, gc, gt, gp, 0);
+                                                       tile, gn, ge, gs, gc, gt, gp, 0);
                     if (e == hipSuccess) e = hipDeviceSynchronize();
                     if (e == hipSuccess)
                         for (int r = 0; r < T * NU; ++r)
@@ -436,7 +440,7 @@ int main(int argc, char** argv) {
                 }
                 if (e == hipSuccess)
                     e = qmatvec_launch_q8_id_batch(L.We_down.type, L.We_down.data, L.We_down.row_bytes, &g_q8, g_y, E, FE,
-                                                   mt, gn, ge, gs, gc, gp, gp, 0);
+                                                   mt, tile, gn, ge, gs, gc, gp, gp, 0);
                 if (e == hipSuccess) e = hipDeviceSynchronize();
                 if (e != hipSuccess) { fprintf(stderr, "grouped expert matmul: %s\n", hipGetErrorString(e)); return 1; }
                 for (int r = 0; r < T * NU; ++r) sbd.add(g_y + (size_t)r * E, &md[(size_t)r * E], E);

@@ -135,7 +135,8 @@ struct Scratch {
     float* moe_act = nullptr;   // SiLU(gate) * up per expert [n_used * n_ff_exp]
     float* moe_down = nullptr;  // expert down projections [n_used * n_embd]
     float* sh_out = nullptr;    // shared expert output [n_embd]
-    // MoE prefill grouping (gpu_moe_group): entries sorted by expert, and tiles of them
+    // MoE prefill grouping (gpu_moe_group): entries sorted by expert, and tiles of up to g_tile of them
+    int g_tile = 0;
     int *g_tok = nullptr, *g_pair = nullptr, *g_ntiles = nullptr, *g_tile_e = nullptr, *g_tile_start = nullptr,
         *g_tile_n = nullptr;
     // Attention partial results, per (token, head, 256-position chunk) up to n_ctx (attention.h)
@@ -590,7 +591,7 @@ struct QwenModel {
     // Expert matvecs for T tokens with the experts in s.ids (n_used per token): int8 when s.q8 holds the input
     // rows (T of them, or T * n_used with x_per_slot), else float. W stacks all experts' N rows. With `grouped`
     // (a prefill batch after gpu_moe_group), the expert-tiled matmul: each expert's weights are decoded once
-    // per tile of up to 16 of its (token, slot) entries instead of once per entry.
+    // per tile of up to s.g_tile of its (token, slot) entries instead of once per entry.
     bool matvec_id(const QuantWeight& W, const float* x, int x_per_slot, float* y, int N, int T, bool grouped,
                    ProfCat c) {
         const int NU = eng->n_expert_used, K = W.K;
@@ -600,7 +601,7 @@ struct QwenModel {
         hipError_t e;
         if (q8 && grouped && qmatvec_q8_id_batch_supported(W.type, K))
             e = qmatvec_launch_q8_id_batch(W.type, W.data, W.row_bytes, &s.q8, y, N, K,
-                                           gpu_moe_max_tiles(T, NU, eng->n_expert, qmatvec_mm_tile()), s.g_ntiles,
+                                           gpu_moe_max_tiles(T, NU, eng->n_expert, s.g_tile), s.g_tile, s.g_ntiles,
                                            s.g_tile_e, s.g_tile_start, s.g_tile_n, x_per_slot ? s.g_pair : s.g_tok,
                                            s.g_pair, 0);
         else if (q8)
@@ -696,10 +697,14 @@ struct QwenModel {
         // (a speculative verify pass) take the per-token kernels, which give exactly what decoding them one at a
         // time gives
         const bool grouped = T >= 8;
+        if (grouped)  // the largest tile all three expert matrices' kernels take
+            s.g_tile = std::min({qmatvec_id_batch_tile(L.We_gate.type, FE, E),
+                                 qmatvec_id_batch_tile(L.We_up.type, FE, E),
+                                 qmatvec_id_batch_tile(L.We_down.type, E, FE)});
         if (!matvec(L.W_router, s.xn, s.r_logits, T, P_FFN) ||
             !check(gpu_moe_router(s.r_logits, s.xn, L.shexp_gate, s.ids, s.wts, s.sg, NE, NU, E, T, 0, 0),
                    "moe_router") ||
-            (grouped && !check(gpu_moe_group(s.ids, T, NU, NE, qmatvec_mm_tile(), s.g_tok, s.g_pair, s.g_ntiles,
+            (grouped && !check(gpu_moe_group(s.ids, T, NU, NE, s.g_tile, s.g_tok, s.g_pair, s.g_ntiles,
                                              s.g_tile_e, s.g_tile_start, s.g_tile_n, 0), "moe_group")) ||
             !matvec_id_gate_up(L.We_gate, L.We_up, s.xn, s.moe_g, s.moe_u, FE, T, grouped, P_FFN) ||
             !matvec_pair(L.W_gate, L.W_up, s.xn, s.ffg, s.ffu, T, P_FFN))

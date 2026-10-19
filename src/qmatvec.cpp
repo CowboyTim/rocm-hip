@@ -31,7 +31,8 @@ static hipFunction_t g_lr_fast = nullptr;         // matvec_q8_lr_q4_0_rocmfp4_f
 static hipFunction_t g_fn_q8t[QMV_MAX_TYPE];     // int8 kernels for 2..4 tokens, matvec_q8t_<type>
 static bool g_use_wmma = true;
 static int g_wmma_min_t = 32;  // smaller batches, and N < 64 (a 64-row tile mostly padding), stay on matmul_q8_<type>
-#define QMV_MM_TB 16  // tokens per tile, must match MM_TB in matvec_q.hip
+#define QMV_MM_TB 16      // tokens per tile, must match MM_TB in matvec_q.hip
+#define QMV_WMMA_ID_TB 64  // entries per expert tile of matmul_wmma_id_<type> (4 sub-tiles of 16)
 
 int qmatvec_init(const char *co_path) {
     if (g_mod) return 0;
@@ -379,18 +380,26 @@ hipError_t qmatvec_launch_id(int type, const void *W, size_t row_bytes, const in
                                  stream, args, nullptr);
 }
 
-int qmatvec_mm_tile(void) { return QMV_MM_TB; }
+static bool wmma_id_ok(int type, int N, int K) {
+    return g_use_wmma && g_fn_wmma_id[type] && N >= 64 && K % 128 == 0;
+}
+
+int qmatvec_id_batch_tile(int type, int N, int K) {
+    if (type < 0 || type >= QMV_MAX_TYPE) return QMV_MM_TB;
+    return wmma_id_ok(type, N, K) ? QMV_WMMA_ID_TB : QMV_MM_TB;
+}
 
 int qmatvec_q8_id_batch_supported(int type, int K) {
     return qmatvec_q8_supported(type, K) && type >= 0 && type < QMV_MAX_TYPE && g_fn_mm_id[type] != nullptr;
 }
 
 hipError_t qmatvec_launch_q8_id_batch(int type, const void *W, size_t row_bytes, const qmatvec_q8 *q, float *y, int N,
-                                      int K, int max_tiles, const int32_t *n_tiles, const int32_t *tile_e,
+                                      int K, int max_tiles, int tile, const int32_t *n_tiles, const int32_t *tile_e,
                                       const int32_t *tile_start, const int32_t *tile_n, const int32_t *in_rows,
                                       const int32_t *out_rows, hipStream_t stream) {
     if (!qmatvec_q8_id_batch_supported(type, K)) return hipErrorInvalidDeviceFunction;
-    if (max_tiles <= 0 || row_bytes != qt_row_size(type, K) || row_bytes % 4 != 0 || ((uintptr_t)W & 3) != 0)
+    if (max_tiles <= 0 || tile <= 0 || tile > qmatvec_id_batch_tile(type, N, K) || row_bytes != qt_row_size(type, K) ||
+        row_bytes % 4 != 0 || ((uintptr_t)W & 3) != 0)
         return hipErrorInvalidValue;
     const bool kq = type != QT_Q4_0_ROCMFP4 && type != QT_Q4_0_ROCMFP4_FAST;
     const int8_t *q8 = kq ? q->qK : q->q0;
@@ -399,7 +408,7 @@ hipError_t qmatvec_launch_q8_id_batch(int type, const void *W, size_t row_bytes,
     long long rb = (long long)row_bytes;
     void *args[] = {(void *)&W, &rb, (void *)&q8, (void *)&d8, (void *)&bs, (void *)&y, &N, &K, (void *)&n_tiles,
                     (void *)&tile_e, (void *)&tile_start, (void *)&tile_n, (void *)&in_rows, (void *)&out_rows};
-    if (g_use_wmma && g_fn_wmma_id[type] && N >= 64 && K % 128 == 0)  // 64 expert rows x 16 entries per workgroup
+    if (wmma_id_ok(type, N, K))  // 64 expert rows x up to 64 entries per workgroup
         return hipModuleLaunchKernel(g_fn_wmma_id[type], (unsigned)((N + 63) / 64), (unsigned)max_tiles, 1, 128, 1, 1, 0,
                                      stream, args, nullptr);
     const unsigned gx = (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);

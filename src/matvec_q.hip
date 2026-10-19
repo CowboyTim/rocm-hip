@@ -1346,8 +1346,11 @@ MATMUL_Q8_KERNELS(q5_K, mmb_q5_K_lin, mmb_q5_K_exp)
 // all 64 tokens (4 float accumulator tiles of 16 x 16). Per 128-value K chunk the workgroup decodes the 64
 // rows' weights to int8 into LDS once (with their scales) and copies the 64 tokens' Q8_0 bytes and scales into
 // LDS; each 16-value step is then one WMMA per 16 x 16 sub-tile, an exact int32 dot over one ROCmFP4
-// half-block, accumulated as (float)dot * e_w[row] * d_x[token] (the same integer sums and scale products as
-// ggml; only the float accumulation order differs from the dot4 kernels).
+// half-block, accumulated as (float)dot * e_w[row] * d_x[token]. ROCmFP4_FAST (one scale per 32-value block)
+// adds a block's two dots in int32 first and scales once, (e_w * d_x) * (float)dot, the dot4 kernels' per-block
+// term; for it the tokens are operand A, so that a lane's results share its weight row's scale and a token's
+// outputs are stored as 16 consecutive floats. The same integer sums and scale products as ggml; only the
+// float accumulation order differs from the dot4 kernels.
 // WMMA wave32 layout (tests/wmma_layout_verify): A row i / B column i in lanes i and i + 16, 16 int8 each;
 // C column l % 16, row 2r + l / 16.
 // grid (ceil(N / 64), ceil(T / 64)), block 128. Requires K % 128 == 0.
@@ -1363,6 +1366,7 @@ typedef int v8i_t __attribute__((ext_vector_type(8)));
 // (so the next chunk's loads overlap this chunk's WMMAs), store() decodes them to int8 in LDS and writes the two
 // half-block scales of each block.
 struct WStageFP4 {  // Q4_0_ROCMFP4: 18-byte blocks (2-aligned), a UE4M3 scale per 16 values
+    static constexpr bool BLOCK_SCALE = false;
     uint32_t q[2][5];
     __device__ void load(const uint8_t *W, long long rb, int row, bool ok, int b0, int wb) {
 #pragma unroll
@@ -1394,26 +1398,31 @@ struct WStageFP4 {  // Q4_0_ROCMFP4: 18-byte blocks (2-aligned), a UE4M3 scale p
 };
 
 struct WStageFast {  // Q4_0_ROCMFP4_FAST: 17-byte blocks, one UE4M3 scale per 32 values. The chunk's 4 blocks
-                     // of a row are a 68-byte, 4-aligned quad: load it whole, extract bytes with v_alignbyte.
-    uint32_t w[18];
-    __device__ void load(const uint8_t *W, long long rb, int row, bool ok, int b0, int) {
-        const uint8_t *b = W + (long long)row * rb + (long long)b0 * 17;  // b0 % 4 == 0
+                     // of a row are a 68-byte, 4-aligned quad; a thread's two blocks (wb = 0 or 2) are its bytes
+                     // 17 wb .. 17 wb + 33: load the 9 dwords from byte 16 wb on, extract with v_alignbyte.
+    static constexpr bool BLOCK_SCALE = true;  // both half-blocks share it: one int32 dot per block
+    uint32_t w[10];
+    int sh;  // byte offset of the thread's first block in w: 17 wb - 16 wb
+    __device__ void load(const uint8_t *W, long long rb, int row, bool ok, int b0, int wb) {
+        const uint8_t *b = W + (long long)row * rb + (long long)b0 * 17 + 16 * wb;  // b0 % 4 == 0
 #pragma unroll
-        for (int k = 0; k < 17; ++k) w[k] = ok ? ld32(b + 4 * k) : 0;
-        w[17] = 0;
+        for (int k = 0; k < 9; ++k) w[k] = ok ? ld32(b + 4 * k) : 0;
+        w[9] = 0;
+        sh = wb;
     }
     __device__ void store(int8_t *srow, float *erow, int wb) const {
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
-            const int off = 17 * (wb + j);
+            // bytes off .. of w, off = 17 j + sh: the dword index is the same for both sh, only the shift differs
+            const int s = (17 * j + sh) & 3, d = (17 * j) >> 2;
             uint32_t *dst = (uint32_t *)(srow + (wb + j) * 32);
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
-                const uint32_t qd = dword_at(w, off + 4 * k);
+                const uint32_t qd = __builtin_amdgcn_alignbyte(w[d + k + 1], w[d + k], s);
                 dst[k] = (uint32_t)rocmfp4_dec4(qd & 0x0F0F0F0Fu);
                 dst[4 + k] = (uint32_t)rocmfp4_dec4((qd >> 4) & 0x0F0F0F0Fu);
             }
-            const float e = ue4m3_half((uint8_t)(dword_at(w, off + 16) & 0xFF));
+            const float e = ue4m3_half((uint8_t)(__builtin_amdgcn_alignbyte(w[d + 5], w[d + 4], s) & 0xFF));
             erow[(wb + j) * 2] = e;
             erow[(wb + j) * 2 + 1] = e;
         }
@@ -1437,17 +1446,33 @@ struct WRowsExpert {  // MoE prefill: one expert's tile of (token, slot) entries
     __device__ long long out(int j) const { return out_rows[j]; }
 };
 
-// NT: 16-token sub-tiles per workgroup (4: 64 tokens for dense prefill; 1: 16 entries for an expert tile)
+__device__ __forceinline__ void token_scales(const float *p, float dx[8]) {  // 8 adjacent floats, 16-aligned
+    const float4 a = ((const float4 *)p)[0], b = ((const float4 *)p)[1];
+    dx[0] = a.x, dx[1] = a.y, dx[2] = a.z, dx[3] = a.w, dx[4] = b.x, dx[5] = b.y, dx[6] = b.z, dx[7] = b.w;
+}
+
+// The kernel's LDS, declared once by the __global__ function: the expert kernel instantiates wmma_q80 for 1..4
+// sub-tiles, whose own __shared__ arrays would each take their space. Rows padded by 16 bytes: the WMMA operand
+// loads read 16 bytes from 16 consecutive rows, and an unpadded 128-byte row stride would put them all in the
+// same LDS banks.
+struct WmmaSmem {
+    int8_t sw[WM_TILE][WM_KC + 16];  // decoded weights
+    int8_t sx[WM_TILE][WM_KC + 16];  // token activations
+    float sew[WM_TILE][WM_KC / 16];  // weight half-block scales
+    // token block scales, block c of token 16 n + 2 r + hi at [c][16 n + 8 hi + r]: a lane's 8 C rows are adjacent
+    float sdx[WM_KC / 32][WM_TILE];
+};
+
+// NT: 16-token sub-tiles per workgroup (4: 64 tokens of a dense prefill; an expert tile of up to 64 entries takes
+// the fewest that cover it). No per-sub-tile branches: uniform branches between the WMMAs cost a dense
+// prefill 17%. Each value is the same sum in the same order whichever NT computes it.
 template <class WS, int NT, class RM>
 __device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8,
-                                         float *y, long long ldy, int N, int K, const RM &rm) {
+                                         float *y, long long ldy, int N, int K, const RM &rm, WmmaSmem &sm) {
     constexpr int TOK = 16 * NT;
-    // Rows padded by 16 bytes: the WMMA operand loads read 16 bytes from 16 consecutive rows, and an unpadded
-    // 128-byte row stride would put them all in the same LDS banks
-    __shared__ __attribute__((aligned(16))) int8_t sw[WM_TILE][WM_KC + 16];  // decoded weights
-    __shared__ __attribute__((aligned(16))) int8_t sx[TOK][WM_KC + 16];      // token activations
-    __shared__ float sew[WM_TILE][WM_KC / 16];                               // weight half-block scales
-    __shared__ float sdx[TOK][WM_KC / 32];                                   // token block scales
+    auto &sw = sm.sw, &sx = sm.sx;
+    auto &sew = sm.sew;
+    auto &sdx = sm.sdx;
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     const int r0 = blockIdx.x * WM_TILE, T = rm.nt;
     const int nb = K / 32;
@@ -1483,7 +1508,7 @@ __device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, 
         // token block scales: TOK tokens x 4 blocks
         for (int task = tid; task < TOK * 4; task += 128) {
             const int tt = task >> 2, c = task & 3;
-            sdx[tt][c] = tt < T ? d8[rm.in(tt) * nb + b0 + c] : 0.0f;
+            sdx[c][(tt & ~15) + 8 * (tt & 1) + ((tt & 15) >> 1)] = tt < T ? d8[rm.in(tt) * nb + b0 + c] : 0.0f;
         }
     };
 
@@ -1495,57 +1520,106 @@ __device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, 
         if (k0 + WM_KC < K) load_chunk(k0 + WM_KC);  // in flight during the WMMAs below
         // Not unrolled: unrolling all 8 steps let the compiler hoist every step's operand loads and spill
         // (256 VGPRs + 260 spilled)
+        if constexpr (WS::BLOCK_SCALE) {
 #pragma unroll 1
-        for (int h = 0; h < WM_KC / 16; ++h) {
-            const v4i_t a = *(const v4i_t *)&sw[16 * w + i][16 * h];
-            v8i_t c[NT];
+            for (int j = 0; j < WM_KC / 32; ++j) {
+                // one scale per 32-value block: its two 16-value steps' dots are added in int32 (the WMMA's
+                // accumulator), then scaled once, as the dot4 kernels' e * dx * (float)(s0 + s1)
+                const v4i_t a0 = *(const v4i_t *)&sw[16 * w + i][32 * j];
+                const v4i_t a1 = *(const v4i_t *)&sw[16 * w + i][32 * j + 16];
+                v8i_t c[NT];
 #pragma unroll
-            for (int n = 0; n < NT; ++n) {  // issue the WMMAs first, then their epilogues
-                const v4i_t bx = *(const v4i_t *)&sx[16 * n + i][16 * h];
-                c[n] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, bx, v8i_t{}, false);
+                for (int n = 0; n < NT; ++n) {  // issue the WMMAs first, then their epilogues
+                    const v4i_t b0 = *(const v4i_t *)&sx[16 * n + i][32 * j];
+                    const v4i_t b1 = *(const v4i_t *)&sx[16 * n + i][32 * j + 16];
+                    c[n] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, b0, true, a0, v8i_t{}, false);
+                    c[n] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, b1, true, a1, c[n], false);
+                }
+                const float ew = sew[16 * w + i][2 * j];
+#pragma unroll
+                for (int n = 0; n < NT; ++n) {
+                    float dx[8];
+                    token_scales(&sdx[j][16 * n + 8 * hi], dx);
+#pragma unroll
+                    for (int r = 0; r < 8; ++r) acc[n][r] += (ew * dx[r]) * (float)c[n][r];
+                }
             }
-            float ew[8];
+        } else {
+#pragma unroll 1
+            for (int h = 0; h < WM_KC / 16; ++h) {
+                const v4i_t a = *(const v4i_t *)&sw[16 * w + i][16 * h];
+                v8i_t c[NT];
 #pragma unroll
-            for (int r = 0; r < 8; ++r) ew[r] = sew[16 * w + 2 * r + hi][h];
+                for (int n = 0; n < NT; ++n) {  // issue the WMMAs first, then their epilogues
+                    const v4i_t bx = *(const v4i_t *)&sx[16 * n + i][16 * h];
+                    c[n] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, bx, v8i_t{}, false);
+                }
+                float ew[8];
 #pragma unroll
-            for (int n = 0; n < NT; ++n) {
-                const float dx = sdx[16 * n + i][h / 2];
+                for (int r = 0; r < 8; ++r) ew[r] = sew[16 * w + 2 * r + hi][h];
 #pragma unroll
-                for (int r = 0; r < 8; ++r) acc[n][r] += (float)c[n][r] * (ew[r] * dx);
+                for (int n = 0; n < NT; ++n) {
+                    const float dx = sdx[h / 2][16 * n + 8 * (i & 1) + (i >> 1)];  // token 16 n + i
+#pragma unroll
+                    for (int r = 0; r < 8; ++r) acc[n][r] += (float)c[n][r] * (ew[r] * dx);
+                }
             }
         }
         __syncthreads();
     }
 
+    if constexpr (WS::BLOCK_SCALE) {  // C column l % 16 = weight row 16 w + l % 16, row 2 r + l / 16 = token
+        const int row = r0 + 16 * w + i;
+        if (row >= N) return;
 #pragma unroll
-    for (int n = 0; n < NT; ++n) {
-        const int tt = 16 * n + i;
-        if (tt >= T) continue;
-        const long long orow = rm.out(tt);
+        for (int n = 0; n < NT; ++n) {
 #pragma unroll
-        for (int r = 0; r < 8; ++r) {
-            const int row = r0 + 16 * w + 2 * r + hi;
-            if (row < N) y[orow * ldy + row] = acc[n][r];
+            for (int r = 0; r < 8; ++r) {
+                const int tt = 16 * n + 2 * r + hi;
+                if (tt < T) y[rm.out(tt) * ldy + row] = acc[n][r];
+            }
+        }
+    } else {  // C column l % 16 = token, row 2 r + l / 16 = weight row
+#pragma unroll
+        for (int n = 0; n < NT; ++n) {
+            const int tt = 16 * n + i;
+            if (tt >= T) continue;
+            const long long orow = rm.out(tt);
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int row = r0 + 16 * w + 2 * r + hi;
+                if (row < N) y[orow * ldy + row] = acc[n][r];
+            }
         }
     }
 }
 
 // matmul_wmma_<type>: grid (ceil(N / 64), ceil(T / 64)). matmul_wmma_id_<type> (MoE prefill): grid
-// (ceil(N / 64), max_tiles) over moe_group's expert tiles, 16 entries wide; same arguments as matmul_q8_id_<type>.
+// (ceil(N / 64), max_tiles) over moe_group's expert tiles of up to 64 entries (QMV_WMMA_ID_TB in qmatvec.cpp), so a
+// batch reads each expert's weights once per 64 of its entries; same arguments as matmul_q8_id_<type>.
 #define MATMUL_WMMA_Q80_KERNELS(name, WS)                                                                    \
     extern "C" __global__ void __launch_bounds__(128)                                                        \
         matmul_wmma_##name(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, float *y, \
                            long long ldy, int N, int K, int T) {                                             \
+        __shared__ __attribute__((aligned(16))) WmmaSmem sm;                                                 \
         const int t0 = blockIdx.y * WM_TILE;                                                                 \
         const WRowsLinear rm{t0, min(WM_TILE, T - t0)};                                                      \
-        wmma_q80<WS, 4>(W, row_bytes, q8, d8, y, ldy, N, K, rm);                                             \
+        wmma_q80<WS, 4>(W, row_bytes, q8, d8, y, ldy, N, K, rm, sm);                                         \
     }                                                                                                        \
     extern "C" __global__ void __launch_bounds__(128) matmul_wmma_id_##name(MMID_ARGS) {                      \
         (void)bs;                                                                                            \
+        __shared__ __attribute__((aligned(16))) WmmaSmem sm;                                                 \
         const int k = blockIdx.y;                                                                            \
         if (k >= *n_tiles) return;                                                                           \
         const WRowsExpert rm{tile_e[k], tile_n[k], in_rows + tile_start[k], out_rows + tile_start[k]};       \
-        wmma_q80<WS, 1>(W, row_bytes, q8, d8, y, N, N, K, rm);                                               \
+        if (rm.nt <= 16)                                                                                     \
+            wmma_q80<WS, 1>(W, row_bytes, q8, d8, y, N, N, K, rm, sm);                                       \
+        else if (rm.nt <= 32)                                                                                \
+            wmma_q80<WS, 2>(W, row_bytes, q8, d8, y, N, N, K, rm, sm);                                       \
+        else if (rm.nt <= 48)                                                                                \
+            wmma_q80<WS, 3>(W, row_bytes, q8, d8, y, N, N, K, rm, sm);                                       \
+        else                                                                                                 \
+            wmma_q80<WS, 4>(W, row_bytes, q8, d8, y, N, N, K, rm, sm);                                       \
     }
 
 MATMUL_WMMA_Q80_KERNELS(q4_0_rocmfp4, WStageFP4)

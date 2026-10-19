@@ -76,7 +76,8 @@ Weights stay in their GGUF blocks; each type has a CPU decoder (tests) and GPU k
 - **Batched** (`matmul_q8_<type>`, tiles of 16 tokens) and **WMMA** (`matmul_wmma_<type>`, 64×64 int8 WMMA tiles
   from 32 tokens): prefill.
 - **Experts** (`matvec_q8_id_*`, `matmul_q8_id_*`, `matmul_wmma_id_*`): expert-indexed; prefill batches of 8+
-  tokens are grouped by expert (`moe_group`) into tiles; an id of -1 selects an extra matrix (the shared
+  tokens are grouped by expert (`moe_group`) into tiles (up to 64 entries on the WMMA path, so a 1,024-token
+  batch reads each expert's weights about once; 16 otherwise); an id of -1 selects an extra matrix (the shared
   expert as one more slot when generating).
 - **LM head**: on the last row only (two rows in a verify pass); opt-in int8 copy of a float head
   (`inference_set_lm_head_q8`).
@@ -108,8 +109,11 @@ The batched kernels (`matmul_q8_*`, `matvec_q8t_*`, attention below 16 tokens, t
 tokens) reproduce the single-token sums bit for bit. The WMMA kernels (int8 matmuls from 32 tokens, the
 expert-grouped matmuls, FP16 flash attention from 16 tokens) sum in another order: prefill then differs from
 token-by-token decoding in the last bits, which routing near-ties can amplify, but not in accuracy against the
-reference. `QMATVEC_NO_WMMA=1` (all), `QMATVEC_NO_WMMA_MM=1` (matmuls), `ATTN_NO_FLASH=1` (attention) switch them
-off; the exactness tests run with `QMATVEC_NO_WMMA=1`.
+reference. Their integer dots are exact; ROCmFP4_FAST (one scale per 32 values) adds a block's two 16-value
+WMMA dots in int32 and scales once, the same per-block term as the dot4 kernels, so only the order of the float
+sum over blocks differs (within ~5e-6 relative of the dot4 kernels). `QMATVEC_NO_WMMA=1` (all),
+`QMATVEC_NO_WMMA_MM=1` (matmuls), `ATTN_NO_FLASH=1` (attention) switch them off; the exactness tests run with
+`QMATVEC_NO_WMMA=1`.
 
 ## 6. Models
 
@@ -193,7 +197,7 @@ layout (`tools/gen_qwen4exp_tiny.py`).
 | Model | Generation | Prefill |
 |---|---|---|
 | Qwen3.5-4B (ROCmFP4) | 64 tok/s | 1,826 tok/s (2,455 tokens) |
-| Qwen3.6-35B-A3B (ROCmFP4, BF16 head) | 65.7 tok/s (more with the int8 head option) | 1,193 tok/s |
-| Qwen3.8-Flash-Next (ROCmFP4_FAST, 94 GB) | 38.1 tok/s; ~50 with the MTP head | 434 tok/s (2,427 tokens) |
+| Qwen3.6-35B-A3B (ROCmFP4, BF16 head) | 65.7 tok/s (more with the int8 head option) | 1,807 tok/s (2,427 tokens) |
+| Qwen3.8-Flash-Next (ROCmFP4_FAST, 94 GB) | 38.1 tok/s; ~50 with the MTP head | ~700 tok/s (2,427 tokens; 667–731) |
 
 Profiling: `QWEN_PROFILE=1` (per-section times), `rocprofv3 --kernel-trace` + `tools/prof_summary.py` (per kernel).
