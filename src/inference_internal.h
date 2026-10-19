@@ -171,6 +171,7 @@ struct inference_model {
 
     inference_kv_cache_t* kvc = nullptr;               // KV cache manager handle
     MtpHead* mtp = nullptr;                            // MTP draft head, if loaded (inference_set_draft_model)
+    int spec_drafts = 2;                               // drafts per verify pass (inference_set_draft_tokens)
     void* scratch_base = nullptr;                      // temporary scratch buffer base
     size_t scratch_bytes = 0;                          // scratch buffer size in bytes
 

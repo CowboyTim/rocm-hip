@@ -526,6 +526,13 @@ static void free_mtp(inference_model* m) {
     m->mtp = nullptr;
 }
 
+int inference_set_draft_tokens(inference_model_t* m, int n) {
+    clear_error();
+    if (!m || n < 1 || n > SPEC_MAX_DRAFTS) { set_error("draft tokens: 1 .. %d", SPEC_MAX_DRAFTS); return -1; }
+    m->spec_drafts = n;
+    return 0;
+}
+
 int inference_set_draft_model(inference_model_t* m, const char* path) {
     clear_error();
     if (!m) { set_error("NULL model"); return -1; }
@@ -838,32 +845,46 @@ static int forward_next(inference_model_t* m, int token_id) {
     return store_after_forward(m);
 }
 
+// A verify pass in flight: drafts d[0 .. k - 1] decoded after the token at position n_past - 1 (not counted yet);
+// the next token is sampled from the logits after token i of the pass (i drafts accepted so far)
+struct SpecPass {
+    int d[SPEC_MAX_DRAFTS];
+    int k = 0, i = 0;
+};
+
 // Speculative decoding (an MTP draft head is loaded): decode token_id like forward_next, but verify the head's
-// draft of the token after it in the same pass. On success *draft is that draft and l0 the logits after
-// token_id (the draft sits decoded at position n_past, not yet counted: the caller accepts it with
-// accept_draft or undoes it with qwen_model_rollback); *draft = -1 when the step decoded token_id alone.
-static int forward_next_spec(inference_model_t* m, int token_id, int* draft, std::vector<float>& l0) {
-    *draft = -1;
+// drafts of the tokens after it in the same pass (sp.k of them; 0: the step decoded token_id alone). The drafts
+// sit decoded after n_past, not counted yet: the caller accepts them one by one with accept_draft, or keeps a
+// prefix with qwen_model_rollback.
+static int forward_next_spec(inference_model_t* m, int token_id, SpecPass& sp) {
+    sp.k = sp.i = 0;
+    if (!m->mtp || !m->kvc || !m->qwen) return forward_next(m, token_id);
     const int B = kv_B(m);
-    // the state snapshot of a block boundary right after token_id must not contain the draft
-    const bool snap_next = m->store_dirfd >= 0 && (m->n_past + 1) % B == 0 && snapshot_boundary(m, (m->n_past + 1) / B);
-    if (!m->mtp || !m->kvc || !m->qwen || m->n_past + 2 > m->n_ctx || snap_next) return forward_next(m, token_id);
-    const int d = qwen_model_mtp_draft(m->qwen, token_id, m->n_past);
-    if (d < 0) return forward_next(m, token_id);
-    if (ensure_writable(m, m->n_past, 2) != 0) return -1;
-    l0.resize((size_t)m->vocab_size);
-    const int pair[2] = {token_id, d};
-    if (qwen_model_forward_verify(m->qwen, pair, m->n_past, l0.data(), nullptr) != 0) {
+    // the state snapshot of a block boundary inside the pass must not contain drafts after it: only drafts up to
+    // the first snapshot boundary (one right after token_id: none)
+    int k = std::min(m->spec_drafts, m->n_ctx - m->n_past - 1);
+    for (int j = 0; j < k; ++j)
+        if (m->store_dirfd >= 0 && (m->n_past + 1 + j) % B == 0 && snapshot_boundary(m, (m->n_past + 1 + j) / B)) {
+            k = j;
+            break;
+        }
+    if (k <= 0) return forward_next(m, token_id);
+    int toks[SPEC_MAX_DRAFTS + 1] = {token_id};
+    const int n = qwen_model_mtp_drafts(m->qwen, token_id, m->n_past, toks + 1, k);
+    if (n <= 0) return forward_next(m, token_id);
+    if (ensure_writable(m, m->n_past, n + 1) != 0) return -1;
+    if (qwen_model_forward_verify(m->qwen, toks, n + 1, m->n_past) != 0) {
         set_error("forward pass failed: %s", qwen_model_last_error());
         return -1;
     }
     ++m->n_past;
     m->seq.push_back(token_id);
-    *draft = d;
+    for (int j = 0; j < n; ++j) sp.d[j] = toks[1 + j];
+    sp.k = n;
     return store_after_forward(m);
 }
 
-// The verified draft is the token that follows: count it as decoded (its logits are the model's current ones)
+// A verified draft is the token that follows: count it as decoded
 static int accept_draft(inference_model_t* m, int draft) {
     ++m->n_past;
     m->seq.push_back(draft);
@@ -1368,26 +1389,30 @@ int inference_generate_stream(inference_model_t* m, const int32_t* prompt_ids, i
     std::vector<char> buf(256);
     inference_stop_reason stop = INFERENCE_STOP_NONE;
     int emitted = 0, rc = 0;
-    // Speculative decoding (a draft head loaded): `draft` was decoded right after the last emitted token, which
-    // l0 holds the logits after. The next token is sampled from l0 as always; if it is the draft, the draft is
-    // already decoded and the model's logits are the ones after it; if not, the model rolls back. Either way the
-    // tokens are those of plain decoding, sampled from the same logits in the same order.
-    int draft = -1;
-    std::vector<float> l0;
+    // Speculative decoding (a draft head loaded): a verify pass decoded the last emitted token and the head's
+    // drafts after it. Each next token is sampled as always, from the logits after the tokens before it (row i
+    // of the pass); while it is the next draft, that draft is already decoded; at the first one that differs the
+    // model rolls back to the tokens kept. Either way the tokens are those of plain decoding, sampled from the
+    // same logits in the same order.
+    SpecPass sp;
     while (stop == INFERENCE_STOP_NONE) {
         if (emitted >= o.max_new_tokens) { stop = INFERENCE_STOP_MAX_TOKENS; break; }
-        const int next = sampler_sample(smp, draft >= 0 ? l0.data() : qwen_model_logits(m->qwen), m->vocab_size);
+        const float* lg = sp.k > 0 ? qwen_model_verify_logits(m->qwen, sp.i) : qwen_model_logits(m->qwen);
+        const int next = sampler_sample(smp, lg, m->vocab_size);
         const bool eog = !o.ignore_eog && tokenizer_is_eog(m->tokenizer, next);
         bool decoded = false;
-        if (draft >= 0) {
-            if (next == draft && !eog) {
-                rc = accept_draft(m, draft);
+        if (sp.k > 0) {
+            if (sp.i < sp.k && next == sp.d[sp.i] && !eog) {
+                rc = accept_draft(m, next);
+                ++sp.i;
                 decoded = true;
-            } else if (qwen_model_rollback(m->qwen) != 0) {
-                set_error("rollback failed: %s", qwen_model_last_error());
-                rc = -1;
+            } else {
+                if (sp.i < sp.k && qwen_model_rollback(m->qwen, sp.i + 1) != 0) {
+                    set_error("rollback failed: %s", qwen_model_last_error());
+                    rc = -1;
+                }
+                sp.k = 0;
             }
-            draft = -1;
             if (rc != 0) break;
         }
         if (eog) { stop = INFERENCE_STOP_EOG; break; }
@@ -1416,9 +1441,9 @@ int inference_generate_stream(inference_model_t* m, const int32_t* prompt_ids, i
         pending.erase(0, stop == INFERENCE_STOP_STRING ? pending.size() : ready);
 
         // Every emitted token joins the sequence, so a later call continues right after it (with a draft head,
-        // also verifying the head's draft of the token after it, unless generation stops here)
+        // also verifying the head's drafts of the tokens after it, unless generation stops here)
         if (decoded) continue;
-        rc = stop == INFERENCE_STOP_NONE && emitted < o.max_new_tokens ? forward_next_spec(m, next, &draft, l0)
+        rc = stop == INFERENCE_STOP_NONE && emitted < o.max_new_tokens ? forward_next_spec(m, next, sp)
                                                                       : forward_next(m, next);
         if (rc == INFERENCE_ERR_CONTEXT_FULL) {
             rc = 0;
@@ -1426,7 +1451,7 @@ int inference_generate_stream(inference_model_t* m, const int32_t* prompt_ids, i
         }
         if (rc != 0) break;
     }
-    if (draft >= 0 && qwen_model_rollback(m->qwen) != 0 && rc == 0) {  // stopped with a draft decoded
+    if (sp.k > 0 && sp.i < sp.k && qwen_model_rollback(m->qwen, sp.i + 1) != 0 && rc == 0) {  // drafts decoded
         set_error("rollback failed: %s", qwen_model_last_error());
         rc = -1;
     }

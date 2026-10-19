@@ -25,11 +25,15 @@ kv_cache_init($m, 4096);
 my $prompt = tokenize($m, "<|im_start|>user\nWrite a Perl function that reverses the words of a sentence."
     . "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
 
-# The same tokens and text with and without the head, greedy and sampled
+my $err = eval { set_draft_tokens($m, 4); 1 } ? '' : $@;
+like($err, qr/set_draft_tokens/, 'more than 3 drafts per pass dies');
+
+# The same tokens and text with and without the head (1 and 3 drafts per pass), greedy and sampled
 for my $temp (0, 0.8) {
     my (%ids, %text, %secs);
-    for my $with (1, 0) {
+    for my $with (3, 1, 0) {
         set_draft_model($m, $with ? $draft : undef);
+        set_draft_tokens($m, $with) if $with;
         reset($m);
         my $t = '';
         my $t0 = time;
@@ -39,14 +43,18 @@ for my $temp (0, 0.8) {
         });
         ($ids{$with}, $text{$with}, $secs{$with}) = ($ids, $t, time - $t0);
     }
-    is_deeply($ids{1}, $ids{0}, "temperature $temp: the same " . scalar(@{ $ids{0} }) . ' tokens with the head');
-    is($text{1}, $text{0}, "temperature $temp: the same streamed text");
-    note(sprintf('temperature %.1f: %.1f tok/s with the head, %.1f without', $temp,
-                 @{ $ids{1} } / $secs{1}, @{ $ids{0} } / $secs{0}));
+    for my $k (1, 3) {
+        is_deeply($ids{$k}, $ids{0}, "temperature $temp, $k drafts per pass: the same "
+            . scalar(@{ $ids{0} }) . ' tokens with the head');
+        is($text{$k}, $text{0}, "temperature $temp, $k drafts per pass: the same streamed text");
+    }
+    note(sprintf('temperature %.1f: %.1f / %.1f tok/s with the head (1 / 3 drafts), %.1f without', $temp,
+                 @{ $ids{1} } / $secs{1}, @{ $ids{3} } / $secs{3}, @{ $ids{0} } / $secs{0}));
 }
 
 # A turn that ends by itself (end of turn), then a second one continuing the sequence
 set_draft_model($m, $draft);
+set_draft_tokens($m, 2);
 reset($m);
 my ($ids, $why) = generate($m, $prompt, { max_new_tokens => 1000, temperature => 0 });
 is($why, STOP_EOG, 'the reply ends at the end of the turn (' . scalar(@$ids) . ' tokens)');

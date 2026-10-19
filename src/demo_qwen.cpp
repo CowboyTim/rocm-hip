@@ -1,9 +1,10 @@
 // demo_qwen.cpp -- text generation with the Qwen3.5 forward pass.
 // Usage: ./qwen_demo <model.gguf> "prompt text" | @prompt_file [n_gen] [--temp T] [--top-k K] [--top-p P] [--min-p P]
-//                    [--repeat-penalty R] [--seed S] [--lm-head-q8] [--ctx N (default 4096)] [--draft mtp.gguf]
+//                    [--repeat-penalty R] [--seed S] [--lm-head-q8] [--ctx N (default 4096)]
+//                    [--draft mtp.gguf [--drafts 1..3]]
 //
 // --draft: an MTP draft head for speculative decoding; generation then runs through inference_generate_stream
-// (ignoring end-of-generation tokens, as this demo does not stop at them either).
+// (ignoring end-of-generation tokens, as this demo does not stop at them either); --drafts: drafts per pass.
 // Greedy by default (--temp 0). QWEN_PROFILE=1 prints the time breakdown.
 
 #include "qwen_model.h"
@@ -20,7 +21,8 @@
 int main(int argc, char** argv) {
     if (argc < 3) {
         printf("Usage: %s <model.gguf> \"prompt text\" [n_gen] [--temp T] [--top-k K] [--top-p P] [--min-p P] "
-               "[--repeat-penalty R] [--seed S] [--lm-head-q8] [--ctx N] [--draft mtp.gguf]\n", argv[0]);
+               "[--repeat-penalty R] [--seed S] [--lm-head-q8] [--ctx N] [--draft mtp.gguf [--drafts 1..3]]\n",
+               argv[0]);
         return 1;
     }
 
@@ -45,6 +47,7 @@ int main(int argc, char** argv) {
     bool head_q8 = false;
     int n_ctx = 4096;
     const char* draft = nullptr;
+    int drafts = 0;  // drafts per pass (0: the library's default)
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         const char* v = i + 1 < argc ? argv[i + 1] : "0";
@@ -57,6 +60,7 @@ int main(int argc, char** argv) {
         else if (a == "--lm-head-q8") head_q8 = true;
         else if (a == "--ctx") { n_ctx = atoi(v); ++i; }
         else if (a == "--draft") { draft = v; ++i; }
+        else if (a == "--drafts") { drafts = atoi(v); ++i; }
         else n_gen = atoi(argv[i]);
     }
     printf("Sampling: temp %g top_k %d top_p %g min_p %g repeat_penalty %g seed %llu\n", sp.temperature, sp.top_k,
@@ -90,6 +94,10 @@ int main(int argc, char** argv) {
         if (inference_set_draft_model(engine, draft) != 0) {
             fprintf(stderr, "Draft model: %s\n", inference_get_last_error());
             inference_free_model(engine);
+            return 1;
+        }
+        if (drafts > 0 && inference_set_draft_tokens(engine, drafts) != 0) {
+            fprintf(stderr, "--drafts: %s\n", inference_get_last_error());
             return 1;
         }
         printf("Draft head: %s (speculative decoding)\n", draft);

@@ -7,6 +7,7 @@
 #include <hip/hip_runtime.h>
 
 #include "qmatvec.h"
+#include "deltanet.h"  // deltanet_mid_states
 
 #ifdef __cplusplus
 extern "C" {
@@ -68,9 +69,9 @@ hipError_t gpu_ple_gate(const float* key, const float* value, const float* res, 
                         hipStream_t stream);
 // PLE conv: res += gated + SiLU(dilated causal depthwise conv of normed), m channels, K taps (F16 w [m][K]),
 // dilation dil; state [(K - 1) * dil][m] holds the inputs before this batch and is advanced. state_mid (optional,
-// NULL): also the state after the first token
+// NULL): also the states after the first tokens (deltanet_mid_states)
 hipError_t gpu_ple_conv(const float* normed, const float* gated, float* res, float* state, const void* w, int m, int T,
-                        int K, int dil, float* state_mid, hipStream_t stream);
+                        int K, int dil, const deltanet_mid_states* state_mid, hipStream_t stream);
 
 // MTP head input: out[t][c] = [e[t] | h[t][c]] for T tokens, hc streams of n values (e [T][n], h [T][hc][n],
 // out [T][hc][2n])

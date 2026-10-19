@@ -125,21 +125,28 @@ deltanet_conv(const float* qkv, const float* conv_state, const float* conv_w, in
     if (blockIdx.x == 0) gates(alpha, beta_in, dt_bias, ssm_a, g_out, beta_out, n_v, t * n_v, (t + 1) * n_v);
 }
 
-// Conv state after T tokens: the last d_conv - 1 inputs. grid conv_dim / DS, block DS. state_mid (optional): the
-// state after the first token as well (speculative decoding's rollback point).
+// The states after the first tokens of a verify pass (speculative decoding's rollback points): p[m] (when set)
+// receives the state after token m, m < T - 1. Same layout as deltanet_mid_states in deltanet.h.
+struct MidStates {
+    float* p[3];
+};
+
+// Conv state after T tokens: the last d_conv - 1 inputs. grid conv_dim / DS, block DS. mid: also the states after
+// the first tokens.
 extern "C" __global__ void __launch_bounds__(DS)
-deltanet_conv_state(const float* qkv, float* conv_state, int d_conv, int T, float* state_mid) {
+deltanet_conv_state(const float* qkv, float* conv_state, int d_conv, int T, MidStates mid) {
     const int conv_dim = gridDim.x * DS;
     const int c = blockIdx.x * DS + threadIdx.x;
     const int ns = d_conv - 1;
     float* st = conv_state + (size_t)c * ns;
     float h[MAX_DCONV];
-    if (state_mid) {
+    for (int m = 0; m < 3 && m < T - 1; ++m) {
+        if (!mid.p[m]) continue;
         for (int i = 0; i < ns; ++i) {
-            const int tt = 1 - ns + i;
-            h[i] = tt >= 0 ? qkv[(size_t)tt * conv_dim + c] : st[i + 1];
+            const int tt = m + 1 - ns + i;
+            h[i] = tt >= 0 ? qkv[(size_t)tt * conv_dim + c] : st[i + m + 1];
         }
-        for (int i = 0; i < ns; ++i) state_mid[(size_t)c * ns + i] = h[i];
+        for (int i = 0; i < ns; ++i) mid.p[m][(size_t)c * ns + i] = h[i];
     }
     for (int i = 0; i < ns; ++i) {
         const int tt = T - ns + i;
@@ -150,7 +157,7 @@ deltanet_conv_state(const float* qkv, float* conv_state, int d_conv, int T, floa
 
 extern "C" __global__ void __launch_bounds__(128)
 deltanet_rule(float* state, const float* conv_out, const float* g, const float* beta, float* out, int n_k, int T,
-              float* state_mid) {
+              MidStates mid) {
     constexpr int R = DS / RULE_RP;
     const int h = blockIdx.x, n_v = gridDim.x, hk = h % n_k;
     const int p = threadIdx.x % RULE_RP, j = blockIdx.y * RULE_CW + threadIdx.x / RULE_RP;
@@ -195,8 +202,8 @@ deltanet_rule(float* state, const float* conv_out, const float* g, const float* 
 #pragma unroll
         for (int off = 1; off < RULE_RP; off <<= 1) o += __shfl_xor(o, off, 32);
         if (p == 0) out[(size_t)t * n_v * DS + h * DS + j] = o * scale;
-        if (t == 0 && state_mid) {  // the state after the first token: speculative decoding's rollback point
-            float* Sm = state_mid + ((size_t)h * (DS / RULE_CW) + blockIdx.y) * R * 128 + threadIdx.x;
+        if (t < 3 && t < T - 1 && mid.p[t]) {  // the state after token t: a rollback point of a verify pass
+            float* Sm = mid.p[t] + ((size_t)h * (DS / RULE_CW) + blockIdx.y) * R * 128 + threadIdx.x;
 #pragma unroll
             for (int r = 0; r < R; ++r) Sm[r * 128] = col[r];
         }

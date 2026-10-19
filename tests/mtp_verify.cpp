@@ -6,11 +6,11 @@
 //    it; the fraction of drafts that equal what the model then picks. The head is only ever a guess, so this
 //    measures it (the reference reports 0.71 on code to 0.94 on reasoning with its Q8_0 head) rather than
 //    checking exact values; a broken head gives ~0.
-// 2. Speculative greedy decoding (qwen_model_mtp_draft, qwen_model_forward_verify, qwen_model_rollback) gives
-//    exactly the tokens plain greedy decoding gives, and how much faster. MTP_VERIFY_SPEC_ONLY=1: the
-//    speculative run alone (profiling), against nothing.
-// 3. The library: inference_generate_stream with the head loaded gives the tokens it gives without (greedy, and
-//    sampling at temperature 0.8 with a fixed seed), ending at the end of the turn.
+// 2. Speculative greedy decoding with 1, 2 and 3 chained drafts per pass (qwen_model_mtp_drafts,
+//    qwen_model_forward_verify, qwen_model_rollback) gives exactly the tokens plain greedy decoding gives, and how
+//    much faster. MTP_VERIFY_SPEC_ONLY=1: the speculative runs alone (profiling), against nothing.
+// 3. The library: inference_generate_stream with the head loaded (1, 2 and 3 drafts per pass) gives the tokens
+//    it gives without (greedy, and sampling at temperature 0.8 with a fixed seed), ending at the end of the turn.
 // Prompts: a coding and a reasoning one, chat-formatted.
 
 #include "inference.h"
@@ -102,46 +102,48 @@ int main(int argc, char** argv) {
         if (!spec_only) check(drafts == n_gen && hits > drafts / 3, what);
         if (spec_only) plain.resize((size_t)n_gen + 1, -1);
 
-        // Speculative: x is emitted but not decoded yet; verify [x, draft] in one pass
-        if (qwen_model_prefill(q, toks.data(), n, 0, logits.data()) != 0) return 1;
-        std::vector<int> spec{argmax(logits.data(), V)};
-        std::vector<float> l0((size_t)V), l1((size_t)V);
-        int passes = 0, accepted = 0;
-        pos = n;
-        t0 = now();
-        while ((int)spec.size() < (int)plain.size()) {
-            const int x = spec.back();
-            const int d = qwen_model_mtp_draft(q, x, pos);
-            const int pair[2] = {x, d};
-            if (d < 0 || qwen_model_forward_verify(q, pair, pos, l0.data(), l1.data()) != 0) {
-                fprintf(stderr, "speculative step at %d failed: %s\n", pos, qwen_model_last_error());
-                return 1;
-            }
-            ++passes;
-            const int y = argmax(l0.data(), V);
-            spec.push_back(y);
-            if (y == d) {
-                ++accepted;
-                spec.push_back(argmax(l1.data(), V));
-                pos += 2;
-            } else {
-                if (qwen_model_rollback(q) != 0) {
+        // Speculative: x is emitted but not decoded yet; verify [x, drafts] in one pass, keep the tokens up to the
+        // first draft that is not the argmax
+        for (int k = 1; k <= SPEC_MAX_DRAFTS; ++k) {
+            if (qwen_model_prefill(q, toks.data(), n, 0, logits.data()) != 0) return 1;
+            std::vector<int> spec{argmax(logits.data(), V)};
+            int passes = 0, accepted = 0;
+            pos = n;
+            t0 = now();
+            while ((int)spec.size() < (int)plain.size()) {
+                int vt[SPEC_MAX_DRAFTS + 1] = {spec.back()};
+                const int nd = qwen_model_mtp_drafts(q, vt[0], pos, vt + 1, k);
+                if (nd < 1 || qwen_model_forward_verify(q, vt, nd + 1, pos) != 0) {
+                    fprintf(stderr, "speculative step at %d failed: %s\n", pos, qwen_model_last_error());
+                    return 1;
+                }
+                ++passes;
+                int keep = 1;
+                for (int i = 0; i <= nd; ++i) {
+                    const int y = argmax(qwen_model_verify_logits(q, i), V);
+                    spec.push_back(y);
+                    if (i == nd || y != vt[1 + i]) break;
+                    ++keep;
+                    ++accepted;
+                }
+                if (keep <= nd && qwen_model_rollback(q, keep) != 0) {
                     fprintf(stderr, "rollback: %s\n", qwen_model_last_error());
                     return 1;
                 }
-                pos += 1;
+                pos += keep;
             }
+            const double t_spec = now() - t0;
+            spec.resize(plain.size());
+            int first_diff = -1;
+            for (size_t i = 0; i < plain.size() && first_diff < 0; ++i)
+                if (plain[i] != spec[i]) first_diff = (int)i;
+            snprintf(what, sizeof(what), "speculative greedy (%d drafts per pass) = plain greedy over %zu tokens%s "
+                     "(first difference at %d)", k, plain.size(), first_diff < 0 ? "" : " -- DIFFERS", first_diff);
+            if (!spec_only) check(first_diff < 0, what);
+            printf("    plain %.1f tok/s; speculative %.1f tok/s (%d passes, %d drafts accepted, %.2f tokens per "
+                   "pass)\n", n_gen / t_plain, n_gen / t_spec, passes, accepted,
+                   (double)plain.size() / std::max(1, passes));
         }
-        const double t_spec = now() - t0;
-        spec.resize(plain.size());
-        int first_diff = -1;
-        for (size_t i = 0; i < plain.size() && first_diff < 0; ++i)
-            if (plain[i] != spec[i]) first_diff = (int)i;
-        snprintf(what, sizeof(what), "speculative greedy = plain greedy over %zu tokens%s (first difference at %d)",
-                 plain.size(), first_diff < 0 ? "" : " -- DIFFERS", first_diff);
-        if (!spec_only) check(first_diff < 0, what);
-        printf("    plain %.1f tok/s; speculative %.1f tok/s (%d passes, %d drafts accepted, %.2f tokens per pass)\n",
-               n_gen / t_plain, n_gen / t_spec, passes, accepted, (double)plain.size() / std::max(1, passes));
     }
     // 3. The library, with and without the head
     for (const char* text : prompts) {
@@ -150,12 +152,14 @@ int main(int argc, char** argv) {
             int32_t* t = inference_tokenize(m, text, &n);
             std::vector<int32_t> toks(t, t + n);
             inference_free_tokens(t, n);
-            std::vector<int32_t> out[2];
-            double secs[2];
-            int nout[2];
-            for (int with = 1; with >= 0; --with) {
+            // with = 0: no head; 1 .. SPEC_MAX_DRAFTS: the head with that many drafts per pass
+            std::vector<int32_t> out[SPEC_MAX_DRAFTS + 1];
+            double secs[SPEC_MAX_DRAFTS + 1];
+            int nout[SPEC_MAX_DRAFTS + 1];
+            for (int with = SPEC_MAX_DRAFTS; with >= 0; --with) {
                 if (with == 0 && inference_set_draft_model(m, nullptr) != 0) return 1;
-                if (with == 1 && inference_set_draft_model(m, argv[2]) != 0) return 1;
+                if (with == SPEC_MAX_DRAFTS && inference_set_draft_model(m, argv[2]) != 0) return 1;
+                if (with > 0 && inference_set_draft_tokens(m, with) != 0) return 1;
                 inference_reset(m);
                 inference_gen_options o = inference_gen_default_options();
                 o.sampler.temperature = temp;
@@ -171,10 +175,12 @@ int main(int argc, char** argv) {
                 secs[with] = now() - t0;
                 out[with].resize((size_t)nout[with]);
             }
-            snprintf(what, sizeof(what), "inference_generate_stream, temperature %.1f: %d tokens with the head = %d "
-                     "without%s (%.1f vs %.1f tok/s incl. the prompt)", temp, nout[1], nout[0],
-                     out[0] == out[1] ? "" : " -- DIFFER", nout[1] / secs[1], nout[0] / secs[0]);
-            check(out[0] == out[1] && nout[0] > 16, what);
+            for (int k = 1; k <= SPEC_MAX_DRAFTS; ++k) {
+                snprintf(what, sizeof(what), "inference_generate_stream, temperature %.1f, %d drafts per pass: %d "
+                         "tokens with the head = %d without%s (%.1f vs %.1f tok/s incl. the prompt)", temp, k, nout[k],
+                         nout[0], out[0] == out[k] ? "" : " -- DIFFER", nout[k] / secs[k], nout[0] / secs[0]);
+                check(out[0] == out[k] && nout[0] > 16, what);
+            }
         }
     }
     inference_kv_cache_free(m);

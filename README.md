@@ -9,7 +9,7 @@ products, WMMA prefill, a KV cache of shareable files and MTP speculative decodi
 |---|---|---|
 | Qwen3.5-4B (ROCmFP4) | 64 tok/s | 1,826 tok/s |
 | Qwen3.6-35B-A3B (ROCmFP4) | 65.7 tok/s | ~1,940 tok/s |
-| Qwen3.8-Flash-Next (177B, ROCmFP4_FAST) | 38 tok/s, ~50 with its MTP head | ~790 tok/s |
+| Qwen3.8-Flash-Next (177B, ROCmFP4_FAST) | 38 tok/s, 40–60 with its MTP head | ~790 tok/s |
 
 All development happens on **`main`**. The `q4_0_rocmfp4_q8_1` branch is an archived reference (an earlier
 forked-llama.cpp snapshot).
@@ -29,7 +29,7 @@ ROCm at `/opt/rocm` (hipcc); kernels are built for `--offload-arch=gfx1151`, wav
 make -j            # the library (build/libinference.so.1), qwen_demo, tests and demos
 ./build/qwen_demo /path/model.gguf "The capital of France is" 64 --temp 0
 ./build/qwen_demo /path/Qwen3.8-Flash-Next-...-00001-of-00003.gguf "Write a sort in C." 256 \
-    --draft /path/mtp-Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST.gguf
+    --draft /path/mtp-Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST.gguf [--drafts 1..3]
 make install PREFIX=/usr/local   # lib, headers, rocm-inference.pc
 ```
 

@@ -140,10 +140,12 @@ hipError_t gpu_ple_gate(const float* key, const float* value, const float* res, 
 }
 
 hipError_t gpu_ple_conv(const float* normed, const float* gated, float* res, float* state, const void* w, int m, int T,
-                        int K, int dil, float* state_mid, hipStream_t stream) {
+                        int K, int dil, const deltanet_mid_states* state_mid, hipStream_t stream) {
     if (!g_ple_conv) return hipErrorInvalidDeviceFunction;
     if (T <= 0 || K < 1 || dil < 1) return hipErrorInvalidValue;
-    void* args[] = {(void*)&normed, (void*)&gated, &res, &state, (void*)&w, &m, &T, &K, &dil, &state_mid};
+    deltanet_mid_states mid = {{nullptr, nullptr, nullptr}};
+    if (state_mid) mid = *state_mid;
+    void* args[] = {(void*)&normed, (void*)&gated, &res, &state, (void*)&w, &m, &T, &K, &dil, &mid};
     return hipModuleLaunchKernel(g_ple_conv, (unsigned)((m + 255) / 256), 1, 1, 256, 1, 1, 0, stream, args, nullptr);
 }
 

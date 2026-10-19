@@ -443,9 +443,13 @@ ple_gate(const float* key, const float* value, const float* res, const float* wk
 //           normed over the tokens, K taps dilated by dil (tap k reads (K - 1 - k) * dil positions back; earlier
 //           positions come from state [(K - 1) * dil][m], oldest first), then res += gated + SiLU(conv). The last
 //           (K - 1) * dil inputs become the new state. w: F16 [m][K].
+struct MidStates {  // deltanet_mid_states (deltanet.h): p[j], when set, receives the state after token j
+    float* p[3];
+};
+
 extern "C" __global__ void __launch_bounds__(256)
 ple_conv(const float* normed, const float* gated, float* res, float* state, const __half* w, int m, int T, int K,
-         int dil, float* state_mid) {
+         int dil, MidStates mid) {
     const int ch = blockIdx.x * 256 + threadIdx.x;
     if (ch >= m) return;
     const int H = (K - 1) * dil;
@@ -460,12 +464,14 @@ ple_conv(const float* normed, const float* gated, float* res, float* state, cons
         const size_t i = (size_t)t * m + ch;
         res[i] += gated[i] + acc / (1.0f + __expf(-acc));
     }
-    // state_mid (optional): the state after the first token, combined[1 + i]
-    if (state_mid)
-        for (int i = 0; i < H; ++i) {
-            const int src = 1 + i;
-            state_mid[(size_t)i * m + ch] = src < H ? state[(size_t)src * m + ch] : normed[(size_t)(src - H) * m + ch];
-        }
+    // mid: the states after the first tokens, the one after token j = combined[j + 1 + i]
+    for (int j = 0; j < 3 && j < T - 1; ++j)
+        if (mid.p[j])
+            for (int i = 0; i < H; ++i) {
+                const int src = j + 1 + i;
+                mid.p[j][(size_t)i * m + ch] =
+                    src < H ? state[(size_t)src * m + ch] : normed[(size_t)(src - H) * m + ch];
+            }
     // new state row i = combined[T + i], combined = state ++ normed; ascending i only reads rows > i of state
     for (int i = 0; i < H; ++i) {
         const int src = T + i;

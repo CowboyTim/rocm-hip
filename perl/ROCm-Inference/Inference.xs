@@ -145,6 +145,16 @@ set_draft_model(h, path)
   OUTPUT:
     RETVAL
 
+int
+set_draft_tokens(h, n)
+    SV* h
+    int n
+  CODE:
+    RETVAL = inference_set_draft_tokens(handle_ptr(aTHX_ h, 0), n);
+    if (RETVAL < 0) croak_last(aTHX_ "set_draft_tokens", RETVAL);
+  OUTPUT:
+    RETVAL
+
 SV*
 tokenize(h, text)
     SV* h

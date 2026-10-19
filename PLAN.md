@@ -1134,6 +1134,13 @@ for the symptoms above.
 >   **38.1 tok/s** (was 31.4; see "generation speed" and "kernel fusions" in Phase 21), prefill **~700 tok/s**
 >   (2,427 tokens; was 436, see "WMMA prefill speed") vs the reference's ~24 / ~345. 35B 65.3 tok/s, 4B 63.7.
 > - **Next:**
+>   0. **Generation speed with the draft head (2026-10-19, user: "do generation speed next, keep prefill in mind
+>      for later")** — **chained drafts DONE ✅**, see "MTP: chained drafts" in Phase 21: 1–3 drafts per pass
+>      (`inference_set_draft_tokens`, default 2, `qwen_demo --drafts`), output identical; chat replies 51 → 60
+>      (2) / 65 (3) tok/s, text prompts +5–12% over 1 draft. **Next:** an adaptive draft count (from recent
+>      acceptance: 3 pays on code / chat, 1–2 on prose / CJK); the verify pass's small-kernel launches (~490
+>      2-token matvecs per pass vs ~143 per plain token: port the T=1 fusions — low-rank HC mix, shared expert
+>      as a slot, grouped matrices — to T <= 4); prefill items below stay open.
 >   1. **MTP speculative decoding — DONE ✅** (see "MTP" in Phase 21): `inference_set_draft_model(model,
 >      "/data/mtp/mtp-Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST.gguf")`, `qwen_demo --draft`, Perl `set_draft_model`.
 >      Output identical to plain decoding (greedy and sampled); ~2 tokens per pass; 38 → ~50 tok/s (bare loop,
@@ -1945,6 +1952,33 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
     **Next:** tiles of 32 / 64 entries (or 2,048-token batches when the attention partials allow) so each
     expert is read once; measure the dense `matmul_wmma` against the roofline the same way (20480-row
     tiles at 1.4 ms); FP16 flash attention precision on long contexts (only a 30k needle test so far).
+
+- **MTP: chained drafts (2026-10-19).** Per pass, the head drafts k tokens (its argmax, then itself again on
+  that draft with its own output streams standing in for the model's; the chained rows are recomputed from the
+  real streams once decoded), the model verifies `[token, d1 .. dk]` in one pass of k + 1 tokens and keeps the
+  states after each of the first k (`deltanet_mid_states`: up to 3 rollback points in the DeltaNet conv /
+  delta-rule and PLE conv kernels; PLE history copies; ~72 MB each), the LM head gives every row's logits;
+  `qwen_model_rollback(keep)`. The library samples row by row and accepts drafts while they match; no pass
+  spans a KV-store snapshot boundary. API: `inference_set_draft_tokens` (1..3, default 2), Perl
+  `set_draft_tokens`, `qwen_demo --drafts`.
+  - Measured first: the chained second draft, given the first accepted, matches 0.91 (code) / 0.77 (Chinese) /
+    0.72 (prose).
+  - Results (tok/s): mtp_verify bare loop, code prompt: plain 34.1, 1 draft 51.3, 2 drafts 59.5, 3 drafts 64.8
+    (2.02 / 2.93 / 3.79 tokens per pass); reasoning 49.1 / 55.7 / 60.0. Library incl. prompt: 48 / 57 / 61 and
+    47 / 51 / 55. qwen_demo, lower acceptance: quicksort prompt plain 38.2, 43.0 / 48.0 / 48.6; Chinese 38.2,
+    37.4 / 40.6 / 38.6; "why is the sky blue" 37.6, 40.7 / 42.4 / 41.1.
+  - Tested: speculative = plain greedy with 1 / 2 / 3 drafts (mtp_verify, 2 prompts), the library with = without
+    the head at each draft count (greedy and temperature 0.8), store_verify with the head (reply identical
+    across processes with QMATVEC_NO_WMMA), Perl t/50-draft.t (1 and 3 drafts), all other tests.
+  - Tried, not kept: (a) a 2-token expert kernel reading the experts both tokens chose once (they share ~3.8 of
+    10): fewer bytes but 197 VGPRs vs 154, 0.5 ms per pass slower. (b) the head's LM head on the first 65,536
+    token ids only (draft 2.7 → 1.3 ms): fine on English, but on Chinese 121 → 152 passes; 131,072 keeps
+    acceptance for ~1 ms per pass, not adopted (other scripts of the 248k vocabulary). Greedy sampling is
+    already an argmax (~0.25 ms). Profile of a 2-token pass vs a plain token: the extra GPU time is the second
+    token's experts (~6.5 ms) and the head (~2.5 ms); the 2-token matvecs themselves read weights once (+6–8%).
+  - Note: `qwen_demo` without `--draft` prefills the prompt in one call, the library in two (a checkpoint
+    before its tail), so their greedy texts can differ (WMMA prefill vs per-token kernels on a router
+    near-tie); the library with and without the head is identical.
 
 - **WMMA prefill speed (2026-10-19).** Qwen3.8 prefill (2,427 tokens) 414 → ~700 tok/s (667–731 over runs; GPU
   5.0 → 3.27 s), 35B 1,193 → 1,807 tok/s, 4B unchanged (1,800–1,838; a regression on the way was caught, below).

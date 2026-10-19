@@ -16,7 +16,7 @@ BEGIN {  # at compile time: the constants below call into the XS
 
 # The C library (libinference.so) mapped one function per C call; plus the plain-Perl chat helpers below
 our @EXPORT_OK = qw(
-    load_model free_model kv_cache_init set_lm_head_q8 set_draft_model
+    load_model free_model kv_cache_init set_lm_head_q8 set_draft_model set_draft_tokens
     tokenize detokenize chat_template bos_id eos_id token_is_eog vocab_size
     n_ctx n_past reset prefill decode_token get_logits
     generate last_prompt_stats last_error
@@ -154,16 +154,22 @@ The store file names of the token list's full blocks, in order (e.g. to keep a s
 
 Load an MTP draft head for speculative decoding (Qwen3.8-Flash-Next: a nextn sidecar GGUF such as
 F<mtp-Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST.gguf>), or unload it. C<generate> then decodes each token
-together with the head's guess of the next one and keeps the guess when it is the token that is sampled
-anyway: the same tokens as without the head, for any sampling options, about twice as many per pass when the
-head guesses well. Dies when the file is not a head for this model. Before or after C<kv_cache_init>.
+together with the head's guesses of the next ones and keeps each guess that is the token sampled anyway: the
+same tokens as without the head, for any sampling options, up to three times as many per pass when the head
+guesses well. Dies when the file is not a head for this model. Before or after C<kv_cache_init>.
+
+=item set_draft_tokens($m, $n)
+
+Guesses per pass with a draft head, 1 to 3 (default 2). More pay off when the head guesses well (code, chat
+replies); dies outside that range.
 
 =item chat_render($m, \@messages, %vars) / chat($m, \@messages, \%options)
 
 Render a conversation with the model's chat template / render it and generate the reply.
 
 =item chat_template($m [, $name]), bos_id, eos_id, token_is_eog, vocab_size, n_ctx, n_past, reset,
-prefill, decode_token, get_logits, last_prompt_stats, set_lm_head_q8, set_draft_model, last_error
+prefill, decode_token, get_logits, last_prompt_stats, set_lm_head_q8, set_draft_model, set_draft_tokens,
+last_error
 
 As the C functions of the same name (C<inference_*>). C<get_logits> returns packed floats
 (C<unpack 'f*'>).

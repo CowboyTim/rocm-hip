@@ -574,14 +574,14 @@ struct QwenModel {
             return false;
         // conv1d + SiLU + q/k L2 norm + gates, then the delta rule + gated norm; alpha/beta become
         // g / sigmoid(beta) in place
-        // a verify pass (spec_mid) also keeps the state after its first token in rs_mid
-        const bool mid = spec_mid && T >= 2;
+        // a verify pass (spec_mid) also keeps the states after its first T - 1 tokens in rs_mid
+        const deltanet_mid_states mc = mids(&RecurrentState::conv, l, T), ms = mids(&RecurrentState::ssm, l, T);
         if (!check(deltanet_pre(s.qkv, rs.conv[l], L.ssm_conv1d, eng->ssm_d_conv, s.conv, NG, NV, s.alpha, s.beta,
-                                L.ssm_dt, L.ssm_a, s.alpha, s.beta, eps, T, mid ? rs_mid.conv[l] : nullptr, 0),
+                                L.ssm_dt, L.ssm_a, s.alpha, s.beta, eps, T, spec_mid ? &mc : nullptr, 0),
                    "deltanet_pre") ||
             !check(deltanet_rule(rs.ssm[l], s.conv, s.alpha, s.beta, s.z, L.ssm_norm, s.lin, NG, NV, eps, T,
-                                 eng->gdn_sigmoid_gate ? 1 : 0, q8_for(eng->ssm_d_inner, T),
-                                 mid ? rs_mid.ssm[l] : nullptr, 0),
+                                 eng->gdn_sigmoid_gate ? 1 : 0, q8_for(eng->ssm_d_inner, T), spec_mid ? &ms : nullptr,
+                                 0),
                    "deltanet_rule"))
             return false;
         mark(s.lin, eng->ssm_d_inner, T, q8_for(eng->ssm_d_inner, T));
@@ -807,21 +807,23 @@ struct QwenModel {
     // The LM head on the last of T tokens of s.xn (its row of the quantized buffer when s.q8 holds them), then
     // the sync that ends the forward pass; the logits are copied to logits_out if given
     int lm_head(int T, float* logits_out) {
-        // a verify pass also needs the logits of its first token: one launch on both rows where there is a
-        // few-token kernel for the head's type (each row as the single-row launch gives it), else one per row
+        // a verify pass needs the logits of all its tokens (rows of spec_logits; the last one also in s.logits):
+        // one launch on all rows where there is a few-token kernel for the head's type (each row as the
+        // single-row launch gives it), else one per row
         const QuantWeight& H = eng->output;
         const int E = eng->n_embd, V = eng->vocab_size;
-        if (spec_mid && T >= 2 && !head_q8 && q8_src == s.xn && qmatvec_q8_few_supported(H.type, E, 2)) {
-            qmatvec_q8 two = s.q8;
-            const size_t r = (size_t)(T - 2) * E;
-            two.q0 += r, two.qK += r, two.d0 += r / 32, two.dK += r / 256, two.bsK += r / 16, two.max_k = 2 * E;
+        if (spec_mid && T >= 2 && !head_q8 && q8_src == s.xn && qmatvec_q8_few_supported(H.type, E, T)) {
+            qmatvec_q8 rows = s.q8;
+            rows.max_k = T * E;
             const void* Ws[] = {H.data};
             const int Ns[] = {V};
-            float* ys[] = {spec_logits0};
+            float* ys[] = {spec_logits};
             prof.bytes[P_HEAD] += (double)H.row_bytes * H.N;
-            if (!check(qmatvec_launch_q8_multi_t(H.type, 1, Ws, Ns, ys, H.row_bytes, &two, E, 2, 0), "LM head (2 rows)") ||
-                !check(hipMemcpyAsync(s.logits, spec_logits0 + V, sizeof(float) * V, hipMemcpyDeviceToDevice, 0),
-                       "LM head (2 rows)") ||
+            if (!check(qmatvec_launch_q8_multi_t(H.type, 1, Ws, Ns, ys, H.row_bytes, &rows, E, T, 0),
+                       "LM head (rows)") ||
+                !check(hipMemcpyAsync(s.logits, spec_logits + (size_t)(T - 1) * V, sizeof(float) * V,
+                                      hipMemcpyDeviceToDevice, 0),
+                       "LM head (rows)") ||
                 !sync())
                 return -1;
             if (logits_out) memcpy(logits_out, s.logits, sizeof(float) * V);
@@ -829,7 +831,9 @@ struct QwenModel {
             prof.tokens += T;
             return 0;
         }
-        if (spec_mid && T >= 2 && lm_head_with(H, spec_logits0, T, nullptr, true, T - 2) != 0) return -1;
+        if (spec_mid)
+            for (int r = 0; r + 1 < T; ++r)
+                if (lm_head_with(H, spec_logits + (size_t)r * V, T, nullptr, true, r) != 0) return -1;
         return lm_head_with(H, s.logits, T, logits_out, true);
     }
 
@@ -943,7 +947,9 @@ struct QwenModel {
         // the last NG - 1 tokens of (history, batch); a verify pass also keeps them after its first token
         std::vector<int32_t> all(hist, hist + NG - 1);
         all.insert(all.end(), tokens, tokens + T);
-        if (spec_mid && T >= 2 && rs_mid.ple_hist) memcpy(rs_mid.ple_hist, all.data() + 1, sizeof(int32_t) * (NG - 1));
+        if (spec_mid)  // the history after token j of a verify pass
+            for (int j = 0; j + 1 < T && j < SPEC_MAX_DRAFTS; ++j)
+                if (rs_mid[j].ple_hist) memcpy(rs_mid[j].ple_hist, all.data() + 1 + j, sizeof(int32_t) * (NG - 1));
         memcpy(hist, all.data() + all.size() - (NG - 1), sizeof(int32_t) * (NG - 1));
         return true;
     }
@@ -951,13 +957,14 @@ struct QwenModel {
     // PLE on layer l: residual streams += gated value + SiLU(dilated conv of its grouped norm), from s.ple_emb
     bool ple(int l, const LayerWeights& L, int T) {
         const int E = eng->n_embd, HC = eng->n_hc;
+        const deltanet_mid_states mp = mids(&RecurrentState::ple, l, T);
         return produced(s.ple_emb, E, T) &&
                matvec_pair(L.ple_key, L.ple_value, s.ple_emb, s.ple_key, s.ple_val, T, P_LIN) &&
                check(gpu_ple_gate(s.ple_key, s.ple_val, s.res, L.ple_norm_key, L.ple_norm_query, L.ple_norm_conv,
                                   s.ple_gated, s.ple_normed, E, HC, T, (float)eng->eps, 0),
                      "ple_gate") &&
                check(gpu_ple_conv(s.ple_normed, s.ple_gated, s.res, rs.ple[l], L.ple_conv1d, HC * E, T, eng->ple_conv,
-                                  eng->ple_ngram, spec_mid && T >= 2 ? rs_mid.ple[l] : nullptr, 0),
+                                  eng->ple_ngram, spec_mid ? &mp : nullptr, 0),
                      "ple_conv");
     }
 
@@ -1032,9 +1039,19 @@ struct QwenModel {
     // sequence; mtp_draft adds the row of the next, not yet decoded token and returns the head's argmax.
     inference_kv_cache_t* kvc_cur = nullptr;     // the KV cache full_attention uses (the model's or the head's)
     ShmRegion mtp_mem, mtp_pad_mem;
-    float *mtp_h = nullptr, *mtp_carry = nullptr, *mtp_cat = nullptr, *mtp_logits = nullptr, *spec_logits0 = nullptr;
-    bool spec_mid = false;                      // a verify pass: keep the state after its first token in rs_mid
-    RecurrentState rs_mid;
+    float *mtp_h = nullptr, *mtp_carry = nullptr, *mtp_cat = nullptr, *mtp_logits = nullptr, *spec_logits = nullptr;
+    float* mtp_chain = nullptr;                 // the head's output streams, the input of its next chained draft
+    bool spec_mid = false;                      // a verify pass: keep the states after its first tokens in rs_mid
+    int spec_n = 0;                             // tokens of the last verify pass (0: none)
+    RecurrentState rs_mid[SPEC_MAX_DRAFTS];     // rs_mid[j]: the state after token j of a verify pass
+
+    // The rollback points of layer l's state array `a` for a pass of T tokens (none outside a verify pass)
+    deltanet_mid_states mids(std::vector<float*> RecurrentState::*a, int l, int T) const {
+        deltanet_mid_states m = {{nullptr, nullptr, nullptr}};
+        if (spec_mid)
+            for (int j = 0; j + 1 < T && j < SPEC_MAX_DRAFTS; ++j) m.p[j] = (rs_mid[j].*a)[l];
+        return m;
+    }
     int mtp_carry_pos = -1;                     // position of the streams in mtp_carry (-1: none)
     int mtp_pos = 0;                            // the head's KV cache holds rows 0 .. mtp_pos - 1
     int mtp_h_pos0 = -1, mtp_h_n = 0;           // mtp_h: positions mtp_h_pos0 - 1 .. mtp_h_pos0 + mtp_h_n - 1
@@ -1049,8 +1066,9 @@ struct QwenModel {
             hc_up_pad.erase(&mtp_ready->hc_head);
         }
         mtp_ready = nullptr;
-        mtp_h = mtp_carry = mtp_cat = mtp_logits = spec_logits0 = nullptr;
-        rs_mid.free();
+        mtp_h = mtp_carry = mtp_cat = mtp_logits = spec_logits = mtp_chain = nullptr;
+        for (RecurrentState& r : rs_mid) r.free();
+        spec_n = 0;
         mtp_carry_pos = -1;
         mtp_pos = 0;
         mtp_h_n = 0;
@@ -1063,10 +1081,11 @@ struct QwenModel {
         const int E = eng->n_embd, HCD = eng->n_hc * E;
         const size_t b = (size_t)s.B;
         const size_t sizes[] = {(b + 1) * HCD, (size_t)HCD, b * HCD * 2, (size_t)eng->vocab_size,
-                                2 * (size_t)eng->vocab_size};
-        float** const ptrs[] = {&mtp_h, &mtp_carry, &mtp_cat, &mtp_logits, &spec_logits0};
-        if (!mtp_mem.alloc("/dev/shm/qwen_mtp.bin", sizes, ptrs, 5, hipExtHostRegisterCoarseGrained) ||
-            (!rs_mid.mem.base && rs.mem.base && !rs_mid.alloc(eng)) ||
+                                (SPEC_MAX_DRAFTS + 1) * (size_t)eng->vocab_size, (size_t)HCD};
+        float** const ptrs[] = {&mtp_h, &mtp_carry, &mtp_cat, &mtp_logits, &spec_logits, &mtp_chain};
+        bool mids_ok = true;
+        for (RecurrentState& r : rs_mid) mids_ok = mids_ok && (r.mem.base || !rs.mem.base || r.alloc(eng));
+        if (!mtp_mem.alloc("/dev/shm/qwen_mtp.bin", sizes, ptrs, 6, hipExtHostRegisterCoarseGrained) || !mids_ok ||
             !pad_hc_up({&h->L.hc_attn, &h->L.hc_ffn, &h->hc_head}, mtp_pad_mem, "/dev/shm/qwen_mtp_hc_up_pad.bin")) {
             qwen_set_error("MTP head: buffers");
             mtp_free();
@@ -1142,51 +1161,76 @@ struct QwenModel {
         return ok;
     }
 
-    // Speculative verify pass: tokens[0] at pos and the draft tokens[1] at pos + 1 in one forward, the logits of
-    // both (logits0, logits1; [vocab] each), and the state after tokens[0] kept for rollback()
-    int forward_verify(const int* tokens, int pos, float* logits0, float* logits1) {
+    // Speculative verify pass: tokens[0] at pos (the next token) and n - 1 drafts after it in one forward; the
+    // logits after each (verify_logits) and the states after the first n - 1 kept for rollback()
+    int forward_verify(const int* tokens, int n, int pos) {
         if (!eng->mtp || !mtp_setup()) { qwen_set_error("no MTP head"); return -1; }
-        if (rs.mem.base && !rs_mid.mem.base) { qwen_set_error("no rollback state"); return -1; }
+        if (n < 2 || n > SPEC_MAX_DRAFTS + 1) { qwen_set_error("verify pass of %d tokens", n); return -1; }
         spec_mid = true;
-        const int r = forward(tokens, 2, pos, logits1);
+        const int r = forward(tokens, n, pos, nullptr);
         spec_mid = false;
         if (r != 0) return r;
-        if (logits0) memcpy(logits0, spec_logits0, sizeof(float) * (size_t)eng->vocab_size);
         spec_pos = pos;
+        spec_n = n;
         return 0;
     }
     int spec_pos = -1;
 
-    // After forward_verify at pos rejected its draft: back to the state after the token at pos (the KV cache needs
-    // nothing: the draft's row is overwritten by the next token)
-    int rollback() {
-        if (spec_pos < 0) { qwen_set_error("rollback without a verify pass"); return -1; }
-        if (rs.mem.base && !check(hipMemcpyAsync(rs.mem.base, rs_mid.mem.base, rs.mem.total, hipMemcpyDeviceToDevice, 0),
+    // The logits after token i of the last verify pass (until the next forward)
+    const float* verify_logits(int i) const {
+        if (spec_n < 2 || i < 0 || i >= spec_n) return nullptr;
+        return i == spec_n - 1 ? s.logits : spec_logits + (size_t)i * eng->vocab_size;
+    }
+
+    // After forward_verify at pos accepted only its first `keep` tokens (1 <= keep < n): back to the state after the
+    // token at pos + keep - 1 (the KV cache needs nothing: the later rows are overwritten by the next tokens)
+    int rollback(int keep) {
+        if (spec_pos < 0 || keep < 1 || keep >= spec_n) { qwen_set_error("rollback without a verify pass"); return -1; }
+        const RecurrentState& mid = rs_mid[keep - 1];
+        if (rs.mem.base && !check(hipMemcpyAsync(rs.mem.base, mid.mem.base, rs.mem.total, hipMemcpyDeviceToDevice, 0),
                                   "rollback"))
             return -1;
         const int HCD = eng->n_hc * eng->n_embd;
-        if (!check(hipMemcpyAsync(mtp_carry, mtp_h + HCD, sizeof(float) * HCD, hipMemcpyDeviceToDevice, 0), "rollback"))
+        if (!check(hipMemcpyAsync(mtp_carry, mtp_h + (size_t)keep * HCD, sizeof(float) * HCD, hipMemcpyDeviceToDevice,
+                                  0),
+                   "rollback"))
             return -1;
-        mtp_carry_pos = spec_pos;
-        mtp_pos = std::min(mtp_pos, spec_pos + 1);
-        mtp_h_n = 1;
+        mtp_carry_pos = spec_pos + keep - 1;
+        mtp_pos = std::min(mtp_pos, spec_pos + keep);
+        mtp_h_n = keep;
         spec_pos = -1;
+        spec_n = 0;
         return sync() ? 0 : -1;
     }
 
-    // The head's draft for position pos + 1, given the token at pos (not decoded yet): the argmax of its logits,
-    // or -1 when there is no draft (no head, or the streams of pos - 1 are not known)
-    int mtp_draft(int token, int pos) {
-        if (!eng->mtp || !mtp_setup() || mtp_carry_pos != pos - 1 || pos < 1) return -1;
+    // The head's drafts for positions pos + 1 .. pos + k, given the token at pos (not decoded yet): its argmax,
+    // then (k > 1) the head again on that draft with its own output streams standing in for the model's, and so
+    // on. Returns how many (0 when there is no draft: no head, or the streams of pos - 1 are not known).
+    int mtp_drafts(int token, int pos, int* drafts, int k) {
+        if (!eng->mtp || !mtp_setup() || mtp_carry_pos != pos - 1 || pos < 1 || k < 1) return 0;
+        k = std::min(k, SPEC_MAX_DRAFTS);
         // rows before pos the head has not seen (after a jump in the sequence) stay as they are: older rows only
         // make its drafts worse, never the output
         mtp_pos = pos;
-        if (!mtp_forward(&token, mtp_carry, 1, pos, true)) return -1;
+        const float* h = mtp_carry;
+        int tok = token, n = 0;
+        for (; n < k; ++n) {
+            if (pos + n + 2 > kv_cache_n_ctx(eng->kvc) || !mtp_forward(&tok, h, 1, pos + n, true)) break;
+            int best = 0;
+            for (int v = 1; v < eng->vocab_size; ++v)
+                if (mtp_logits[v] > mtp_logits[best]) best = v;
+            drafts[n] = best;
+            if (n + 1 < k &&
+                !check(hipMemcpyAsync(mtp_chain, s.res, sizeof(float) * eng->n_hc * eng->n_embd,
+                                      hipMemcpyDeviceToDevice, 0),
+                       "MTP chain"))
+                break;
+            h = mtp_chain;
+            tok = best;
+        }
+        // only row pos has the model's streams: the head recomputes the rows after it once they are decoded
         mtp_pos = pos + 1;
-        int best = 0;
-        for (int v = 1; v < eng->vocab_size; ++v)
-            if (mtp_logits[v] > mtp_logits[best]) best = v;
-        return best;
+        return n;
     }
 
     // The FFN of a hyper-connection block, from s.xn to s.proj: MoE, or a dense SwiGLU
@@ -1348,15 +1392,24 @@ void qwen_model_mtp_reset(qwen_model_t* model) {
 }
 
 int qwen_model_mtp_draft(qwen_model_t* model, int token, int pos) {
-    return model ? model->mtp_draft(token, pos) : -1;
+    int d = -1;
+    return model && model->mtp_drafts(token, pos, &d, 1) == 1 ? d : -1;
 }
 
-int qwen_model_forward_verify(qwen_model_t* model, const int tokens[2], int pos, float* logits0, float* logits1) {
-    return model && tokens ? model->forward_verify(tokens, pos, logits0, logits1) : -1;
+int qwen_model_mtp_drafts(qwen_model_t* model, int token, int pos, int* drafts, int k) {
+    return model && drafts ? model->mtp_drafts(token, pos, drafts, k) : 0;
 }
 
-int qwen_model_rollback(qwen_model_t* model) {
-    return model ? model->rollback() : -1;
+int qwen_model_forward_verify(qwen_model_t* model, const int* tokens, int n, int pos) {
+    return model && tokens ? model->forward_verify(tokens, n, pos) : -1;
+}
+
+const float* qwen_model_verify_logits(const qwen_model_t* model, int i) {
+    return model ? model->verify_logits(i) : nullptr;
+}
+
+int qwen_model_rollback(qwen_model_t* model, int keep) {
+    return model ? model->rollback(keep) : -1;
 }
 
 int qwen_model_max_batch(const qwen_model_t* model) {

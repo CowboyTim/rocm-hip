@@ -46,17 +46,23 @@ int qwen_model_prefill(qwen_model_t* model, const int* tokens, int n, int pos0, 
 int qwen_model_run_layers(qwen_model_t* model, const int* tokens, int n, const float* res_in, int l0, int l1);
 
 // MTP draft head (inference_set_draft_model; qwen4exp). While one is loaded, every forward pass also runs the head
-// on its tokens (its own KV cache follows the sequence). qwen_model_mtp_draft: the head's draft for position
-// pos + 1 given the token at pos, which is not decoded yet and directly follows the last forward pass (its
-// greedy choice; -1 if there is no draft). qwen_model_mtp_reset: forget the head's state (a new or unloaded head).
+// on its tokens (its own KV cache follows the sequence). qwen_model_mtp_drafts: the head's drafts for positions
+// pos + 1 .. pos + k (k <= SPEC_MAX_DRAFTS) given the token at pos, which is not decoded yet and directly follows
+// the last forward pass: its greedy choice, then the head again on that draft with its own output standing in
+// for the model's; returns how many (0: no draft). qwen_model_mtp_draft: one (-1: none). qwen_model_mtp_reset:
+// forget the head's state (a new or unloaded head).
+#define SPEC_MAX_DRAFTS 3
+int qwen_model_mtp_drafts(qwen_model_t* model, int token, int pos, int* drafts, int k);
 int qwen_model_mtp_draft(qwen_model_t* model, int token, int pos);
 void qwen_model_mtp_reset(qwen_model_t* model);
-// Speculative decoding: tokens[0] at pos (the next token) and tokens[1] at pos + 1 (the draft) in one forward
-// pass, the logits after each (logits0, logits1: [vocab] each, either may be NULL; qwen_model_logits() has
-// logits1), exactly what two qwen_model_forward calls give. If the draft is not the token that follows,
-// qwen_model_rollback returns the model to the state after tokens[0] (the next forward is then at pos + 1).
-int qwen_model_forward_verify(qwen_model_t* model, const int tokens[2], int pos, float* logits0, float* logits1);
-int qwen_model_rollback(qwen_model_t* model);
+// Speculative decoding: tokens[0] at pos (the next token) and n - 1 drafts after it (2 <= n <= SPEC_MAX_DRAFTS + 1)
+// in one forward pass. qwen_model_verify_logits(i): the logits after tokens[i] ([vocab], valid until the next
+// forward; i = n - 1 is qwen_model_logits()), exactly what n qwen_model_forward calls give. If only tokens[0 ..
+// keep - 1] are the sequence, qwen_model_rollback(keep) returns the model to the state after them (the next
+// forward is then at pos + keep).
+int qwen_model_forward_verify(qwen_model_t* model, const int* tokens, int n, int pos);
+const float* qwen_model_verify_logits(const qwen_model_t* model, int i);
+int qwen_model_rollback(qwen_model_t* model, int keep);
 
 // Tokens per prefill micro-batch (scratch rows)
 int qwen_model_max_batch(const qwen_model_t* model);
