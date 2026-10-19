@@ -1147,7 +1147,8 @@ for the symptoms above.
 >   3. MTP draft heads (the model card's MTP-Heads GGUF) for speculative decoding: +11–34% in the reference;
 >   4. the STRIX_LEAN release (Q5_K token_embd, Q5_1 PLE table, Q6_K head) if the user wants it.
 >   2. **WMMA prefill — DONE ✅ (2026-10-19)**, see "WMMA prefill speed" in Phase 21: Qwen3.8 prefill 414 →
->      ~700 tok/s (667–731), 35B 1,193 → 1,807, 4B unchanged (~1,800). Expert tiles of up to 64 entries; the
+>      ~700 tok/s (667–731), 35B 1,193 → 1,807, 4B unchanged (~1,800); then ~790 / ~1,940 (moe_group, router,
+>      128-row tiles). Expert tiles of up to 64 entries; the
 >      FAST staging loaded each 68-byte quad twice (2x for the FAST WMMA kernels); FAST blocks summed in int32.
 >      **Next for prefill** (Qwen3.8 GPU 3.27 s per 2,427 tokens): experts 1.02 s (~130 GB/s, latency-bound:
 >      deeper prefetch / a K-chunk of 256?), dense WMMA 0.72 s (~28 TOPS of ~55), the router's `matmul_f32`
@@ -1977,6 +1978,12 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
     bit-identical to `matvec_f32` (checked on ragged N / T / K): 1.81 → 1.38 ms per call. A transposed wave
     reduction (31 shuffles instead of 160) was slower (184 VGPRs); the limit is L2 traffic (~960 MB per call
     at 16 x 8 tiles): a 2D tile (32 rows x 32 tokens, both in LDS) would cut it ~3x. Prefill ~745–765 tok/s.
+  - **128-row WMMA tiles** (ROCmFP4 / FAST, `WM_ROWS`, 8 waves; K-quants stay at 64): each staged token chunk
+    serves twice the rows. Bit-identical; Qwen3.8 experts 1.02 → 0.94 s, prefill ~790 tok/s; 35B ~1,940; 4B
+    unchanged (~1,820).
+  - **Bigger prefill batches** (tried, not adopted): 2,048 tokens cost Qwen3.8 +1 GB of scratch (984 → 1,967 MB)
+    for +2% on the 2,427-token prompt; the whole prompt in one 2,560-token batch +7% (experts 1.02 → 0.75 s,
+    weights read once). A per-model option if memory allows; not the default.
 
 **Needed from the user:** nothing for now (the model is in `/models`, the head in `/data/mtp`). Constraints here: /dev/shm
 is a 63 GB tmpfs (38 GB free) and the disk has 48 GB free, so a ~50 GB model needs space freed or /dev/shm

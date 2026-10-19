@@ -73,8 +73,8 @@ Weights stay in their GGUF blocks; each type has a CPU decoder (tests) and GPU k
   single-token order (speculative verify passes, the 2-row LM head).
 - **Grouped** (`qmatvec_launch_q8_multi[_t]`): up to four matrices on the same input in one launch (DeltaNet
   qkv/z/alpha/beta, attention q/k/v, HC down + inject).
-- **Batched** (`matmul_q8_<type>`, tiles of 16 tokens) and **WMMA** (`matmul_wmma_<type>`, 64×64 int8 WMMA tiles
-  from 32 tokens): prefill.
+- **Batched** (`matmul_q8_<type>`, tiles of 16 tokens) and **WMMA** (`matmul_wmma_<type>`, int8 WMMA tiles of 64
+  tokens × 128 rows for ROCmFP4 / FAST, × 64 rows for K-quants, from 32 tokens): prefill.
 - **Experts** (`matvec_q8_id_*`, `matmul_q8_id_*`, `matmul_wmma_id_*`): expert-indexed; prefill batches of 8+
   tokens are grouped by expert (`moe_group`) into tiles (up to 64 entries on the WMMA path, so a 1,024-token
   batch reads each expert's weights about once; 16 otherwise); an id of -1 selects an extra matrix (the shared
@@ -197,7 +197,7 @@ layout (`tools/gen_qwen4exp_tiny.py`).
 | Model | Generation | Prefill |
 |---|---|---|
 | Qwen3.5-4B (ROCmFP4) | 64 tok/s | 1,826 tok/s (2,455 tokens) |
-| Qwen3.6-35B-A3B (ROCmFP4, BF16 head) | 65.7 tok/s (more with the int8 head option) | 1,807 tok/s (2,427 tokens) |
-| Qwen3.8-Flash-Next (ROCmFP4_FAST, 94 GB) | 38.1 tok/s; ~50 with the MTP head | ~700 tok/s (2,427 tokens; 667–731) |
+| Qwen3.6-35B-A3B (ROCmFP4, BF16 head) | 65.7 tok/s (more with the int8 head option) | ~1,940 tok/s (2,427 tokens) |
+| Qwen3.8-Flash-Next (ROCmFP4_FAST, 94 GB) | 38.1 tok/s; ~50 with the MTP head | ~790 tok/s (2,427 tokens) |
 
 Profiling: `QWEN_PROFILE=1` (per-section times), `rocprofv3 --kernel-trace` + `tools/prof_summary.py` (per kernel).

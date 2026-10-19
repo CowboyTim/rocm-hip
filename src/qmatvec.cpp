@@ -32,6 +32,8 @@ static hipFunction_t g_fn_q8t[QMV_MAX_TYPE];     // int8 kernels for 2..4 tokens
 static bool g_use_wmma = true;
 static int g_wmma_min_t = 32;  // smaller batches, and N < 64 (a 64-row tile mostly padding), stay on matmul_q8_<type>
 #define QMV_MM_TB 16      // tokens per tile, must match MM_TB in matvec_q.hip
+#define QMV_WM_ROWS 128       // weight rows per workgroup of matmul_wmma[_id]_<rocmfp4 type>, WM_ROWS in matvec_q.hip
+#define QMV_WM_THREADS 256    // its block size
 #define QMV_WMMA_ID_TB 64  // entries per expert tile of matmul_wmma_id_<type> (4 sub-tiles of 16)
 
 int qmatvec_init(const char *co_path) {
@@ -321,12 +323,14 @@ hipError_t qmatvec_launch_q8_batch(int type, const void *W, size_t row_bytes, co
     const int32_t *bs = q->bsK;
     long long rb = (long long)row_bytes;
     if (g_use_wmma && g_fn_wmma[type] && T >= g_wmma_min_t && N >= 64 && K % 128 == 0) {
-        // 64 x 64 tiles; the K-quant kernels also take the Q8_K group sums (for the mins)
+        // tiles of 64 tokens x 128 rows (ROCmFP4 types, 256 threads) or 64 rows (K-quants, 128 threads); the
+        // K-quant kernels also take the Q8_K group sums (for the mins)
         void *wargs_q80[] = {(void *)&W, &rb, (void *)&q8, (void *)&d8, (void *)&y, &ldy, &N, &K, &T};
         void *wargs_q8k[] = {(void *)&W, &rb, (void *)&q8, (void *)&d8, (void *)&bs, (void *)&y, &ldy, &N, &K, &T};
         void **wargs = kq ? wargs_q8k : wargs_q80;
-        return hipModuleLaunchKernel(g_fn_wmma[type], (unsigned)((N + 63) / 64), (unsigned)((T + 63) / 64), 1, 128, 1, 1,
-                                     0, stream, wargs, nullptr);
+        const int rows = kq ? 64 : QMV_WM_ROWS, threads = kq ? 128 : QMV_WM_THREADS;
+        return hipModuleLaunchKernel(g_fn_wmma[type], (unsigned)((N + rows - 1) / rows), (unsigned)((T + 63) / 64), 1,
+                                     (unsigned)threads, 1, 1, 0, stream, wargs, nullptr);
     }
     void *args[] = {(void *)&W, &rb, (void *)&q8, (void *)&d8, (void *)&bs, (void *)&y, &ldy, &N, &K, &T};
     const unsigned gx = (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);
@@ -410,8 +414,9 @@ hipError_t qmatvec_launch_q8_id_batch(int type, const void *W, size_t row_bytes,
     long long rb = (long long)row_bytes;
     void *args[] = {(void *)&W, &rb, (void *)&q8, (void *)&d8, (void *)&bs, (void *)&y, &N, &K, (void *)&n_tiles,
                     (void *)&tile_e, (void *)&tile_start, (void *)&tile_n, (void *)&in_rows, (void *)&out_rows};
-    if (wmma_id_ok(type, N, K))  // 64 expert rows x up to 64 entries per workgroup
-        return hipModuleLaunchKernel(g_fn_wmma_id[type], (unsigned)((N + 63) / 64), (unsigned)max_tiles, 1, 128, 1, 1, 0,
+    if (wmma_id_ok(type, N, K))  // 128 expert rows x up to 64 entries per workgroup
+        return hipModuleLaunchKernel(g_fn_wmma_id[type], (unsigned)((N + QMV_WM_ROWS - 1) / QMV_WM_ROWS),
+                                     (unsigned)max_tiles, 1, QMV_WM_THREADS, 1, 1, 0,
                                      stream, args, nullptr);
     const unsigned gx = (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);
     return hipModuleLaunchKernel(g_fn_mm_id[type], gx, (unsigned)max_tiles, 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream,
