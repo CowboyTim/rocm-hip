@@ -1154,17 +1154,28 @@ for the symptoms above.
 >      ~1.3 ms launch gaps (HIP graphs?). Each item is worth well under 5%.
 >   4. **Draft cost**: 2.7 ms per draft, mostly the head's 338 MB LM head. A vocabulary cut hurts other scripts
 >      (tried); options: a shortlist from the main model's top logits of the previous row, or an int8 copy.
->   5. **Prefill, later** (Qwen3.8 GPU ~3.0 s per 2,427 tokens): experts 0.94 s, dense WMMA 0.73 s (~28 of ~55
+>   5. **Kernels for the other quantizations** (measured 2026-10-20, ARCHITECTURE.md section 10):
+>      - **Q8_0 int8 + WMMA kernels**: Q8_0 has none (float path). Qwen3.5-0.8B (UD-Q8_K_XL: Q8_0 / F16
+>        matrices) prefills at 818 tok/s, below the 4B's 1,850; the 122B's dense matrices (attn_qkv, attn_q,
+>        ssm_out) are Q8_0 too. The simplest format for it: the weights are already int8, one F16 scale per 32
+>        (the same block as the Q8_0 activations, so a block's dot is exactly ggml's).
+>      - **WMMA expert kernel for K-quants** (`matmul_wmma_id` exists for ROCmFP4 / FAST only): Qwen3.5-122B-A10B
+>        (Q4_K / Q5_K experts) prefills at 91 tok/s (generation 22.6). The dense K-quant WMMA kernels
+>        (`matmul_wmma_q4_K` / `q5_K` / `q6_K`) give the arithmetic; add the expert-tiled variant.
+>      - F16 matrices (the 0.8B's ssm_out, attn_gate, some ffn) stay on the float path: check their share.
+>   6. **Prefill, later** (Qwen3.8 GPU ~3.0 s per 2,427 tokens): experts 0.94 s, dense WMMA 0.73 s (~28 of ~55
 >      TOPS), `hc_norm` 0.25 s, DeltaNet 0.22 s, router `matmul_f32` 0.20 s (a 2D 32 x 32 tile would cut its L2
 >      traffic ~3x), attention 0.17 s; a bigger prefill batch as an opt-in (+1 GB scratch for +2–7%).
->   6. **Accuracy checks**: greedy text vs `llama-completion` diverges at the 2nd token of the reference prompt
+>   7. **Accuracy checks**: greedy text vs `llama-completion` diverges at the 2nd token of the reference prompt
 >      (a near-tie): compare longer greedy runs on prompts without near-ties, or by teacher forcing; the FP16
 >      flash attention at long contexts (only a 30k needle test so far).
->   7. **Library / packaging**: `perl/ROCm-Inference/t/20-chat.t` with the user's Minijinja module (cargo is
+>   8. **Library / packaging**: `perl/ROCm-Inference/t/20-chat.t` with the user's Minijinja module (cargo is
 >      installed now); CPAN packaging; Phase 22b follow-ups (disk-tier timing, block size option, a Perl web
 >      service example); long-context decode attention.
->   8. **More models** (see the target list): EmbeddingGemma-300M, Nemotron-3, Gemma-4, Qwen3.5-122B; the
->      STRIX_LEAN Qwen3.8 release (Q5_K token_embd, Q5_1 PLE table, Q6_K head) if the user wants it.
+>   9. **More models** (see the target list): EmbeddingGemma-300M, Nemotron-3, Gemma-4; the older `qwen3`
+>      architecture (Qwen3-0.6B-Q8_0 does not load: no `post_attention_norm`); the STRIX_LEAN Qwen3.8 release
+>      (Q5_K token_embd, Q5_1 PLE table, Q6_K head) if the user wants it. Qwen3.5-122B-A10B and Qwen3.8-27B
+>      already run (see item 5 for the 122B's prefill).
 >   Profiling: `rocprofv3 --kernel-trace -d <dir> -o run -- <cmd>`, then `tools/prof_summary.py <dir>`;
 >   `QWEN_PROFILE=1` for per-section times.
 > - **Perl module (2026-10-18):** `Makefile.PL` finds libinference via ROCM_INFERENCE_PREFIX, pkg-config

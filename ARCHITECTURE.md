@@ -199,12 +199,22 @@ less well and 2 is best; the adaptive default is within ~1% of the best fixed co
 Models without room for their weights are verified on small random-weight replicas with the real tensor
 layout (`tools/gen_qwen4exp_tiny.py`).
 
-## 10. Performance (gfx1151, as of 2026-10-19)
+## 10. Performance (gfx1151, measured 2026-10-20)
 
-| Model | Generation | Prefill |
-|---|---|---|
-| Qwen3.5-4B (ROCmFP4) | 64 tok/s | 1,826 tok/s (2,455 tokens) |
-| Qwen3.6-35B-A3B (ROCmFP4, BF16 head) | 65.7 tok/s (more with the int8 head option) | ~1,940 tok/s (2,427 tokens) |
-| Qwen3.8-Flash-Next (ROCmFP4_FAST, 94 GB) | 38.1 tok/s; 42–62 with the MTP head | ~790 tok/s (2,427 tokens) |
+`qwen_demo`, greedy, second run (weights in the page cache); prefill of a 2,427-token prompt; generation of 256
+tokens after a short prompt. Runs vary by about ±5%.
+
+| Model | Quantization (size) | Generation | Prefill |
+|---|---|---|---|
+| Qwen3.5-0.8B | UD-Q8_K_XL (1.2 GB): Q8_0 / F16 matrices | 90 tok/s | 818 tok/s |
+| Qwen3.5-4B | ROCmFP4 (2.9 GB) | 59 tok/s | 1,850 tok/s |
+| Qwen3.6-35B-A3B | ROCmFP4 (20 GB), BF16 head | 62 tok/s (more with the int8 head option) | 2,005 tok/s |
+| Qwen3.8-27B (dense) | Q4_0_ROCMFP4_FAST (14.6 GB) | 13.8 tok/s (~200 GB/s of weights) | 296 tok/s |
+| Qwen3.5-122B-A10B | UD-Q4_K_XL (77 GB): Q4_K / Q5_K experts, Q8_0 dense | 22.6 tok/s | 91 tok/s |
+| Qwen3.8-Flash-Next (177B) | Q4_0_ROCmFP4_FAST (94 GB) | 34–38 tok/s; 48–55 with the MTP head | 797 tok/s |
+
+Qwen3-0.6B (the older `qwen3` architecture) does not load: only Qwen3.5 and later layouts are supported. The
+0.8B's and the 122B's prefill are low because Q8_0 has no int8 / WMMA kernels (float path) and the K-quant
+experts no WMMA expert kernel (PLAN.md, NEXT STEP).
 
 Profiling: `QWEN_PROFILE=1` (per-section times), `rocprofv3 --kernel-trace` + `tools/prof_summary.py` (per kernel).
