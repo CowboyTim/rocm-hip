@@ -1140,10 +1140,13 @@ for the symptoms above.
 >   1. **Adaptive draft count — DONE ✅** (see "MTP: adaptive draft count" in Phase 21): the default
 >      (`inference_set_draft_tokens(m, 0)`) picks 2 or 3 drafts per pass; within ~1% of the best fixed count on
 >      code / Chinese / prose / chat prompts, +9% over fixed 2 on chat.
->   2. **Verify-pass launches**: a pass launches ~490 small 2–4-token matvecs (4–25 µs each, ~6.6 ms) vs ~143 per
->      plain token, because the T = 1 fusions are missing for T <= 4: the low-rank HC mix (`matvec_q8_lr`), the
->      shared expert as an extra expert slot (`moe_core_one`, id -1), grouped matrices. The big 2-token matvecs
->      are fine (+6–8% over one token).
+>   2. **Verify-pass launches — done as far as it pays** (see "MTP: verify-pass cost" in Phase 21): pairs of
+>      matrices in one few-token launch (+1.2–2.5%); a pass is dominated by reading each verified token's experts,
+>      not by launches. **Next: read experts shared by the verified tokens once**: a tiny kernel splits the slots
+>      into experts used by several tokens and single ones, then separate launches (the one-token expert kernel
+>      for singles, a 2- / 3-token one for shared experts, each with its own register budget; one kernel with both
+>      paths lost to 197 vs 154 VGPRs). Two tokens share ~3.8 of 10 experts: ~19% of a 2-token pass's expert
+>      bytes, more at 3 tokens.
 >   3. **Plain decode efficiency** (helps both modes): 26.6 ms per token streams 3.97 GB = ~150 GB/s against
 >      ~215 achievable; ~925 launches per token, many tiny kernels (`hc_mix`, `hc_lowrank`, `swiglu`, ...) and
 >      launch gaps. Options: more fusion, HIP graphs for the fixed per-token sequence. The expert matvec
@@ -1978,6 +1981,16 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
   - Note: `qwen_demo` without `--draft` prefills the prompt in one call, the library in two (a checkpoint
     before its tail), so their greedy texts can differ (WMMA prefill vs per-token kernels on a router
     near-tie); the library with and without the head is identical.
+
+- **MTP: verify-pass cost (2026-10-20).** Per pass with 2 drafts (3 tokens, incl. the 2 drafts) vs a plain token:
+  1,509 vs 956 launches, ~46 vs ~25.5 ms GPU; dense few-token matvecs 13.9 ms (574 launches) vs 10.2, experts
+  18.4 vs 7.6 ms, router 2.2 vs 1.3. Wall: ~48 ms per pass = ~29 (one token) + ~5.4 (two drafts) + ~6.8 per extra
+  verified token, ~80% of which is that token's experts (bandwidth-bound). Done: `matvec_pair` at 2..4 tokens
+  through `matvec_multi` (one launch for a mixer's down + inject and the shared expert's gate + up): 1,509 → ~1,130
+  launches with the next item, +1.2–2.5% tok/s (mtp_verify, all 6 configurations, 2 runs each). Tried, not kept:
+  a 2..4-token fused low-rank kernel (`matvec_q8_lr` for T rows: every workgroup quantizes all T rows into LDS):
+  25 µs vs ~13 µs for hc_lowrank + the few-token matvec. Note: rocprofv3 kernel timestamps overlap inside a
+  pass under the profiler (gaps summing past the span); judge idle time by wall clock, not trace gaps.
 
 - **MTP: adaptive draft count (2026-10-19).** Default `inference_set_draft_tokens(m, 0)` (and `qwen_demo
   --drafts 0`, Perl `set_draft_tokens($m, 0)`): per pass, of 2 and 3 drafts the one with the most expected tokens

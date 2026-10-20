@@ -940,12 +940,12 @@ __device__ __forceinline__ float mv_q5_K(const uint8_t *wr, const int8_t *q8, co
     }
 
 // The same for NT tokens (2..4): each lane decodes its quads once and applies them to every token's Q8_0 input
-// (rows t * K / blocks t * K / 32 of q8 / d8), keeping each token's sums exactly as mv_rocmfp4_fast does, so the
+// (q8[t] / d8[t]), keeping each token's sums exactly as mv_rocmfp4_fast does, so the
 // results are those of NT single-token launches (speculative decoding's verify pass) while the weights are
 // read once.
 template <int NT>
-__device__ __forceinline__ void mv_rocmfp4_fast_t(const uint8_t *wr, const int8_t *q8, const float *d8, int K,
-                                                  int lane, int L, float out[NT]) {
+__device__ __forceinline__ void mv_rocmfp4_fast_tp(const uint8_t *wr, const int8_t *const q8[NT],
+                                                   const float *const d8[NT], int K, int lane, int L, float out[NT]) {
     const int nquad = K / 128, V = 32 / L;
     float a[NT][8];
 #pragma unroll
@@ -964,8 +964,7 @@ __device__ __forceinline__ void mv_rocmfp4_fast_t(const uint8_t *wr, const int8_
                 const int ib = 4 * p + j;
 #pragma unroll
                 for (int t = 0; t < NT; ++t)
-                    a[t][k] += rocmfp4_fast_q8_block(qs[j], e[j], q8 + (long long)t * K + ib * 32,
-                                                     d8[(long long)t * (K / 32) + ib]);
+                    a[t][k] += rocmfp4_fast_q8_block(qs[j], e[j], q8[t] + ib * 32, d8[t][ib]);
             }
         }
     }
@@ -979,6 +978,17 @@ __device__ __forceinline__ void mv_rocmfp4_fast_t(const uint8_t *wr, const int8_
                     if (k < d) a[t][k] += a[t][k + d];
         out[t] = a[t][0];
     }
+}
+
+// Token t's input at rows t * K of q8 / t * K / 32 of d8
+template <int NT>
+__device__ __forceinline__ void mv_rocmfp4_fast_t(const uint8_t *wr, const int8_t *q8, const float *d8, int K,
+                                                  int lane, int L, float out[NT]) {
+    const int8_t *q[NT];
+    const float *d[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) q[t] = q8 + (long long)t * K, d[t] = d8 + (long long)t * (K / 32);
+    mv_rocmfp4_fast_tp<NT>(wr, q, d, K, lane, L, out);
 }
 
 template <int NT>

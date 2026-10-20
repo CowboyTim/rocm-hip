@@ -495,6 +495,7 @@ struct QwenModel {
             return check(qmatvec_launch_q8_pair(A.type, A.data, A.N, ya, B.data, B.N, yb, A.row_bytes, &s.q8, A.K, 0),
                          "matvec pair");
         }
+        if (T >= 2 && T <= 4) return matvec_multi({{&A, ya}, {&B, yb}}, x, T, c);  // one launch where they match
         return matvec(A, x, ya, T, c) && matvec(B, x, yb, T, c);
     }
 
@@ -895,7 +896,9 @@ struct QwenModel {
         if (!(M.inject.data ? matvec_pair(M.down, M.inject, s.hxn, s.hlo, s.inj, T, c)
                             : matvec(M.down, s.hxn, s.hlo, T, c)))
             return false;
-        if (T == 1 && ql && qmatvec_q8_lr_supported(U.type, U.K)) {  // SiLU, padding and quantizing in the matvec
+        // SiLU, padding and quantizing in the matvec (one token; a 2..4-token version, every workgroup quantizing
+        // all rows, was slower than hc_lowrank + the few-token matvec)
+        if (T == 1 && ql && qmatvec_q8_lr_supported(U.type, U.K)) {
             prof.bytes[c] += (double)U.row_bytes * U.N;
             if (!check(qmatvec_launch_q8_lr(U.type, U.data, U.row_bytes, s.hlo, R, U.K, 1.0f / (float)HC, s.hgate,
                                             U.N, 0),
