@@ -83,10 +83,10 @@ Weights stay in their GGUF blocks; each type has a CPU decoder (tests) and GPU k
   (`inference_set_lm_head_q8`).
 
 Supported weight types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K–Q6_K, ROCmFP4 and ROCmFP4_FAST; int8
-kernels (single token, batched, WMMA where noted) for ROCmFP4, ROCmFP4_FAST and Q8_0 (WMMA, also for experts),
-Q4_K, Q5_K, Q6_K (WMMA for dense matrices only); F32, F16 and BF16 have dedicated 16-byte-load float kernels
-(F16 / BF16 round the activations to their type first, as ggml). The CPU decoders are bit-exact against the reference's on
-real tensors (`tests/dequant_verify`).
+kernels (single token, batched, WMMA where noted) for ROCmFP4, ROCmFP4_FAST and Q8_0 (WMMA, also for experts), Q4_K,
+Q5_K, Q6_K (WMMA for dense matrices only); F32, F16 and BF16 have dedicated 16-byte-load float kernels (F16 / BF16
+round the activations to their type first, as ggml). The CPU decoders are bit-exact against the reference's on real
+tensors (`tests/dequant_verify`).
 
 **ROCmFP4** (as the reference's `rocmfp4.h` defines it): `Q4_0_ROCMFP4` (type 100) blocks of 32 values in 18
 bytes, `qs[16] e[2]`: values 0..15 are the low nibbles (scale `e[0]`), 16..31 the high nibbles (`e[1]`); 4.5
