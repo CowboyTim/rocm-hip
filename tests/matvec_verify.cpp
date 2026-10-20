@@ -52,9 +52,9 @@ struct ShmBuf {
 };
 
 // x quantized and decoded back as ggml's CPU reference does for this weight type's vec_dot_type:
-// Q8_0 (x86 SIMD quantize_row_q8_0) for ROCmFP4, Q8_K (quantize_row_q8_K_ref) for K-quants
+// Q8_0 (x86 SIMD quantize_row_q8_0) for ROCmFP4 and Q8_0, Q8_K (quantize_row_q8_K_ref) for K-quants
 static void q8_roundtrip(int wtype, const float *x, float *out, int K) {
-    if (wtype != QT_Q4_0_ROCMFP4 && wtype != QT_Q4_0_ROCMFP4_FAST) {
+    if (wtype == QT_Q4_K || wtype == QT_Q5_K || wtype == QT_Q6_K) {
         for (int b = 0; b < K; b += 256) {
             float amax = 0.0f, mx = 0.0f;
             for (int j = 0; j < 256; ++j)
@@ -112,8 +112,10 @@ static bool run_one(gguf_model_t *g, int64_t idx, ShmBuf &xb, ShmBuf &yb) {
     }
 
     std::vector<float> row((size_t)K);
-    // The BF16 kernel rounds x to BF16 first, as ggml (BF16's vec_dot_type is BF16)
+    // The BF16 / F16 kernels round x to BF16 / F16 first, as ggml (the type is its own vec_dot_type)
     std::vector<float> xr(x, x + K);
+    if (type == QT_F16)
+        for (int k = 0; k < K; ++k) xr[k] = __half2float(__float2half(xr[k]));
     if (type == QT_BF16)
         for (int k = 0; k < K; ++k) {
             uint32_t u;

@@ -1155,14 +1155,13 @@ for the symptoms above.
 >   4. **Draft cost**: 2.7 ms per draft, mostly the head's 338 MB LM head. A vocabulary cut hurts other scripts
 >      (tried); options: a shortlist from the main model's top logits of the previous row, or an int8 copy.
 >   5. **Kernels for the other quantizations** (measured 2026-10-20, ARCHITECTURE.md section 10):
->      - **Q8_0 int8 + WMMA kernels**: Q8_0 has none (float path). Qwen3.5-0.8B (UD-Q8_K_XL: Q8_0 / F16
->        matrices) prefills at 818 tok/s, below the 4B's 1,850; the 122B's dense matrices (attn_qkv, attn_q,
->        ssm_out) are Q8_0 too. The simplest format for it: the weights are already int8, one F16 scale per 32
->        (the same block as the Q8_0 activations, so a block's dot is exactly ggml's).
+>      - **Q8_0 int8 + WMMA kernels — DONE ✅ (2026-10-20)**, and **F16 16-byte-load kernels — DONE ✅** (see
+>        "Q8_0 and F16 kernels" in Phase 21): Qwen3.5-0.8B prefill 818 → 4,110 tok/s, generation 90 → 120;
+>        Qwen3.5-122B prefill 91 → 367 (generation unchanged, 22.6: its decode is the experts). Left: the
+>        0.8B's small F16 matrices (1,024-2,048 rows) at ~55-76 GB/s are latency-bound (more rows per wave?).
 >      - **WMMA expert kernel for K-quants** (`matmul_wmma_id` exists for ROCmFP4 / FAST only): Qwen3.5-122B-A10B
 >        (Q4_K / Q5_K experts) prefills at 91 tok/s (generation 22.6). The dense K-quant WMMA kernels
 >        (`matmul_wmma_q4_K` / `q5_K` / `q6_K`) give the arithmetic; add the expert-tiled variant.
->      - F16 matrices (the 0.8B's ssm_out, attn_gate, some ffn) stay on the float path: check their share.
 >   6. **Prefill, later** (Qwen3.8 GPU ~3.0 s per 2,427 tokens): experts 0.94 s, dense WMMA 0.73 s (~28 of ~55
 >      TOPS), `hc_norm` 0.25 s, DeltaNet 0.22 s, router `matmul_f32` 0.20 s (a 2D 32 x 32 tile would cut its L2
 >      traffic ~3x), attention 0.17 s; a bigger prefill batch as an opt-in (+1 GB scratch for +2–7%).
@@ -1993,6 +1992,22 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
   - Note: `qwen_demo` without `--draft` prefills the prompt in one call, the library in two (a checkpoint
     before its tail), so their greedy texts can differ (WMMA prefill vs per-token kernels on a router
     near-tie); the library with and without the head is identical.
+
+- **Q8_0 and F16 kernels (2026-10-20).** Q8_0 int8: lanes take 68-byte block pairs (4-aligned; K % 64),
+  each block `(d_w * d_x) * (float)sumi` as ggml's vec_dot_q8_0_q8_0, fewer than 32 lanes per row only when each
+  has at most one pair (so the single-token sums are the batched kernel's); `matvec_q8_q8_0` (+ expert-indexed),
+  `matmul_q8_q8_0` (batched, exact vs single), WMMA dense and expert (`WStageQ8_0`: no decode, one scale per
+  block: the int32 block path). `reads_q8k(type)` in qmatvec.cpp: only K-quants read the Q8_K activations (the
+  old "not ROCmFP4" checks would have sent Q8_0 there). matvec_verify: int8 path ~1e-8 of the CPU reference,
+  batched (11 tokens) identical, WMMA (70) ~3e-8. Result: 0.8B prefill 818 → ~1,200, 122B 91 → 367.
+  - The 0.8B's decode was then 74% `matvec_f16`: the generic one-value-per-lane kernel (2-byte loads, 56-142
+    GB/s; the tied F16 LM head 508 MB at 3.6 ms). Now dedicated `matvec_f16` / `matmul_f_f16` (8 weights per
+    16-byte load, `f16_dot8` with explicit FMAs shared by both, so prefill = decode bit for bit: checked on 5
+    shapes incl. an unaligned K) and the activations rounded to F16 first as ggml (F16 is its own
+    vec_dot_type; matvec_verify's reference does the same, ~1e-8). LM head 3.6 → 2.2 ms (234 GB/s). 0.8B:
+    prefill → 4,110 tok/s, generation 90 → 120 tok/s; text coherent; generate_verify passes on it.
+  - Note: matvec_verify cannot read split GGUFs (the first shard has no tensor data: a GPU fault in the old
+    float kernel, not a kernel bug); test split models end to end.
 
 - **Plain decode budget (2026-10-20, Qwen3.8, 25.3 ms GPU / ~26.6 ms wall per token, 956 launches):** dense
   int8 matvecs 8.75 ms (~205 GB/s), experts 7.6 ms (1.38 GB at ~187 GB/s: gate/up 102.7 µs, down 50.8 µs per

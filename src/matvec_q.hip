@@ -439,7 +439,88 @@ __device__ void matmul_float_impl(const uint8_t *W, long long row_bytes, const f
         matmul_float_impl<B>(W, row_bytes, x, y, N, K, T);                                                 \
     }
 
-MATVEC_KERNEL(f16, BlkF16)
+// F16: dedicated kernels instead of the generic one-value-per-lane loop (2-byte loads: 56-142 GB/s on the
+// Qwen3.5-0.8B's F16 matrices and tied LM head). Each lane takes chunks of 8 weights (16 bytes) and 8 activations:
+// chunks lane, lane + 32, ... of the row, f16_dot8 each, then the wave reduction. The activations are rounded to
+// F16 first (round to nearest even): F16's vec_dot_type in ggml is F16, so the reference converts them, and the
+// products are then exact in FP32. matmul_f_f16 sums every token exactly so (same chunks per lane, same
+// f16_dot8, same reduction): prefill gives decoding's bits. The vector path needs 16-byte-aligned rows and
+// activations and K % 8 == 0 (uniform per launch); otherwise one value per lane, in the same order for both.
+__device__ __forceinline__ float f16_lo(uint32_t w) { return __half2float(__ushort_as_half((uint16_t)(w & 0xFFFF))); }
+__device__ __forceinline__ float f16_hi(uint32_t w) { return __half2float(__ushort_as_half((uint16_t)(w >> 16))); }
+__device__ __forceinline__ float f16_round(float v) { return __half2float(__float2half(v)); }
+
+__device__ __forceinline__ float f16_dot8(const uint4 w, const float4 xa, const float4 xb) {  // explicit FMAs
+    float s = f16_lo(w.x) * f16_round(xa.x);
+    s = fmaf(f16_hi(w.x), f16_round(xa.y), s);
+    s = fmaf(f16_lo(w.y), f16_round(xa.z), s);
+    s = fmaf(f16_hi(w.y), f16_round(xa.w), s);
+    s = fmaf(f16_lo(w.z), f16_round(xb.x), s);
+    s = fmaf(f16_hi(w.z), f16_round(xb.y), s);
+    s = fmaf(f16_lo(w.w), f16_round(xb.z), s);
+    return fmaf(f16_hi(w.w), f16_round(xb.w), s);
+}
+
+__device__ __forceinline__ bool f16_vec_ok(const uint8_t *W, long long row_bytes, const float *x, int K) {
+    return (((uintptr_t)W | (uintptr_t)row_bytes | (uintptr_t)x) & 15) == 0 && K % 8 == 0;
+}
+
+extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
+matvec_f16(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= N) return;
+    const uint8_t *wr = W + (long long)row * row_bytes;
+    float acc = 0.0f;
+    if (f16_vec_ok(W, row_bytes, x, K)) {
+        const int n8 = K / 8;
+        for (int i = lane; i < n8; i += 32) {
+            const uint4 u = ((const uint4 *)wr)[i];
+            acc += f16_dot8(u, ((const float4 *)x)[2 * i], ((const float4 *)x)[2 * i + 1]);
+        }
+    } else {
+        for (int k = lane; k < K; k += 32) acc += fp16(wr + 2 * k) * f16_round(x[k]);
+    }
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
+    if (lane == 0) y[row] = acc;
+}
+
+extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
+matmul_f_f16(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K, int T) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= N) return;
+    const int t0 = blockIdx.y * MMF_TT, nt = min(MMF_TT, T - t0);
+    const uint8_t *wr = W + (long long)row * row_bytes;
+    float acc[MMF_TT];
+#pragma unroll
+    for (int j = 0; j < MMF_TT; ++j) acc[j] = 0.0f;
+    if (f16_vec_ok(W, row_bytes, x, K)) {
+        const int n8 = K / 8;
+        for (int i = lane; i < n8; i += 32) {
+            const uint4 u = ((const uint4 *)wr)[i];
+#pragma unroll
+            for (int j = 0; j < MMF_TT; ++j)
+                if (j < nt) {
+                    const float4 *xt = (const float4 *)(x + (size_t)(t0 + j) * K);
+                    acc[j] += f16_dot8(u, xt[2 * i], xt[2 * i + 1]);
+                }
+        }
+    } else {
+        for (int k = lane; k < K; k += 32) {
+            const float w = fp16(wr + 2 * k);
+#pragma unroll
+            for (int j = 0; j < MMF_TT; ++j)
+                if (j < nt) acc[j] += w * f16_round(x[(size_t)(t0 + j) * K + k]);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < MMF_TT; ++j) {
+        float a = acc[j];
+        for (int off = 16; off > 0; off >>= 1) a += __shfl_xor(a, off, 32);
+        if (lane == 0 && j < nt) y[(size_t)(t0 + j) * N + row] = a;
+    }
+}
 // BF16: a dedicated kernel instead of the generic one-value-per-lane loop (that read 2 bytes per load and
 // reached ~140 GB/s on the 35B's 1 GB BF16 LM head). Each lane loads 8 weights (16 bytes) and 8 activations at
 // a time. The activations are rounded to BF16 (round to nearest even) first: BF16's vec_dot_type in ggml is
@@ -816,6 +897,49 @@ __device__ __forceinline__ float mv_rocmfp4_fast(const uint8_t *wr, const int8_t
     return a[0];
 }
 
+// Q8_0 (34-byte blocks: an F16 scale, then 32 int8 values) x Q8_0: a lane takes a pair of blocks (68 bytes,
+// 4-aligned; the host requires K % 64 == 0). Of the pair's 17 dwords, block 0's scale is the low half of w[0] and
+// its values bytes 2..33 (v_alignbyte), block 1's scale the high half of w[8] and its values w[9..16]. As ggml's
+// vec_dot_q8_0_q8_0: (d_w * d_x) * (float)sumi per block.
+__device__ __forceinline__ void q8_0_pair(const uint8_t *b, uint32_t qs[2][8], float e[2]) {
+    uint32_t w[17];
+#pragma unroll
+    for (int k = 0; k < 17; ++k) w[k] = ld32(b + 4 * k);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        qs[0][k] = __builtin_amdgcn_alignbyte(w[k + 1], w[k], 2);
+        qs[1][k] = w[9 + k];
+    }
+    e[0] = __half2float(__ushort_as_half((uint16_t)(w[0] & 0xFFFF)));
+    e[1] = __half2float(__ushort_as_half((uint16_t)(w[8] >> 16)));
+}
+
+__device__ __forceinline__ float q8_0_q8_block(const uint32_t qs[8], float e, const int8_t *q8, float dx) {
+    const int *x8 = (const int *)q8;
+    int s = 0;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) s = dot4((int)qs[k], x8[k], s);
+    return e * dx * (float)s;
+}
+
+// L lanes per row: lane l sums pairs l, l + L, ...; the host only takes L < 32 when every lane has at most one
+// pair, so the sums are those of the batched kernel's 32 lanes (plus exact zeros)
+__device__ __forceinline__ float mv_q8_0(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
+                                         int lane, int L) {
+    (void)bs;
+    const int npairs = K / 64;
+    float acc = 0.0f;
+    for (int p = lane; p < npairs; p += L) {
+        uint32_t qs[2][8];
+        float e[2];
+        q8_0_pair(wr + (long long)p * 68, qs, e);
+        const int ib = 2 * p;
+        acc += q8_0_q8_block(qs[0], e[0], q8 + ib * 32, d8[ib]);
+        acc += q8_0_q8_block(qs[1], e[1], q8 + (ib + 1) * 32, d8[ib + 1]);
+    }
+    return acc;
+}
+
 // K-quant x Q8_K kernels: the wave works on 4 blocks at a time, 8 lanes per 256-value block, each lane on 16
 // consecutive quant bytes (16 or 32 values that share one scale group per nibble half). One lane per block
 // sub-group also adds that block's min / offset correction through the Q8_K group sums. (A first version
@@ -1112,6 +1236,7 @@ matvec_q8_lr_q4_0_rocmfp4_fast(const uint8_t *W, long long row_bytes, const floa
 
 MATVEC_Q8_KERNELS(q4_0_rocmfp4, mv_rocmfp4, 0)
 MATVEC_Q8_KERNELS(q4_0_rocmfp4_fast, mv_rocmfp4_fast, 0)
+MATVEC_Q8_KERNELS(q8_0, mv_q8_0, 0)
 MATVEC_Q8_KERNELS(q4_K, mv_q4_K, 1)
 MATVEC_Q8_KERNELS(q5_K, mv_q5_K, 1)
 MATVEC_Q8_KERNELS(q6_K, mv_q6_K, 1)
@@ -1343,6 +1468,29 @@ __device__ __forceinline__ void mmb_rocmfp4_fast(MM_BARGS, const RM &rm) {
     MM_STORE
 }
 
+template <class RM>
+__device__ __forceinline__ void mmb_q8_0(MM_BARGS, const RM &rm) {
+    (void)bs;
+    MM_ROW_SETUP
+    const int npairs = K / 64, nb = K / 32;
+    for (int p = lane; p < npairs; p += 32) {
+        uint32_t qs[2][8];
+        float e[2];
+        q8_0_pair(wr + (long long)p * 68, qs, e);
+        // Not unrolled: see matmul_q8_q4_0_rocmfp4
+        for (int j = 0; j < MM_TB; ++j) {
+            if (j >= nt) break;
+            const long long t = rm.in(j);
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int ib = 2 * p + h;
+                acc[j] += q8_0_q8_block(qs[h], e[h], q8 + t * K + ib * 32, d8[t * nb + ib]);
+            }
+        }
+    }
+    MM_STORE
+}
+
 __device__ __forceinline__ void mmb_q4_K_lin(MM_BARGS, const RowsLinear &rm) { mmb_kquant<false>(W, row_bytes, q8, d8, bs, y, ldy, N, K, rm); }
 __device__ __forceinline__ void mmb_q5_K_lin(MM_BARGS, const RowsLinear &rm) { mmb_kquant<true>(W, row_bytes, q8, d8, bs, y, ldy, N, K, rm); }
 __device__ __forceinline__ void mmb_q4_K_exp(MM_BARGS, const RowsExpert &rm) { mmb_kquant<false>(W, row_bytes, q8, d8, bs, y, ldy, N, K, rm); }
@@ -1373,6 +1521,7 @@ __device__ __forceinline__ void mmb_q5_K_exp(MM_BARGS, const RowsExpert &rm) { m
 
 MATMUL_Q8_KERNELS(q4_0_rocmfp4, mmb_rocmfp4<RowsLinear>, mmb_rocmfp4<RowsExpert>)
 MATMUL_Q8_KERNELS(q4_0_rocmfp4_fast, mmb_rocmfp4_fast<RowsLinear>, mmb_rocmfp4_fast<RowsExpert>)
+MATMUL_Q8_KERNELS(q8_0, mmb_q8_0<RowsLinear>, mmb_q8_0<RowsExpert>)
 MATMUL_Q8_KERNELS(q6_K, mmb_q6_K<RowsLinear>, mmb_q6_K<RowsExpert>)
 MATMUL_Q8_KERNELS(q4_K, mmb_q4_K_lin, mmb_q4_K_exp)
 MATMUL_Q8_KERNELS(q5_K, mmb_q5_K_lin, mmb_q5_K_exp)
@@ -1464,6 +1613,36 @@ struct WStageFast {  // Q4_0_ROCMFP4_FAST: 17-byte blocks, one UE4M3 scale per 3
             const float e = ue4m3_half((uint8_t)(__builtin_amdgcn_alignbyte(w[d + 5], w[d + 4], s) & 0xFF));
             erow[(wb + j) * 2] = e;
             erow[(wb + j) * 2 + 1] = e;
+        }
+    }
+};
+
+struct WStageQ8_0 {  // Q8_0: 34-byte blocks, an F16 scale per 32 int8 values (no decode: copied as they are).
+                     // A thread's two blocks (wb = 0 or 2) are the 68-byte, 4-aligned pair at byte 34 wb of the
+                     // chunk's 4 blocks.
+    static constexpr bool BLOCK_SCALE = true;
+    uint32_t qs[2][8];
+    float e[2];
+    __device__ void load(const uint8_t *W, long long rb, int row, bool ok, int b0, int wb) {
+        if (ok) {
+            q8_0_pair(W + (long long)row * rb + (long long)(b0 + wb) * 34, qs, e);  // b0 % 4 == 0
+        } else {
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                e[j] = 0.0f;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) qs[j][k] = 0;
+            }
+        }
+    }
+    __device__ void store(int8_t *srow, float *erow, int wb) const {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            uint32_t *dst = (uint32_t *)(srow + (wb + j) * 32);
+#pragma unroll
+            for (int k = 0; k < 8; ++k) dst[k] = qs[j][k];
+            erow[(wb + j) * 2] = e[j];
+            erow[(wb + j) * 2 + 1] = e[j];
         }
     }
 };
@@ -1667,6 +1846,7 @@ __device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, 
 
 MATMUL_WMMA_Q80_KERNELS(q4_0_rocmfp4, WStageFP4)
 MATMUL_WMMA_Q80_KERNELS(q4_0_rocmfp4_fast, WStageFast)
+MATMUL_WMMA_Q80_KERNELS(q8_0, WStageQ8_0)
 
 // ---------------------------------------------------------------- WMMA for K-quants x Q8_K (Phase 20 W3)
 //

@@ -36,6 +36,10 @@ static int g_wmma_min_t = 32;  // smaller batches, and N < 64 (a 64-row tile mos
 #define QMV_WM_THREADS 256    // its block size
 #define QMV_WMMA_ID_TB 64  // entries per expert tile of matmul_wmma_id_<type> (4 sub-tiles of 16)
 
+// The int8 kernels of the K-quants read the activations' Q8_K form; ROCmFP4, ROCmFP4_FAST and Q8_0 weights the
+// Q8_0 form
+static bool reads_q8k(int type) { return type == QT_Q4_K || type == QT_Q5_K || type == QT_Q6_K; }
+
 int qmatvec_init(const char *co_path) {
     if (g_mod) return 0;
     if (kernel_module_load(&g_mod, co_path) != hipSuccess) {
@@ -203,7 +207,7 @@ void qmatvec_q8_bind(qmatvec_q8 *q, void *mem, int max_k) {
 // whole 256-value Q8_K blocks: e.g. the qwen4exp experts' K = 640. K-quants read Q8_K and need K % 256 == 0.
 int qmatvec_q8_supported(int type, int K) {
     if (type < 0 || type >= QMV_MAX_TYPE || !g_fn_q8[type] || !g_quant) return 0;
-    if (type == QT_Q4_0_ROCMFP4) return K % 64 == 0;        // lanes take 36-byte block pairs
+    if (type == QT_Q4_0_ROCMFP4 || type == QT_Q8_0) return K % 64 == 0;  // lanes take block pairs (36 / 68 bytes)
     if (type == QT_Q4_0_ROCMFP4_FAST) return K % 128 == 0;  // lanes take 68-byte block quads
     return K % 256 == 0;
 }
@@ -220,8 +224,10 @@ hipError_t qmatvec_quantize(const float *x, int K, const qmatvec_q8 *q, hipStrea
 // lanes per 256-value block) that still gives every lane a task, so short rows (K = 512 MoE experts) don't
 // leave most of the wave idle. See Q8_ROW_INDEX in matvec_q.hip.
 static int q8_lanes_per_row(int type, int K, long long rows) {
-    const bool kq = type != QT_Q4_0_ROCMFP4 && type != QT_Q4_0_ROCMFP4_FAST;
-    const int tasks = type == QT_Q4_0_ROCMFP4 ? K / 64 : type == QT_Q4_0_ROCMFP4_FAST ? K / 128 : K / 256 * 8;
+    const bool kq = reads_q8k(type);
+    const int tasks = type == QT_Q4_0_ROCMFP4 || type == QT_Q8_0 ? K / 64
+                      : type == QT_Q4_0_ROCMFP4_FAST          ? K / 128
+                                                              : K / 256 * 8;
     int L = 32;
     while (L > (kq ? 8 : 4) && L / 2 >= tasks) L /= 2;
     // ROCmFP4_FAST: at most 8 lanes per row, i.e. several 68-byte quads per lane. Measured on the 35B: z
@@ -285,7 +291,7 @@ hipError_t qmatvec_launch_q8_multi_t(int type, int n, const void *const *Ws, con
         if (i < n) Nt += Ns[i];
         bound[i] = Nt;
     }
-    const bool kq = type != QT_Q4_0_ROCMFP4 && type != QT_Q4_0_ROCMFP4_FAST;  // K-quants read Q8_K, ROCmFP4 Q8_0
+    const bool kq = reads_q8k(type);  // K-quants read Q8_K, ROCmFP4 / Q8_0 weights Q8_0
     const int8_t *q8 = kq ? q->qK : q->q0;
     const float *d8 = kq ? q->dK : q->d0;
     const int32_t *bs = q->bsK;
@@ -317,7 +323,7 @@ hipError_t qmatvec_launch_q8_batch(int type, const void *W, size_t row_bytes, co
         float *ys[] = {y};
         return qmatvec_launch_q8_multi_t(type, 1, Ws, Ns, ys, row_bytes, q, K, T, stream);
     }
-    const bool kq = type != QT_Q4_0_ROCMFP4 && type != QT_Q4_0_ROCMFP4_FAST;
+    const bool kq = reads_q8k(type);
     const int8_t *q8 = kq ? q->qK : q->q0;
     const float *d8 = kq ? q->dK : q->d0;
     const int32_t *bs = q->bsK;
@@ -359,7 +365,7 @@ hipError_t qmatvec_launch_q8_id_x(int type, const void *W, const void *W2, const
     if (T <= 0 || n_used <= 0 || row_bytes != qt_row_size(type, K) || row_bytes % 4 != 0 || ((uintptr_t)W & 3) != 0 ||
         in_rows * K > q->max_k)
         return hipErrorInvalidValue;
-    const bool kq = type != QT_Q4_0_ROCMFP4 && type != QT_Q4_0_ROCMFP4_FAST;
+    const bool kq = reads_q8k(type);
     const int8_t *q8 = kq ? q->qK : q->q0;
     const float *d8 = kq ? q->dK : q->d0;
     const int32_t *bs = q->bsK;
@@ -407,7 +413,7 @@ hipError_t qmatvec_launch_q8_id_batch(int type, const void *W, size_t row_bytes,
     if (max_tiles <= 0 || tile <= 0 || tile > qmatvec_id_batch_tile(type, N, K) || row_bytes != qt_row_size(type, K) ||
         row_bytes % 4 != 0 || ((uintptr_t)W & 3) != 0)
         return hipErrorInvalidValue;
-    const bool kq = type != QT_Q4_0_ROCMFP4 && type != QT_Q4_0_ROCMFP4_FAST;
+    const bool kq = reads_q8k(type);
     const int8_t *q8 = kq ? q->qK : q->q0;
     const float *d8 = kq ? q->dK : q->d0;
     const int32_t *bs = q->bsK;
