@@ -1958,9 +1958,10 @@ struct WStageK {
     }
 };
 
-template <int KT>
+// RM: the tile's tokens (WRowsLinear, or WRowsExpert: one expert's entries, MoE prefill), as in wmma_q80
+template <int KT, class RM>
 __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8,
-                                         const int *bs, float *y, long long ldy, int N, int K, int T) {
+                                         const int *bs, float *y, long long ldy, int N, int K, const RM &rm) {
     __shared__ __attribute__((aligned(16))) int8_t sw[WM_TILE][WM_KC + 16];
     __shared__ __attribute__((aligned(16))) int8_t sx[WM_TILE][WM_KC + 16];
     __shared__ int sgsc[WM_TILE][8];   // integer scale of each local 16-value group
@@ -1969,8 +1970,9 @@ __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, 
     __shared__ float sdx[WM_TILE];     // token Q8_K scale of this super-block
     __shared__ int sbs[WM_TILE][4];    // Q4/5: token group sums per sub-block (bs[2 sub] + bs[2 sub + 1])
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
-    const int r0 = blockIdx.x * WM_TILE, t0 = blockIdx.y * WM_TILE;
+    const int r0 = blockIdx.x * WM_TILE, T = rm.nt;
     const int nbk = K / 256;
+    const uint8_t *Wb = rm.base(W, row_bytes, N);
 
     float acc[4][8];
 #pragma unroll
@@ -1983,11 +1985,11 @@ __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, 
     const int wr_row = tid >> 1, part = tid & 1;
     const int xt0 = tid >> 1, xc = (tid & 1) * 64;
     auto load_chunk = [&](int k0) {
-        ws.load(W, row_bytes, r0 + wr_row, r0 + wr_row < N, k0, part);
-        const int t = t0 + xt0;
+        ws.load(Wb, row_bytes, r0 + wr_row, r0 + wr_row < N, k0, part);
+        const long long t = xt0 < T ? rm.in(xt0) : 0;
 #pragma unroll
         for (int c = 0; c < 4; ++c)
-            gx[c] = t < T ? *(const uint4 *)(q8 + (long long)t * K + k0 + xc + 16 * c) : uint4{0, 0, 0, 0};
+            gx[c] = xt0 < T ? *(const uint4 *)(q8 + t * K + k0 + xc + 16 * c) : uint4{0, 0, 0, 0};
     };
     auto store_chunk = [&](int k0) {
         ws.store(&sw[wr_row][0], &sgsc[wr_row][0], &sdw[wr_row], &sdm[wr_row], &smin[wr_row][0], k0, part);
@@ -1995,16 +1997,15 @@ __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, 
         for (int c = 0; c < 4; ++c) *(uint4 *)&sx[xt0][xc + 16 * c] = gx[c];
         const int bk = k0 / 256, hh = (k0 / 128) & 1;
         if (tid < 64) {
-            const int t = t0 + tid;
-            sdx[tid] = t < T ? d8[(long long)t * nbk + bk] : 0.0f;
+            sdx[tid] = tid < T ? d8[rm.in(tid) * nbk + bk] : 0.0f;
         } else if (KT != 6) {
-            const int tt = tid - 64, t = t0 + tt;
+            const int tt = tid - 64;
+            const long long t = tt < T ? rm.in(tt) : 0;
 #pragma unroll
             for (int s2 = 0; s2 < 4; ++s2) {
                 const int sub = 4 * hh + s2;
-                sbs[tt][s2] = t < T ? bs[(long long)t * (K / 16) + bk * 16 + 2 * sub] +
-                                          bs[(long long)t * (K / 16) + bk * 16 + 2 * sub + 1]
-                                    : 0;
+                sbs[tt][s2] = tt < T ? bs[t * (K / 16) + bk * 16 + 2 * sub] + bs[t * (K / 16) + bk * 16 + 2 * sub + 1]
+                                     : 0;
             }
         }
     };
@@ -2070,12 +2071,13 @@ __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, 
 
 #pragma unroll
     for (int n = 0; n < 4; ++n) {
-        const int t = t0 + 16 * n + i;
-        if (t >= T) continue;
+        const int tt = 16 * n + i;
+        if (tt >= T) continue;
+        const long long orow = rm.out(tt);
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             const int row = r0 + 16 * w + 2 * r + hi;
-            if (row < N) y[(long long)t * ldy + row] = acc[n][r];
+            if (row < N) y[orow * ldy + row] = acc[n][r];
         }
     }
 }
@@ -2083,19 +2085,49 @@ __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, 
 extern "C" __global__ void __launch_bounds__(128)
 matmul_wmma_q4_K(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, const int *bs, float *y,
                  long long ldy, int N, int K, int T) {
-    wmma_q8k<4>(W, row_bytes, q8, d8, bs, y, ldy, N, K, T);
+    const int t0 = blockIdx.y * WM_TILE;
+    wmma_q8k<4>(W, row_bytes, q8, d8, bs, y, ldy, N, K, WRowsLinear{t0, min(WM_TILE, T - t0)});
+}
+
+// MoE prefill: grid (ceil(N / 64), max_tiles) over moe_group's expert tiles of up to 64 entries (QMV_WMMA_ID_TB),
+// block 128; same arguments as matmul_q8_id_<type>
+extern "C" __global__ void __launch_bounds__(128) matmul_wmma_id_q4_K(MMID_ARGS) {
+    const int k = blockIdx.y;
+    if (k >= *n_tiles) return;
+    wmma_q8k<4>(W, row_bytes, q8, d8, bs, y, N, N, K,
+                   WRowsExpert{tile_e[k], tile_n[k], in_rows + tile_start[k], out_rows + tile_start[k]});
 }
 
 extern "C" __global__ void __launch_bounds__(128)
 matmul_wmma_q5_K(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, const int *bs, float *y,
                  long long ldy, int N, int K, int T) {
-    wmma_q8k<5>(W, row_bytes, q8, d8, bs, y, ldy, N, K, T);
+    const int t0 = blockIdx.y * WM_TILE;
+    wmma_q8k<5>(W, row_bytes, q8, d8, bs, y, ldy, N, K, WRowsLinear{t0, min(WM_TILE, T - t0)});
+}
+
+// MoE prefill: grid (ceil(N / 64), max_tiles) over moe_group's expert tiles of up to 64 entries (QMV_WMMA_ID_TB),
+// block 128; same arguments as matmul_q8_id_<type>
+extern "C" __global__ void __launch_bounds__(128) matmul_wmma_id_q5_K(MMID_ARGS) {
+    const int k = blockIdx.y;
+    if (k >= *n_tiles) return;
+    wmma_q8k<5>(W, row_bytes, q8, d8, bs, y, N, N, K,
+                   WRowsExpert{tile_e[k], tile_n[k], in_rows + tile_start[k], out_rows + tile_start[k]});
 }
 
 extern "C" __global__ void __launch_bounds__(128)
 matmul_wmma_q6_K(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, const int *bs, float *y,
                  long long ldy, int N, int K, int T) {
-    wmma_q8k<6>(W, row_bytes, q8, d8, bs, y, ldy, N, K, T);
+    const int t0 = blockIdx.y * WM_TILE;
+    wmma_q8k<6>(W, row_bytes, q8, d8, bs, y, ldy, N, K, WRowsLinear{t0, min(WM_TILE, T - t0)});
+}
+
+// MoE prefill: grid (ceil(N / 64), max_tiles) over moe_group's expert tiles of up to 64 entries (QMV_WMMA_ID_TB),
+// block 128; same arguments as matmul_q8_id_<type>
+extern "C" __global__ void __launch_bounds__(128) matmul_wmma_id_q6_K(MMID_ARGS) {
+    const int k = blockIdx.y;
+    if (k >= *n_tiles) return;
+    wmma_q8k<6>(W, row_bytes, q8, d8, bs, y, N, N, K,
+                   WRowsExpert{tile_e[k], tile_n[k], in_rows + tile_start[k], out_rows + tile_start[k]});
 }
 
 // ================================================================ int8 copy of a float LM head (opt-in)

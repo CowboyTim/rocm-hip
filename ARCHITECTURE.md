@@ -84,7 +84,7 @@ Weights stay in their GGUF blocks; each type has a CPU decoder (tests) and GPU k
 
 Supported weight types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K–Q6_K, ROCmFP4 and ROCmFP4_FAST; int8
 kernels (single token, batched, WMMA where noted) for ROCmFP4, ROCmFP4_FAST and Q8_0 (WMMA, also for experts), Q4_K,
-Q5_K, Q6_K (WMMA for dense matrices only); F32, F16 and BF16 have dedicated 16-byte-load float kernels (F16 / BF16
+Q5_K, Q6_K (WMMA dense and expert); F32, F16 and BF16 have dedicated 16-byte-load float kernels (F16 / BF16
 round the activations to their type first, as ggml). The CPU decoders are bit-exact against the reference's on real
 tensors (`tests/dequant_verify`).
 
@@ -212,10 +212,9 @@ tokens after a short prompt. Runs vary by about ±5%.
 | Qwen3.5-4B | ROCmFP4 (2.9 GB) | 59 tok/s | 1,850 tok/s |
 | Qwen3.6-35B-A3B | ROCmFP4 (20 GB), BF16 head | 62 tok/s (more with the int8 head option) | 2,005 tok/s |
 | Qwen3.8-27B (dense) | Q4_0_ROCMFP4_FAST (14.6 GB) | 13.8 tok/s (~200 GB/s of weights) | 296 tok/s |
-| Qwen3.5-122B-A10B | UD-Q4_K_XL (77 GB): Q4_K / Q5_K experts, Q8_0 dense | 22.6 tok/s | 367 tok/s |
+| Qwen3.5-122B-A10B | UD-Q4_K_XL (77 GB): Q4_K / Q5_K experts, Q8_0 dense | 22.6 tok/s | 533 tok/s |
 | Qwen3.8-Flash-Next (177B) | Q4_0_ROCmFP4_FAST (94 GB) | 34–38 tok/s; 48–55 with the MTP head | 797 tok/s |
 
-Qwen3-0.6B (the older `qwen3` architecture) does not load: only Qwen3.5 and later layouts are supported. The
-122B's prefill is held back by its K-quant experts, which have no WMMA expert kernel yet (PLAN.md, NEXT STEP).
+Qwen3-0.6B (the older `qwen3` architecture) does not load: only Qwen3.5 and later layouts are supported.
 
 Profiling: `QWEN_PROFILE=1` (per-section times), `rocprofv3 --kernel-trace` + `tools/prof_summary.py` (per kernel).

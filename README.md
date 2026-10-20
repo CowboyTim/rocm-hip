@@ -11,7 +11,7 @@ products, WMMA prefill, a KV cache of shareable files and MTP speculative decodi
 | Qwen3.5-4B (ROCmFP4) | 59 tok/s | 1,850 tok/s |
 | Qwen3.6-35B-A3B (ROCmFP4) | 62 tok/s | 2,005 tok/s |
 | Qwen3.8-27B (ROCmFP4_FAST, dense) | 13.8 tok/s | 296 tok/s |
-| Qwen3.5-122B-A10B (UD-Q4_K_XL) | 22.6 tok/s | 367 tok/s |
+| Qwen3.5-122B-A10B (UD-Q4_K_XL) | 22.6 tok/s | 533 tok/s |
 | Qwen3.8-Flash-Next (177B, ROCmFP4_FAST) | 34–38 tok/s, 48–55 with its MTP head | 797 tok/s |
 
 (gfx1151, 2026-10-20; prefill of 2,427 tokens; details in ARCHITECTURE.md section 10.)

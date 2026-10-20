@@ -420,10 +420,11 @@ hipError_t qmatvec_launch_q8_id_batch(int type, const void *W, size_t row_bytes,
     long long rb = (long long)row_bytes;
     void *args[] = {(void *)&W, &rb, (void *)&q8, (void *)&d8, (void *)&bs, (void *)&y, &N, &K, (void *)&n_tiles,
                     (void *)&tile_e, (void *)&tile_start, (void *)&tile_n, (void *)&in_rows, (void *)&out_rows};
-    if (wmma_id_ok(type, N, K))  // 128 expert rows x up to 64 entries per workgroup
-        return hipModuleLaunchKernel(g_fn_wmma_id[type], (unsigned)((N + QMV_WM_ROWS - 1) / QMV_WM_ROWS),
-                                     (unsigned)max_tiles, 1, QMV_WM_THREADS, 1, 1, 0,
-                                     stream, args, nullptr);
+    if (wmma_id_ok(type, N, K)) {  // up to 64 entries x 128 expert rows (ROCmFP4 / Q8_0) or 64 (K-quants)
+        const int rows = kq ? 64 : QMV_WM_ROWS, threads = kq ? 128 : QMV_WM_THREADS;
+        return hipModuleLaunchKernel(g_fn_wmma_id[type], (unsigned)((N + rows - 1) / rows), (unsigned)max_tiles, 1,
+                                     (unsigned)threads, 1, 1, 0, stream, args, nullptr);
+    }
     const unsigned gx = (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);
     return hipModuleLaunchKernel(g_fn_mm_id[type], gx, (unsigned)max_tiles, 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream,
                                  args, nullptr);

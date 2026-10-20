@@ -1159,9 +1159,12 @@ for the symptoms above.
 >        "Q8_0 and F16 kernels" in Phase 21): Qwen3.5-0.8B prefill 818 → 4,110 tok/s, generation 90 → 120;
 >        Qwen3.5-122B prefill 91 → 367 (generation unchanged, 22.6: its decode is the experts). Left: the
 >        0.8B's small F16 matrices (1,024-2,048 rows) at ~55-76 GB/s are latency-bound (more rows per wave?).
->      - **WMMA expert kernel for K-quants** (`matmul_wmma_id` exists for ROCmFP4 / FAST only): Qwen3.5-122B-A10B
->        (Q4_K / Q5_K experts) prefills at 91 tok/s (generation 22.6). The dense K-quant WMMA kernels
->        (`matmul_wmma_q4_K` / `q5_K` / `q6_K`) give the arithmetic; add the expert-tiled variant.
+>      - **WMMA expert kernel for K-quants — DONE ✅ (2026-10-20)**: `matmul_wmma_id_q4_K` / `q5_K` / `q6_K`;
+>        Qwen3.5-122B-A10B prefill 367 → 533 tok/s (91 before the Q8_0 kernels). Left: the K-quant WMMA kernel
+>        always computes 4 sub-tiles of 16 entries (no compile-time sub-tile count as in `wmma_q80`): short tiles
+>        (the last, partial batch; few entries per expert) waste WMMAs: below ~300 tokens per batch it is slower
+>        than the dot4 expert kernel (5.4 vs 4.1 ms at 300 tokens, 6.2 vs 11.6 at 1,024). Its LDS would have to
+>        move into a shared struct first (as `WmmaSmem`).
 >   6. **Prefill, later** (Qwen3.8 GPU ~3.0 s per 2,427 tokens): experts 0.94 s, dense WMMA 0.73 s (~28 of ~55
 >      TOPS), `hc_norm` 0.25 s, DeltaNet 0.22 s, router `matmul_f32` 0.20 s (a 2D 32 x 32 tile would cut its L2
 >      traffic ~3x), attention 0.17 s; a bigger prefill batch as an opt-in (+1 GB scratch for +2–7%).
@@ -1992,6 +1995,14 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
   - Note: `qwen_demo` without `--draft` prefills the prompt in one call, the library in two (a checkpoint
     before its tail), so their greedy texts can differ (WMMA prefill vs per-token kernels on a router
     near-tie); the library with and without the head is identical.
+
+- **K-quant WMMA expert kernels (2026-10-20).** `wmma_q8k` takes a row map like `wmma_q80` (`WRowsLinear` /
+  `WRowsExpert`: activation rows, the per-token Q8_K scales and group sums for the mins, output rows by entry);
+  `matmul_wmma_id_q{4,5,6}_K` over 64-entry expert tiles (64 rows x 4 waves, as the dense K-quant kernel); the
+  launcher picks 64 rows / 128 threads for K-quants. On the 122B's real expert tensors (blk.0 gate / up Q4_K,
+  down Q5_K; scratch harness, 1,024 tokens, top-8 of 256): ~2e-7 relative to the per-token kernel; gate 11.6 →
+  6.2 ms, down 15.9 → 6.9 ms; the dot4 path (QMATVEC_NO_WMMA) stays bit-exact. 122B prefill 367 → 533 tok/s,
+  text coherent. 4B (dense Q5_K / Q6_K WMMA through the same template): tests pass, prefill unchanged.
 
 - **Q8_0 and F16 kernels (2026-10-20).** Q8_0 int8: lanes take 68-byte block pairs (4-aligned; K % 64),
   each block `(d_w * d_x) * (float)sumi` as ggml's vec_dot_q8_0_q8_0, fewer than 32 lanes per row only when each
