@@ -115,7 +115,7 @@ swiglu(const float* g, const float* u, float* out, int n, Q8Out o) {
 // ---------------------------------------------------------------- mixture of experts (qwen35moe)
 //
 // moe_router   grid T, block 256: per token, softmax over the n_expert router logits, the n_used largest
-//              probabilities in descending order (a bitonic sort; ties go to the lowest expert index),
+//              probabilities in descending order (wave argmax rounds; ties go to the lowest expert index),
 //              their weights renormalized by max(sum, 6.103515625e-5), and the shared-expert gate
 //              sigmoid(x . w_shexp). As llama.cpp's build_moe_ffn (softmax gating, norm_w, no scale).
 // moe_combine  grid (ceil(n / 256), T), block 256: out = sum_j w_j * down_j (in slot order, as ggml's add chain)
@@ -145,11 +145,46 @@ __device__ float block256_max(float v, float* part) {
     return m;
 }
 
+// moe_router's selection on one wave: lane l holds experts l + 32 j, j < PL, of p[n_expert] in registers; each
+// of the n_used rounds takes the largest remaining (the lowest index among equals) into ids / sel_w
+template <int PL>
+__device__ __forceinline__ void router_select(const float* p, int n_expert, int n_used, int* ids, float* sel_w,
+                                              int lane) {
+    float v[PL];
+#pragma unroll
+    for (int j = 0; j < PL; ++j) {
+        const int e = lane + 32 * j;
+        v[j] = e < n_expert ? p[e] : -1.0f;
+    }
+    for (int r = 0; r < n_used; ++r) {
+        float bv = v[0];
+        int bj = 0;
+#pragma unroll
+        for (int j = 1; j < PL; ++j)
+            if (v[j] > bv) bv = v[j], bj = j;  // strict: the lowest index among equals
+        int be = lane + 32 * bj;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_xor(bv, off, 32);
+            const int oe = __shfl_xor(be, off, 32);
+            if (ov > bv || (ov == bv && oe < be)) bv = ov, be = oe;
+        }
+        if (lane == 0) {
+            ids[r] = be;
+            sel_w[r] = bv;
+        }
+        if ((be & 31) == lane) {
+#pragma unroll
+            for (int j = 0; j < PL; ++j)
+                if (j == be / 32) v[j] = -INFINITY;
+        }
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(256)
 moe_router(const float* logits, const float* x, const float* w_shexp, int* ids, float* wts, float* sg, int n_expert,
            int n_used, int n, int ids_stride) {
     __shared__ __attribute__((aligned(16))) float p[MOE_MAX_EXPERTS];
-    __shared__ int pidx[MOE_MAX_EXPERTS];
     __shared__ float part[8];
     __shared__ float sel_w[64];
     const int t = blockIdx.x, tid = threadIdx.x;
@@ -183,34 +218,12 @@ moe_router(const float* logits, const float* x, const float* w_shexp, int* ids, 
     for (int e = tid; e < n_expert; e += 256) p[e] *= inv;
     __syncthreads();
 
-    // Top n_used: a bitonic sort of (p, index) pairs, descending by p, ties to the lower index (the order of the
-    // ranks the reference's argsort gives), padded to a power of two with p = -1; the first n_used entries are
-    // the selection in order. 45 compare-exchange steps for 512 experts: a scan of all experts per expert
-    // (their ranks) took ~15 us.
-    int n2 = 1;
-    while (n2 < n_expert) n2 <<= 1;
-    for (int e = tid; e < n2; e += 256) {
-        if (e >= n_expert) p[e] = -1.0f;
-        pidx[e] = e;
-    }
-    __syncthreads();
-    for (int k = 2; k <= n2; k <<= 1)
-        for (int j = k >> 1; j > 0; j >>= 1) {
-            for (int i = tid; i < n2 / 2; i += 256) {
-                const int a = 2 * j * (i / j) + (i % j), b = a + j;
-                const float pa = p[a], pb = p[b];
-                const int ia = pidx[a], ib = pidx[b];
-                const bool b_first = pb > pa || (pb == pa && ib < ia);  // b sorts before a
-                if ((a & k) == 0 ? b_first : !b_first) {
-                    p[a] = pb, p[b] = pa;
-                    pidx[a] = ib, pidx[b] = ia;
-                }
-            }
-            __syncthreads();
-        }
-    if (tid < n_used) {
-        ids[t * ids_stride + tid] = pidx[tid];
-        sel_w[tid] = p[tid];
+    // Top n_used: n_used rounds of a wave argmax over the remaining experts, ties to the lower index (the order of
+    // the ranks the reference's argsort gives). Lane l holds experts l + 32 j in registers (static indices); the
+    // winner's lane drops it. A bitonic sort of all 512 (45 steps, each with a workgroup barrier) took ~10 us.
+    if (tid < 32) {
+        if (n_expert <= 512) router_select<16>(p, n_expert, n_used, ids + t * ids_stride, sel_w, tid);
+        else router_select<MOE_MAX_EXPERTS / 32>(p, n_expert, n_used, ids + t * ids_stride, sel_w, tid);
     }
     if (tid == n_used && ids_stride > n_used) ids[t * ids_stride + n_used] = -1;  // the shared expert's slot
     __syncthreads();

@@ -1147,10 +1147,11 @@ for the symptoms above.
 >      for singles, a 2- / 3-token one for shared experts, each with its own register budget; one kernel with both
 >      paths lost to 197 vs 154 VGPRs). Two tokens share ~3.8 of 10 experts: ~19% of a 2-token pass's expert
 >      bytes, more at 3 tokens.
->   3. **Plain decode efficiency** (helps both modes): 26.6 ms per token streams 3.97 GB = ~150 GB/s against
->      ~215 achievable; ~925 launches per token, many tiny kernels (`hc_mix`, `hc_lowrank`, `swiglu`, ...) and
->      launch gaps. Options: more fusion, HIP graphs for the fixed per-token sequence. The expert matvec
->      kernels use ~154 VGPRs (the 2-token one 255): check occupancy against a leaner virtual-lane loop.
+>   3. **Plain decode efficiency — looked at (2026-10-20), near its limit** (see "Plain decode budget" in Phase
+>      21): router top-k 14.8 → 11.4 µs (wave argmax, bit-identical). What is left is spread thin: experts at ~187
+>      GB/s and dense at ~205 vs ~230 for the LM head (up to ~1.5 ms if all reached it), ~3.9 ms of 3–8 µs
+>      latency-bound small kernels (`hc_norm` 0.8, DeltaNet ~1.1, router 0.57; fusing pairs saves ~3 µs each),
+>      ~1.3 ms launch gaps (HIP graphs?). Each item is worth well under 5%.
 >   4. **Draft cost**: 2.7 ms per draft, mostly the head's 338 MB LM head. A vocabulary cut hurts other scripts
 >      (tried); options: a shortlist from the main model's top logits of the previous row, or an int8 copy.
 >   5. **Prefill, later** (Qwen3.8 GPU ~3.0 s per 2,427 tokens): experts 0.94 s, dense WMMA 0.73 s (~28 of ~55
@@ -1981,6 +1982,16 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
   - Note: `qwen_demo` without `--draft` prefills the prompt in one call, the library in two (a checkpoint
     before its tail), so their greedy texts can differ (WMMA prefill vs per-token kernels on a router
     near-tie); the library with and without the head is identical.
+
+- **Plain decode budget (2026-10-20, Qwen3.8, 25.3 ms GPU / ~26.6 ms wall per token, 956 launches):** dense
+  int8 matvecs 8.75 ms (~205 GB/s), experts 7.6 ms (1.38 GB at ~187 GB/s: gate/up 102.7 µs, down 50.8 µs per
+  layer), LM head 2.3 ms (Q6_K 525 MB, 230 GB/s), HC up projection (fused low-rank) 1.5 ms, router logits
+  (F32, 5.2 MB per layer) 1.3 ms; small kernels ~3.9 ms: hc_norm 101 x 7.8 µs, DeltaNet rule / pre / norm ~1.1
+  ms, moe_router 49 x 11.4 µs (was 14.8: the bitonic sort of all 512 experts with 45 workgroup barriers replaced
+  by n_used wave-argmax rounds on registers, ties to the lower index, identical ids and weights; without any
+  selection it would be 7.4 µs: the softmax reductions and gate dot), hc_mix, attention, swiglu, combine. Tried
+  in the router, no effect: issuing the logits loads before the gate's (not load-latency bound); 16 instead of
+  32 experts per lane in the selection.
 
 - **MTP: verify-pass cost (2026-10-20).** Per pass with 2 drafts (3 tokens, incl. the 2 drafts) vs a plain token:
   1,509 vs 956 launches, ~46 vs ~25.5 ms GPU; dense few-token matvecs 13.9 ms (574 launches) vs 10.2, experts
