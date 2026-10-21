@@ -213,7 +213,7 @@ tokens after a short prompt. Runs vary by about ±5%.
 
 | Model | Quantization (size) | Generation | Prefill |
 |---|---|---|---|
-| Qwen3-0.6B | Q8_0 (0.6 GB) | 184 tok/s | 2,236 tok/s |
+| Qwen3-0.6B | Q8_0 (0.6 GB) | 184 tok/s | 7,200 tok/s |
 | Qwen3.5-0.8B | UD-Q8_K_XL (1.2 GB): Q8_0 / F16 matrices | 120 tok/s | 4,110 tok/s |
 | Qwen3.5-4B | ROCmFP4 (2.9 GB) | 59 tok/s | 1,850 tok/s |
 | Qwen3.6-35B-A3B | ROCmFP4 (20 GB), BF16 head | 62 tok/s (more with the int8 head option) | 2,005 tok/s |

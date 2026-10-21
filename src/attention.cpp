@@ -13,6 +13,8 @@
 static hipModule_t g_mod = nullptr;
 // [0]: head_dim 128 (attn_*_128), [1]: 256
 static hipFunction_t g_prep[2], g_partial[2], g_combine[2], g_flash[2];
+// attn_flash_128_g2: 2 KV heads per workgroup, for a query / KV head ratio of 2 (Qwen3)
+static hipFunction_t g_flash128_g2 = nullptr;
 
 // attn_flash takes batches of at least this many tokens. QMATVEC_NO_WMMA (qmatvec.h) also turns it off, so
 // that prefill can be compared bit for bit with token by token.
@@ -42,6 +44,7 @@ int attention_init(const char* co_path) {
             return -1;
         }
     }
+    if (hipModuleGetFunction(&g_flash128_g2, g_mod, "attn_flash_128_g2") != hipSuccess) g_flash128_g2 = nullptr;
     g_flash_off = getenv("QMATVEC_NO_WMMA") != nullptr || getenv("ATTN_NO_FLASH") != nullptr;  // A/B: attention only
     return 0;
 }
@@ -50,6 +53,7 @@ void attention_free(void) {
     if (g_mod) (void)hipModuleUnload(g_mod);
     g_mod = nullptr;
     for (int i = 0; i < 2; ++i) g_prep[i] = g_partial[i] = g_combine[i] = g_flash[i] = nullptr;
+    g_flash128_g2 = nullptr;
 }
 
 hipError_t attention_forward(const float* qfull, const float* k, const float* v, const float* q_norm,
@@ -82,13 +86,19 @@ hipError_t attention_forward(const float* qfull, const float* k, const float* v,
     const float* qc = q;
     qmatvec_q8_out o = qmatvec_q8_outputs(q8);
 
-    if (T >= kFlashMinT && !g_flash_off && (n_q / n_kv) % 4 == 0) {
+    // attn_flash: 4 query heads per workgroup, sharing one KV head (ratio a multiple of 4) or, head_dim 128,
+    // two (ratio 2); other ratios take attn_partial
+    const int ratio = n_q / n_kv;
+    hipFunction_t flash = ratio % 4 == 0                          ? g_flash[hi]
+                          : D == 128 && ratio == 2 && n_q % 4 == 0 ? g_flash128_g2
+                                                                   : nullptr;
+    if (T >= kFlashMinT && !g_flash_off && flash) {
         // Up to ATTN_MAX_SPLITS ranges per token, each a multiple of 16 positions
         int n_split = std::min(nc, ATTN_MAX_SPLITS);
         int chunk = ((n_last + n_split - 1) / n_split + 15) / 16 * 16;
         n_split = (n_last + chunk - 1) / chunk;
         void* a_flash[] = {(void*)&qc, &K, &V, &kv_stride, &kv_shift, &kv_bstride, &pos0, &T, &n_q, &n_kv, &chunk, &scale, &part_ml, &part_acc};
-        e = hipModuleLaunchKernel(g_flash[hi], (unsigned)(n_q / 4), (unsigned)((T + 15) / 16), (unsigned)n_split,
+        e = hipModuleLaunchKernel(flash, (unsigned)(n_q / 4), (unsigned)((T + 15) / 16), (unsigned)n_split,
                                   128, 1,
                                   1, 0, stream, a_flash, nullptr);
         if (e != hipSuccess) return e;

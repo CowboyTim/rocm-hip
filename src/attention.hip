@@ -217,18 +217,22 @@ typedef float v8f __attribute__((ext_vector_type(8)));
 
 #define FT 16          // query tokens per tile
 #define FB 16          // positions per block
-template <int D>
+// NG: KV heads per workgroup (its 4 query heads h = 4 bx + w read KV head h / (n_q / n_kv)): 1 when the ratio
+// n_q / n_kv is a multiple of 4, 2 for ratio 2 (Qwen3). Each block stages the NG KV heads' K / V rows; wave w
+// reads those of its own KV head (local index w * NG / 4). (NG = 4, ratio 1, would fit too: no such model here
+// to test it with.)
+template <int D, int NG>
 __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K, const __half* V, int kv_stride,
                                                 int kv_shift, long long kv_bstride, int pos0, int T, int n_q,
                                                 int n_kv_heads, int chunk, float scale, float* part_ml,
                                                 float* part_acc) {
     constexpr int QP = D + 8;  // padded LDS row of Q / K (halves)
     __shared__ __attribute__((aligned(16))) _Float16 sQ[4][FT][QP];
-    __shared__ __attribute__((aligned(16))) _Float16 sK[FB][QP];
-    __shared__ __attribute__((aligned(16))) _Float16 sVt[D][FB];  // V block transposed: [dim][position]
+    __shared__ __attribute__((aligned(16))) _Float16 sK[NG][FB][QP];
+    __shared__ __attribute__((aligned(16))) _Float16 sVt[NG][D][FB];  // V blocks transposed: [dim][position]
     __shared__ __attribute__((aligned(16))) _Float16 sP[4][FT][FB];
     const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31, i = lane & 15, hi = lane >> 4;
-    const int h = blockIdx.x * 4 + w, g = blockIdx.x * 4 / (n_q / n_kv_heads);
+    const int h = blockIdx.x * 4 + w, g0 = blockIdx.x * 4 / (n_q / n_kv_heads), gw = w * NG / 4;
     const int z0 = blockIdx.y * FT, c = blockIdx.z, n_chunks = gridDim.z;
     const int zmax = min(T, z0 + FT) - 1;                   // last token of the tile
     const int npos = min(chunk, pos0 + zmax + 1 - c * chunk);  // chunk positions any token of the tile sees
@@ -254,21 +258,22 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
     for (int b = 0; b < nb; ++b) {
         const int P0 = c * chunk + b * FB;
         __syncthreads();  // the previous block's sK / sVt reads are done (and, the first time, sQ is written)
-        // Stage the K and V blocks: 16 positions x 256 dims, 8 halves per uint4. Positions no token of the
-        // tile sees are zeroed: they are masked, but 0 * (stale V) must stay 0.
+        // Stage the NG KV heads' K and V blocks: 16 positions x D dims each, 8 halves per uint4. Positions no
+        // token of the tile sees are zeroed: they are masked, but 0 * (stale V) must stay 0.
 #pragma unroll
-        for (int k = 0; k < FB * D / 8 / 128; ++k) {
-            const int idx = tid + 128 * k, p = idx / (D / 8), d = 8 * (idx % (D / 8));
+        for (int k = 0; k < NG * FB * D / 8 / 128; ++k) {
+            const int idx = tid + 128 * k, gl = idx / (FB * D / 8), r = idx % (FB * D / 8);
+            const int p = r / (D / 8), d = 8 * (r % (D / 8));
             uint4 ku = make_uint4(0, 0, 0, 0), vu = ku;
             if (P0 + p <= pos0 + zmax) {
-                const size_t off = kv_row(P0 + p, kv_stride, kv_shift, kv_bstride) + (size_t)g * D + d;
+                const size_t off = kv_row(P0 + p, kv_stride, kv_shift, kv_bstride) + (size_t)(g0 + gl) * D + d;
                 ku = *(const uint4*)(K + off);
                 vu = *(const uint4*)(V + off);
             }
-            *(uint4*)&sK[p][d] = ku;
+            *(uint4*)&sK[gl][p][d] = ku;
             const _Float16* vh = (const _Float16*)&vu;
 #pragma unroll
-            for (int e = 0; e < 8; ++e) sVt[d + e][p] = vh[e];
+            for (int e = 0; e < 8; ++e) sVt[gl][d + e][p] = vh[e];
         }
         __syncthreads();
 
@@ -277,7 +282,7 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
 #pragma unroll
         for (int kk = 0; kk < D / 16; ++kk) {
             const v16h a = *(const v16h*)&sQ[w][i][kk * 16];
-            const v16h bk = *(const v16h*)&sK[i][kk * 16];
+            const v16h bk = *(const v16h*)&sK[gw][i][kk * 16];
             s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bk, s);
         }
 
@@ -307,7 +312,7 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
         const v16h a = *(const v16h*)&sP[w][i][0];
 #pragma unroll
         for (int dt = 0; dt < D / 16; ++dt) {
-            const v16h bv = *(const v16h*)&sVt[dt * 16 + i][0];
+            const v16h bv = *(const v16h*)&sVt[gw][dt * 16 + i][0];
             acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bv, acc[dt]);
         }
     }
@@ -348,13 +353,19 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
                          float* out, Q8Out o, int gated) {                                                   \
         attn_combine_body<D>(part_ml, part_acc, n_chunks, n_q, qfull, out, o, gated);                         \
     }                                                                                                        \
+    ATTN_FLASH_KERNEL(D, 1)
+
+// attn_flash_<D> (ratio n_q / n_kv a multiple of 4), attn_flash_<D>_g<NG>: NG KV heads per workgroup
+#define ATTN_FLASH_KERNEL_NAMED(NAME, D, NG)                                                                  \
     extern "C" __global__ void __launch_bounds__(128)                                                        \
-        attn_flash_##D(const float* q, const __half* K, const __half* V, int kv_stride, int kv_shift,         \
-                       long long kv_bstride, int pos0, int T, int n_q, int n_kv_heads, int chunk, float scale, \
-                       float* part_ml, float* part_acc) {                                                    \
-        attn_flash_body<D>(q, K, V, kv_stride, kv_shift, kv_bstride, pos0, T, n_q, n_kv_heads, chunk, scale,  \
-                           part_ml, part_acc);                                                               \
+        NAME(const float* q, const __half* K, const __half* V, int kv_stride, int kv_shift, long long kv_bstride, \
+             int pos0, int T, int n_q, int n_kv_heads, int chunk, float scale, float* part_ml, float* part_acc) { \
+        attn_flash_body<D, NG>(q, K, V, kv_stride, kv_shift, kv_bstride, pos0, T, n_q, n_kv_heads, chunk, scale, \
+                               part_ml, part_acc);                                                           \
     }
+#define ATTN_FLASH_KERNEL(D, NG) ATTN_FLASH_KERNEL_NAMED(attn_flash_##D, D, NG)
 
 ATTN_KERNELS(128)
 ATTN_KERNELS(256)
+// Two KV heads per workgroup (Qwen3: ratio 2): head_dim 128 only (256 would need over 64 KB of LDS)
+ATTN_FLASH_KERNEL_NAMED(attn_flash_128_g2, 128, 2)

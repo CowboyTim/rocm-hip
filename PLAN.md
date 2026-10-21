@@ -1163,6 +1163,11 @@ for the symptoms above.
 >        Qwen3.5-122B-A10B prefill 367 → 533 → **620 tok/s** (91 before the Q8_0 kernels) with the sub-tile
 >        count per expert tile (1..4 x 16 entries, compile-time, LDS in `WmmaKSmem`): now faster than the dot4
 >        expert kernel at every batch size.
+>   6a. **Qwen3 prefill: flash attention for query / KV head ratio 2 — DONE ✅ (2026-10-21)**: attn_flash needed
+>      n_q / n_kv % 4 == 0 (4 waves = 4 query heads of one staged KV head); Qwen3-0.6B (16 / 8) fell back to the
+>      decode path (attn_partial_128: 0.87 s of 1.04 s). Now `attn_flash_128_g2` stages 2 KV heads per
+>      workgroup: Qwen3-0.6B prefill 2,236 → ~7,200 tok/s. Ratio 1 (NG = 4, 53 KB LDS) would fit; left out
+>      until a model needs it (nothing here to test it with).
 >   6. **Prefill, later** (Qwen3.8 GPU ~3.0 s per 2,427 tokens): experts 0.94 s, dense WMMA 0.73 s (~28 of ~55
 >      TOPS), `hc_norm` 0.25 s, DeltaNet 0.22 s, router `matmul_f32` 0.20 s (a 2D 32 x 32 tile would cut its L2
 >      traffic ~3x), attention 0.17 s; a bigger prefill batch as an opt-in (+1 GB scratch for +2–7%).
@@ -2007,7 +2012,8 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
   pass. The tests learned the attention-only cases: llama.cpp's last layer keeps only the output rows
   (compare the rows the reference has); prefix reuse resumes at the divergence and the block store at any
   block (no checkpoints / snapshots). Qwen3.5 / 3.8 results unchanged. Qwen3-0.6B: 184 tok/s generation,
-  2,236 tok/s prefill.
+  2,236 tok/s prefill; then ~7,200 with flash attention for its head ratio of 2 (`attn_flash_<D>` templated on
+  the KV heads per workgroup, NG; forward_verify's 40-token check goes through it: cos 0.9999998).
 
 - **K-quant WMMA expert kernels (2026-10-20).** `wmma_q8k` takes a row map like `wmma_q80` (`WRowsLinear` /
   `WRowsExpert`: activation rows, the per-token Q8_K scales and group sums for the mins, output rows by entry);

@@ -7,7 +7,7 @@ products, WMMA prefill, a KV cache of shareable files and MTP speculative decodi
 
 | Model | Generation | Prefill |
 |---|---|---|
-| Qwen3-0.6B (Q8_0) | 184 tok/s | 2,236 tok/s |
+| Qwen3-0.6B (Q8_0) | 184 tok/s | 7,200 tok/s |
 | Qwen3.5-0.8B (UD-Q8_K_XL) | 120 tok/s | 4,110 tok/s |
 | Qwen3.5-4B (ROCmFP4) | 59 tok/s | 1,850 tok/s |
 | Qwen3.6-35B-A3B (ROCmFP4) | 62 tok/s | 2,005 tok/s |
