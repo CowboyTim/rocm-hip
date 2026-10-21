@@ -1182,7 +1182,11 @@ for the symptoms above.
 >      (a near-tie): compare longer greedy runs on prompts without near-ties, or by teacher forcing; the FP16
 >      flash attention at long contexts (only a 30k needle test so far).
 >   8. **Library / packaging**: **`t/20-chat.t` with Minijinja — DONE ✅ (2026-10-21)** and **CPAN packaging —
->      DONE ✅ (2026-10-21)**, see "Chat templates with Minijinja" in Phase 22 and "CPAN packaging" in Phase 21; Phase 22b
+>      DONE ✅ (2026-10-21)**, see "Chat templates with Minijinja" in Phase 22 and "CPAN packaging" in Phase 21. `chat_render`
+>      needs Minijinja 0.1.1 (perl-minijinja-xs f3028ef: callback errors, boolean returns, UTF-8, leaks fixed;
+>      push it before rocm-hip's 14b1e12). Build it: rustup (`~/.cargo/bin`), `scripts/setup-minijinja.sh`,
+>      `perl Makefile.PL && make` (absolute rpath, no `LD_LIBRARY_PATH`); the clone lives in
+>      `./perl-minijinja-xs` (excluded via `.git/info/exclude`). Phase 22b
 >      follow-ups (disk-tier timing, block size option, a Perl web service example); long-context decode
 >      attention.
 >   9. **More models** (see the target list): EmbeddingGemma-300M, Nemotron-3, Gemma-4; `qwen3moe` (Qwen3 MoE:
