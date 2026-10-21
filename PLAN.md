@@ -1168,8 +1168,9 @@ for the symptoms above.
 >      decode path (attn_partial_128: 0.87 s of 1.04 s). Now `attn_flash_128_g2` stages 2 KV heads per
 >      workgroup: Qwen3-0.6B prefill 2,236 → ~7,200 tok/s. Ratio 1 (NG = 4, 53 KB LDS) would fit; left out
 >      until a model needs it (nothing here to test it with).
->   6. **Prefill, later** (Qwen3.8 GPU ~3.0 s per 2,427 tokens): experts 0.94 s, dense WMMA 0.73 s (~28 of ~55
->      TOPS), `hc_norm` 0.25 s, DeltaNet 0.22 s, router `matmul_f32` 0.20 s (a 2D 32 x 32 tile would cut its L2
+>   6. **Prefill, later** (Qwen3.8 GPU ~3.0 s per 2,427 tokens; dense WMMA looked at 2026-10-21, see "Dense
+>      WMMA kernel investigated": no gain from bigger tiles or 2 tiles per wave): experts 0.94 s, dense WMMA 0.73 s
+>      (~28 of ~55 TOPS), `hc_norm` 0.25 s, DeltaNet 0.22 s, router `matmul_f32` 0.20 s (a 2D 32 x 32 tile would cut its L2
 >      traffic ~3x), attention 0.17 s; a bigger prefill batch as an opt-in (+1 GB scratch for +2–7%).
 >   7. **Accuracy checks**: greedy text vs `llama-completion` diverges at the 2nd token of the reference prompt
 >      (a near-tie): compare longer greedy runs on prompts without near-ties, or by teacher forcing; the FP16
@@ -1999,6 +2000,22 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
   - Note: `qwen_demo` without `--draft` prefills the prompt in one call, the library in two (a checkpoint
     before its tail), so their greedy texts can differ (WMMA prefill vs per-token kernels on a router
     near-tie); the library with and without the head is identical.
+
+- **Dense WMMA kernel (`wmma_q80`) investigated, 2026-10-21: no gain found, nothing kept.** FAST dense
+  10240 x 2560 x 1,024 tokens: 1.96 ms (27 TOPS). Removing parts (scratch harness, `INFERENCE_KERNEL_DIR`):
+  without the WMMAs 1.35 ms, with the float epilogue reduced to an int add 1.64 ms, without both 0.94 ms
+  (staging: global loads, decode, LDS stores and operand reads, barriers), so ~48% staging, ~30-35% WMMA,
+  ~16-20% epilogue. Tried: (a) 128-token dense tiles (weights reread half as often; WMMA results in groups of 4
+  sub-tiles; 43 KB LDS): big FAST shapes +2-8%, small ones slower (N 640 x 200 tokens 0.047 → 0.089 ms),
+  model-level no gain (4B 1,850 = 1,850, Qwen3-0.6B 7,200 → 6,900). (b) 32 weight rows per wave (each token
+  operand read from LDS feeds 2 weight tiles, 4 waves per 128 rows): 255-256 VGPRs, no gain (FAST equal, FP4 2%
+  slower). Both bit-identical, both reverted. An experiment with 2 instead of 10 LDS operand reads per block
+  had suggested LDS bandwidth (staging 0.94 → 0.43 ms), but (b) did not confirm it: the compiler likely dropped
+  more than the reads. rocprofv3 --pmc on gfx1151: SQ_WAVES / SQ_WAVE_CYCLES / SQ_BUSY_CYCLES / SQ_WAIT_ANY /
+  SQ_WAIT_INST_ANY / SQ_WAIT_DELAY_ALU report values; SQ_INSTS_VALU / _LDS, SQ_WAIT_CNT_* , SQ_WAIT_BARRIER,
+  SQ_INST_CYCLES_* read 0 (unsupported here); the per-SE "_" variants fail. Wave cycles: ~45% waiting on
+  instruction issue. Next ideas if revisited: a profiler that works on gfx1151 (e.g. rocprof-compute / ATT
+  thread trace) before more restructuring; K chunks of 256 (half the barriers); double-buffered LDS.
 
 - **Qwen3 (2026-10-21).** `qwen3`: every layer plain attention with head_dim 128 and no output gate (attn_q
   is Q only), `ffn_norm` for the FFN norm, tied Q8_0 LM head. The loader takes `post_attention_norm` or
