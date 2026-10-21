@@ -1,6 +1,8 @@
+Changes
 Inference.xs
 lib/ROCm/Inference.pm
 lib/ROCm/Inference/Store.pm
+LICENSE
 Makefile.PL
 MANIFEST
 MANIFEST.SKIP
@@ -11,3 +13,5 @@ t/20-chat.t
 t/30-store.t
 t/40-store-policy.t
 t/50-draft.t
+xt/pod-coverage.t
+xt/pod.t

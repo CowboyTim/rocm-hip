@@ -1182,7 +1182,7 @@ for the symptoms above.
 >      (a near-tie): compare longer greedy runs on prompts without near-ties, or by teacher forcing; the FP16
 >      flash attention at long contexts (only a 30k needle test so far).
 >   8. **Library / packaging**: `perl/ROCm-Inference/t/20-chat.t` with the user's Minijinja module (cargo is
->      installed now); CPAN packaging; Phase 22b follow-ups (disk-tier timing, block size option, a Perl web
+>      installed now); **CPAN packaging — DONE ✅ (2026-10-21)**, see "CPAN packaging" in Phase 21; Phase 22b follow-ups (disk-tier timing, block size option, a Perl web
 >      service example); long-context decode attention.
 >   9. **More models** (see the target list): EmbeddingGemma-300M, Nemotron-3, Gemma-4; `qwen3moe` (Qwen3 MoE:
 >      no shared expert; no such model in /models); the STRIX_LEAN Qwen3.8 release (Q5_K token_embd, Q5_1 PLE
@@ -2006,6 +2006,19 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
   - Note: `qwen_demo` without `--draft` prefills the prompt in one call, the library in two (a checkpoint
     before its tail), so their greedy texts can differ (WMMA prefill vs per-token kernels on a router
     near-tie); the library with and without the head is identical.
+
+- **CPAN packaging (2026-10-21).** perl/ROCm-Inference as a CPAN distribution (`make dist`):
+  - Makefile.PL: without libinference (no ROCM_INFERENCE_PREFIX, no pkg-config rocm-inference, not inside a
+    rocm-hip checkout) it prints what is needed and exits 0 without a Makefile, which CPAN clients and testers
+    report as "not applicable" instead of a failure.
+  - META: repository / bugtracker (github.com/CowboyTim/rocm-hip), develop prereqs Test::Pod /
+    Test::Pod::Coverage; AUTHOR Tim Aerts. License: the dist said MIT while the repository is the Unlicense:
+    now the Unlicense (LICENSE copied, META `unrestricted`, POD LICENSE sections).
+  - Changes, LICENSE; POD SEE ALSO / AUTHOR / LICENSE in both modules; author tests xt/pod.t and
+    xt/pod-coverage.t (skip without those modules; both pass).
+  - Checked from the unpacked tarball outside the checkout: no library → message, exit 0, no Makefile;
+    ROCM_INFERENCE_PREFIX and PKG_CONFIG_PATH (a `make install PREFIX=` copy) → builds, linked to that copy,
+    81 tests pass with a model. `make distcheck` clean. Upload needs the user's PAUSE account.
 
 - **Small-kernel merges assessed (2026-10-21): not done.** Qwen3.8 prefill per 2,427 tokens: hc_norm 252 ms,
   hc_mix 135, deltanet_conv 80, moe_combine 76, swiglu 64, deltanet_norm 52, attn_combine 44. They run at

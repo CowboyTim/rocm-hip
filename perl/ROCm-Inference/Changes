@@ -1,0 +1,13 @@
+Revision history for ROCm-Inference
+
+0.01  unreleased
+    - First version: the libinference C API function by function (load_model, kv_cache_init, tokenize,
+      detokenize, generate with streaming callbacks and stop strings, prefill, decode_token, get_logits, ...).
+    - Chat: chat_render / chat with the model's own chat template, rendered by the Minijinja module.
+    - KV block store: store_open, store_stats, store_block_names; ROCm::Inference::Store for the policy
+      (eviction to a size, a disk tier: store_evict, store_spill, store_fetch).
+    - Speculative decoding with an MTP draft head (Qwen3.8-Flash-Next): set_draft_model, set_draft_tokens
+      (1-3 chained drafts per pass, or adaptive); the output equals decoding without it.
+    - set_lm_head_q8 (an int8 copy of a float LM head), set_prefill_batch (tokens per prefill micro-batch).
+    - Makefile.PL finds libinference through ROCM_INFERENCE_PREFIX, pkg-config (rocm-inference) or the
+      rocm-hip checkout it sits in, and exits without a Makefile ("not applicable") when there is none.

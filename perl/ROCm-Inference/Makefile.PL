@@ -37,10 +37,21 @@ sub find_lib {
 }
 
 my ($inc, $lib, $from) = find_lib();
-$inc or die "libinference not found: set ROCM_INFERENCE_PREFIX to an installed copy, put rocm-inference.pc on the "
-    . "pkg-config path, or build this module inside a rocm-hip checkout\n";
--f "$inc/inference.h" or die "inference.h not found in $inc ($from)\n";
--e "$lib/libinference.so" or die "libinference.so not found in $lib ($from)\n";
+# Without the library there is nothing to build: say what is needed and exit 0 without writing a Makefile, which
+# CPAN clients and testers report as "not applicable" here rather than as a failure
+my $missing = !$inc                          ? "libinference not found"
+            : !-f "$inc/inference.h"         ? "inference.h not found in $inc ($from)"
+            : !-e "$lib/libinference.so"     ? "libinference.so not found in $lib ($from)"
+            :                                  '';
+if ($missing) {
+    print STDERR <<"EOT";
+$missing.
+ROCm::Inference needs libinference, the C library of https://github.com/CowboyTim/rocm-hip (ROCm, an AMD gfx1151
+GPU): build and install it there (make && make install PREFIX=<dir>), then set ROCM_INFERENCE_PREFIX=<dir> or put
+<dir>/lib/pkgconfig on PKG_CONFIG_PATH, or build this module inside a rocm-hip checkout (perl/ROCm-Inference).
+EOT
+    exit 0;
+}
 print "Using libinference from $from: $lib\n";
 
 print <<'EOT';
@@ -55,8 +66,8 @@ WriteMakefile(
     NAME               => 'ROCm::Inference',
     VERSION_FROM       => 'lib/ROCm/Inference.pm',
     ABSTRACT_FROM      => 'lib/ROCm/Inference.pm',
-    AUTHOR             => 'rocm-hip contributors',
-    LICENSE            => 'mit',
+    AUTHOR             => 'Tim Aerts <aardbeiplantje@gmail.com>',
+    LICENSE            => 'unrestricted',  # the Unlicense (public domain), as the rocm-hip repository
     MIN_PERL_VERSION   => '5.010',
     INC                => "-I$inc",
     LIBS               => ["-L$lib -linference"],
@@ -66,7 +77,19 @@ WriteMakefile(
     TEST_REQUIRES      => { 'Test::More' => '0.88', 'File::Temp' => 0 },
     META_MERGE         => {
         'meta-spec' => { version => 2 },
-        prereqs     => { runtime => { recommends => { 'Minijinja' => 0 } } },
+        prereqs     => {
+            runtime => { recommends => { 'Minijinja' => 0 } },
+            develop => { requires => { 'Test::Pod' => '1.22', 'Test::Pod::Coverage' => '1.08' } },
+        },
+        resources => {
+            license    => ['https://unlicense.org/'],
+            repository => {
+                type => 'git',
+                url  => 'https://github.com/CowboyTim/rocm-hip.git',
+                web  => 'https://github.com/CowboyTim/rocm-hip/tree/main/perl/ROCm-Inference',
+            },
+            bugtracker => { web => 'https://github.com/CowboyTim/rocm-hip/issues' },
+        },
     },
     clean              => { FILES => 'ROCm-Inference-*' },
 );

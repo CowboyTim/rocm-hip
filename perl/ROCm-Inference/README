@@ -27,4 +27,4 @@ Tests beyond t/00-load.t need the GPU and models, given by environment variables
 
 LICENSE
 
-MIT.
+The Unlicense (public domain), as the rocm-hip repository: see LICENSE.

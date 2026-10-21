@@ -186,4 +186,18 @@ As the C functions of the same name (C<inference_*>). C<get_logits> returns pack
 
 C<STOP_NONE STOP_EOG STOP_MAX_TOKENS STOP_STRING STOP_CALLBACK STOP_CONTEXT_FULL>: the stop reasons.
 
+=head1 SEE ALSO
+
+L<ROCm::Inference::Store>, L<Minijinja>; the C API (F<inference.h>) and the engine:
+L<https://github.com/CowboyTim/rocm-hip>.
+
+=head1 AUTHOR
+
+Tim Aerts E<lt>aardbeiplantje@gmail.comE<gt>
+
+=head1 LICENSE
+
+This is free and unencumbered software released into the public domain (the Unlicense): see the LICENSE file
+or L<https://unlicense.org/>.
+
 =cut
