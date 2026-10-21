@@ -1191,7 +1191,9 @@ for the symptoms above.
 >      attention.
 >   9. **More models** (see the target list): EmbeddingGemma-300M, Nemotron-3, Gemma-4; `qwen3moe` (Qwen3 MoE:
 >      no shared expert; no such model in /models); the STRIX_LEAN Qwen3.8 release (Q5_K token_embd, Q5_1 PLE
->      table, Q6_K head) if the user wants it. **`qwen3` DONE ✅ (2026-10-21)**: Qwen3-0.6B (see "Qwen3" in
+>      table, Q6_K head) if the user wants it. **Gemma-4 26B-A4B analyzed (2026-10-21)**: see "Gemma-4 26B-A4B:
+>      analysis" in Phase 21 (tokenizer, two attention kinds incl. D 512, dense FFN + 128 experts, steps).
+>      **`qwen3` DONE ✅ (2026-10-21)**: Qwen3-0.6B (see "Qwen3" in
 >      Phase 21). All Qwen GGUFs in /models run: Qwen3-0.6B, Qwen3.5-0.8B / 4B / 122B-A10B, Qwen3.6-35B-A3B,
 >      Qwen3.8-27B / Flash-Next.
 >  10. **Thinking tags and streaming chat — DONE ✅ in Perl (2026-10-21; user: "use Perl as much as possible")**.
@@ -1218,7 +1220,7 @@ for the symptoms above.
 >        deltas add up, both tool formats, render back), `t/20-chat.t` (+10: budget, streamed kinds, a
 >        get_weather round trip) on Qwen3.5-4B and 3.6-35B; by hand also Qwen3-0.6B (JSON tool calls, model-
 >        opened think) and Qwen3.8-27B.
->      - **Left:** the SSE server example (OpenAI-style `/v1/chat/completions` with `reasoning_content` /
+>      - **Left:** the SSE server example (design: "Web service: nginx -> Perl, SSE" in Phase 21) (OpenAI-style `/v1/chat/completions` with `reasoning_content` /
 >        `tool_calls` deltas), merged with the Phase 22b "Perl web service example" in item 8; per-family tags
 >        when Gemma-4 / Nemotron land (item 9: check their templates, extend `%REPLY_TAGS`). A C API channel
 >        flag only if a non-Perl user needs it.
@@ -2231,6 +2233,74 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
 **Needed from the user:** nothing for now (the model is in `/models`, the head in `/data/mtp`). Constraints here: /dev/shm
 is a 63 GB tmpfs (38 GB free) and the disk has 48 GB free, so a ~50 GB model needs space freed or /dev/shm
 remounted larger; the reference oracle must also run each model on the CPU for `ref_dump`.
+
+### Gemma-4 26B-A4B: analysis (2026-10-21, not started)
+
+Files: `/models/gemma-4-26B-A4B-it-Q4_0_ROCMFP4.gguf` (18.3 GB: ROCMFP4 q / k / up / token_embd, Q5_K
+attn_output / v / some gate(_up), Q8_0 or **Q5_1** down + down_exps) and `-UD-Q8_K_XL.gguf` (27.6 GB: Q8_0,
+one BF16 layer). Reference: `llama.cpp/src/models/gemma4.cpp` + `gemma4-common.h`. Architecture `gemma4`:
+
+- **Shape:** 30 layers, n_embd 2816, vocab 262,144 (tied LM head = token_embd, 415 MB in FP4), 128 experts
+  top-8 (n_ff_exp 704, gate+up fused in one `ffn_gate_up_exps` [2816, 1408, 128]) **plus a dense GeGLU FFN
+  (n_ff 2112) in every layer**, both GELU-tanh. No PLE (`embedding_length_per_layer_input` 0), no shared-KV
+  layers.
+- **Attention, two kinds of layer** (pattern 5 sliding + 1 global, `sliding_window_pattern`):
+  sliding: 16 q / 8 kv heads x 256, window 1024, RoPE NEOX base 10k; global: 16 q / 2 kv heads x **512**, base
+  1M, **no `attn_v`: V = the raw K projection**, and `rope_freqs` (1 for the first 64 frequency pairs, 1e30 for
+  the other 192: only 128 of 512 dims rotate, pairs (i, i+256)). q_norm / k_norm per head (weights), **V
+  RMS-normed without weight**, attention **scale 1.0** (the norms replace 1/sqrt(d)).
+- **Block:** x = embd * sqrt(2816); per layer: attn_norm -> attention -> post_attention_norm, + x;
+  MLP branch ffn_norm -> GeGLU -> post_ffw_norm_1; MoE branch pre_ffw_norm_2 -> experts -> post_ffw_norm_2
+  (router: rms_norm(no weight)(h) / sqrt(2816) * `ffn_gate_inp.scale` -> F32 [2816 x 128] -> softmax, top-8,
+  renormalized; per-expert output scale `ffn_down_exps.scale`); sum -> post_ffw_norm, + h; then x
+  `layer_output_scale` (a scalar per layer: 0.07 .. 0.65). Output: output_norm -> LM head -> softcap
+  30 tanh(x / 30).
+- **Tokenizer `gemma4`:** SPM-style BPE (spaces -> U+2581, raw UTF-8, no byte-level map, split only on
+  newline runs, 514,906 merges, newline-run tokens looked up whole); BOS 2 added. Ours is GPT-2 byte BPE only:
+  a second mode. EOG: `<eos>` 1, `<turn|>` 106 (the UD file's eos), `<|tool_response>` 50.
+- **Chat:** `chat_render` already renders the 17 KB template byte-identical to jinja2 (tools, a tool call
+  with reasoning, tool response, thinking on / off; `.get` / `.split` / `dictsort` / macros). Reply tags differ:
+  reasoning `<|channel>thought\n` .. `<channel|>` (thinking switched on by `<|think|>` in the system turn; off =
+  an empty channel in the generation prompt), tool calls `<|tool_call>call:NAME{key:value,...}<tool_call|>`
+  with strings as `<|"|>..<|"|>` (a new parser), stop at `<|tool_response>`. So `%REPLY_TAGS` per model family.
+- **KV cache:** per-layer sizes differ (8 x 256 vs 2 x 512 per token; ours is uniform); F16 it is 225 KB per
+  token (32k: 7.4 GB, 128k: 29.5 GB), 91% of it in sliding layers: ring buffers of 1024 there bring 128k to
+  2.9 GB. Pure attention: prefix reuse / the block store resume anywhere (no DeltaNet snapshots).
+- **Kernels:** have: Q8_0 / ROCMFP4 / K-quant matvec, int8 and WMMA (dense and expert), F32 router, RMSNorm,
+  per-head q/k norm, top-k, attention D 128 / 256. **New:** attention D 512 (LDS), sliding-window mask, scale
+  1, V norm; RoPE with freq factors; GELU-tanh GeGLU; fused gate_up expert output split; per-expert scale;
+  softcap; Q5_1 int8 / WMMA paths (the FP4 file's down projections in 10 layers; float matvec only today);
+  BF16 batched (one layer of the UD file).
+- **Cost estimate:** ~3.7 B parameters read per token (experts 1.4 B, attention 1.0 B, dense FFN 0.5 B, LM
+  head 0.74 B): Q8 file ~4 GB/token (~45-50 tok/s at ~200 GB/s), FP4 file ~2.2 GB (~80 tok/s bound).
+- **Steps:** (1) tokenizer `gemma4` + `tokenizer_gguf_verify` against llama.cpp ids; (2) loader + a
+  `gemma_model.cpp` forward (decode first) on shared kernels, with the new ops, verified per layer against
+  `ref_dump` on the Q8 file (CPU reference build has gemma4); (3) batched prefill (WMMA), then the FP4 file
+  (Q5_1 int8 / WMMA kernels); (4) chat: per-family reply tags, the Gemma tool-call parser, EOG list; (5)
+  sliding-window ring KV + block store; later a `gemma4-assistant` draft head if one appears (llama.cpp
+  supports it).
+
+### Web service: nginx -> Perl, SSE (2026-10-21, design, not started)
+
+User: nginx in front, Perl behind, Flask-like routes, no Moose / Mojolicious / heavy OO. Installed here: only
+core Perl (HTTP::Tiny, JSON::PP, IO::Socket::UNIX); no Plack, FCGI, Starman, nginx. Design:
+- **Transport:** a small HTTP/1.1 server in core Perl on a unix socket, nginx `proxy_pass
+  http://unix:/run/rocm-inference.sock;` with `proxy_buffering off; proxy_http_version 1.1;` (SSE). nginx does
+  TLS, limits, keep-alive; the Perl side parses only what nginx sends (request line, headers, Content-Length
+  body). No dependencies. (FastCGI via FCGI.pm, `fastcgi_buffering off`, is the alternative with one XS dep.)
+- **Process model:** one process owns the model (GPU context does not survive fork; one sequence at a
+  time): requests are served one after another; while generating, `on_token` can poll the listen socket to
+  queue / answer health checks; a client that goes away (write fails, SIGPIPE ignored) stops the generation
+  through `on_delta`. Multi-user batching needs multi-sequence KV in the engine (later).
+- **Routes, Flask-like with plain functions:** `get '/v1/models' => sub { my ($req) = @_; ... };`,
+  `post '/v1/chat/completions' => sub { ... }` with `:name` path parameters; `$req` a plain hash (method, path,
+  query, headers, body, json, params); a handler returns `[status, headers, body]` (PSGI-shaped, so the app
+  also runs under a PSGI server if wanted) or a streaming sub given `$write`; helpers `json(...)`, `sse(...)`.
+- **API:** OpenAI-compatible `/v1/chat/completions` (`stream: true` -> `data: {...}` chunks with
+  `delta.content` / `delta.reasoning_content` / `delta.tool_calls`, then `data: [DONE]`; non-stream returns the
+  message), `/v1/models`, `/health`; options mapped to chat's (max_tokens, temperature, top_p, stop, tools,
+  `chat_template_kwargs.enable_thinking`, a thinking budget). The KV block store (Phase 22b) gives prefix reuse
+  across conversations.
 
 ## Phase 22 – Product C API + Perl XS module (Phase 14) — DONE ✅ (2026-10-18; Minijinja chat and CPAN packaging 2026-10-21)
 
