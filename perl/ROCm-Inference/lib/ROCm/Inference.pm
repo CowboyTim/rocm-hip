@@ -16,7 +16,7 @@ BEGIN {  # at compile time: the constants below call into the XS
 
 # The C library (libinference.so) mapped one function per C call; plus the plain-Perl chat helpers below
 our @EXPORT_OK = qw(
-    load_model free_model kv_cache_init set_lm_head_q8 set_draft_model set_draft_tokens
+    load_model free_model kv_cache_init set_lm_head_q8 set_draft_model set_draft_tokens set_prefill_batch
     tokenize detokenize chat_template bos_id eos_id token_is_eog vocab_size
     n_ctx n_past reset prefill decode_token get_logits
     generate last_prompt_stats last_error
@@ -158,6 +158,12 @@ together with the head's guesses of the next ones and keeps each guess that is t
 same tokens as without the head, for any sampling options, up to three times as many per pass when the head
 guesses well. Dies when the file is not a head for this model. Before or after C<kv_cache_init>.
 
+=item set_prefill_batch($m, $n_tokens)
+
+Tokens per prefill micro-batch, 16 to 8192, or 0 for the default (1024). Larger batches speed up long prompts
+on MoE models (up to ~10%: each expert's weights are read once per batch) at the cost of scratch memory (about
+1 MB per token on Qwen3.8-Flash-Next); no gain for dense models. Before C<kv_cache_init>; dies after it.
+
 =item set_draft_tokens($m, $n)
 
 Guesses per pass with a draft head: 1 to 3, or 0 (the default) to choose 2 or 3 per pass from how well the
@@ -169,7 +175,7 @@ Render a conversation with the model's chat template / render it and generate th
 
 =item chat_template($m [, $name]), bos_id, eos_id, token_is_eog, vocab_size, n_ctx, n_past, reset,
 prefill, decode_token, get_logits, last_prompt_stats, set_lm_head_q8, set_draft_model, set_draft_tokens,
-last_error
+set_prefill_batch, last_error
 
 As the C functions of the same name (C<inference_*>). C<get_logits> returns packed floats
 (C<unpack 'f*'>).

@@ -172,6 +172,7 @@ struct inference_model {
 
     inference_kv_cache_t* kvc = nullptr;               // KV cache manager handle
     MtpHead* mtp = nullptr;                            // MTP draft head, if loaded (inference_set_draft_model)
+    int prefill_batch = 0;                             // tokens per prefill micro-batch (0: 1024; set_prefill_batch)
     int spec_drafts = 0;                               // drafts per pass (inference_set_draft_tokens; 0: adaptive)
     float spec_acc[3] = {0.8f, 0.8f, 0.8f};            // adaptive: acceptance of draft j given drafts < j accepted
     float spec_ms[3] = {0.0f, 0.0f, 0.0f};             // adaptive: time of a pass with j + 1 drafts, ms (0: not yet)

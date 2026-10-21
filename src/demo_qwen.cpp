@@ -1,10 +1,11 @@
 // demo_qwen.cpp -- text generation with the Qwen3.5 forward pass.
 // Usage: ./qwen_demo <model.gguf> "prompt text" | @prompt_file [n_gen] [--temp T] [--top-k K] [--top-p P] [--min-p P]
 //                    [--repeat-penalty R] [--seed S] [--lm-head-q8] [--ctx N (default 4096)]
-//                    [--draft mtp.gguf [--drafts 0..3]]
+//                    [--draft mtp.gguf [--drafts 0..3]] [--batch N]
 //
 // --draft: an MTP draft head for speculative decoding; generation then runs through inference_generate_stream
-// (ignoring end-of-generation tokens, as this demo does not stop at them either); --drafts: drafts per pass
+// (ignoring end-of-generation tokens, as this demo does not stop at them either); --drafts: drafts per pass.
+// --batch: tokens per prefill micro-batch (16 .. 8192; default 1024).
 // (0: adaptive, the default).
 // Greedy by default (--temp 0). QWEN_PROFILE=1 prints the time breakdown.
 
@@ -22,7 +23,8 @@
 int main(int argc, char** argv) {
     if (argc < 3) {
         printf("Usage: %s <model.gguf> \"prompt text\" [n_gen] [--temp T] [--top-k K] [--top-p P] [--min-p P] "
-               "[--repeat-penalty R] [--seed S] [--lm-head-q8] [--ctx N] [--draft mtp.gguf [--drafts 0..3]]\n",
+               "[--repeat-penalty R] [--seed S] [--lm-head-q8] [--ctx N] [--draft mtp.gguf [--drafts 0..3]]\n"
+               "       [--batch N]\n",
                argv[0]);
         return 1;
     }
@@ -49,6 +51,7 @@ int main(int argc, char** argv) {
     int n_ctx = 4096;
     const char* draft = nullptr;
     int drafts = -1;  // drafts per pass (0: adaptive; -1: the library's default)
+    int batch = 0;    // tokens per prefill micro-batch (0: the library's default, 1024)
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         const char* v = i + 1 < argc ? argv[i + 1] : "0";
@@ -62,6 +65,7 @@ int main(int argc, char** argv) {
         else if (a == "--ctx") { n_ctx = atoi(v); ++i; }
         else if (a == "--draft") { draft = v; ++i; }
         else if (a == "--drafts") { drafts = atoi(v); ++i; }
+        else if (a == "--batch") { batch = atoi(v); ++i; }
         else n_gen = atoi(argv[i]);
     }
     printf("Sampling: temp %g top_k %d top_p %g min_p %g repeat_penalty %g seed %llu\n", sp.temperature, sp.top_k,
@@ -75,6 +79,10 @@ int main(int argc, char** argv) {
     }
 
     printf("Initializing KV cache...\n");
+    if (batch > 0 && inference_set_prefill_batch(engine, batch) != 0) {
+        fprintf(stderr, "--batch: %s\n", inference_get_last_error());
+        return 1;
+    }
     if (inference_kv_cache_init(engine, n_ctx) != 0) {
         fprintf(stderr, "KV cache init failed: %s\n", inference_get_last_error());
         inference_free_model(engine);

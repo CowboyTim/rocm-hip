@@ -532,6 +532,17 @@ static void free_mtp(inference_model* m) {
     m->mtp = nullptr;
 }
 
+int inference_set_prefill_batch(inference_model_t* m, int n_tokens) {
+    clear_error();
+    if (!m || (n_tokens != 0 && (n_tokens < 16 || n_tokens > 8192))) {
+        set_error("prefill batch: 0 (default) or 16 .. 8192 tokens");
+        return INFERENCE_ERR_INVALID_ARG;
+    }
+    if (m->qwen) { set_error("prefill batch: call before inference_kv_cache_init"); return -1; }
+    m->prefill_batch = n_tokens;
+    return 0;
+}
+
 int inference_set_draft_tokens(inference_model_t* m, int n) {
     clear_error();
     if (!m || n < 0 || n > SPEC_MAX_DRAFTS) {

@@ -1168,6 +1168,9 @@ for the symptoms above.
 >      decode path (attn_partial_128: 0.87 s of 1.04 s). Now `attn_flash_128_g2` stages 2 KV heads per
 >      workgroup: Qwen3-0.6B prefill 2,236 → ~7,200 tok/s. Ratio 1 (NG = 4, 53 KB LDS) would fit; left out
 >      until a model needs it (nothing here to test it with).
+>   6b. **Opt-in larger prefill batch — DONE ✅ (2026-10-21)**: `inference_set_prefill_batch(m, n)` (16 .. 8192,
+>      before kv_cache_init), Perl `set_prefill_batch`, `qwen_demo --batch N`; see "Prefill batch option" in
+>      Phase 21. Up to ~10% on MoE models' long prompts at 4096; nothing for dense models; default stays 1024.
 >   6. **Prefill, later** (Qwen3.8 GPU ~3.0 s per 2,427 tokens; dense WMMA looked at 2026-10-21, see "Dense
 >      WMMA kernel investigated": no gain from bigger tiles or 2 tiles per wave): experts 0.94 s, dense WMMA 0.73 s
 >      (~28 of ~55 TOPS), `hc_norm` 0.25 s, DeltaNet 0.22 s, router `matmul_f32` 0.20 s (a 2D 32 x 32 tile would cut its L2
@@ -2000,6 +2003,22 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
   - Note: `qwen_demo` without `--draft` prefills the prompt in one call, the library in two (a checkpoint
     before its tail), so their greedy texts can differ (WMMA prefill vs per-token kernels on a router
     near-tie); the library with and without the head is identical.
+
+- **Prefill batch option (2026-10-21).** `inference_set_prefill_batch(m, n)`: tokens per prefill micro-batch, 16
+  to 8,192 (0: 1024), set before `inference_kv_cache_init` (the scratch is allocated there; refused after).
+  The attention partials' budget scales with it (256 MB per 1024 tokens). Prefill (tok/s, 1024 / 2048 / 4096):
+
+  | Model | 2,427 tokens | 7,281 tokens |
+  |---|---|---|
+  | Qwen3.8-Flash-Next | 795 / 808 / 799-812 | 725 / 760 / 795 |
+  | Qwen3.5-122B-A10B | 608 / 637 / 674 | 551 / 582 / 581 |
+  | Qwen3.6-35B-A3B | 1,999 / 2,047 / 2,151 | 1,852 / 1,888 / 1,926 |
+  | Qwen3.5-4B (dense) | 1,846 / 1,829 / 1,831 | 1,661 / 1,625 / 1,641 |
+
+  (The first run after switching models reads the weights from disk: much slower; repeats are the numbers.)
+  Tested: generate_verify prefills a 2,879-token prompt with the default and with 1500-token batches: identical
+  logits with QMATVEC_NO_WMMA, cosine 0.9994-0.9997 and the same argmax with WMMA (4B, 35B, Qwen3-0.6B); the
+  call after kv_cache_init is refused; Perl t/00-load.t, t/10-generate.t.
 
 - **Dense WMMA kernel (`wmma_q80`) investigated, 2026-10-21: no gain found, nothing kept.** FAST dense
   10240 x 2560 x 1,024 tokens: 1.96 ms (27 TOPS). Removing parts (scratch harness, `INFERENCE_KERNEL_DIR`):

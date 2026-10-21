@@ -410,8 +410,58 @@ int main(int argc, char** argv) {
     check(!s1.empty() && s1 == s2, "seeded sampling is reproducible");
     check(!s3.empty() && s3 != s1, "a hotter distribution or another seed gives different tokens");
 
+    check(inference_set_prefill_batch(m, 2048) != 0, "inference_set_prefill_batch after kv_cache_init is refused");
     inference_kv_cache_free(m);
     inference_free_model(m);
+
+    // The prefill micro-batch (inference_set_prefill_batch): a ~3,000-token prompt prefilled with the default
+    // (1024) and with 1500 tokens per batch gives the same logits: exactly with QMATVEC_NO_WMMA (prefill is then
+    // token by token's bits whatever the batching), else the same argmax, cosine > 0.99 (WMMA summation order)
+    {
+        std::vector<float> lg[2];
+        int n_long = 0;
+        for (int b = 0; b < 2; ++b) {
+            inference_model_t* mb = inference_load_model(argv[1]);
+            if (!mb || (b == 1 && inference_set_prefill_batch(mb, 1500) != 0) ||
+                inference_kv_cache_init(mb, 4096) != 0) {
+                fprintf(stderr, "batch test setup: %s\n", inference_get_last_error());
+                return 1;
+            }
+            std::string text;
+            for (int i = 0; text.size() < 12000; ++i)
+                text += "Record " + std::to_string(i) +
+                        ": the harbour archive lists a shipment, its weight and origin. ";
+            int n = 0;
+            int32_t* t = inference_tokenize(mb, text.c_str(), &n);
+            qwen_model_t* q = inference_get_qwen_model(mb);
+            const int V = inference_vocab_size(mb);
+            lg[b].resize((size_t)V);
+            if (qwen_model_prefill(q, (const int*)t, n, 0, lg[b].data()) != 0) {
+                fprintf(stderr, "batch test prefill: %s\n", qwen_model_last_error());
+                return 1;
+            }
+            n_long = n;
+            printf("  (batch test: %d tokens, micro-batches of %d)\n", n, qwen_model_max_batch(q));
+            inference_free_tokens(t, n);
+            inference_kv_cache_free(mb);
+            inference_free_model(mb);
+        }
+        const bool exact = getenv("QMATVEC_NO_WMMA") != nullptr;
+        double dot = 0, na = 0, nb = 0, maxd = 0;
+        for (size_t i = 0; i < lg[0].size(); ++i) {
+            dot += (double)lg[0][i] * lg[1][i], na += (double)lg[0][i] * lg[0][i], nb += (double)lg[1][i] * lg[1][i];
+            maxd = std::max(maxd, (double)std::fabs(lg[0][i] - lg[1][i]));
+        }
+        const double cs = dot / std::sqrt(na * nb);
+        const int a0 = (int)(std::max_element(lg[0].begin(), lg[0].end()) - lg[0].begin());
+        const int a1 = (int)(std::max_element(lg[1].begin(), lg[1].end()) - lg[1].begin());
+        char what[200];
+        snprintf(what, sizeof(what),
+                 "prefill of %d tokens in micro-batches of 1500 = the default's logits: max |d| %.3g, cosine %.7f, "
+                 "argmax %d / %d%s",
+                 n_long, maxd, cs, a1, a0, exact ? " (exact)" : "");
+        check(exact ? maxd == 0.0 : (cs > 0.99 && a0 == a1), what);
+    }
     printf("%s (%d failed)\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;
 }

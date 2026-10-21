@@ -146,6 +146,16 @@ set_draft_model(h, path)
     RETVAL
 
 int
+set_prefill_batch(h, n)
+    SV* h
+    int n
+  CODE:
+    RETVAL = inference_set_prefill_batch(handle_ptr(aTHX_ h, 0), n);
+    if (RETVAL < 0) croak_last(aTHX_ "set_prefill_batch", RETVAL);
+  OUTPUT:
+    RETVAL
+
+int
 set_draft_tokens(h, n)
     SV* h
     int n

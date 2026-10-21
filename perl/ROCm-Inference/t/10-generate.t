@@ -9,8 +9,11 @@ my $path = $ENV{ROCM_INFERENCE_TEST_MODEL};
 plan skip_all => 'set ROCM_INFERENCE_TEST_MODEL to a GGUF model to run' unless $path && -f $path;
 
 my $m = load_model($path);
+is(set_prefill_batch($m, 512), 0, 'set_prefill_batch before kv_cache_init');
 kv_cache_init($m, 2048);
 is(n_ctx($m), 2048, 'n_ctx');
+my $err = eval { set_prefill_batch($m, 1024); 1 } ? '' : $@;
+like($err, qr/set_prefill_batch/, 'set_prefill_batch after kv_cache_init dies');
 ok(vocab_size($m) > 1000, 'vocab_size');
 ok(token_is_eog($m, eos_id($m)), 'EOS ends generation');
 

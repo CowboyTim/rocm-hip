@@ -136,7 +136,9 @@ attention-only model at any position / block (no recurrent state, no snapshots).
 **Forward pass** (`QwenModel::forward`, T tokens at positions pos0..): the CPU decodes the embedding rows into
 the residual, then each layer: norm → token mixer (attention with the KV cache, or DeltaNet with the recurrent
 state) → residual add + norm → FFN / MoE → residual add fused with the next norm (`add_rmsnorm`); the LM head
-on the last token and one sync. Prefill runs this in micro-batches of up to 1,024 tokens.
+on the last token and one sync. Prefill runs this in micro-batches of up to 1,024 tokens
+(`inference_set_prefill_batch`: 16 to 8,192, up to ~10% faster long prompts on MoE models at 4,096, for ~1 MB of
+scratch per token on Qwen3.8).
 
 - **Attention**: gated Q (`[Q | gate]` per head), q/k RMSNorm, partial NeoX / IMRoPE, GQA, sigmoid output gate.
   Decode: split-K partial attention over 256-position chunks + combine; prefill: FP16 WMMA flash attention.
