@@ -8,7 +8,7 @@ use ROCm::Inference qw(:all);
 # Needs a model and the Minijinja module (chat templates are rendered in Perl)
 my $path = $ENV{ROCM_INFERENCE_TEST_MODEL};
 plan skip_all => 'set ROCM_INFERENCE_TEST_MODEL to a GGUF model to run' unless $path && -f $path;
-plan skip_all => 'Minijinja is not installed' unless eval { require Minijinja; 1 };
+plan skip_all => "Minijinja $ROCm::Inference::MINIJINJA_VERSION is not installed" unless ROCm::Inference::_require_minijinja();
 
 my $m = load_model($path);
 kv_cache_init($m, 4096);

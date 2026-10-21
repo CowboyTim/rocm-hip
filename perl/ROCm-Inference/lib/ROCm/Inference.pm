@@ -40,7 +40,7 @@ use constant {
 # so _py_methods rewrites RECV.name(args) inside template tags to (RECV|py_name(args)), and these filters give
 # the Python semantics; a name mapped to a string uses that builtin filter instead.
 sub _py_strip_re { defined $_[0] ? '[' . quotemeta($_[0]) . ']' : '\s' }
-sub _py_bool { $_[0] ? 1 : 0 }  # not JSON::PP booleans: Minijinja 0.1.0 crashes on blessed scalar returns
+sub _py_bool { require JSON::PP; $_[0] ? JSON::PP::true() : JSON::PP::false() }
 our %PY_METHODS = (
     startswith => sub {
         my ($s, $p) = (shift // '', shift);
@@ -122,13 +122,17 @@ sub _py_methods {
     return $tmpl;
 }
 
+# Minijinja 0.1.1: callbacks that die abort the rendering, blessed (boolean) returns, Perl character strings
+our $MINIJINJA_VERSION = '0.1.1';
+sub _require_minijinja { eval { require Minijinja; Minijinja->VERSION($MINIJINJA_VERSION); 1 } }
+
 # chat_render($model, \@messages, %vars): the conversation as prompt text, rendered with the model's own chat
 # template (the GGUF's tokenizer.chat_template) by Minijinja. Template variables: messages, bos_token,
 # eos_token, add_generation_prompt (default 1), and any %vars (e.g. enable_thinking => 0, tools => [...]);
 # template_name => 'name' picks tokenizer.chat_template.<name>.
 sub chat_render {
     my ($m, $messages, %vars) = @_;
-    eval { require Minijinja; 1 } or croak "ROCm::Inference::chat_render needs the Minijinja module: $@";
+    _require_minijinja() or croak "ROCm::Inference::chat_render needs the Minijinja module $MINIJINJA_VERSION: $@";
     my $name = delete $vars{template_name};
     my $tmpl = defined $name ? chat_template($m, $name) : chat_template($m);
     croak "ROCm::Inference::chat_render: the model has no chat template" . ($name ? " '$name'" : '')
@@ -156,25 +160,10 @@ sub _render_template {
     my $env = Minijinja::minijinja();
     Minijinja::add_filter($env, "py_$_", $PY_METHODS{$_}) for grep { ref $PY_METHODS{$_} } keys %PY_METHODS;
     Minijinja::add_filter($env, 'tojson', \&_py_tojson);
-    my $raised;  # Minijinja 0.1.0 renders on past a function that dies
-    Minijinja::add_function($env, 'raise_exception', sub { $raised //= $_[0] // 'template error'; undef });
-    my $text = Minijinja::render_str($env, 'chat_template', _py_methods($tmpl), _utf8_copy(\%ctx));
-    croak "ROCm::Inference::chat_render: $raised" if defined $raised;
+    Minijinja::add_function($env, 'raise_exception', sub { die(($_[0] // 'template error') . "\n") });
+    my $text = Minijinja::render_str($env, 'chat_template', _py_methods($tmpl), \%ctx);
     croak "ROCm::Inference::chat_render: " . (Minijinja::error_detail() // 'template error') unless defined $text;
-    utf8::decode($text);  # Minijinja returns the UTF-8 bytes
     return $text;
-}
-
-# A copy of the template context with every string in Perl's UTF-8 form: Minijinja passes a string's internal
-# bytes on as they are, which for a string of Latin-1 characters (é) are not UTF-8
-sub _utf8_copy {
-    my ($v) = @_;
-    return { map { $_ => _utf8_copy($v->{$_}) } keys %$v } if ref $v eq 'HASH';
-    return [ map { _utf8_copy($_) } @$v ] if ref $v eq 'ARRAY';
-    return $v if ref $v || !defined $v || !utf8::is_utf8($v) && $v !~ /[^\x00-\x7f]/;
-    my $s = "$v";
-    utf8::upgrade($s);
-    return $s;
 }
 
 # chat($model, \@messages, \%options): render the conversation, then generate the assistant's reply, reusing
@@ -293,7 +282,7 @@ The template is rendered by L<Minijinja> with what chat templates expect of Pyth
 methods (C<startswith>, C<endswith>, C<split>, C<strip>, C<lstrip>, C<rstrip>, C<replace>, C<upper>,
 C<lower>, C<get>, C<items>), C<tojson> as C<json.dumps> writes it, C<raise_exception>, and the plain Perl
 values of C<enable_thinking> / C<add_generation_prompt> as booleans. Text is passed and returned as Perl
-character strings.
+character strings. Needs Minijinja 0.1.1 or later.
 
 =item chat_template($m [, $name]), bos_id, eos_id, token_is_eog, vocab_size, n_ctx, n_past, reset,
 prefill, decode_token, get_logits, last_prompt_stats, set_lm_head_q8, set_draft_model, set_draft_tokens,

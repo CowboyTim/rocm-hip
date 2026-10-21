@@ -7,7 +7,7 @@ use ROCm::Inference;
 
 # Chat template rendering without a model: the Python string and dict methods that templates call, tojson, the
 # boolean template flags and UTF-8 text (the outputs match Python jinja2's)
-plan skip_all => 'Minijinja is not installed' unless eval { require Minijinja; 1 };
+plan skip_all => "Minijinja $ROCm::Inference::MINIJINJA_VERSION is not installed" unless ROCm::Inference::_require_minijinja();
 binmode Test::More->builder->$_, ':encoding(UTF-8)' for qw(output failure_output todo_output);
 
 sub r { ROCm::Inference::_render_template($_[0], $_[1] // {}) }
@@ -35,6 +35,9 @@ is(r(q[{{ args|tojson }}], { args => { city => 'Gent', n => 2, l => [1, 'été']
 is(r(q[{% if enable_thinking is false %}off{% endif %}{% if add_generation_prompt %}+{% endif %}],
      { enable_thinking => 0, add_generation_prompt => 1 }), 'off+', 'boolean template flags');
 is(r(q[{{ a }} {{ b }} {{ b.strip() }}], { a => 'été', b => ' 中文 ' }), 'été  中文  中文', 'UTF-8 text in and out');
+is(r(q[{{ a }}], { a => "\x{c3}\x{a9}" }), "\x{c3}\x{a9}", 'text that looks like UTF-8 bytes stays as it is');
+is(r(q[{% if x.startswith('a') %}{{ x.startswith('a') }}{% endif %}], { x => 'ab' }), 'True',
+   'startswith gives a boolean');
 
 ok(!eval { r(q[{{ raise_exception('System message must be at the beginning.') }}]) }, 'raise_exception aborts');
 like($@, qr/System message must be at the beginning/, "with the template's message");

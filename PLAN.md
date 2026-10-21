@@ -2264,7 +2264,7 @@ remounted larger; the reference oracle must also run each model on the CPU for `
 - **Chat templates with Minijinja (2026-10-21):** `t/20-chat.t` passes with the user's perl-minijinja-xs
   (built with rustup's cargo against minijinja-cabi) on Qwen3.5-4B, Qwen3.6-35B-A3B and Qwen3.8-27B; on
   Qwen3-0.6B only the content check of the second reply fails (the model answers "red + blue, ..."). What
-  it took, all in `ROCm::Inference` (the Minijinja module and its C ABI unchanged):
+  it took, in `ROCm::Inference` and in the Minijinja module (its C ABI unchanged):
   - minijinja-cabi has no pycompat layer, so `.startswith(` etc. fail ("string has no method named
     startswith"). `_py_methods` rewrites `RECV.name(args)` inside `{{ }}` / `{% %}` tags to
     `(RECV|py_name(args))` (token-wise: the receiver is the postfix chain of names, attributes, subscripts,
@@ -2273,18 +2273,22 @@ remounted larger; the reference oracle must also run each model on the CPU for `
     `strip` / `lstrip` / `rstrip` (char sets), `replace` (count), `upper`, `lower`, dict `get`; `items` maps to
     the builtin filter. Gemma-4 uses `.get(`, Nemotron-3 `.split(`.
   - `tojson` is missing from the C build: added as `json.dumps` writes it (`", "` / `": "`, non-ASCII kept;
-    keys sorted). `raise_exception` added (it records the message and `chat_render` croaks after rendering:
-    the module renders on past a function that dies). `enable_thinking` / `add_generation_prompt` become
-    JSON::PP booleans (templates test `is false`).
-  - UTF-8: the XS passes a string's internal bytes and returns UTF-8 bytes without the flag, so a Latin-1
-    string (`été`) became `null` and `chat()` double-encoded every non-ASCII prompt. The context is now
-    upgraded (a copy) and the output decoded.
-  - Module bug found (not worked around beyond avoiding it): a filter returning a blessed scalar
-    (`JSON::PP::true`) segfaults — `cb_filter_wrapper` calls `mg_get` on the reference itself
-    (`lib/Minijinja.xs`); the py_ filters return 1 / 0 instead.
+    keys sorted). `raise_exception` added (dies: `chat_render` croaks with the template's message).
+    `enable_thinking` / `add_generation_prompt` become JSON::PP booleans (templates test `is false`).
+  - Minijinja itself fixed (perl-minijinja-xs, version 0.1.1; `chat_render` requires it): a callback that
+    died did not abort rendering (with `G_EVAL|G_SCALAR`, `call_sv` returns 1 even on a die, so `$@` is
+    checked now; the message is copied, not a pointer into `$@`); a callback returning a blessed scalar
+    (`JSON::PP::true`) segfaulted (`mg_get` on the reference); strings went to Rust as Perl's internal
+    bytes (a Latin-1 `été` became `null`) and came back without the UTF8 flag (`chat()` double-encoded
+    every non-ASCII prompt): text is now Perl character strings both ways; the rpath was relative (needed
+    `LD_LIBRARY_PATH`); leaks: every callback argument (an extra refcount), every nested list/map value
+    and `eval_expr` result (owned `mj_value`s never released; 600 B per render of a list of maps), a
+    `strdup` per loader / path-join call. Its `has_prefix` / `has_suffix` returned the string "0" (truthy
+    in Jinja) and its JSON helper decoded with `->utf8`; both fixed. Its own test template had relied on
+    the swallowed exception: its expected output is corrected (matches jinja2 now).
   - Verified against Python jinja2 (transformers' settings: trim_blocks, lstrip_blocks): a conversation with
     a reasoning turn, a tool call, a tool response, a tool list, Latin-1 and CJK text renders byte-identical,
-    with thinking on and off, for all six Qwen GGUF templates. `t/15-template.t` (16 tests, no model needed)
+    with thinking on and off, for all six Qwen GGUF templates. `t/15-template.t` (18 tests, no model needed)
     covers the rewrite, the filters, tojson, booleans, UTF-8 and raise_exception.
 - **Next:** session save/load became Phase 22b (the KV block store), done. Later: long-context decode
   attention.
