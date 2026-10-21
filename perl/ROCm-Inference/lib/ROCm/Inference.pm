@@ -166,18 +166,146 @@ sub _render_template {
     return $text;
 }
 
+# The tags that mark a reply's reasoning and its tool calls (Qwen, Nemotron, ...); everything else is content
+our %REPLY_TAGS = (reasoning => ['<think>', '</think>'], tool_call => ['<tool_call>', '</tool_call>']);
+
+# A splitter for a reply's text as it streams: feed($text) takes the next piece (true when on_delta asked to
+# stop), finish() the end. Pieces go to on_delta($text, $kind) by kind: 'reasoning', 'content' or 'tool_call'
+# (a tool call block's inner text), without the tags. Reasoning and content are trimmed as the chat templates
+# trim them (leading whitespace dropped, trailing whitespace held back until more text follows), so the
+# deltas of a kind add up to the message's field. Tags are found in the text, not by token: the text a token
+# brings may arrive with the next one.
+sub _reply_splitter {
+    my ($kind, $on_delta, $tags) = @_;
+    $tags //= \%REPLY_TAGS;
+    my (%text, %hold, @calls, $buf, $stop) = (reasoning => '', content => '');
+    $buf = '';
+    my $put = sub {
+        my ($k, $t) = @_;
+        if ($k eq 'tool_call') {
+            $calls[-1] .= $t;
+        } else {
+            $t = $hold{$k} . $t if defined $hold{$k};
+            $t =~ s/^\s+// unless length $text{$k};
+            $t =~ s/(\s*)\z//;
+            $hold{$k} = $1;
+            $text{$k} .= $t;
+        }
+        $stop = 1 if length $t && $on_delta && $on_delta->($t, $k);
+    };
+    my $feed = sub {
+        $buf .= $_[0] // '';
+        while (length $buf) {
+            # the tags that can end this kind: its close tag, or in content the open tags
+            my %next = $kind eq 'content' ? map { $tags->{$_}[0] => $_ } keys %$tags : ($tags->{$kind}[1] => 'content');
+            my ($at, $tag) = (-1, undef);
+            for my $t (keys %next) {
+                my $i = index($buf, $t);
+                ($at, $tag) = ($i, $t) if $i >= 0 && ($at < 0 || $i < $at);
+            }
+            if ($at < 0) {  # keep what could be the start of a tag
+                my $keep = 0;
+                for my $t (keys %next) {
+                    my $n = length($t) - 1;
+                    $n = length $buf if $n > length $buf;
+                    for (; $n > $keep; --$n) {
+                        if (substr($buf, -$n) eq substr($t, 0, $n)) { $keep = $n; last }
+                    }
+                }
+                $put->($kind, substr($buf, 0, length($buf) - $keep, '')) if length($buf) > $keep;
+                last;
+            }
+            $put->($kind, substr($buf, 0, $at)) if $at > 0;
+            substr($buf, 0, $at + length $tag, '');
+            $kind = $next{$tag};
+            push @calls, '' if $kind eq 'tool_call';
+        }
+        my $s = $stop;
+        $stop = 0;
+        return $s;
+    };
+    return {
+        feed   => $feed,
+        kind   => sub { $kind },
+        finish => sub {
+            $put->($kind, $buf) if length $buf;
+            $buf = '';
+            my %msg = (role => 'assistant', content => $text{content});
+            $msg{reasoning_content} = $text{reasoning} if length $text{reasoning};
+            for my $raw (@calls) {
+                my $call = _parse_tool_call($raw);
+                push @{ $msg{$call ? 'tool_calls' : 'invalid_tool_calls'} }, $call // $raw;
+            }
+            return \%msg;
+        },
+    };
+}
+
+# A tool call block's text as { type => 'function', function => { name, arguments => {...} } }: Qwen3.5+ XML
+# (<function=name> <parameter=p>value</parameter>, values as written) or Qwen3 JSON ({"name", "arguments"});
+# undef when it is neither
+sub _parse_tool_call {
+    my ($t) = @_;
+    if ($t =~ /<function=([^>\n]+)>(.*?)(?:<\/function>|\z)/s) {
+        my ($name, $body, %args) = ($1, $2);
+        $args{$1} = $2 while $body =~ /<parameter=([^>\n]+)>\n?(.*?)\n?<\/parameter>/sg;
+        return { type => 'function', function => { name => $name, arguments => \%args } };
+    }
+    require JSON::PP;
+    my $j = eval { JSON::PP->new->decode($t) };
+    return undef unless ref $j eq 'HASH' && defined $j->{name} && !ref $j->{name};
+    my $args = $j->{arguments} // {};
+    $args = eval { JSON::PP->new->decode($args) } // $args unless ref $args;  # arguments as a JSON string
+    return { type => 'function', function => { name => $j->{name}, arguments => $args } };
+}
+
 # chat($model, \@messages, \%options): render the conversation, then generate the assistant's reply, reusing
-# what the model already holds of the same conversation (reuse_prefix). Returns the reply text, and in list
-# context also the stop reason. %options: those of generate (on_token, max_new_tokens, temperature, stop, ...)
-# plus template variables in vars => { enable_thinking => 0, ... }.
+# what the model already holds of the same conversation (reuse_prefix). The reply is split into its reasoning
+# (the <think> block), its content and its tool calls. Returns the content, and in list context also the stop
+# reason and the reply as a message ({ role => 'assistant', content, reasoning_content, tool_calls }) to push
+# onto @messages for the next turn. %options: those of generate (on_token, max_new_tokens, temperature, stop,
+# ...), template variables in vars => { enable_thinking => 0, tools => [...], ... }, and
+#   on_delta => sub { my ($text, $kind) = @_; return $stop }   the reply streamed by kind (see _reply_splitter)
+#   max_thinking_tokens => $n   close the reasoning after $n tokens and go on with the answer
 sub chat {
     my ($m, $messages, $opts) = @_;
     my %o = %{ $opts // {} };
     my %vars = %{ delete $o{vars} // {} };
-    my $prompt = tokenize($m, chat_render($m, $messages, %vars));
-    my ($ids, $reason) = generate($m, $prompt, { reuse_prefix => 1, %o });
-    my $reply = detokenize($m, $ids);
-    return wantarray ? ($reply, $reason) : $reply;
+    my ($on_delta, $budget, $on_token) = delete @o{qw(on_delta max_thinking_tokens on_token)};
+    my $text = chat_render($m, $messages, %vars);
+    # Does the generation prompt open the reasoning (Qwen3.5+ with thinking on ends it with "<think>\n")?
+    my ($open, $close) = @{ $REPLY_TAGS{reasoning} };
+    my $history = eval { chat_render($m, $messages, %vars, add_generation_prompt => 0) } // '';
+    my $gen = index($text, $history) == 0 ? substr($text, length $history) : $text;
+    my $split = _reply_splitter(rindex($gen, $open) > rindex($gen, $close) ? 'reasoning' : 'content', $on_delta);
+
+    my ($max, $thinking, @ids, $reason) = ($o{max_new_tokens} // 256, 0);
+    my %g = (reuse_prefix => 1, %o);
+    my $prompt = tokenize($m, $text);
+    while (1) {
+        my ($stopped, $budget_hit) = (0, 0);
+        $g{max_new_tokens} = $max - @ids;
+        $g{on_token} = sub {
+            my ($tok, $piece) = @_;
+            $stopped = 1 if $on_token && $on_token->($tok, $piece);
+            $stopped = 1 if $split->{feed}->($piece);
+            $budget_hit = 1 if defined $budget && $tok >= 0 && $split->{kind}->() eq 'reasoning' && ++$thinking >= $budget;
+            return $stopped || $budget_hit;
+        };
+        my ($ids, $why) = generate($m, $prompt, \%g);
+        push @ids, @$ids;
+        $reason = $why;
+        last unless $budget_hit && !$stopped && $why == STOP_CALLBACK() && @ids < $max;
+        # Out of thinking budget: close the reasoning as the model would and continue with the answer, right
+        # after the tokens generated so far
+        my $closing = "\n$close\n\n";
+        $prompt = tokenize($m, $closing);
+        $split->{feed}->($closing);
+        $budget = undef;
+        $g{reuse_prefix} = 0;
+    }
+    my $msg = $split->{finish}->();
+    return wantarray ? ($msg->{content}, $reason, $msg) : $msg->{content};
 }
 
 1;
@@ -208,6 +336,15 @@ ROCm::Inference - LLM inference on AMD Strix Halo (gfx1151) through libinference
     push @messages, { role => 'assistant', content => $reply },
                     { role => 'user', content => 'And three secondary colors?' };
     print chat($m, \@messages, { vars => { enable_thinking => 0 } }), "\n";
+
+    # Thinking, streamed by kind ('reasoning', 'content', 'tool_call'), at most 256 tokens of it; the reply
+    # message keeps the reasoning and any tool calls for the next turn
+    my ($answer, $why, $msg) = chat($m, \@messages, {
+        vars                => { enable_thinking => 1, tools => \@tools },
+        max_thinking_tokens => 256,
+        on_delta            => sub { my ($text, $kind) = @_; print $kind eq 'content' ? $text : ''; return 0 },
+    });
+    push @messages, $msg;    # { role => 'assistant', content, reasoning_content, tool_calls }
 
 =head1 DESCRIPTION
 
@@ -283,6 +420,19 @@ methods (C<startswith>, C<endswith>, C<split>, C<strip>, C<lstrip>, C<rstrip>, C
 C<lower>, C<get>, C<items>), C<tojson> as C<json.dumps> writes it, C<raise_exception>, and the plain Perl
 values of C<enable_thinking> / C<add_generation_prompt> as booleans. Text is passed and returned as Perl
 character strings. Needs Minijinja 0.1.1 or later.
+
+C<chat> splits the reply at its tags (C<< <think> >> ... C<< </think> >>, C<< <tool_call> >> ...
+C<< </tool_call> >>; C<%ROCm::Inference::REPLY_TAGS>) into reasoning, content and tool calls; a generation
+prompt that opens the reasoning (Qwen3.5+ with thinking on) starts the reply in it. It returns the content,
+and in list context also the stop reason and the reply as a message to push onto the conversation:
+C<< { role => 'assistant', content, reasoning_content, tool_calls } >>, the tool calls as
+C<< { type => 'function', function => { name, arguments => { ... } } } >> (Qwen3.5+ XML parameters as the model
+wrote them, Qwen3 JSON decoded; blocks that parse as neither in C<invalid_tool_calls>). The templates render
+such a message back as the model wrote it, so the next turn reuses it. Options beyond C<generate>'s:
+C<vars> (template variables), C<on_delta> (C<< sub { my ($text, $kind) = @_; return $stop } >>: the reply
+streamed by kind, C<reasoning>, C<content> or C<tool_call>, without the tags; reasoning and content trimmed as
+the templates trim them, so the deltas of a kind add up to the message's field) and C<max_thinking_tokens>
+(after that many reasoning tokens, close the reasoning as the model would and go on with the answer).
 
 =item chat_template($m [, $name]), bos_id, eos_id, token_is_eog, vocab_size, n_ctx, n_past, reset,
 prefill, decode_token, get_logits, last_prompt_stats, set_lm_head_q8, set_draft_model, set_draft_tokens,

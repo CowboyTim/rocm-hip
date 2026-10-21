@@ -7,6 +7,9 @@ Revision history for ROCm-Inference
       the Python string/dict methods, tojson and raise_exception that chat templates use; the Qwen3,
       Qwen3.5/3.6 and Qwen3.8 templates render as Python jinja2 does (tools, tool calls, UTF-8 text).
       Needs Minijinja 0.1.1 (callbacks that die abort rendering, boolean returns, character strings).
+    - chat splits the reply into reasoning, content and tool calls and returns it as a message for the next
+      turn (reasoning_content, tool_calls); on_delta streams it by kind; max_thinking_tokens caps the
+      reasoning.
     - KV block store: store_open, store_stats, store_block_names; ROCm::Inference::Store for the policy
       (eviction to a size, a disk tier: store_evict, store_spill, store_fetch).
     - Speculative decoding with an MTP draft head (Qwen3.8-Flash-Next): set_draft_model, set_draft_tokens

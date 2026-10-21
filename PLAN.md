@@ -1194,26 +1194,34 @@ for the symptoms above.
 >      table, Q6_K head) if the user wants it. **`qwen3` DONE ✅ (2026-10-21)**: Qwen3-0.6B (see "Qwen3" in
 >      Phase 21). All Qwen GGUFs in /models run: Qwen3-0.6B, Qwen3.5-0.8B / 4B / 122B-A10B, Qwen3.6-35B-A3B,
 >      Qwen3.8-27B / Flash-Next.
->  10. **Thinking tags and streaming chat** (user, 2026-10-21; open). Today `inference_generate_stream` /
->      Perl `generate` and `chat` stream raw token text through `on_token`, and `chat()` returns the whole
->      reply, `<think>` block included; nothing knows about reasoning or tool calls. To do:
->      - **Split thinking from the answer:** the reply's reasoning (between `<think>` and `</think>`; the
->        Qwen3.5+ generation prompt already ends in `<think>\n`, so the reply starts inside the block) and its
->        answer, both returned by `chat` (e.g. `{ content, reasoning_content }`), with `reasoning_content` kept in
->        the assistant message so the next turn's template renders the history as the model was trained on
->        (Qwen drops it before the last user turn, keeps it after) and prefix reuse still matches.
->      - **Streaming with channels:** `on_token` also says whether a piece is thinking or answer. The tags
->        are single tokens in every Qwen vocab here (`<think>` 151667 / 248068, `</think>` 151668 / 248069,
->        `<tool_call>` 151657 / 248058), so switch on token ids, not text. Options: hide the thinking, a
->        thinking budget (after N thinking tokens force `</think>`), `enable_thinking` per call.
->      - **In the C API** (a channel flag in the stream callback, the tag token ids from the vocab) so non-Perl
->        users get it; per-family tags taken from the templates (Qwen `<think>`; Gemma-4 / Nemotron formats
->        when those models land, item 9).
->      - **Tool calls:** parse `<tool_call>` blocks (Qwen3.5+ `<function=...><parameter=...>` XML, Qwen3 JSON)
->        into `tool_calls` for the next turn's template (`chat_render` already renders tools, tool calls and
->        tool responses identically to jinja2).
->      - **A streaming server example:** SSE, OpenAI-style `/v1/chat/completions` with `reasoning_content`
->        deltas; the same as the Phase 22b "Perl web service example" in item 8.
+>  10. **Thinking tags and streaming chat — DONE ✅ in Perl (2026-10-21; user: "use Perl as much as possible")**.
+>      libinference only generates tokens: reasoning, answer and tool calls come out as one stream. Now
+>      `ROCm::Inference::chat` splits it:
+>      - **Reply as a message:** returns the content, and in list context the stop reason and
+>        `{ role => 'assistant', content, reasoning_content, tool_calls }` to push for the next turn; the
+>        templates render it back as the model wrote it, so the turn after a tool call reuses all but ~30
+>        tokens (4B: reused 336, prefilled 31; 35B 453 / 31; 27B 377 / 31). Tool calls parsed from Qwen3.5+ XML
+>        (`<function=..><parameter=..>`, values as written) and Qwen3 JSON (decoded); unparsable blocks in
+>        `invalid_tool_calls`.
+>      - **Streaming by kind:** `on_delta => sub { my ($text, $kind) = @_ }` with `reasoning` / `content` /
+>        `tool_call`, tags removed, reasoning and content trimmed as the templates trim them (leading whitespace
+>        dropped, trailing held back), so the deltas of a kind add up to the message field. Tags are matched in
+>        the text (`%REPLY_TAGS`, with a hold-back like stop strings), **not by token id** as first planned:
+>        `on_token` text is not token-aligned (partial UTF-8 and stop-string prefixes are held back), and text
+>        tags also cover models where they are not single tokens. The start state comes from the generation
+>        prompt (the template rendered with and without it): Qwen3.5+ with thinking on opens `<think>` there,
+>        Qwen3 lets the model open it.
+>      - **Thinking budget:** `max_thinking_tokens => n` stops at n reasoning tokens (on_token returns stop;
+>        the last token is already in the sequence), then `generate` continues from `"\n</think>\n\n"`
+>        without reuse_prefix, i.e. right after the generated tokens. No C change needed.
+>      - Tested: `t/16-reply.t` (532 checks, no model: every way of cutting the text gives the same message,
+>        deltas add up, both tool formats, render back), `t/20-chat.t` (+10: budget, streamed kinds, a
+>        get_weather round trip) on Qwen3.5-4B and 3.6-35B; by hand also Qwen3-0.6B (JSON tool calls, model-
+>        opened think) and Qwen3.8-27B.
+>      - **Left:** the SSE server example (OpenAI-style `/v1/chat/completions` with `reasoning_content` /
+>        `tool_calls` deltas), merged with the Phase 22b "Perl web service example" in item 8; per-family tags
+>        when Gemma-4 / Nemotron land (item 9: check their templates, extend `%REPLY_TAGS`). A C API channel
+>        flag only if a non-Perl user needs it.
 >   Profiling: `rocprofv3 --kernel-trace -d <dir> -o run -- <cmd>`, then `tools/prof_summary.py <dir>`;
 >   `QWEN_PROFILE=1` for per-section times.
 > - **Perl module (2026-10-18):** `Makefile.PL` finds libinference via ROCM_INFERENCE_PREFIX, pkg-config
