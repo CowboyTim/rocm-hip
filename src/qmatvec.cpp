@@ -19,6 +19,7 @@ static hipFunction_t g_fn[QMV_MAX_TYPE];
 static hipFunction_t g_fn_q8[QMV_MAX_TYPE];  // int8 kernels, matvec_q8_<type>
 static hipFunction_t g_quant = nullptr;
 static hipFunction_t g_mm_f32 = nullptr;  // matmul_f32: batched F32
+static hipFunction_t g_mm_f32_tile = nullptr;  // matmul_f32_tile: F32 prefill, another summation order (WMMA mode)
 static hipFunction_t g_quant_rows_q8_0 = nullptr, g_mv_q8_0s = nullptr;  // int8 copy of a float LM head
 static hipFunction_t g_fn_mm[QMV_MAX_TYPE];  // batched int8 kernels, matmul_q8_<type>
 static hipFunction_t g_fn_q8_id[QMV_MAX_TYPE];  // expert-indexed int8 kernels, matvec_q8_id_<type>
@@ -84,6 +85,7 @@ int qmatvec_init(const char *co_path) {
     }
     if (hipModuleGetFunction(&g_quant, g_mod, "quantize_q8") != hipSuccess) g_quant = nullptr;
     if (hipModuleGetFunction(&g_mm_f32, g_mod, "matmul_f32") != hipSuccess) g_mm_f32 = nullptr;
+    if (hipModuleGetFunction(&g_mm_f32_tile, g_mod, "matmul_f32_tile") != hipSuccess) g_mm_f32_tile = nullptr;
     if (hipModuleGetFunction(&g_lr_fast, g_mod, "matvec_q8_lr_q4_0_rocmfp4_fast") != hipSuccess) g_lr_fast = nullptr;
     if (hipModuleGetFunction(&g_quant_rows_q8_0, g_mod, "quantize_rows_q8_0") != hipSuccess) g_quant_rows_q8_0 = nullptr;
     if (hipModuleGetFunction(&g_mv_q8_0s, g_mod, "matvec_q8_0s") != hipSuccess) g_mv_q8_0s = nullptr;
@@ -106,7 +108,7 @@ void qmatvec_free(void) {
     memset(g_fn_mmf, 0, sizeof(g_fn_mmf));
     memset(g_fn_q8t, 0, sizeof(g_fn_q8t));
     g_quant = nullptr;
-    g_mm_f32 = g_quant_rows_q8_0 = g_mv_q8_0s = g_lr_fast = nullptr;
+    g_mm_f32 = g_mm_f32_tile = g_quant_rows_q8_0 = g_mv_q8_0s = g_lr_fast = nullptr;
 }
 
 int qmatvec_supported(int type) {
@@ -136,6 +138,11 @@ hipError_t qmatvec_launch_batch(int type, const void *W, size_t row_bytes, const
         (((uintptr_t)W | (uintptr_t)x) & 15) == 0) {
         long long rb = (long long)row_bytes;
         void *args[] = {(void *)&W, &rb, (void *)&x, (void *)&y, &N, &K, &T};
+        // Prefill batches in the WMMA mode: the tiled kernel (another summation order, like the WMMA kernels;
+        // decoding, verify passes and QMATVEC_NO_WMMA keep matvec_f32's order)
+        if (g_use_wmma && g_mm_f32_tile && T >= g_wmma_min_t && K % 32 == 0)
+            return hipModuleLaunchKernel(g_mm_f32_tile, (unsigned)((N + 63) / 64), (unsigned)((T + 63) / 64), 1, 256,
+                                         1, 1, 0, stream, args, nullptr);
         return hipModuleLaunchKernel(g_mm_f32, (unsigned)((N + QMV_MF32_ROWS - 1) / QMV_MF32_ROWS),
                                      (unsigned)((T + QMV_MF32_TT - 1) / QMV_MF32_TT), 1,
                                      32 * QMV_F32_PARTS, 1, 1, 0, stream, args, nullptr);

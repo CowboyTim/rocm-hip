@@ -1168,6 +1168,8 @@ for the symptoms above.
 >      decode path (attn_partial_128: 0.87 s of 1.04 s). Now `attn_flash_128_g2` stages 2 KV heads per
 >      workgroup: Qwen3-0.6B prefill 2,236 → ~7,200 tok/s. Ratio 1 (NG = 4, 53 KB LDS) would fit; left out
 >      until a model needs it (nothing here to test it with).
+>   6c. **Router float matmul for prefill — DONE ✅ (2026-10-21)**: `matmul_f32_tile` (see "Router prefill tile");
+>      Qwen3.8 router 1.38 → 0.48 ms per call, prefill ~795 → ~826 tok/s; 35B ~2,000 → ~2,075.
 >   6b. **Opt-in larger prefill batch — DONE ✅ (2026-10-21)**: `inference_set_prefill_batch(m, n)` (16 .. 8192,
 >      before kv_cache_init), Perl `set_prefill_batch`, `qwen_demo --batch N`; see "Prefill batch option" in
 >      Phase 21. Up to ~10% on MoE models' long prompts at 4096; nothing for dense models; default stays 1024.
@@ -2003,6 +2005,18 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
   - Note: `qwen_demo` without `--draft` prefills the prompt in one call, the library in two (a checkpoint
     before its tail), so their greedy texts can differ (WMMA prefill vs per-token kernels on a router
     near-tie); the library with and without the head is identical.
+
+- **Router prefill tile (2026-10-21).** The MoE router's F32 logits (512 x 2560 on Qwen3.8) in prefill:
+  `matmul_f32` keeps matvec_f32's order (lane-strided quarters, wave reduction), which limits it to 16 rows x 8
+  tokens per workgroup (~5x the L2 traffic). In the WMMA mode prefill may sum in another order (as the int8
+  WMMA kernels), so batches of >= 32 tokens there take `matmul_f32_tile`: 64 rows x 64 tokens per 256-thread
+  workgroup, each thread a 4 x 4 block, 32-value chunks staged in LDS transposed (float4 reads), each chunk's
+  sum added separately. Decoding, 2..4-token verify passes and QMATVEC_NO_WMMA keep the exact kernel. Error vs
+  a double reference 3-5e-6 (matvec_f32 1-1.5e-6; |y| ~10), top-1 router logit never different (scratch
+  harness, 4 shapes). Qwen3.8 1.38 → 0.48 ms per call (0.20 → 0.07 s per 2,427-token prompt), prefill ~795 →
+  ~826 tok/s; 35B ~2,000 → ~2,075; 122B ~620 (its router was already small). Tests pass in both modes; the
+  35B's batch-size check went from cosine 0.9995 to 0.9971 (the router's sums now differ between batchings too,
+  so near-tied experts can flip; same argmax).
 
 - **Prefill batch option (2026-10-21).** `inference_set_prefill_batch(m, n)`: tokens per prefill micro-batch, 16
   to 8,192 (0: 1024), set before `inference_kv_cache_init` (the scratch is allocated there; refused after).

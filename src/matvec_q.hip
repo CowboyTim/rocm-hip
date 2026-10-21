@@ -647,6 +647,72 @@ matmul_f32(const uint8_t *W, long long row_bytes, const float *x, float *y, int 
             if (row0 + r < N && t < nt) y[(size_t)(t0 + t) * N + row0 + r] = res[r][t];
 }
 
+// F32 prefill (the MoE router's logits) when the summation order may differ from matvec_f32 (the WMMA mode,
+// as the int8 WMMA kernels): a register-blocked tile of FT_ROWS rows x FT_TOK tokens per 256-thread workgroup,
+// thread (ty, tx) computing rows 4 ty .. + 3 x tokens 4 tx .. + 3. Per chunk of FT_KC values both operands are
+// staged in LDS transposed ([k][row], [k][token]) so that a thread reads its 4 rows / 4 tokens as one float4;
+// each chunk's 16 dot products are summed with FMAs in k order and then added to the accumulators (fewer
+// roundings of large partial sums). Each weight is read once per 64 tokens and each activation once per 64
+// rows: matmul_f32 (16 rows x 8 tokens, matvec_f32's order) moved ~5x the bytes through L2. K % 32 == 0.
+#define FT_ROWS 64
+#define FT_TOK 64
+#define FT_KC 32
+extern "C" __global__ void __launch_bounds__(256)
+matmul_f32_tile(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K, int T) {
+    __shared__ __attribute__((aligned(16))) float sw[FT_KC][FT_ROWS + 4];
+    __shared__ __attribute__((aligned(16))) float sx[FT_KC][FT_TOK + 4];
+    const int tid = threadIdx.x, tx = tid % 16, ty = tid / 16;
+    const int r0 = blockIdx.x * FT_ROWS, t0 = blockIdx.y * FT_TOK;
+    float acc[4][4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r)
+#pragma unroll
+        for (int c = 0; c < 4; ++c) acc[r][c] = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += FT_KC) {
+        // stage: 64 rows / tokens x 32 values = 512 float4 each, 2 per thread
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int idx = tid + 256 * j, rr = idx / (FT_KC / 4), k4 = 4 * (idx % (FT_KC / 4));
+            const float4 wv = r0 + rr < N ? *(const float4 *)((const float *)(W + (long long)(r0 + rr) * row_bytes) +
+                                                                k0 + k4)
+                                          : float4{0, 0, 0, 0};
+            const float4 xv = t0 + rr < T ? *(const float4 *)(x + (size_t)(t0 + rr) * K + k0 + k4) : float4{0, 0, 0, 0};
+            sw[k4][rr] = wv.x, sw[k4 + 1][rr] = wv.y, sw[k4 + 2][rr] = wv.z, sw[k4 + 3][rr] = wv.w;
+            sx[k4][rr] = xv.x, sx[k4 + 1][rr] = xv.y, sx[k4 + 2][rr] = xv.z, sx[k4 + 3][rr] = xv.w;
+        }
+        __syncthreads();
+        float s[4][4];
+#pragma unroll
+        for (int r = 0; r < 4; ++r)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) s[r][c] = 0.0f;
+#pragma unroll 8
+        for (int k = 0; k < FT_KC; ++k) {
+            const float4 wv = *(const float4 *)&sw[k][4 * ty], xv = *(const float4 *)&sx[k][4 * tx];
+            const float wr[4] = {wv.x, wv.y, wv.z, wv.w}, xc[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+            for (int r = 0; r < 4; ++r)
+#pragma unroll
+                for (int c = 0; c < 4; ++c) s[r][c] = fmaf(wr[r], xc[c], s[r][c]);
+        }
+#pragma unroll
+        for (int r = 0; r < 4; ++r)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) acc[r][c] += s[r][c];
+        __syncthreads();
+    }
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        const int t = t0 + 4 * tx + c;
+        if (t >= T) continue;
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const int row = r0 + 4 * ty + r;
+            if (row < N) y[(size_t)t * N + row] = acc[r][c];
+        }
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
 matvec_bf16(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K) {
     const int lane = threadIdx.x & 31;

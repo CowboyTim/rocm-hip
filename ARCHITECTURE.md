@@ -111,11 +111,11 @@ The batched kernels (`matmul_q8_*`, `matvec_q8t_*`, attention below 16 tokens, t
 tokens) reproduce the single-token sums bit for bit. The WMMA kernels (int8 matmuls from 32 tokens, the
 expert-grouped matmuls, FP16 flash attention from 16 tokens) sum in another order: prefill then differs from
 token-by-token decoding in the last bits, which routing near-ties can amplify, but not in accuracy against the
-reference. Their integer dots are exact; ROCmFP4_FAST (one scale per 32 values) adds a block's two 16-value
-WMMA dots in int32 and scales once, the same per-block term as the dot4 kernels, so only the order of the float
-sum over blocks differs (within ~5e-6 relative of the dot4 kernels). `QMATVEC_NO_WMMA=1` (all),
-`QMATVEC_NO_WMMA_MM=1` (matmuls), `ATTN_NO_FLASH=1` (attention) switch them off; the exactness tests run with
-`QMATVEC_NO_WMMA=1`.
+reference (also the F32 router logits in prefill: `matmul_f32_tile`). Their integer dots are exact; ROCmFP4_FAST
+(one scale per 32 values) adds a block's two 16-value WMMA dots in int32 and scales once, the same per-block term as
+the dot4 kernels, so only the order of the float sum over blocks differs (within ~5e-6 relative of the dot4
+kernels). `QMATVEC_NO_WMMA=1` (all), `QMATVEC_NO_WMMA_MM=1` (matmuls), `ATTN_NO_FLASH=1` (attention) switch them
+off; the exactness tests run with `QMATVEC_NO_WMMA=1`.
 
 ## 6. Models
 
@@ -218,10 +218,10 @@ tokens after a short prompt. Runs vary by about ±5%.
 | Qwen3-0.6B | Q8_0 (0.6 GB) | 184 tok/s | 7,200 tok/s |
 | Qwen3.5-0.8B | UD-Q8_K_XL (1.2 GB): Q8_0 / F16 matrices | 120 tok/s | 4,110 tok/s |
 | Qwen3.5-4B | ROCmFP4 (2.9 GB) | 59 tok/s | 1,850 tok/s |
-| Qwen3.6-35B-A3B | ROCmFP4 (20 GB), BF16 head | 62 tok/s (more with the int8 head option) | 2,005 tok/s |
+| Qwen3.6-35B-A3B | ROCmFP4 (20 GB), BF16 head | 62 tok/s (more with the int8 head option) | 2,075 tok/s |
 | Qwen3.8-27B (dense) | Q4_0_ROCMFP4_FAST (14.6 GB) | 13.8 tok/s (~200 GB/s of weights) | 296 tok/s |
 | Qwen3.5-122B-A10B | UD-Q4_K_XL (77 GB): Q4_K / Q5_K experts, Q8_0 dense | 22.6 tok/s | 620 tok/s |
-| Qwen3.8-Flash-Next (177B) | Q4_0_ROCmFP4_FAST (94 GB) | 34–38 tok/s; 48–55 with the MTP head | 797 tok/s |
+| Qwen3.8-Flash-Next (177B) | Q4_0_ROCmFP4_FAST (94 GB) | 34–38 tok/s; 48–55 with the MTP head | 826 tok/s |
 
 Qwen3 MoE models (`qwen3moe`: no shared expert) are not supported yet.
 
