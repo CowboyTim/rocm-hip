@@ -1181,9 +1181,10 @@ for the symptoms above.
 >   7. **Accuracy checks**: greedy text vs `llama-completion` diverges at the 2nd token of the reference prompt
 >      (a near-tie): compare longer greedy runs on prompts without near-ties, or by teacher forcing; the FP16
 >      flash attention at long contexts (only a 30k needle test so far).
->   8. **Library / packaging**: `perl/ROCm-Inference/t/20-chat.t` with the user's Minijinja module (cargo is
->      installed now); **CPAN packaging — DONE ✅ (2026-10-21)**, see "CPAN packaging" in Phase 21; Phase 22b follow-ups (disk-tier timing, block size option, a Perl web
->      service example); long-context decode attention.
+>   8. **Library / packaging**: **`t/20-chat.t` with Minijinja — DONE ✅ (2026-10-21)** and **CPAN packaging —
+>      DONE ✅ (2026-10-21)**, see "Chat templates with Minijinja" in Phase 22 and "CPAN packaging" in Phase 21; Phase 22b
+>      follow-ups (disk-tier timing, block size option, a Perl web service example); long-context decode
+>      attention.
 >   9. **More models** (see the target list): EmbeddingGemma-300M, Nemotron-3, Gemma-4; `qwen3moe` (Qwen3 MoE:
 >      no shared expert; no such model in /models); the STRIX_LEAN Qwen3.8 release (Q5_K token_embd, Q5_1 PLE
 >      table, Q6_K head) if the user wants it. **`qwen3` DONE ✅ (2026-10-21)**: Qwen3-0.6B (see "Qwen3" in
@@ -2199,7 +2200,7 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
 is a 63 GB tmpfs (38 GB free) and the disk has 48 GB free, so a ~50 GB model needs space freed or /dev/shm
 remounted larger; the reference oracle must also run each model on the CPU for `ref_dump`.
 
-## Phase 22 – Product C API + Perl XS module (Phase 14) — DONE ✅ (2026-10-18; open: t/20-chat.t with Minijinja, CPAN packaging)
+## Phase 22 – Product C API + Perl XS module (Phase 14) — DONE ✅ (2026-10-18; Minijinja chat and CPAN packaging 2026-10-21)
 
 **Progress:**
 - **Step 1a — DONE ✅: streaming generation.** `inference_generate_stream` continues the current sequence
@@ -2260,9 +2261,32 @@ remounted larger; the reference oracle must also run each model on the CPU for `
     tokenize/UTF-8 round trips, streaming, stop string / callback / die, chat turns with prefix reuse,
     logits, freed handle), `t/20-chat.t` (MiniJinja chat; skipped here: Minijinja needs the Rust
     minijinja-cabi library and there is no cargo on this machine). All pass on both models.
-- **Next:** run `t/20-chat.t` with Minijinja installed (the Qwen template uses `.startswith` / `.split` /
-  `namespace` / `raise_exception`: check the module supports them); CPAN packaging (build or locate
-  libinference). Session save/load became Phase 22b (the KV block store), done. Later: long-context decode
+- **Chat templates with Minijinja (2026-10-21):** `t/20-chat.t` passes with the user's perl-minijinja-xs
+  (built with rustup's cargo against minijinja-cabi) on Qwen3.5-4B, Qwen3.6-35B-A3B and Qwen3.8-27B; on
+  Qwen3-0.6B only the content check of the second reply fails (the model answers "red + blue, ..."). What
+  it took, all in `ROCm::Inference` (the Minijinja module and its C ABI unchanged):
+  - minijinja-cabi has no pycompat layer, so `.startswith(` etc. fail ("string has no method named
+    startswith"). `_py_methods` rewrites `RECV.name(args)` inside `{{ }}` / `{% %}` tags to
+    `(RECV|py_name(args))` (token-wise: the receiver is the postfix chain of names, attributes, subscripts,
+    calls and string literals), with Perl filters giving Python semantics: `startswith` / `endswith`
+    (tuples too), `split` (keeps trailing empty fields, unlike Perl's split and the module's own filter),
+    `strip` / `lstrip` / `rstrip` (char sets), `replace` (count), `upper`, `lower`, dict `get`; `items` maps to
+    the builtin filter. Gemma-4 uses `.get(`, Nemotron-3 `.split(`.
+  - `tojson` is missing from the C build: added as `json.dumps` writes it (`", "` / `": "`, non-ASCII kept;
+    keys sorted). `raise_exception` added (it records the message and `chat_render` croaks after rendering:
+    the module renders on past a function that dies). `enable_thinking` / `add_generation_prompt` become
+    JSON::PP booleans (templates test `is false`).
+  - UTF-8: the XS passes a string's internal bytes and returns UTF-8 bytes without the flag, so a Latin-1
+    string (`été`) became `null` and `chat()` double-encoded every non-ASCII prompt. The context is now
+    upgraded (a copy) and the output decoded.
+  - Module bug found (not worked around beyond avoiding it): a filter returning a blessed scalar
+    (`JSON::PP::true`) segfaults — `cb_filter_wrapper` calls `mg_get` on the reference itself
+    (`lib/Minijinja.xs`); the py_ filters return 1 / 0 instead.
+  - Verified against Python jinja2 (transformers' settings: trim_blocks, lstrip_blocks): a conversation with
+    a reasoning turn, a tool call, a tool response, a tool list, Latin-1 and CJK text renders byte-identical,
+    with thinking on and off, for all six Qwen GGUF templates. `t/15-template.t` (16 tests, no model needed)
+    covers the rewrite, the filters, tojson, booleans, UTF-8 and raise_exception.
+- **Next:** session save/load became Phase 22b (the KV block store), done. Later: long-context decode
   attention.
 
 

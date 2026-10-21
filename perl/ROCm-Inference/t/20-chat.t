@@ -1,5 +1,6 @@
 use strict;
 use warnings;
+use utf8;
 use Test::More;
 
 use ROCm::Inference qw(:all);
@@ -16,6 +17,8 @@ my @messages = ({ role => 'system', content => 'Answer briefly.' },
 my $prompt = chat_render($m, \@messages, enable_thinking => 0);
 like($prompt, qr/<\|im_start\|>user\nName three primary colors\.<\|im_end\|>/, 'the template renders the user turn');
 like($prompt, qr/<\|im_start\|>assistant\n<think>\n\n<\/think>\n\n\z/, 'generation prompt without thinking');
+like(chat_render($m, [{ role => 'user', content => '你好, été' }]), qr/user\n你好, été<\|im_end\|>/,
+     'non-ASCII text renders intact');
 
 my ($reply, $why) = chat($m, \@messages, { temperature => 0, max_new_tokens => 48, vars => { enable_thinking => 0 } });
 is($why, STOP_EOG, 'the reply ends at end-of-turn');

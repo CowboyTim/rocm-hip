@@ -35,6 +35,93 @@ use constant {
     STOP_CONTEXT_FULL => _constant_stop(5),
 };
 
+# Python methods that chat templates call on strings and dicts (content.startswith('<tool_response>'),
+# content.split('</think>')[-1].lstrip('\n'), tool.get('name'), ...). Minijinja's C API has no pycompat layer,
+# so _py_methods rewrites RECV.name(args) inside template tags to (RECV|py_name(args)), and these filters give
+# the Python semantics; a name mapped to a string uses that builtin filter instead.
+sub _py_strip_re { defined $_[0] ? '[' . quotemeta($_[0]) . ']' : '\s' }
+sub _py_bool { $_[0] ? 1 : 0 }  # not JSON::PP booleans: Minijinja 0.1.0 crashes on blessed scalar returns
+our %PY_METHODS = (
+    startswith => sub {
+        my ($s, $p) = (shift // '', shift);
+        _py_bool(grep { index($s, $_) == 0 } ref $p eq 'ARRAY' ? @$p : ($p // ''));
+    },
+    endswith => sub {
+        my ($s, $p) = (shift // '', shift);
+        _py_bool(grep { length($s) >= length && substr($s, length($s) - length) eq $_ } ref $p eq 'ARRAY' ? @$p : ($p // ''));
+    },
+    split => sub {
+        my ($s, $sep, $max) = (shift // '', @_);
+        my $limit = defined $max && $max >= 0 ? $max + 1 : -1;
+        return [ split /\Q$sep\E/, $s, $limit ] if defined $sep;
+        $s =~ s/^\s+//;
+        [ split /\s+/, $s, $limit < 0 ? 0 : $limit ];
+    },
+    strip  => sub { my ($s, $re) = (shift // '', _py_strip_re(shift)); $s =~ s/^$re+//; $s =~ s/$re+\z//; $s },
+    lstrip => sub { my ($s, $re) = (shift // '', _py_strip_re(shift)); $s =~ s/^$re+//; $s },
+    rstrip => sub { my ($s, $re) = (shift // '', _py_strip_re(shift)); $s =~ s/$re+\z//; $s },
+    upper  => sub { uc(shift // '') },
+    lower  => sub { lc(shift // '') },
+    replace => sub {
+        my ($s, $old, $new, $n) = (shift // '', shift // '', shift // '', shift);
+        return $s if $old eq '';
+        my $out = '';
+        while ((!defined $n || $n-- > 0) && (my $i = index($s, $old)) >= 0) {
+            $out .= substr($s, 0, $i) . $new;
+            $s = substr($s, $i + length $old);
+        }
+        $out . $s;
+    },
+    get => sub {
+        my ($h, $k, $def) = @_;
+        ref $h eq 'HASH' && defined $k && defined $h->{$k} ? $h->{$k} : $def;
+    },
+    items => 'items',
+);
+
+# The tojson filter (tool call arguments, tool definitions) as Python's json.dumps writes it: ", " and ": "
+# separators, non-ASCII kept; keys sorted, as Perl hashes have no order
+sub _py_tojson {
+    my ($v, $indent) = @_;
+    my $js = JSON::PP->new->canonical->allow_nonref->allow_blessed;
+    return $js->indent->indent_length($indent)->space_after->encode($v) =~ s/\n\z//r if $indent;
+    $js->space_after->encode($v) =~ s/("(?:[^"\\]|\\.)*")|,/$1 \/\/ ', '/ger;
+}
+
+# The method calls in a template's {{ }} and {% %} tags as filter calls (see %PY_METHODS)
+sub _py_methods {
+    my ($tmpl) = @_;
+    my $names = join '|', keys %PY_METHODS;
+    my $tag = sub {
+        my ($s) = @_;
+        while (1) {
+            my @t = $s =~ /\G('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|\w+|\s+|.)/gs;
+            my ($j) = grep { $t[$_] eq '.' && ($t[$_ + 1] // '') =~ /^(?:$names)\z/ && ($t[$_ + 2] // '') eq '(' } 0 .. $#t;
+            return $s unless defined $j;
+            # the receiver: names, attributes, subscripts, calls and string literals left of the dot
+            my $k = $j;
+            while ($k > 0) {
+                my $p = $t[$k - 1];
+                if ($p eq ')' || $p eq ']') {
+                    my ($close, $open, $d) = ($p, $p eq ')' ? '(' : '[', 0);
+                    do { --$k; $d += ($t[$k] eq $close) - ($t[$k] eq $open) } while ($d && $k > 0);
+                } elsif ($p =~ /^(?:\w+|\.|['"].*)\z/s) {
+                    --$k;
+                } else {
+                    last;
+                }
+            }
+            my ($e, $d) = ($j + 2, 0);  # the closing parenthesis of the call
+            for (; $e <= $#t; ++$e) { $d += ($t[$e] eq '(') - ($t[$e] eq ')'); last unless $d }
+            my $f = $PY_METHODS{ $t[$j + 1] };
+            $s = join '', @t[0 .. $k - 1], '(', @t[$k .. $j - 1], '|', ref $f ? "py_$t[$j + 1]" : $f,
+                @t[$j + 2 .. $e], ')', @t[$e + 1 .. $#t];
+        }
+    };
+    $tmpl =~ s/(\{\{|\{%)(.*?)(\}\}|%\})/$1 . $tag->($2) . $3/gse;
+    return $tmpl;
+}
+
 # chat_render($model, \@messages, %vars): the conversation as prompt text, rendered with the model's own chat
 # template (the GGUF's tokenizer.chat_template) by Minijinja. Template variables: messages, bos_token,
 # eos_token, add_generation_prompt (default 1), and any %vars (e.g. enable_thinking => 0, tools => [...]);
@@ -43,7 +130,7 @@ sub chat_render {
     my ($m, $messages, %vars) = @_;
     eval { require Minijinja; 1 } or croak "ROCm::Inference::chat_render needs the Minijinja module: $@";
     my $name = delete $vars{template_name};
-    my $tmpl = chat_template($m, $name);
+    my $tmpl = defined $name ? chat_template($m, $name) : chat_template($m);
     croak "ROCm::Inference::chat_render: the model has no chat template" . ($name ? " '$name'" : '')
         unless defined $tmpl;
     my ($bos, $eos) = (bos_id($m), eos_id($m));
@@ -54,10 +141,40 @@ sub chat_render {
         eos_token             => $eos >= 0 ? detokenize($m, [$eos]) : '',
         %vars,
     );
+    return _render_template($tmpl, \%ctx);
+}
+
+# A chat template rendered by Minijinja with the Python methods (%PY_METHODS) and tojson
+sub _render_template {
+    my ($tmpl, $vars) = @_;
+    my %ctx = %$vars;
+    # Perl has no booleans, and templates test these with 'is false' / 'is true'
+    require JSON::PP;
+    for (grep { exists $ctx{$_} && !ref $ctx{$_} } qw(add_generation_prompt enable_thinking)) {
+        $ctx{$_} = $ctx{$_} ? JSON::PP::true() : JSON::PP::false();
+    }
     my $env = Minijinja::minijinja();
-    my $text = Minijinja::render_str($env, 'chat_template', $tmpl, \%ctx);
+    Minijinja::add_filter($env, "py_$_", $PY_METHODS{$_}) for grep { ref $PY_METHODS{$_} } keys %PY_METHODS;
+    Minijinja::add_filter($env, 'tojson', \&_py_tojson);
+    my $raised;  # Minijinja 0.1.0 renders on past a function that dies
+    Minijinja::add_function($env, 'raise_exception', sub { $raised //= $_[0] // 'template error'; undef });
+    my $text = Minijinja::render_str($env, 'chat_template', _py_methods($tmpl), _utf8_copy(\%ctx));
+    croak "ROCm::Inference::chat_render: $raised" if defined $raised;
     croak "ROCm::Inference::chat_render: " . (Minijinja::error_detail() // 'template error') unless defined $text;
+    utf8::decode($text);  # Minijinja returns the UTF-8 bytes
     return $text;
+}
+
+# A copy of the template context with every string in Perl's UTF-8 form: Minijinja passes a string's internal
+# bytes on as they are, which for a string of Latin-1 characters (é) are not UTF-8
+sub _utf8_copy {
+    my ($v) = @_;
+    return { map { $_ => _utf8_copy($v->{$_}) } keys %$v } if ref $v eq 'HASH';
+    return [ map { _utf8_copy($_) } @$v ] if ref $v eq 'ARRAY';
+    return $v if ref $v || !defined $v || !utf8::is_utf8($v) && $v !~ /[^\x00-\x7f]/;
+    my $s = "$v";
+    utf8::upgrade($s);
+    return $s;
 }
 
 # chat($model, \@messages, \%options): render the conversation, then generate the assistant's reply, reusing
@@ -172,6 +289,11 @@ head has been guessing (3 pays off on code and chat replies). Dies outside that 
 =item chat_render($m, \@messages, %vars) / chat($m, \@messages, \%options)
 
 Render a conversation with the model's chat template / render it and generate the reply.
+The template is rendered by L<Minijinja> with what chat templates expect of Python's Jinja: string and dict
+methods (C<startswith>, C<endswith>, C<split>, C<strip>, C<lstrip>, C<rstrip>, C<replace>, C<upper>,
+C<lower>, C<get>, C<items>), C<tojson> as C<json.dumps> writes it, C<raise_exception>, and the plain Perl
+values of C<enable_thinking> / C<add_generation_prompt> as booleans. Text is passed and returned as Perl
+character strings.
 
 =item chat_template($m [, $name]), bos_id, eos_id, token_is_eog, vocab_size, n_ctx, n_past, reset,
 prefill, decode_token, get_logits, last_prompt_stats, set_lm_head_q8, set_draft_model, set_draft_tokens,
