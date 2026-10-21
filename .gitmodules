@@ -1,0 +1,3 @@
+[submodule "perl-minijinja-xs"]
+	path = perl-minijinja-xs
+	url = https://github.com/aardbeiplantje/perl-minijinja-xs.git

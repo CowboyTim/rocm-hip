@@ -42,6 +42,14 @@ make install PREFIX=/usr/local   # lib, headers, rocm-inference.pc
 From C: `inference.h` (`inference_load_model`, `inference_kv_cache_init`, `inference_generate_stream`, ...;
 `tests/capi_smoke.c` is a minimal example). From Perl: `cd perl/ROCm-Inference && perl Makefile.PL && make test`.
 
+Chat templates are rendered by the Minijinja Perl module (0.1.1 or later), the `perl-minijinja-xs` submodule
+(it needs Rust's cargo to build the minijinja C library):
+
+```sh
+git submodule update --init perl-minijinja-xs
+cd perl-minijinja-xs && bash scripts/setup-minijinja.sh && perl Makefile.PL && make && make install
+```
+
 The tests compare with llama.cpp as a reference oracle (`make ref_dump`, CPU build in `llama.cpp/build-cpu`);
 see ARCHITECTURE.md section 9.
 

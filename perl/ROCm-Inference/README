@@ -19,6 +19,12 @@ Makefile.PL finds libinference through ROCM_INFERENCE_PREFIX (an installed copy,
 rocm-hip), pkg-config (rocm-inference), or the rocm-hip checkout the module sits in (perl/ROCm-Inference),
 building libinference.so there when needed (ROCm / hipcc).
 
+chat_render / chat need the Minijinja module 0.1.1 or later (Perl XS over the Rust minijinja library). In a
+rocm-hip checkout it is the perl-minijinja-xs submodule:
+
+    git submodule update --init perl-minijinja-xs
+    cd perl-minijinja-xs && bash scripts/setup-minijinja.sh && perl Makefile.PL && make && make install
+
 Tests beyond t/00-load.t need the GPU and models, given by environment variables:
 
     ROCM_INFERENCE_TEST_MODEL=/path/Qwen3.5-4B-ROCMFP4.gguf
