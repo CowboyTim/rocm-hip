@@ -301,8 +301,11 @@ $(E2E_TEST): $(SRCDIR)/inference_e2e_test.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
 $(MATVEC_BENCH): tools/matvec_bench.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/matvec_q.co
 	$(CLANG) $(CXXFLAGS) -I. tools/matvec_bench.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
 
+# Same ROCm include path and --rocm-path as HIPFLAGS: without them hipcc can pick up a distro's /usr/include/hip,
+# whose headers do not match ROCm's clang (undeclared __AMDGCN_WAVEFRONT_SIZE, __ocml_*)
 $(WMMA_LAYOUT_VERIFY): $(TESTSDIR)/wmma_layout_verify.hip
-	$(HIPCC) -O3 --offload-arch=$(ARCH) -mno-wavefrontsize64 $< -o $@
+	$(HIPCC) -isystem $(ROCM_PATH)/include --rocm-path=$(ROCM_PATH) -O3 --offload-arch=$(ARCH) -mno-wavefrontsize64 \
+		$< -o $@
 
 # Build all demos and benchmark
 both: $(TARGET) $(WMMA_TARGET) $(WMMA_FP4_TARGET) $(WMMA_FP4_NATIVE_TARGET) $(BENCH_TARGET)
