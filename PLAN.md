@@ -1170,6 +1170,7 @@ for the symptoms above.
 >      until a model needs it (nothing here to test it with).
 >   6c. **Router float matmul for prefill — DONE ✅ (2026-10-21)**: `matmul_f32_tile` (see "Router prefill tile");
 >      Qwen3.8 router 1.38 → 0.48 ms per call, prefill ~795 → ~826 tok/s; 35B ~2,000 → ~2,075.
+>   6d. **Small-kernel merges — not worth it (2026-10-21, user agreed)**, see "Small-kernel merges assessed".
 >   6b. **Opt-in larger prefill batch — DONE ✅ (2026-10-21)**: `inference_set_prefill_batch(m, n)` (16 .. 8192,
 >      before kv_cache_init), Perl `set_prefill_batch`, `qwen_demo --batch N`; see "Prefill batch option" in
 >      Phase 21. Up to ~10% on MoE models' long prompts at 4096; nothing for dense models; default stays 1024.
@@ -2005,6 +2006,20 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
   - Note: `qwen_demo` without `--draft` prefills the prompt in one call, the library in two (a checkpoint
     before its tail), so their greedy texts can differ (WMMA prefill vs per-token kernels on a router
     near-tie); the library with and without the head is identical.
+
+- **Small-kernel merges assessed (2026-10-21): not done.** Qwen3.8 prefill per 2,427 tokens: hc_norm 252 ms,
+  hc_mix 135, deltanet_conv 80, moe_combine 76, swiglu 64, deltanet_norm 52, attn_combine 44. They run at
+  ~150-200 GB/s on data the next step needs (the residual streams, the normed streams hc_mix reads, the int8
+  copies the matmuls read), so a merge saves only what it no longer writes and rereads:
+  - moe_combine into the next hc_norm: hc_norm has a workgroup per stream (4 per token), each would recompute
+    the expert sum (the experts' outputs read 4x: 420 instead of 105 MB per batch); with one workgroup per
+    token instead, only the 10 MB output and its rereads go: ~20 ms per prompt (~0.7%).
+  - swiglu into the expert matmuls: in the down projection's staging the float gate / up would be loaded
+    (8x the int8 bytes) and reread per 128 rows: worse. A fused gate + up + SwiGLU WMMA kernel needs the int8
+    quantization's 32-value blocks across two waves' row tiles: a large change for ~60-80 ms (~2-3%).
+  - deltanet_norm into deltanet_rule: the norm needs a whole 128-value head, a rule workgroup has 16 columns.
+  - Generation: each of these is 3-8 us per call; a merge saves ~0.2-0.6% per token.
+  If revisited: the fused expert gate + up + SwiGLU kernel is the only one above 1%.
 
 - **Router prefill tile (2026-10-21).** The MoE router's F32 logits (512 x 2560 on Qwen3.8) in prefill:
   `matmul_f32` keeps matvec_f32's order (lane-strided quarters, wave reduction), which limits it to 16 rows x 8
