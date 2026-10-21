@@ -374,13 +374,24 @@ int main(int argc, char** argv) {
         snprintf(what, sizeof(what), "chat turn 2: reused %d of %d prompt tokens, prefilled %d; reply %s a fresh "
                  "prefill's%s (\"%s\")", r2, (int)t2.size(), p2, same2 ? "matches" : "DIFFERS from",
                  exact ? " exactly" : " (first token; WMMA chunking)", a2.text.c_str());
-        // turn 1 saved its checkpoint min(16, n / 2) tokens before the end of its prompt
-        const int ck1 = (int)t1.size() - std::min(16, (int)t1.size() / 2);
+        // Recurrent models resume at a checkpoint: turn 1 saved one min(16, n / 2) tokens before the end of its
+        // prompt. Attention-only ones (Qwen3) at the divergence: the common prefix of turn 1's sequence (prompt and
+        // reply) and turn 2's prompt, keeping at least the last prompt token to decode.
+        const bool recurrent = qwen_model_is_recurrent(inference_get_qwen_model(m)) != 0;
+        std::vector<int32_t> seq1(t1);
+        seq1.insert(seq1.end(), a1.ids.begin(), a1.ids.end());
+        size_t lcp = 0;
+        while (lcp < seq1.size() && lcp < t2.size() && seq1[lcp] == t2[lcp]) ++lcp;
+        const int ck1 = recurrent ? (int)t1.size() - std::min(16, (int)t1.size() / 2)
+                                  : (int)std::min(lcp, t2.size() - 1);
         check(a2.rc == 0 && r2 == ck1 && r2 + p2 == (int)t2.size() && same2 && r4 == 0, what);
-        snprintf(what, sizeof(what), "chat: regenerating turn 2 reuses %d tokens (its own checkpoint), same reply: %s",
+        snprintf(what, sizeof(what), "chat: regenerating turn 2 reuses %d tokens (its own checkpoint or all but the "
+                 "last), same reply: %s",
                  r3, a3.ids == a2.ids || !exact ? "yes" : "NO");
-        // turn 2 prefilled from r2, so its checkpoint is min(16, p2 / 2) tokens before the end
-        check(a3.rc == 0 && r3 == (int)t2.size() - std::min(16, p2 / 2) && (!exact || a3.ids == a2.ids), what);
+        // turn 2 prefilled from r2, so its checkpoint is min(16, p2 / 2) tokens before the end (attention only:
+        // all of the prompt but its last token)
+        const int ck2 = recurrent ? (int)t2.size() - std::min(16, p2 / 2) : (int)t2.size() - 1;
+        check(a3.rc == 0 && r3 == ck2 && (!exact || a3.ids == a2.ids), what);
     }
 
     sampler_params p = sampler_default_params();  // temperature 0.8, top_k 40, top_p 0.95, min_p 0.05

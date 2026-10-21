@@ -128,6 +128,7 @@ struct inference_model {
     int n_head = 0;                                     // attention heads
     int n_head_kv = 0;                                  // KV cache heads
     int head_dim = 0;                                   // per-head dimension (attention.key_length)
+    bool attn_gated = true;                             // attn_q holds [Q | output gate] (Qwen3.5+); not Qwen3
     int n_ff = 0;                                       // FFN width (feed_forward_length); 0 for MoE models
     int n_expert = 0;                                   // MoE: experts per layer (expert_count)
     int n_expert_used = 0;                              // MoE: experts per token (expert_used_count)

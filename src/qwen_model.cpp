@@ -412,8 +412,9 @@ struct QwenModel {
             }
         }
         if (eng->n_kv_layers > 0) {
-            if (eng->head_dim != ATTN_HEAD_DIM) {
-                qwen_set_error("head_dim %d: the attention kernels are built for %d", eng->head_dim, ATTN_HEAD_DIM);
+            if ((eng->head_dim != 128 && eng->head_dim != 256) || eng->n_head % (256 / eng->head_dim) != 0) {
+                qwen_set_error("head_dim %d / %d heads: the attention kernels are built for head_dim 128 or 256",
+                               eng->head_dim, eng->n_head);
                 return false;
             }
             if (attention_init("attention.co") != 0) {
@@ -558,7 +559,8 @@ struct QwenModel {
         const qmatvec_q8* q8 = q8_for(DQ, T);
         if (!check(attention_forward(s.qfull, s.k, s.v, L.q_norm, L.k_norm, K, V, kv_cache_block_shift(kvc),
                                      kv_cache_block_stride(kvc), HQ, HKV, eng->n_rot, pos0, T,
-                                     eng->rope_freq_base, (float)eng->eps, s.q, s.part_ml, s.part_acc, s.attn, q8, 0),
+                                     eng->rope_freq_base, (float)eng->eps, s.q, s.part_ml, s.part_acc, s.attn,
+                                     eng->head_dim, eng->attn_gated ? 1 : 0, q8, 0),
                    "attention kernels"))
             return false;
         mark(s.attn, DQ, T, q8);

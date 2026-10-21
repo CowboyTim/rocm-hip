@@ -12,6 +12,7 @@
 // QMATVEC_NO_WMMA=1, else by their first tokens (WMMA prefill sums in a different order when cut differently).
 
 #include "inference.h"
+#include "qwen_model.h"
 #include "sha256.h"
 
 #include <cstdio>
@@ -101,6 +102,7 @@ int main(int argc, char** argv) {
     inference_store_stats st;
     inference_store_get_stats(m, &st);
     const int B = st.block_tokens;
+    const bool recurrent = qwen_model_is_recurrent(inference_get_qwen_model(m)) != 0;
     printf("store_verify phase %d: %s, blocks of %d tokens (%lld bytes), snapshots %lld bytes\n", phase, dir.c_str(), B,
            st.block_bytes, st.snapshot_bytes);
 
@@ -127,7 +129,10 @@ int main(int argc, char** argv) {
         const long long blocks = (long long)(prompt.size() + out.size() - 1) / B;  // the last token is not decoded
         snprintf(what, sizeof(what), "fresh store: nothing reused, %lld blocks published (expected %lld), %lld snapshots",
                  st.blocks_published, blocks, st.snapshots_saved);
-        check(reused == 0 && (int)out.size() == 24 && st.blocks_published == blocks && st.snapshots_saved >= 2, what);
+        // snapshots hold the recurrent state: none for an attention-only model (Qwen3)
+        check(reused == 0 && (int)out.size() == 24 && st.blocks_published == blocks &&
+                  (recurrent ? st.snapshots_saved >= 2 : st.snapshots_saved == 0),
+              what);
         check((long long)files(dir, ".kvb").size() == blocks && (long long)files(dir, ".rst").size() == st.snapshots_saved,
               "the store directory holds exactly those .kvb and .rst files (no temporary files)");
         FILE* f = fopen(expected_path.c_str(), "w");
@@ -147,17 +152,20 @@ int main(int argc, char** argv) {
             snprintf(what, sizeof(what), "new process, same prompt: %d of %zu tokens from the store (%lld blocks mapped, "
                      "%lld snapshot restored), reply %s", reused, prompt.size(), st.blocks_attached,
                      st.snapshots_restored, same ? (exact ? "identical" : "same first token") : "DIFFERS");
-            check(reused == deepest && st.tokens_from_store == deepest && st.snapshots_restored == 1 && same, what);
+            const long long restored = recurrent ? 1 : 0;
+            check(reused == deepest && st.tokens_from_store == deepest && st.snapshots_restored == restored && same,
+                  what);
 
-            // A prompt sharing the first 3 blocks: the deepest snapshot inside them is at 2 blocks (every 2)
+            // A prompt sharing the first 3 blocks: the deepest snapshot inside them is at 2 blocks (every 2); an
+            // attention-only model resumes after all 3
             std::vector<int32_t> p2(prompt.begin(), prompt.begin() + 3 * B);
             const std::vector<int32_t> tail = tokens(m, " A completely different ending about mountains.");
             p2.insert(p2.end(), tail.begin(), tail.end());
             inference_reset(m);
             run(m, p2, 8, &reused, &prefilled);
-            snprintf(what, sizeof(what), "a prompt sharing 3 blocks resumes at the 2-block snapshot (%d tokens reused)",
-                     reused);
-            check(reused == 2 * B, what);
+            snprintf(what, sizeof(what), "a prompt sharing 3 blocks resumes at the %s (%d tokens reused)",
+                     recurrent ? "2-block snapshot" : "3rd block", reused);
+            check(reused == (recurrent ? 2 : 3) * B, what);
 
             // Diverging inside block 0, which is now a shared store block: its file must not change
             const std::vector<std::string> kvb = files(dir, ".kvb");
@@ -172,11 +180,14 @@ int main(int argc, char** argv) {
             check(unchanged, "writing positions inside shared blocks leaves every store file unchanged (copy on write)");
         } else if (phase == 3) {
             // Phase 3: block 1 of the prompt was deleted, so nothing past block 1 can be used: the deepest
-            // remaining resume point is 0 (snapshots are at 2, 4, ...)
+            // remaining resume point is 0 (snapshots are at 2, 4, ...), or block 0's end without recurrent state
             const std::vector<int32_t> out = run(m, prompt, 24, &reused, &prefilled);
             snprintf(what, sizeof(what), "after deleting block 1: %d tokens reused, %d prefilled, reply %s", reused,
                      prefilled, !out.empty() && !expected.empty() && out[0] == expected[0] ? "same first token" : "DIFFERS");
-            check(reused == 0 && prefilled == (int)prompt.size() && !out.empty() && out[0] == expected[0], what);
+            const int resume = recurrent ? 0 : B;
+            check(reused == resume && prefilled == (int)prompt.size() - resume && !out.empty() &&
+                      out[0] == expected[0],
+                  what);
             inference_store_get_stats(m, &st);
             check(st.blocks_published >= 1, "the missing block is published again");
         }

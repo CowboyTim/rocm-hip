@@ -1172,10 +1172,11 @@ for the symptoms above.
 >   8. **Library / packaging**: `perl/ROCm-Inference/t/20-chat.t` with the user's Minijinja module (cargo is
 >      installed now); CPAN packaging; Phase 22b follow-ups (disk-tier timing, block size option, a Perl web
 >      service example); long-context decode attention.
->   9. **More models** (see the target list): EmbeddingGemma-300M, Nemotron-3, Gemma-4; the older `qwen3`
->      architecture (Qwen3-0.6B-Q8_0 does not load: no `post_attention_norm`); the STRIX_LEAN Qwen3.8 release
->      (Q5_K token_embd, Q5_1 PLE table, Q6_K head) if the user wants it. Qwen3.5-122B-A10B and Qwen3.8-27B
->      already run (see item 5 for the 122B's prefill).
+>   9. **More models** (see the target list): EmbeddingGemma-300M, Nemotron-3, Gemma-4; `qwen3moe` (Qwen3 MoE:
+>      no shared expert; no such model in /models); the STRIX_LEAN Qwen3.8 release (Q5_K token_embd, Q5_1 PLE
+>      table, Q6_K head) if the user wants it. **`qwen3` DONE ✅ (2026-10-21)**: Qwen3-0.6B (see "Qwen3" in
+>      Phase 21). All Qwen GGUFs in /models run: Qwen3-0.6B, Qwen3.5-0.8B / 4B / 122B-A10B, Qwen3.6-35B-A3B,
+>      Qwen3.8-27B / Flash-Next.
 >   Profiling: `rocprofv3 --kernel-trace -d <dir> -o run -- <cmd>`, then `tools/prof_summary.py <dir>`;
 >   `QWEN_PROFILE=1` for per-section times.
 > - **Perl module (2026-10-18):** `Makefile.PL` finds libinference via ROCM_INFERENCE_PREFIX, pkg-config
@@ -1993,6 +1994,20 @@ WMMA kernels, checked against the reference dequantizer (the "all quant types" g
   - Note: `qwen_demo` without `--draft` prefills the prompt in one call, the library in two (a checkpoint
     before its tail), so their greedy texts can differ (WMMA prefill vs per-token kernels on a router
     near-tie); the library with and without the head is identical.
+
+- **Qwen3 (2026-10-21).** `qwen3`: every layer plain attention with head_dim 128 and no output gate (attn_q
+  is Q only), `ffn_norm` for the FFN norm, tied Q8_0 LM head. The loader takes `post_attention_norm` or
+  `ffn_norm` and sets `attn_gated` from attn_q's shape (2 x or 1 x n_head x head_dim). The attention kernels
+  are templates on head_dim, compiled for 128 and 256 (`attn_prep/partial/combine/flash_<D>`); positions per
+  attn_partial chunk stay 256 (the partial buffers' sizes unchanged); attn_combine workgroups take 256 / D heads
+  (one 256-value block for the int8 attn_output input). Verified: forward_verify on a new reference dump
+  (`/dev/shm/ref_qwen3_06b`, prompt "The capital of France is"): attention kernels vs the CPU reference at
+  2,500 positions (single, partial-chunk batches, flash; blocked KV identical), every layer's l_out cos >=
+  0.99936, next token " Paris", prefill = token by token; generate_verify (incl. exact mode) and store_verify
+  pass. The tests learned the attention-only cases: llama.cpp's last layer keeps only the output rows
+  (compare the rows the reference has); prefix reuse resumes at the divergence and the block store at any
+  block (no checkpoints / snapshots). Qwen3.5 / 3.8 results unchanged. Qwen3-0.6B: 184 tok/s generation,
+  2,236 tok/s prefill.
 
 - **K-quant WMMA expert kernels (2026-10-20).** `wmma_q8k` takes a row map like `wmma_q80` (`WRowsLinear` /
   `WRowsExpert`: activation rows, the per-token Q8_K scales and group sums for the mins, output rows by entry);

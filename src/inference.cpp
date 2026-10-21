@@ -301,7 +301,10 @@ static bool load_layer(inference_model* m, gguf_model_t* g, int i, LayerWeights&
             return false;
     } else {
         if (!bind_norm(g, nm(i, "attn_norm.weight"), E, L.attn_norm, true)) return false;
-        if (!bind_norm(g, nm(i, "post_attention_norm.weight"), E, L.ffn_norm, true)) return false;
+        // the FFN's norm: post_attention_norm (Qwen3.5 and later) or ffn_norm (Qwen3)
+        const bool post = find_tensor_index(g, nm(i, "post_attention_norm.weight")) >= 0;
+        if (!bind_norm(g, nm(i, post ? "post_attention_norm.weight" : "ffn_norm.weight"), E, L.ffn_norm, true))
+            return false;
     }
     L.ple = std::find(ple_layers.begin(), ple_layers.end(), i) != ple_layers.end();
     if (L.ple) {
@@ -354,8 +357,10 @@ static bool load_layer(inference_model* m, gguf_model_t* g, int i, LayerWeights&
         if (!bind_weight(g, nm(i, "attn_output.weight"), L.Wo, true)) return false;
         if (!bind_norm(g, nm(i, "attn_q_norm.weight"), HD, L.q_norm, true)) return false;
         if (!bind_norm(g, nm(i, "attn_k_norm.weight"), HD, L.k_norm, true)) return false;
-        // Gated attention: attn_q holds Q and the output gate, head_dim each, interleaved per head
-        if (!check_shape("attn_q", i, L.Wq, 2 * HQ * HD, E) ||
+        // Gated attention (Qwen3.5 and later): attn_q holds Q and the output gate, head_dim each, interleaved per
+        // head; Qwen3: Q only. The first attention layer decides, the others must agree.
+        if (L.kv_slot == 0) m->attn_gated = L.Wq.N == 2 * HQ * HD;
+        if (!check_shape("attn_q", i, L.Wq, (m->attn_gated ? 2 : 1) * HQ * HD, E) ||
             !check_shape("attn_k", i, L.Wk, HKV * HD, E) ||
             !check_shape("attn_v", i, L.Wv, HKV * HD, E) ||
             !check_shape("attn_output", i, L.Wo, E, HQ * HD)) return false;

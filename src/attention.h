@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define ATTN_HEAD_DIM 256       // the kernels are compiled for head_dim = 256
+#define ATTN_HEAD_DIM 256       // the largest head_dim the kernels are compiled for (also 128)
 #define ATTN_CHUNK 256          // KV positions per attn_partial workgroup
 
 // Load attention.co. Returns 0 on success.
@@ -43,17 +43,19 @@ static inline size_t attention_part_acc_floats(int n_q, int n_ctx, int T) {
 }
 
 // T tokens at positions pos0 .. pos0 + T - 1; token t attends to positions 0 .. pos0 + t. Per token row t:
-//   qfull [n_q][2 * 256] (attn_q output, [Q | gate] per head), k, v [n_kv * 256] (attn_k / attn_v outputs),
-//   q: scratch [n_q * 256], out [n_q * 256] (gated). q_norm, k_norm [256]; K, V: the layer's cache (row p at
-//   (p >> kv_shift) * kv_bstride + (p & (2^kv_shift - 1)) * kv_stride halves from row 0, kv_stride = n_kv * 256:
+//   head_dim D = 128 or 256; gated: qfull [n_q][2 * D] (attn_q output, [Q | gate] per head; Qwen3.5 and later),
+//   else qfull [n_q][D] (Qwen3) and no output gate. k, v [n_kv * D] (attn_k / attn_v outputs), q: scratch
+//   [n_q * D], out [n_q * D]. q_norm, k_norm [D]; K, V: the layer's cache (row p at
+//   (p >> kv_shift) * kv_bstride + (p & (2^kv_shift - 1)) * kv_stride halves from row 0, kv_stride = n_kv * D:
 //   kv_cache.h's blocks; a contiguous cache passes kv_shift 30, kv_bstride 0); part_ml / part_acc: scratch sized
 //   by the helpers above.
-//   q8: if not NULL, out is also quantized into it (flattened [T * n_q * 256]) for the int8 attn_output matmul.
+//   q8: if not NULL, out is also quantized into it (flattened [T * n_q * D]) for the int8 attn_output matmul.
+//   n_q must be a multiple of 256 / D.
 hipError_t attention_forward(const float* qfull, const float* k, const float* v, const float* q_norm,
                              const float* k_norm, __half* K, __half* V, int kv_shift, long long kv_bstride, int n_q,
                              int n_kv, int n_rot, int pos0, int T,
                              float freq_base, float eps, float* q, float* part_ml, float* part_acc, float* out,
-                             const qmatvec_q8* q8, hipStream_t stream);
+                             int head_dim, int gated, const qmatvec_q8* q8, hipStream_t stream);
 
 #ifdef __cplusplus
 }

@@ -279,10 +279,15 @@ int main(int argc, char** argv) {
     float* y = g_y;
     std::vector<float> a, b, c, d;
 
+    // Qwen3 (no attention gate): the reference graph differs (embd, no post_attention_norm, plain attention), so
+    // only the embedding, the long-context attention kernels, the LM head and the whole model are checked
+    const bool qwen35 = m->attn_gated;
+    const char* embd_name = qwen35 ? "model.input_embed" : "embd";
+
     // ---- token embedding
     {
         Stat s;
-        if (!ref("model.input_embed", nullptr, a)) return 1;
+        if (!ref(embd_name, nullptr, a)) return 1;
         for (int t = 0; t < T; ++t) {
             qt_to_float(m->token_embd.type, m->token_embd.row(tokens[t]), y, E);
             s.add(y, &a[(size_t)t * E], E);
@@ -291,7 +296,7 @@ int main(int argc, char** argv) {
     }
 
     // ---- layer 0: attn_norm, post_attention_norm, FFN
-    {
+    if (qwen35) {
         const LayerWeights& L = m->layers[0];
         Stat sn, spn, ssw;
         ProjStat sg, su, sd;
@@ -681,7 +686,7 @@ int main(int argc, char** argv) {
     int la = -1;
     for (int l = 0; l < m->n_layer && la < 0; ++l)
         if (m->layers[l].kind == LAYER_FULL_ATTN) la = l;
-    if (la >= 0) {
+    if (la >= 0 && qwen35) {
         const LayerWeights& L = m->layers[la];
         auto nm = [&](const char* base) {
             static char buf[64];
@@ -765,7 +770,12 @@ int main(int argc, char** argv) {
     if (la >= 0) {
         const LayerWeights& L = m->layers[la];
         const int P = 2500, DQ = HQ * HD, DKV = HKV * HD, pos = P - 1;
-        if (HD != ATTN_HEAD_DIM || attention_init("attention.co") != 0) { fprintf(stderr, "attention kernels unavailable\n"); return 1; }
+        const bool gated = m->attn_gated;
+        const int QS = gated ? 2 * HD : HD;  // a head's stride in attn_q's output ([Q | gate] when gated)
+        if ((HD != 128 && HD != 256) || attention_init("attention.co") != 0) {
+            fprintf(stderr, "attention kernels unavailable\n");
+            return 1;
+        }
         ShmBuf b_qf, b_k, b_v, b_q, b_ml, b_acc, b_out, b_K, b_V;
         if (!b_qf.alloc("fwdv_at_qf.bin", 2 * DQ) || !b_k.alloc("fwdv_at_k.bin", DKV) || !b_v.alloc("fwdv_at_v.bin", DKV) ||
             !b_q.alloc("fwdv_at_q.bin", DQ) || !b_ml.alloc("fwdv_at_ml.bin", attention_part_ml_floats(HQ, P, 1)) ||
@@ -786,7 +796,7 @@ int main(int argc, char** argv) {
         std::vector<float> q(DQ), kk(DKV), ref_out(DQ);
         std::vector<__half> Kr(K, K + (size_t)P * DKV), Vr(Vc, Vc + (size_t)P * DKV);
         for (int h = 0; h < HQ; ++h) {
-            qwen_rmsnorm(&b_qf.p[(size_t)h * 2 * HD], L.q_norm, &q[(size_t)h * HD], HD, eps);
+            qwen_rmsnorm(&b_qf.p[(size_t)h * QS], L.q_norm, &q[(size_t)h * HD], HD, eps);
             qwen_rope_neox(&q[(size_t)h * HD], m->n_rot, pos, m->rope_freq_base);
         }
         for (int g = 0; g < HKV; ++g) {
@@ -798,11 +808,14 @@ int main(int argc, char** argv) {
             Vr[(size_t)pos * DKV + i] = __float2half(b_v.p[i]);
         }
         qwen_attention(q.data(), Kr.data(), Vr.data(), DKV, P, HQ, HKV, HD, 1.0f / sqrtf((float)HD), ref_out.data());
-        for (int h = 0; h < HQ; ++h)
-            for (int d = 0; d < HD; ++d) ref_out[(size_t)h * HD + d] *= qwen_sigmoid(b_qf.p[(size_t)h * 2 * HD + HD + d]);
+        if (gated)
+            for (int h = 0; h < HQ; ++h)
+                for (int d = 0; d < HD; ++d)
+                    ref_out[(size_t)h * HD + d] *= qwen_sigmoid(b_qf.p[(size_t)h * QS + HD + d]);
 
         hipError_t e = attention_forward(b_qf.p, b_k.p, b_v.p, L.q_norm, L.k_norm, K, Vc, 30, 0, HQ, HKV, m->n_rot, pos, 1,
-                                         m->rope_freq_base, eps, b_q.p, b_ml.p, b_acc.p, b_out.p, nullptr, 0);
+                                         m->rope_freq_base, eps, b_q.p, b_ml.p, b_acc.p, b_out.p, HD,
+                                         m->attn_gated ? 1 : 0, nullptr, 0);
         if (e == hipSuccess) e = hipDeviceSynchronize();
         if (e != hipSuccess) { fprintf(stderr, "attention kernels: %s\n", hipGetErrorString(e)); return 1; }
         Stat sq, skv, so;
@@ -853,15 +866,16 @@ int main(int argc, char** argv) {
             std::vector<float> refb((size_t)TB * DQ), qt(DQ);
             for (int t = 0; t < TB; ++t) {
                 for (int h = 0; h < HQ; ++h) {
-                    qwen_rmsnorm(&c_qf.p[(size_t)t * 2 * DQ + (size_t)h * 2 * HD], L.q_norm, &qt[(size_t)h * HD], HD, eps);
+                    qwen_rmsnorm(&c_qf.p[(size_t)t * HQ * QS + (size_t)h * QS], L.q_norm, &qt[(size_t)h * HD], HD, eps);
                     qwen_rope_neox(&qt[(size_t)h * HD], m->n_rot, pos0 + t, m->rope_freq_base);
                 }
                 qwen_attention(qt.data(), Kr.data(), Vr.data(), DKV, pos0 + t + 1, HQ, HKV, HD, 1.0f / sqrtf((float)HD),
                                &refb[(size_t)t * DQ]);
-                for (int h = 0; h < HQ; ++h)
-                    for (int d = 0; d < HD; ++d)
-                        refb[(size_t)t * DQ + (size_t)h * HD + d] *=
-                            qwen_sigmoid(c_qf.p[(size_t)t * 2 * DQ + (size_t)h * 2 * HD + HD + d]);
+                if (gated)
+                    for (int h = 0; h < HQ; ++h)
+                        for (int d = 0; d < HD; ++d)
+                            refb[(size_t)t * DQ + (size_t)h * HD + d] *=
+                                qwen_sigmoid(c_qf.p[(size_t)t * HQ * QS + (size_t)h * QS + HD + d]);
             }
             // The output is also quantized in the same launches (attn_combine, per token group); compare that
             // with quantizing it separately
@@ -876,7 +890,8 @@ int main(int argc, char** argv) {
             qmatvec_q8_bind(&q8a, qa.p, nq8);
             qmatvec_q8_bind(&q8b, qb.p, nq8);
             e = attention_forward(c_qf.p, c_k.p, c_v.p, L.q_norm, L.k_norm, K, Vc, 30, 0, HQ, HKV, m->n_rot, pos0, TB,
-                                  m->rope_freq_base, eps, c_q.p, c_ml.p, c_acc.p, c_out.p, &q8a, 0);
+                                  m->rope_freq_base, eps, c_q.p, c_ml.p, c_acc.p, c_out.p, HD,
+                                  m->attn_gated ? 1 : 0, &q8a, 0);
             if (e == hipSuccess) e = qmatvec_quantize(c_out.p, nq8, &q8b, 0);
             if (e == hipSuccess) e = hipDeviceSynchronize();
             if (e != hipSuccess) { fprintf(stderr, "batched attention kernels: %s\n", hipGetErrorString(e)); return 1; }
@@ -909,7 +924,8 @@ int main(int argc, char** argv) {
                     memcpy(Vb + at(p), Vc + (size_t)p * DKV, DKV * sizeof(__half));
                 }
                 e = attention_forward(c_qf.p, c_k.p, c_v.p, L.q_norm, L.k_norm, Kb, Vb, BS, bstride, HQ, HKV, m->n_rot,
-                                      pos0, TB, m->rope_freq_base, eps, c_q.p, c_ml.p, c_acc.p, outb.p, nullptr, 0);
+                                      pos0, TB, m->rope_freq_base, eps, c_q.p, c_ml.p, c_acc.p, outb.p, HD,
+                                      m->attn_gated ? 1 : 0, nullptr, 0);
                 if (e == hipSuccess) e = hipDeviceSynchronize();
                 if (e != hipSuccess) { fprintf(stderr, "blocked attention: %s\n", hipGetErrorString(e)); return 1; }
                 bool same = memcmp(outb.p, c_out.p, (size_t)TB * DQ * sizeof(float)) == 0;
@@ -1023,7 +1039,10 @@ int main(int argc, char** argv) {
         for (int l = 0; l < m->n_layer; ++l) {
             if (!ref(("l_out-" + std::to_string(l)).c_str(), nullptr, a)) return 1;
             Stat s;
-            for (int t = 0; t < T; ++t) s.add(&ctx.l_out[((size_t)l * T + t) * E], &a[(size_t)t * E], E);
+            // the reference may keep only the last rows (llama.cpp's last layer computes just the output rows)
+            const int rows = (int)std::min<size_t>(a.size() / (size_t)E, (size_t)T);
+            for (int r = 0; r < rows; ++r)
+                s.add(&ctx.l_out[((size_t)l * T + T - rows + r) * E], &a[(size_t)r * E], E);
             if (s.min_cos < worst) { worst = s.min_cos; worst_l = l; }
             if (s.min_cos <= 0.99) ++n_bad;
             if (verbose_layers())
@@ -1068,9 +1087,10 @@ int main(int argc, char** argv) {
         for (int l = 0; l < m->n_layer; ++l) {
             if (!ref(("l_out-" + std::to_string(l)).c_str(), nullptr, a)) return 1;
             Stat sp, sr;
+            const int rows = (int)std::min<size_t>(a.size() / (size_t)E, (size_t)T);  // the reference's last rows
             for (int t = 0; t < T; ++t) {
                 sp.add(&pctx.l_out[((size_t)l * T + t) * E], &ctx.l_out[((size_t)l * T + t) * E], E);
-                sr.add(&pctx.l_out[((size_t)l * T + t) * E], &a[(size_t)t * E], E);
+                if (t >= T - rows) sr.add(&pctx.l_out[((size_t)l * T + t) * E], &a[(size_t)(t - (T - rows)) * E], E);
             }
             pcos = std::min(pcos, sp.min_cos);
             rcos = std::min(rcos, sr.min_cos);
