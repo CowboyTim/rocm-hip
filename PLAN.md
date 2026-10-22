@@ -1221,7 +1221,7 @@ for the symptoms above.
 >        get_weather round trip) on Qwen3.5-4B and 3.6-35B; by hand also Qwen3-0.6B (JSON tool calls, model-
 >        opened think) and Qwen3.8-27B.
 >      - **SSE server — DONE ✅ (2026-10-22):** `perl/ROCm-Inference/bin/rocm-inference-server` on
->        `Web::Plain` (see "Web service" in Phase 21). **Left:** per-family tags when Gemma-4 / Nemotron land
+>        `Web::Route` (see "Web service" in Phase 21). **Left:** per-family tags when Gemma-4 / Nemotron land
 >        (item 9: Gemma-4's are known, see its analysis); a C API channel flag only if a non-Perl user needs it.
 >   Profiling: `rocprofv3 --kernel-trace -d <dir> -o run -- <cmd>`, then `tools/prof_summary.py <dir>`;
 >   `QWEN_PROFILE=1` for per-section times.
@@ -2285,8 +2285,11 @@ Built as designed below (user, 2026-10-22: a unix socket, nginx does the hard wo
 separate CPAN module; nginx's embedded Perl rejected: a long handler blocks the whole nginx worker, output
 only leaves when control returns to nginx's event loop, the model would live in nginx workers that a reload
 replaces (and a GPU context does not survive the master's fork), a GPU fault would take nginx down):
-- **`perl/Web-Plain`** (`Web::Plain` 0.01, own distribution, core Perl only; name free on CPAN, can move to its
-  own repo): `get` / `post` / `put` / `patch` / `del` / `any` with `:name` / `*name`, requests as hashes,
+- **`perl/Web-Route`** (`Web::Route` 0.01, own distribution, core Perl only; name free on CPAN, can move to its
+  own repo; renamed from Web::Plain on 2026-10-22, user's `route::get "/v2/.." => sub {}` style):
+  `route::get` / `post` / `put` / `patch` / `delete` / `head` / `options` / `any` / `add` (a package filled
+  through globs, so nothing that clashes is exported and PAUSE does not index `route`; lower-case module
+  names are pragmas by convention, hence not `web::route`) with `:name` / `*name`, requests as hashes,
   responses `[status, headers, body]` (a hash -> JSON, a string -> text, undef -> 204, die with a response),
   `json` / `text` / `stream` / `sse`; `run(listen => $socket)` serves one request at a time (unix socket or
   host:port, `mode`, limits: 400 / 405 / 408 / 413 / 431 / 501, a die -> 500 on STDERR, SIGTERM removes the

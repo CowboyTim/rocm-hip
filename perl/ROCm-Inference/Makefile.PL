@@ -79,7 +79,7 @@ WriteMakefile(
     META_MERGE         => {
         'meta-spec' => { version => 2 },
         prereqs     => {
-            runtime => { recommends => { 'Minijinja' => '0.1.1', 'Web::Plain' => '0.01' } },
+            runtime => { recommends => { 'Minijinja' => '0.1.1', 'Web::Route' => '0.01' } },
             develop => { requires => { 'Test::Pod' => '1.22', 'Test::Pod::Coverage' => '1.08' } },
         },
         resources => {

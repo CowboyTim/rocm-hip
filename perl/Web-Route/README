@@ -1,15 +1,17 @@
-Web::Plain
+Web::Route
 ==========
 
-Flask-like routes and a small HTTP server for behind nginx, in plain Perl: routes are functions in a table,
-requests plain hashes, responses plain arrays. No objects and no dependencies beyond core Perl.
+Flask-like routes and a small HTTP server for behind nginx, in plain Perl: routes are declared with plain
+functions in the route:: package, requests are plain hashes, responses plain arrays. No objects and no
+dependencies beyond core Perl.
 
-    use Web::Plain;
+    use Web::Route;
 
-    get  '/health'      => sub { { ok => 1 } };
-    get  '/hello/:name' => sub { my ($req) = @_; "Hello, $req->{params}{name}!" };
-    post '/echo'        => sub { my ($req) = @_; json($req->{json}, 201) };
-    get  '/events'      => sub {
+    route::get    '/health'      => sub { { ok => 1 } };
+    route::get    '/hello/:name' => sub { my ($req) = @_; "Hello, $req->{params}{name}!" };
+    route::post   '/echo'        => sub { my ($req) = @_; json($req->{json}, 201) };
+    route::delete '/items/:id'   => sub { undef };
+    route::get    '/events'      => sub {
         stream(200, ['Content-Type' => 'text/event-stream'], sub {
             my ($write) = @_;
             $write->(sse({ n => $_ })) or return for 1 .. 3;

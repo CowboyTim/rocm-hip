@@ -9,7 +9,7 @@ use File::Basename qw(basename);
 use JSON::PP ();
 use Pod::Usage qw(pod2usage);
 use ROCm::Inference qw(:all);
-use Web::Plain;
+use Web::Route;
 
 my %o = (listen => './rocm-inference.sock', ctx => 8192, max_tokens => 4096);
 GetOptions(\%o, 'model=s', 'listen=s', 'mode=s', 'ctx=i', 'name=s', 'draft=s', 'store=s', 'max_tokens=i',
@@ -100,18 +100,18 @@ sub finish_reason {
     return $why == STOP_MAX_TOKENS() || $why == STOP_CONTEXT_FULL() ? 'length' : 'stop';
 }
 
-get '/health' => sub { { status => 'ok' } };
+route::get '/health' => sub { { status => 'ok' } };
 
-get '/v1/models' => sub {
+route::get '/v1/models' => sub {
     { object => 'list', data => [ { id => $name, object => 'model', created => $created, owned_by => 'rocm-inference' } ] };
 };
-get '/v1/models/*id' => sub {
+route::get '/v1/models/*id' => sub {
     my ($req) = @_;
     $req->{params}{id} eq $name or error(404, "no model '$req->{params}{id}'", 'not_found_error');
     { id => $name, object => 'model', created => $created, owned_by => 'rocm-inference' };
 };
 
-post '/v1/chat/completions' => sub {
+route::post '/v1/chat/completions' => sub {
     my ($req) = @_;
     my $p = $req->{json};
     ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');

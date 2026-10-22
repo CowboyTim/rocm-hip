@@ -2,7 +2,7 @@ use strict;
 use warnings;
 use Test::More;
 
-use Web::Plain;
+use Web::Route;
 use File::Temp qw(tempdir);
 use IO::Socket::UNIX;
 use Socket qw(SOCK_STREAM);
@@ -15,16 +15,16 @@ my $dir = tempdir(CLEANUP => 1);
 my $sock = "$dir/s.sock";
 my $flag = "$dir/gone";
 
-get '/hello/:name' => sub { my ($r) = @_; "hello $r->{params}{name} $r->{args}{x}" };
-post '/echo' => sub { my ($r) = @_; { json => $r->{json}, len => length $r->{body}, ct => $r->{headers}{'content-type'} } };
-get '/events' => sub {
+route::get '/hello/:name' => sub { my ($r) = @_; "hello $r->{params}{name} $r->{args}{x}" };
+route::post '/echo' => sub { my ($r) = @_; { json => $r->{json}, len => length $r->{body}, ct => $r->{headers}{'content-type'} } };
+route::get '/events' => sub {
     stream(200, [ 'Content-Type' => 'text/event-stream' ], sub {
         my ($write) = @_;
         $write->(sse({ n => $_ })) and sleep 0.2 for 1 .. 3;
         $write->(sse('[DONE]'));
     });
 };
-get '/endless' => sub {
+route::get '/endless' => sub {
     stream(200, [ 'Content-Type' => 'text/event-stream' ], sub {
         my ($write) = @_;
         my $n = 0;

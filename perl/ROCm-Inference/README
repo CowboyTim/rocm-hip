@@ -26,7 +26,7 @@ rocm-hip checkout it is the perl-minijinja-xs submodule:
     cd perl-minijinja-xs && bash scripts/setup-minijinja.sh && perl Makefile.PL && make && make install
 
 bin/rocm-inference-server is an OpenAI-compatible chat server (streamed, with reasoning and tool calls) for
-one model on a unix socket behind nginx; it needs Web::Plain (perl/Web-Plain in rocm-hip). See its POD:
+one model on a unix socket behind nginx; it needs Web::Route (perl/Web-Route in rocm-hip). See its POD:
 
     rocm-inference-server --model /models/Qwen3.5-4B-ROCMFP4.gguf --listen /run/llm/llm.sock --mode 0660
 

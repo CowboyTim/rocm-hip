@@ -11,7 +11,7 @@ use Time::HiRes qw(sleep);
 # bin/rocm-inference-server on a unix socket: models, a plain and a streamed chat, a tool call round trip
 my $path = $ENV{ROCM_INFERENCE_TEST_MODEL};
 plan skip_all => 'set ROCM_INFERENCE_TEST_MODEL to a GGUF model to run' unless $path && -f $path;
-plan skip_all => 'Web::Plain is not installed' unless eval { require Web::Plain; 1 };
+plan skip_all => 'Web::Route is not installed' unless eval { require Web::Route; 1 };
 require ROCm::Inference;
 plan skip_all => "Minijinja $ROCm::Inference::MINIJINJA_VERSION is not installed"
     unless ROCm::Inference::_require_minijinja();

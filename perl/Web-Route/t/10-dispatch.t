@@ -3,8 +3,8 @@ use warnings;
 use utf8;
 use Test::More;
 
-use Web::Plain;
-use Web::Plain qw(dispatch routes clear_routes);
+use Web::Route;
+use Web::Route qw(dispatch);
 use JSON::PP ();
 
 # Routing without a socket: dispatch on request hashes
@@ -13,18 +13,18 @@ sub body { my ($res) = @_; ref $res->[2] ? join('', @{ $res->[2] }) : $res->[2] 
 sub hdr { my ($res, $name) = @_; my %h = @{ $res->[1] }; $h{$name} }
 my $J = JSON::PP->new->utf8;
 
-get '/' => sub { 'root' };
-get '/health' => sub { { ok => 1 } };
-get '/users/:id' => sub { my ($r) = @_; "user $r->{params}{id}" };
-get '/users/:id/posts/:post' => sub { my ($r) = @_; [ 200, [], "$r->{params}{id}/$r->{params}{post}" ] };
-get '/files/*rest' => sub { my ($r) = @_; text($r->{params}{rest}) };
-post '/users' => sub { my ($r) = @_; json({ created => $r->{json}{name} }, 201) };
-del '/users/:id' => sub { undef };
-any '/any' => sub { my ($r) = @_; $r->{method} };
-get '/list' => sub { [1, 2, 3] };
-get '/die' => sub { die "boom\n" };
-get '/teapot' => sub { die text('no coffee', 418) };
-get '/utf8/:w' => sub { my ($r) = @_; "→ $r->{params}{w}" };
+route::get '/' => sub { 'root' };
+route::get '/health' => sub { { ok => 1 } };
+route::get '/users/:id' => sub { my ($r) = @_; "user $r->{params}{id}" };
+route::get '/users/:id/posts/:post' => sub { my ($r) = @_; [ 200, [], "$r->{params}{id}/$r->{params}{post}" ] };
+route::get '/files/*rest' => sub { my ($r) = @_; text($r->{params}{rest}) };
+route::post '/users' => sub { my ($r) = @_; json({ created => $r->{json}{name} }, 201) };
+route::delete '/users/:id' => sub { undef };
+route::any '/any' => sub { my ($r) = @_; $r->{method} };
+route::get '/list' => sub { [1, 2, 3] };
+route::get '/die' => sub { die "boom\n" };
+route::get '/teapot' => sub { die text('no coffee', 418) };
+route::get '/utf8/:w' => sub { my ($r) = @_; "→ $r->{params}{w}" };
 
 is(body(dispatch(req(GET => '/'))), 'root', 'a string is text');
 is(hdr(dispatch(req(GET => '/')), 'Content-Type'), 'text/plain; charset=utf-8', 'text content type');
@@ -59,17 +59,20 @@ $r = dispatch(req(GET => '/teapot'));
 is_deeply([ $r->[0], body($r) ], [ 418, 'no coffee' ], 'die with a response');
 is(body(dispatch(req(GET => '/utf8/%C3%A9t%C3%A9'))), '→ été', 'UTF-8 parameters decode to characters');
 
-is_deeply([ map { "@$_" } routes() ], [ 'GET /', 'GET /health', 'GET /users/:id', 'GET /users/:id/posts/:post',
+is_deeply([ map { "@$_" } route::list() ], [ 'GET /', 'GET /health', 'GET /users/:id', 'GET /users/:id/posts/:post',
           'GET /files/*rest', 'POST /users', 'DELETE /users/:id', '* /any', 'GET /list', 'GET /die',
-          'GET /teapot', 'GET /utf8/:w' ], 'routes()');
-clear_routes();
-is(dispatch(req(GET => '/'))->[0], 404, 'clear_routes');
+          'GET /teapot', 'GET /utf8/:w' ], 'route::list');
+route::clear();
+is(dispatch(req(GET => '/'))->[0], 404, 'route::clear');
 
 is(sse('hi'), "data: hi\n\n", 'sse: text');
 is(sse({ a => 1 }, event => 'x', id => 3), qq[event: x\nid: 3\ndata: {"a":1}\n\n], 'sse: JSON with fields');
 is(sse("a\nb"), "data: a\ndata: b\n\n", 'sse: multi-line');
 is(sse('é'), "data: \xc3\xa9\n\n", 'sse: UTF-8 bytes');
 
-ok(!eval { get 'nope' => sub {}; 1 }, 'a pattern must start with /');
+ok(!eval { route::get 'nope' => sub {}; 1 }, 'a pattern must start with /');
+route::add 'PURGE', '/cache' => sub { 'purged' };
+is(body(dispatch(req(PURGE => '/cache'))), 'purged', 'route::add with any method name');
+ok(!defined &main::get && !defined &main::any, 'nothing that clashes is exported');
 
 done_testing;

@@ -12,7 +12,7 @@ Revision history for ROCm-Inference
       reasoning.
     - bin/rocm-inference-server: an OpenAI-compatible chat server (/v1/chat/completions, streamed as
       server-sent events with reasoning_content and tool_calls) for one model on a unix socket behind nginx,
-      built on Web::Plain.
+      built on Web::Route.
     - KV block store: store_open, store_stats, store_block_names; ROCm::Inference::Store for the policy
       (eviction to a size, a disk tier: store_evict, store_spill, store_fetch).
     - Speculative decoding with an MTP draft head (Qwen3.8-Flash-Next): set_draft_model, set_draft_tokens

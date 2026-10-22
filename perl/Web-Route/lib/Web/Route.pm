@@ -1,4 +1,4 @@
-package Web::Plain;
+package Web::Route;
 
 use strict;
 use warnings;
@@ -13,8 +13,8 @@ use JSON::PP ();
 
 our $VERSION = '0.01';
 
-our @EXPORT    = qw(get post put patch del any route json text stream sse run);
-our @EXPORT_OK = qw(routes clear_routes dispatch);
+our @EXPORT    = qw(json text stream sse run);
+our @EXPORT_OK = qw(dispatch);
 
 # The route table: [method or undef for any, pattern, regex, [param names], handler]
 my @ROUTES;
@@ -31,11 +31,11 @@ my %REASON = (
     503 => 'Service Unavailable', 504 => 'Gateway Timeout',
 );
 
-# route($method, $pattern, $handler): $method undef for any method; :name in the pattern matches one path
-# segment, *name the rest of the path, both land in $req->{params}
-sub route {
+# Adds a route: $method undef for any method; :name in the pattern matches one path segment, *name the rest
+# of the path, both land in $req->{params}
+sub _add {
     my ($method, $pattern, $handler) = @_;
-    croak "Web::Plain: a route needs a pattern starting with / and a code reference"
+    croak "Web::Route: a route needs a pattern starting with / and a code reference"
         unless defined $pattern && $pattern =~ m{^/} && ref $handler eq 'CODE';
     my @names;
     my $re = join '', map {
@@ -47,15 +47,20 @@ sub route {
     return;
 }
 
-sub get   { route('GET',    @_) }
-sub post  { route('POST',   @_) }
-sub put   { route('PUT',    @_) }
-sub patch { route('PATCH',  @_) }
-sub del   { route('DELETE', @_) }
-sub any   { route(undef,    @_) }
-
-sub routes       { map { [ $_->[0] // '*', $_->[1] ] } @ROUTES }
-sub clear_routes { @ROUTES = () }
+# The route declarations live in the route:: package, called by their full name, so nothing is exported
+# that could clash (get, any, delete): route::get '/path' => sub { ... }. Assigned to globs, as subs named
+# delete in a package would be ambiguous with the builtin inside it.
+{
+    no strict 'refs';
+    for my $m (qw(get post put patch delete head options)) {
+        my $method = uc $m;
+        *{"route::$m"} = sub { _add($method, @_) };
+    }
+    *{'route::any'}   = sub { _add(undef, @_) };
+    *{'route::add'}   = \&_add;
+    *{'route::list'}  = sub { map { [ $_->[0] // '*', $_->[1] ] } @ROUTES };
+    *{'route::clear'} = sub { @ROUTES = () };
+}
 
 # Responses: [status, [headers], body], body a string, an array of strings or a sub that streams
 sub json {
@@ -72,7 +77,7 @@ sub text {
 # returns false once the client is gone
 sub stream {
     my ($status, $headers, $code) = @_;
-    croak "Web::Plain::stream: needs a code reference" unless ref $code eq 'CODE';
+    croak "Web::Route::stream: needs a code reference" unless ref $code eq 'CODE';
     return [ $status // 200, $headers // [ 'Content-Type' => 'application/octet-stream' ], $code ];
 }
 
@@ -118,7 +123,7 @@ sub dispatch {
         return $res if $res;
         my $err = $@ || 'unknown error';
         return $err if ref $err eq 'ARRAY';  # a handler may die with a response
-        warn "Web::Plain: $method $path: $err";
+        warn "Web::Route: $method $path: $err";
         return json({ error => 'internal server error' }, 500);
     }
     if (%allow) {
@@ -234,7 +239,7 @@ sub _respond {
     if ($streaming) {
         my $ok = 1;
         eval { $body->(sub { $ok &&= _send($c, $_[0] // '') }); 1 }
-            or warn "Web::Plain: $req->{method} $req->{path}: stream: $@";
+            or warn "Web::Route: $req->{method} $req->{path}: stream: $@";
     } else {
         _send($c, $body);
     }
@@ -243,17 +248,17 @@ sub _respond {
 # The socket to listen on: a path (unix socket, default) or host:port
 sub _listen {
     my ($o) = @_;
-    my $l = $o->{listen} // croak "Web::Plain::run: listen => '/path/to.sock' or 'host:port'";
+    my $l = $o->{listen} // croak "Web::Route::run: listen => '/path/to.sock' or 'host:port'";
     if ($l =~ m{^(?:\[([^\]]+)\]|([^/:]+)):(\d+)\z}) {
         require IO::Socket::IP;
         return IO::Socket::IP->new(LocalHost => $1 // $2, LocalPort => $3, Listen => $o->{backlog},
                                    ReuseAddr => 1, Type => SOCK_STREAM)
-            // croak "Web::Plain::run: cannot listen on $l: $@";
+            // croak "Web::Route::run: cannot listen on $l: $@";
     }
     unlink $l if -S $l;
     my $s = IO::Socket::UNIX->new(Local => $l, Listen => $o->{backlog}, Type => SOCK_STREAM)
-        // croak "Web::Plain::run: cannot listen on $l: $!";
-    chmod $o->{mode}, $l or croak "Web::Plain::run: chmod $l: $!" if defined $o->{mode};
+        // croak "Web::Route::run: cannot listen on $l: $!";
+    chmod $o->{mode}, $l or croak "Web::Route::run: chmod $l: $!" if defined $o->{mode};
     return $s;
 }
 
@@ -286,22 +291,23 @@ __END__
 
 =head1 NAME
 
-Web::Plain - Flask-like routes and a small HTTP server for behind nginx, in plain Perl
+Web::Route - Flask-like routes and a small HTTP server for behind nginx, in plain Perl
 
 =head1 SYNOPSIS
 
-    use Web::Plain;
+    use Web::Route;
 
-    get '/health' => sub { { ok => 1 } };                     # a hash: JSON
-    get '/hello/:name' => sub {
+    route::get '/health' => sub { { ok => 1 } };              # a hash: JSON
+    route::get '/hello/:name' => sub {
         my ($req) = @_;
         "Hello, $req->{params}{name}!";                       # a string: text
     };
-    post '/echo' => sub {
+    route::post '/echo' => sub {
         my ($req) = @_;
         json({ got => $req->{json}, args => $req->{args} }, 201);
     };
-    get '/events' => sub {
+    route::delete '/items/:id' => sub { undef };              # undef: 204
+    route::get '/events' => sub {
         stream(200, ['Content-Type' => 'text/event-stream'], sub {
             my ($write) = @_;
             for my $n (1 .. 3) {
@@ -327,8 +333,10 @@ and in nginx:
 
 =head1 DESCRIPTION
 
-Routes are plain functions in a table, requests are plain hashes and responses plain arrays: no objects, no
-dependencies beyond core Perl. The server behind them is deliberately small: it listens on a unix socket (or
+Routes are declared with plain functions in the C<route::> package, requests are plain hashes and responses
+plain arrays: no objects, no dependencies beyond core Perl. The route functions are called by their full name
+(C<route::get>), so C<use Web::Route> exports nothing that clashes with other modules' C<get> or C<any>; it
+exports the response helpers C<json>, C<text>, C<stream>, C<sse> and C<run>. The server behind them is deliberately small: it listens on a unix socket (or
 C<host:port>), serves one request at a time and closes the connection after each, and leaves the hard work to
 nginx in front of it: TLS, keep-alive, slow clients, limits, access control, static files. That suits a
 process that holds one expensive resource (a model on a GPU, say) and does one thing at a time; requests that
@@ -338,15 +346,15 @@ arrive meanwhile wait in the socket's backlog.
 
 =over
 
-=item get / post / put / patch / del / any ($pattern => sub { my ($req) = @_; ... })
+=item route::get / route::post / route::put / route::patch / route::delete / route::head / route::options / route::any ($pattern => sub { my ($req) = @_; ... })
 
-=item route($method, $pattern, $handler)
+=item route::add($method, $pattern, $handler)
 
-Add a route. In C<$pattern>, C<:name> matches one path segment and C<*name> the rest of the path, both
+Add a route (C<route::any> and C<route::add> with an undef method: any method). In C<$pattern>, C<:name> matches one path segment and C<*name> the rest of the path, both
 URL-decoded into C<< $req->{params} >>. Routes are tried in the order they were added; a C<GET> route also
 answers C<HEAD>. A path that matches a route of another method gets 405 with an C<Allow> header, no match 404.
 
-=item routes(), clear_routes()
+=item route::list(), route::clear()
 
 The table as C<[method, pattern]> pairs (C<*> for any method) / empty it.
 

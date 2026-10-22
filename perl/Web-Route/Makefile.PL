@@ -3,9 +3,9 @@ use warnings;
 use ExtUtils::MakeMaker;
 
 WriteMakefile(
-    NAME               => 'Web::Plain',
-    VERSION_FROM       => 'lib/Web/Plain.pm',
-    ABSTRACT_FROM      => 'lib/Web/Plain.pm',
+    NAME               => 'Web::Route',
+    VERSION_FROM       => 'lib/Web/Route.pm',
+    ABSTRACT_FROM      => 'lib/Web/Route.pm',
     AUTHOR             => 'Tim Aerts <aardbeiplantje@gmail.com>',
     LICENSE            => 'unrestricted',  # the Unlicense (public domain)
     MIN_PERL_VERSION   => '5.014',
@@ -23,10 +23,10 @@ WriteMakefile(
             repository => {
                 type => 'git',
                 url  => 'https://github.com/CowboyTim/rocm-hip.git',
-                web  => 'https://github.com/CowboyTim/rocm-hip/tree/main/perl/Web-Plain',
+                web  => 'https://github.com/CowboyTim/rocm-hip/tree/main/perl/Web-Route',
             },
             bugtracker => { web => 'https://github.com/CowboyTim/rocm-hip/issues' },
         },
     },
-    clean              => { FILES => 'Web-Plain-*' },
+    clean              => { FILES => 'Web-Route-*' },
 );

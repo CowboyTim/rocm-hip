@@ -1,7 +1,0 @@
-Revision history for Web-Plain
-
-0.01  unreleased
-    - First version: Flask-like routes as plain functions (get, post, put, patch, del, any, route; :name and
-      *name parameters), requests as plain hashes, responses as [status, headers, body] (a hash becomes JSON,
-      a string text), json / text / stream / sse helpers, and a small sequential HTTP/1.1 server on a unix
-      socket (or host:port) for behind nginx: streamed responses, client-gone detection, limits, SIGTERM.

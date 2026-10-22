@@ -450,7 +450,7 @@ C<STOP_NONE STOP_EOG STOP_MAX_TOKENS STOP_STRING STOP_CALLBACK STOP_CONTEXT_FULL
 =head1 SEE ALSO
 
 L<ROCm::Inference::Store>, L<Minijinja>, L<rocm-inference-server> (an OpenAI-compatible server, with
-L<Web::Plain>); the C API (F<inference.h>) and the engine:
+L<Web::Route>); the C API (F<inference.h>) and the engine:
 L<https://github.com/CowboyTim/rocm-hip>.
 
 =head1 AUTHOR
