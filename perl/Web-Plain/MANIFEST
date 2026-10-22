@@ -1,0 +1,11 @@
+Changes
+LICENSE
+MANIFEST
+MANIFEST.SKIP
+Makefile.PL
+README
+lib/Web/Plain.pm
+t/10-dispatch.t
+t/20-server.t
+xt/pod-coverage.t
+xt/pod.t

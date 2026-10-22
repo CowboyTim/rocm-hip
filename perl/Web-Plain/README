@@ -1,0 +1,33 @@
+Web::Plain
+==========
+
+Flask-like routes and a small HTTP server for behind nginx, in plain Perl: routes are functions in a table,
+requests plain hashes, responses plain arrays. No objects and no dependencies beyond core Perl.
+
+    use Web::Plain;
+
+    get  '/health'      => sub { { ok => 1 } };
+    get  '/hello/:name' => sub { my ($req) = @_; "Hello, $req->{params}{name}!" };
+    post '/echo'        => sub { my ($req) = @_; json($req->{json}, 201) };
+    get  '/events'      => sub {
+        stream(200, ['Content-Type' => 'text/event-stream'], sub {
+            my ($write) = @_;
+            $write->(sse({ n => $_ })) or return for 1 .. 3;
+        });
+    };
+    run(listen => '/run/app/app.sock', mode => 0660);
+
+The server listens on a unix socket, serves one request at a time and leaves TLS, keep-alive, slow clients
+and limits to nginx in front of it (proxy_pass http://unix:/run/app/app.sock; proxy_buffering off for
+streams). It suits a process that holds one expensive resource, such as a model on a GPU.
+
+INSTALLATION
+
+    perl Makefile.PL
+    make
+    make test
+    make install
+
+LICENSE
+
+The Unlicense (public domain): see LICENSE.
