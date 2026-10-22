@@ -1220,10 +1220,9 @@ for the symptoms above.
 >        deltas add up, both tool formats, render back), `t/20-chat.t` (+10: budget, streamed kinds, a
 >        get_weather round trip) on Qwen3.5-4B and 3.6-35B; by hand also Qwen3-0.6B (JSON tool calls, model-
 >        opened think) and Qwen3.8-27B.
->      - **Left:** the SSE server example (design: "Web service: nginx -> Perl, SSE" in Phase 21) (OpenAI-style `/v1/chat/completions` with `reasoning_content` /
->        `tool_calls` deltas), merged with the Phase 22b "Perl web service example" in item 8; per-family tags
->        when Gemma-4 / Nemotron land (item 9: check their templates, extend `%REPLY_TAGS`). A C API channel
->        flag only if a non-Perl user needs it.
+>      - **SSE server — DONE ✅ (2026-10-22):** `perl/ROCm-Inference/bin/rocm-inference-server` on
+>        `Web::Plain` (see "Web service" in Phase 21). **Left:** per-family tags when Gemma-4 / Nemotron land
+>        (item 9: Gemma-4's are known, see its analysis); a C API channel flag only if a non-Perl user needs it.
 >   Profiling: `rocprofv3 --kernel-trace -d <dir> -o run -- <cmd>`, then `tools/prof_summary.py <dir>`;
 >   `QWEN_PROFILE=1` for per-section times.
 > - **Perl module (2026-10-18):** `Makefile.PL` finds libinference via ROCM_INFERENCE_PREFIX, pkg-config
@@ -2280,7 +2279,32 @@ one BF16 layer). Reference: `llama.cpp/src/models/gemma4.cpp` + `gemma4-common.h
   sliding-window ring KV + block store; later a `gemma4-assistant` draft head if one appears (llama.cpp
   supports it).
 
-### Web service: nginx -> Perl, SSE (2026-10-21, design, not started)
+### Web service: nginx -> Perl, SSE — DONE ✅ (2026-10-22)
+
+Built as designed below (user, 2026-10-22: a unix socket, nginx does the hard work; the route helpers a
+separate CPAN module; nginx's embedded Perl rejected: a long handler blocks the whole nginx worker, output
+only leaves when control returns to nginx's event loop, the model would live in nginx workers that a reload
+replaces (and a GPU context does not survive the master's fork), a GPU fault would take nginx down):
+- **`perl/Web-Plain`** (`Web::Plain` 0.01, own distribution, core Perl only; name free on CPAN, can move to its
+  own repo): `get` / `post` / `put` / `patch` / `del` / `any` with `:name` / `*name`, requests as hashes,
+  responses `[status, headers, body]` (a hash -> JSON, a string -> text, undef -> 204, die with a response),
+  `json` / `text` / `stream` / `sse`; `run(listen => $socket)` serves one request at a time (unix socket or
+  host:port, `mode`, limits: 400 / 405 / 408 / 413 / 431 / 501, a die -> 500 on STDERR, SIGTERM removes the
+  socket), streams with `X-Accel-Buffering: no`, `$write` false once the client is gone. 51 tests.
+- **`bin/rocm-inference-server`** (in ROCm-Inference, installed by `make install`): `/health`, `/v1/models`,
+  `/v1/chat/completions` (plain and `stream: true`: `reasoning_content` / `content` deltas, tool calls whole
+  once parsed with arguments as a JSON string, `finish_reason` `tool_calls` / `length` / `stop`, a usage chunk
+  with `stream_options.include_usage`, `[DONE]`); OpenAI messages mapped (text parts, tool call arguments
+  decoded, developer -> system); options `max_tokens`, `temperature`, `top_p`, `seed`, `stop`, `tools`,
+  `tool_choice: none`, `chat_template_kwargs`, `reasoning_effort` (none / minimal: thinking off),
+  `max_thinking_tokens`, `top_k`, `min_p`, `repeat_penalty`; `--store` for cross-conversation reuse,
+  `--draft` for the MTP head. A disconnect stops the generation. Verified with the official OpenAI Python
+  client 3.36 (httpx2 unix-socket transport): plain, streamed (first piece after 0.07 s), a get_weather
+  round trip, a dropped stream (next request served at once), a 400; `t/60-server.t` (19 tests) runs it.
+- Not here yet: nginx itself (not installed in the container; the POD has the config). Requests queue in the
+  socket backlog while one generates; serving several conversations at once needs multi-sequence KV.
+
+Design (2026-10-21):
 
 User: nginx in front, Perl behind, Flask-like routes, no Moose / Mojolicious / heavy OO. Installed here: only
 core Perl (HTTP::Tiny, JSON::PP, IO::Socket::UNIX); no Plack, FCGI, Starman, nginx. Design:

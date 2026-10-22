@@ -1,0 +1,264 @@
+#!/usr/bin/perl
+# rocm-inference-server: an OpenAI-compatible chat server (/v1/chat/completions, streamed as server-sent events)
+# for one model, on a unix socket behind nginx. See the POD at the end, or --help.
+use strict;
+use warnings;
+
+use Getopt::Long qw(GetOptions);
+use File::Basename qw(basename);
+use JSON::PP ();
+use Pod::Usage qw(pod2usage);
+use ROCm::Inference qw(:all);
+use Web::Plain;
+
+my %o = (listen => './rocm-inference.sock', ctx => 8192, max_tokens => 4096);
+GetOptions(\%o, 'model=s', 'listen=s', 'mode=s', 'ctx=i', 'name=s', 'draft=s', 'store=s', 'max_tokens=i',
+           'thinking!', 'log!', 'help') or pod2usage(2);
+pod2usage(-verbose => 2, -exitval => 0) if $o{help};
+pod2usage("--model is required\n") unless $o{model};
+ROCm::Inference::_require_minijinja()
+    or die "rocm-inference-server needs the Minijinja module $ROCm::Inference::MINIJINJA_VERSION\n";
+
+my $name = $o{name} // basename($o{model}) =~ s/(?:-\d{5}-of-\d{5})?\.gguf\z//r;
+print STDERR "loading $o{model} ...\n";
+my $m = load_model($o{model}) // die "cannot load $o{model}: " . last_error() . "\n";
+kv_cache_init($m, $o{ctx});
+set_draft_model($m, $o{draft}) if $o{draft};
+store_open($m, $o{store}) if $o{store};
+my $created = time;
+my $J = JSON::PP->new->utf8->canonical;
+
+# An OpenAI-style error, as a response to die with
+sub error {
+    my ($status, $msg, $type) = @_;
+    die json({ error => { message => $msg, type => $type // 'invalid_request_error' } }, $status);
+}
+
+# OpenAI messages as the chat template wants them: text parts joined, tool call arguments as hashes,
+# 'developer' as 'system'
+sub messages {
+    my ($in) = @_;
+    ref $in eq 'ARRAY' && @$in or error(400, "'messages' must be a non-empty array");
+    my @out;
+    for my $msg (@$in) {
+        ref $msg eq 'HASH' && defined $msg->{role} or error(400, 'each message needs a role');
+        my %m = %$msg;
+        $m{role} = 'system' if $m{role} eq 'developer';
+        if (ref $m{content} eq 'ARRAY') {
+            my @types = grep { ($_->{type} // '') ne 'text' } @{ $m{content} };
+            error(400, "content parts of type '$types[0]{type}' are not supported") if @types;
+            $m{content} = join '', map { $_->{text} // '' } @{ $m{content} };
+        }
+        $m{content} //= '';
+        if (ref $m{tool_calls} eq 'ARRAY') {
+            $m{tool_calls} = [ map {
+                my %c = %$_;
+                my %f = %{ $c{function} // {} };
+                $f{arguments} = eval { $J->decode($f{arguments}) } // $f{arguments} if defined $f{arguments} && !ref $f{arguments};
+                $c{function} = \%f;
+                \%c;
+            } @{ $m{tool_calls} } ];
+        }
+        push @out, \%m;
+    }
+    return \@out;
+}
+
+# The request's options as chat's
+sub options {
+    my ($p) = @_;
+    error(400, 'n > 1 is not supported') if ($p->{n} // 1) != 1;
+    my %vars = %{ ref $p->{chat_template_kwargs} eq 'HASH' ? $p->{chat_template_kwargs} : {} };
+    $vars{tools} = $p->{tools} if ref $p->{tools} eq 'ARRAY' && @{ $p->{tools} } && ($p->{tool_choice} // '') ne 'none';
+    if (!exists $vars{enable_thinking}) {
+        my $effort = $p->{reasoning_effort};
+        $vars{enable_thinking} = defined $effort ? ($effort =~ /^(?:none|minimal)\z/ ? 0 : 1) : $o{thinking}
+            if defined $effort || defined $o{thinking};
+    }
+    my %c = (vars => \%vars, max_new_tokens => $p->{max_completion_tokens} // $p->{max_tokens} // $o{max_tokens});
+    $c{max_new_tokens} = $o{max_tokens} if $c{max_new_tokens} > $o{max_tokens} || $c{max_new_tokens} < 1;
+    for (qw(temperature top_p top_k min_p seed repeat_penalty)) { $c{$_} = $p->{$_} if defined $p->{$_} }
+    $c{stop} = ref $p->{stop} ? $p->{stop} : [ $p->{stop} ] if defined $p->{stop};
+    my $budget = $p->{max_thinking_tokens} // $p->{thinking_budget_tokens};
+    $c{max_thinking_tokens} = $budget if defined $budget && $budget >= 0;
+    return \%c;
+}
+
+sub tool_calls {
+    my ($msg) = @_;
+    return [ map { {
+        id       => sprintf('call_%08x%08x', int rand 2**32, int rand 2**32),
+        type     => 'function',
+        function => { name => $_->{function}{name}, arguments => ref $_->{function}{arguments}
+                          ? $J->encode($_->{function}{arguments}) : $_->{function}{arguments} // '{}' },
+    } } @{ $msg->{tool_calls} // [] } ];
+}
+
+sub finish_reason {
+    my ($why, $msg) = @_;
+    return 'tool_calls' if $msg->{tool_calls};
+    return $why == STOP_MAX_TOKENS() || $why == STOP_CONTEXT_FULL() ? 'length' : 'stop';
+}
+
+get '/health' => sub { { status => 'ok' } };
+
+get '/v1/models' => sub {
+    { object => 'list', data => [ { id => $name, object => 'model', created => $created, owned_by => 'rocm-inference' } ] };
+};
+get '/v1/models/*id' => sub {
+    my ($req) = @_;
+    $req->{params}{id} eq $name or error(404, "no model '$req->{params}{id}'", 'not_found_error');
+    { id => $name, object => 'model', created => $created, owned_by => 'rocm-inference' };
+};
+
+post '/v1/chat/completions' => sub {
+    my ($req) = @_;
+    my $p = $req->{json};
+    ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');
+    my ($messages, $opts) = (messages($p->{messages}), options($p));
+    my $id = sprintf 'chatcmpl-%x%06x', time, int rand 2**24;
+    my ($prompt_tokens, $completion_tokens) = (undef, 0);
+    # the prompt's length is the sequence length when the first token comes; every token emitted counts
+    $opts->{on_token} = sub { $prompt_tokens //= n_past($m); ++$completion_tokens if $_[0] >= 0; 0 };
+    my $usage = sub {
+        $prompt_tokens //= n_past($m);
+        { prompt_tokens => $prompt_tokens, completion_tokens => $completion_tokens,
+          total_tokens => $prompt_tokens + $completion_tokens };
+    };
+
+    unless ($p->{stream}) {
+        my ($content, $why, $msg) = eval { chat($m, $messages, $opts) };
+        error(400, $@ =~ s/ at \S+ line \d+\.?\n?\z//r) unless $msg;
+        my %out = (role => 'assistant', content => $content);
+        $out{reasoning_content} = $msg->{reasoning_content} if defined $msg->{reasoning_content};
+        $out{tool_calls} = tool_calls($msg) if $msg->{tool_calls};
+        return { id => $id, object => 'chat.completion', created => time, model => $name,
+                 choices => [ { index => 0, message => \%out, finish_reason => finish_reason($why, $msg) } ],
+                 usage => $usage->() };
+    }
+
+    my $include_usage = ref $p->{stream_options} eq 'HASH' && $p->{stream_options}{include_usage};
+    return stream(200, [ 'Content-Type' => 'text/event-stream' ], sub {
+        my ($write) = @_;
+        my $chunk = sub {
+            my ($delta, $finish) = @_;
+            $write->(sse({ id => $id, object => 'chat.completion.chunk', created => time, model => $name,
+                           choices => [ { index => 0, delta => $delta, finish_reason => $finish } ] }));
+        };
+        $chunk->({ role => 'assistant', content => '' }, undef) or return;
+        my $gone = 0;
+        my ($content, $why, $msg) = eval {
+            chat($m, $messages, { %$opts, on_delta => sub {
+                my ($text, $kind) = @_;
+                return 0 if $kind eq 'tool_call';  # sent whole, once parsed
+                $gone = 1 unless $chunk->({ ($kind eq 'reasoning' ? 'reasoning_content' : 'content') => $text }, undef);
+                return $gone;
+            } });
+        };
+        return if $gone;
+        unless ($msg) {
+            $write->(sse({ error => { message => $@ =~ s/ at \S+ line \d+\.?\n?\z//r, type => 'server_error' } }));
+            return;
+        }
+        if ($msg->{tool_calls}) {
+            my $i = 0;
+            $chunk->({ tool_calls => [ map { { index => $i++, %$_ } } @{ tool_calls($msg) } ] }, undef) or return;
+        }
+        $chunk->({}, finish_reason($why, $msg)) or return;
+        $write->(sse({ id => $id, object => 'chat.completion.chunk', created => time, model => $name, choices => [],
+                       usage => $usage->() })) or return if $include_usage;
+        $write->(sse('[DONE]'));
+    });
+};
+
+print STDERR "serving $name on $o{listen}\n";
+run(listen => $o{listen}, log => $o{log} // 1, defined $o{mode} ? (mode => oct $o{mode}) : ());
+
+__END__
+
+=head1 NAME
+
+rocm-inference-server - an OpenAI-compatible chat server for one model, behind nginx
+
+=head1 SYNOPSIS
+
+    rocm-inference-server --model /models/Qwen3.5-4B-ROCMFP4.gguf --listen /run/llm/llm.sock --mode 0660
+
+    curl --unix-socket /run/llm/llm.sock http://x/v1/chat/completions -H 'Content-Type: application/json' \
+         -d '{"messages": [{"role": "user", "content": "Hi!"}], "stream": true}'
+
+=head1 OPTIONS
+
+=over
+
+=item --model F<file.gguf>
+
+The model (the first shard of a split one). Required.
+
+=item --listen F<path> | host:port
+
+Where to listen: a unix socket (default F<./rocm-inference.sock>) or host:port.
+
+=item --mode 0660
+
+The socket file's permissions (nginx's user must be able to write to it).
+
+=item --ctx N
+
+Context length (8192).
+
+=item --name NAME
+
+The model id in the API (default: the file name without F<.gguf>).
+
+=item --draft F<file.gguf>
+
+An MTP draft head for speculative decoding (Qwen3.8-Flash-Next).
+
+=item --store F<dir>
+
+A KV block store (e.g. under F</dev/shm>): prompt prefixes are reused across conversations and restarts.
+
+=item --max_tokens N
+
+The most tokens a reply may have, and the default (4096).
+
+=item --[no]thinking
+
+Thinking on or off when a request does not say (default: the chat template's default).
+
+=item --[no]log
+
+A line per request on STDERR (on).
+
+=back
+
+=head1 API
+
+C<GET /health>, C<GET /v1/models>, C<GET /v1/models/{id}> and C<POST /v1/chat/completions>, as OpenAI's:
+C<messages> (text content; tool calls and tool results), C<tools>, C<tool_choice> (C<none> drops the tools),
+C<max_tokens> / C<max_completion_tokens>, C<temperature>, C<top_p>, C<seed>, C<stop>, C<stream> and
+C<stream_options.include_usage>. A reply's reasoning comes as C<reasoning_content> (in C<message> or in the
+streamed C<delta>s), its tool calls as C<tool_calls> (with arguments as a JSON string) and C<finish_reason>
+C<tool_calls>. Beyond OpenAI's: C<top_k>, C<min_p>, C<repeat_penalty>, C<chat_template_kwargs> (template
+variables, e.g. C<{"enable_thinking": false}>), C<reasoning_effort> (C<none> / C<minimal> turn thinking off),
+C<max_thinking_tokens> (or C<thinking_budget_tokens>): close the reasoning after that many tokens.
+
+Requests are served one at a time; the model keeps the last conversation, so its next turn only prefills
+what is new (C<--store> extends that to every conversation). A client that disconnects stops its reply.
+
+=head1 NGINX
+
+    upstream llm { server unix:/run/llm/llm.sock; }
+    server {
+        listen 443 ssl;
+        location /v1/ {
+            proxy_pass http://llm;
+            proxy_http_version 1.1;
+            proxy_buffering off;
+            proxy_read_timeout 900s;
+            client_max_body_size 16m;
+        }
+    }
+
+=cut

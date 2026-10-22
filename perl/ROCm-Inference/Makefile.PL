@@ -74,11 +74,12 @@ WriteMakefile(
     dynamic_lib        => { OTHERLDFLAGS => "-Wl,-rpath,$lib" },
     CONFIGURE_REQUIRES => { 'ExtUtils::MakeMaker' => '6.64' },
     PREREQ_PM          => { 'Carp' => 0, 'Exporter' => 0, 'XSLoader' => 0 },
+    EXE_FILES          => ['bin/rocm-inference-server'],
     TEST_REQUIRES      => { 'Test::More' => '0.88', 'File::Temp' => 0 },
     META_MERGE         => {
         'meta-spec' => { version => 2 },
         prereqs     => {
-            runtime => { recommends => { 'Minijinja' => '0.1.1' } },
+            runtime => { recommends => { 'Minijinja' => '0.1.1', 'Web::Plain' => '0.01' } },
             develop => { requires => { 'Test::Pod' => '1.22', 'Test::Pod::Coverage' => '1.08' } },
         },
         resources => {

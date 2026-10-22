@@ -10,6 +10,9 @@ Revision history for ROCm-Inference
     - chat splits the reply into reasoning, content and tool calls and returns it as a message for the next
       turn (reasoning_content, tool_calls); on_delta streams it by kind; max_thinking_tokens caps the
       reasoning.
+    - bin/rocm-inference-server: an OpenAI-compatible chat server (/v1/chat/completions, streamed as
+      server-sent events with reasoning_content and tool_calls) for one model on a unix socket behind nginx,
+      built on Web::Plain.
     - KV block store: store_open, store_stats, store_block_names; ROCm::Inference::Store for the policy
       (eviction to a size, a disk tier: store_evict, store_spill, store_fetch).
     - Speculative decoding with an MTP draft head (Qwen3.8-Flash-Next): set_draft_model, set_draft_tokens

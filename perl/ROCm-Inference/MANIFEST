@@ -1,12 +1,13 @@
 Changes
 Inference.xs
-lib/ROCm/Inference.pm
-lib/ROCm/Inference/Store.pm
 LICENSE
-Makefile.PL
 MANIFEST
 MANIFEST.SKIP
+Makefile.PL
 README
+bin/rocm-inference-server
+lib/ROCm/Inference.pm
+lib/ROCm/Inference/Store.pm
 t/00-load.t
 t/10-generate.t
 t/15-template.t
@@ -15,5 +16,6 @@ t/20-chat.t
 t/30-store.t
 t/40-store-policy.t
 t/50-draft.t
+t/60-server.t
 xt/pod-coverage.t
 xt/pod.t

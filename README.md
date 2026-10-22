@@ -42,6 +42,9 @@ make install PREFIX=/usr/local   # lib, headers, rocm-inference.pc
 From C: `inference.h` (`inference_load_model`, `inference_kv_cache_init`, `inference_generate_stream`, ...;
 `tests/capi_smoke.c` is a minimal example). From Perl: `cd perl/ROCm-Inference && perl Makefile.PL && make test`.
 
+An OpenAI-compatible chat server for behind nginx (unix socket, streamed, reasoning and tool calls):
+`perl/ROCm-Inference/bin/rocm-inference-server`, on the `Web::Plain` route module (`perl/Web-Plain`).
+
 Chat templates are rendered by the Minijinja Perl module (0.1.1 or later), the `perl-minijinja-xs` submodule
 (it needs Rust's cargo to build the minijinja C library):
 
