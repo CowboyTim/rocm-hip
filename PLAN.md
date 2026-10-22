@@ -2304,7 +2304,24 @@ replaces (and a GPU context does not survive the master's fork), a GPU fault wou
   `--draft` for the MTP head. A disconnect stops the generation. Verified with the official OpenAI Python
   client 3.36 (httpx2 unix-socket transport): plain, streamed (first piece after 0.07 s), a get_weather
   round trip, a dropped stream (next request served at once), a 400; `t/60-server.t` (19 tests) runs it.
-- Not here yet: nginx itself (not installed in the container; the POD has the config). Requests queue in the
+- **Plugged into llama.cpp-rocm-gfx1151-docker (2026-10-22, branch `rocm-inference` there, 7ba0e04, not
+  pushed: this session cannot push to that repo):** a `rocm-hip-build` stage builds this repo from a named
+  build context (`rocm-hip-src` = `ROCM_HIP_CONTEXT`, default `../rocm-hip`: the repo is private; this repo's
+  `.dockerignore` keeps the context to Makefile, src, perl, perl-minijinja-xs) into `/opt/rocm-hip`;
+  `llama.sh` starts rocm-inference-server on `/tmp/rocm-inference.sock` next to llama-server (`ROCM_MODEL`)
+  or alone (`rocm-server`), without the debugging `HIP_LAUNCH_BLOCKING` / `AMD_SERIALIZE_KERNEL` that
+  llama.sh exports; nginx serves it at `/rocm/v1/` behind the same Lua + embedded-Perl request fixups
+  (llama.pm, opencode prompt cleanup). Tested here without Docker (no daemon): the same build commands into
+  a prefix, that nginx.conf on nginx 1.24 + Lua / Perl modules (Ubuntu debs extracted, OpenResty's luajit2),
+  the OpenAI client through nginx with the fixup header: streaming unbuffered (first piece 0.15 s), a 45 KB
+  body (temp file path), tool calls; nginx adds no time (11,922-token prompt 17.09 s direct, 17.10 s via
+  nginx; the GPU was 93% busy with another job then: 4B prefill ~700-790 tok/s instead of ~1,850).
+  Found in that repo, not changed: run.sh sets `HSA_FORCE_FINE_GRAIN_PCIE=1` (AGENTS.md: keep off);
+  `LLAMA_PRESETS` is mounted where llama.sh does not read it; llama.sh exports `HIP_LAUNCH_BLOCKING=1` /
+  `AMD_SERIALIZE_KERNEL=1` for llama-server; the runtime stage is `FROM base` (compilers, the ROCm tarball
+  in a layer); no `proxy_buffering off` for llama-server's streams; llama.pm sets status after
+  send_http_header and forces messages[0] to system.
+- Not here yet: the Docker image build itself (untested). Requests queue in the
   socket backlog while one generates; serving several conversations at once needs multi-sequence KV.
 
 Design (2026-10-21):

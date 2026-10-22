@@ -1,0 +1,20 @@
+# As a Docker build context (llama.cpp-rocm-gfx1151-docker's rocm-hip-src): only what `make install` and the
+# Perl modules build from; not the llama.cpp reference, build outputs or the Rust minijinja checkout
+*
+!Makefile
+!src
+!perl
+!perl-minijinja-xs
+perl-minijinja-xs/minijinja
+perl-minijinja-xs/.git
+**/blib
+**/Makefile.old
+**/pm_to_blib
+**/MYMETA.*
+**/*.o
+**/*.bs
+**/*.so
+perl/*/Makefile
+perl-minijinja-xs/Makefile
+perl-minijinja-xs/lib/Minijinja.c
+perl/ROCm-Inference/Inference.c
