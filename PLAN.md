@@ -2365,7 +2365,10 @@ one BF16 layer). Reference: `llama.cpp/src/models/gemma4.cpp` + `gemma4-common.h
     matvec_verify difference is unchanged); ROCmFP4 (a scale per 16 values, VALU-bound: ~24 VALU instructions per
     WMMA): acc += d_x (e_w0 dot0 + e_w1 dot1) per 32-value block (5 ops per pair, not 6). Gemma FP4 1,731 ->
     **1,795 tok/s**, Qwen3.5-4B 1,880 -> 1,974, Qwen3.6-35B 2,247 -> 2,252. Measured: dense ROCmFP4 ~20 TOPS,
-    K-quants ~14, experts 13 - 18.5 (of ~55).
+    K-quants ~14, experts 13 - 18.5 (of ~55). Tried: K-quant tiles of 128 rows / 8 waves (as the Q8_0-activation
+    kernels): Gemma 1,795 -> 1,770, reverted. The expert kernels are not worse than the dense ones of their type
+    (ROCmFP4 18.9 vs 21 TOPS, Q5_K 14.8 vs ~14): what limits both is the VALU epilogue (a scale per 16 values for
+    ROCmFP4; isum scaling, mins and the float step per chunk for K-quants), not the expert tiling.
   - **Left (profile, FP4 file, 2.0 s):** attn_flash 512 0.32 s + 256 0.24 s, the WMMA matmuls ~1.0 s (ROCmFP4,
     Q5_K dense and experts), add_rmsnorm_rows 0.08 s. Generation (44 / 35 tok/s) not looked at yet.
 - **Step 5 — DONE ✅ (2026-10-25): sliding-window ring KV cache.** `inference_kv_cache_init` puts the 25
