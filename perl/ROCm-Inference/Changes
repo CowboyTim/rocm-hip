@@ -17,6 +17,12 @@ Revision history for ROCm-Inference
       (eviction to a size, a disk tier: store_evict, store_spill, store_fetch).
     - Speculative decoding with an MTP draft head (Qwen3.8-Flash-Next): set_draft_model, set_draft_tokens
       (1-3 chained drafts per pass, or adaptive); the output equals decoding without it.
-    - set_lm_head_q8 (an int8 copy of a float LM head), set_prefill_batch (tokens per prefill micro-batch).
+    - set_lm_head_q8 (an int8 copy of a float LM head), set_prefill_batch (tokens per prefill micro-batch;
+      2048 by default for MoE models).
+    - Gemma-4: chat's reply tags and tool calls in Gemma's format (<|channel>thought ... <channel|>,
+      <|tool_call>call:name{...}<tool_call|>), chosen by reply_tags from the model's chat template;
+      chat_render leaves out the template's <bos> when tokenize adds one.
+    - set_swa_ring / swa_ring: the sliding-window layers' KV cache as a ring (the default) or every layer's
+      whole history (0, needed by a block store); rocm-inference-server --swa-ring.
     - Makefile.PL finds libinference through ROCM_INFERENCE_PREFIX, pkg-config (rocm-inference) or the
       rocm-hip checkout it sits in, and exits without a Makefile ("not applicable") when there is none.

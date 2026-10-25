@@ -17,6 +17,7 @@ BEGIN {  # at compile time: the constants below call into the XS
 # The C library (libinference.so) mapped one function per C call; plus the plain-Perl chat helpers below
 our @EXPORT_OK = qw(
     load_model free_model kv_cache_init set_lm_head_q8 set_draft_model set_draft_tokens set_prefill_batch
+    set_swa_ring swa_ring
     tokenize detokenize chat_template bos_id eos_id token_is_eog vocab_size
     n_ctx n_past reset prefill decode_token get_logits
     generate last_prompt_stats last_error
@@ -482,6 +483,18 @@ Larger batches speed up long prompts on MoE models (up to ~10%: each expert's we
 at the cost of scratch memory (about 1 MB per token on Qwen3.8-Flash-Next; Gemma-4's sliding-window ring also
 grows with it); no gain for dense models. Before C<kv_cache_init>; dies after it.
 
+=item set_swa_ring($m, $positions), swa_ring($m)
+
+Models with sliding-window attention layers (Gemma-4) keep those layers' KV cache as a ring of their last
+positions instead of the whole context: at 128k positions about 3 GB instead of 31 GB for Gemma-4 26B-A4B.
+C<$positions>: -1 (the default) the smallest power of two that holds the window plus a prefill batch; N > 0 at
+least N positions, i.e. more history for reusing a prefix (C<generate>'s C<reuse_prefix>, C<chat>: a
+conversation continues where the ring still holds the window before the shared prefix, otherwise its prompt is
+processed again from the start); 0 no ring, every layer keeps its whole history, which a block store
+(C<store_open>) needs. Before C<kv_cache_init>; dies after it. C<swa_ring> returns the ring's positions after
+C<kv_cache_init>, 0 when there is none (other models, C<set_swa_ring($m, 0)>, or a context no longer than the
+ring would be).
+
 =item set_draft_tokens($m, $n)
 
 Guesses per pass with a draft head: 1 to 3, or 0 (the default) to choose 2 or 3 per pass from how well the
@@ -515,7 +528,7 @@ the templates trim them, so the deltas of a kind add up to the message's field) 
 
 =item chat_template($m [, $name]), bos_id, eos_id, token_is_eog, vocab_size, n_ctx, n_past, reset,
 prefill, decode_token, get_logits, last_prompt_stats, set_lm_head_q8, set_draft_model, set_draft_tokens,
-set_prefill_batch, last_error
+set_prefill_batch, set_swa_ring, swa_ring, last_error
 
 As the C functions of the same name (C<inference_*>). C<get_logits> returns packed floats
 (C<unpack 'f*'>).

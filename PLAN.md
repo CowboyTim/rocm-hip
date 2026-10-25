@@ -2386,13 +2386,17 @@ one BF16 layer). Reference: `llama.cpp/src/models/gemma4.cpp` + `gemma4-common.h
   -> 2,960 MB** (400 MB ring + 2,560 MB). Prefix reuse: `qwen_model_ring_reuse_ok` (the ring's high-water mark;
   positions below it - R are overwritten): a sequence continues at `start` only if the window before it is
   intact, else `sync_prompt` starts over at 0 (as llama.cpp's SWA cache). The block store needs every layer's
-  history: `inference_store_open` refuses with the ring; `INFERENCE_SWA_FULL=1` keeps one full cache (also when
+  history: `inference_store_open` refuses with the ring; `inference_set_swa_ring(m, 0)` (Perl `set_swa_ring`,
+  server `--swa-ring 0`, the server's default with `--store`) keeps one full cache (also when
   R >= n_ctx). `GEMMA_DUMP_LAYER` now takes the layer index. Checked: 2,792 tokens in 29 prefills of 97 (the
   ring wraps) ring vs full: logits bit-identical; qwen_demo 2,792 + 64 tokens: same text, prefill 1,391 / 1,386
-  tok/s; gemma4_verify (WMMA and NO_WMMA) PASS; reuse after a 2,792-token history (ring 2,048): a
+  tok/s; gemma4_verify (WMMA and NO_WMMA) PASS; (2026-10-25, user: "make the ring KV cache a perl/xs/server option")
+  `inference_set_swa_ring(m, positions)` (-1 auto, 0 none, N >= N positions; replaces the INFERENCE_SWA_FULL
+  environment variable) + `inference_swa_ring`, Perl `set_swa_ring` / `swa_ring`, server `--swa-ring N` (0 by
+  default with `--store`); reuse after a 2,792-token history (ring 2,048): a
   2,700-token common prefix is reused (9 tokens prefilled), a 500-token one starts over (its window was
   overwritten), both give a fresh run's tokens. Perl suite (998 tests) passes on Gemma (FP4) and Qwen3.5-4B;
-  t/30-store.t sets INFERENCE_SWA_FULL=1. Creating and pinning a full 30 GB cache took minutes, the ring
+  t/30-store.t sets set_swa_ring($m, 0). Creating and pinning a full 30 GB cache took minutes, the ring
   cache seconds.
 - **Step 4 — DONE ✅ (2026-10-25): chat in ROCm::Inference** (Perl only). `%REPLY_TAG_SETS` (qwen, gemma4) and
   `reply_tags($m)`, which picks the set whose tags the chat template writes; Gemma-4's reasoning
@@ -2411,7 +2415,7 @@ one BF16 layer). Reference: `llama.cpp/src/models/gemma4.cpp` + `gemma4-common.h
   `gemma_model.cpp` forward (decode first) on shared kernels, with the new ops, verified per layer against
   `ref_dump` on the Q8 file (CPU reference build has gemma4); (3) batched prefill (WMMA), then the FP4 file
   (Q5_1 int8 / WMMA kernels); (4) chat: per-family reply tags, the Gemma tool-call parser, EOG list (done); (5)
-  sliding-window ring KV (done; the block store needs INFERENCE_SWA_FULL=1); later a `gemma4-assistant` draft head if one appears (llama.cpp
+  sliding-window ring KV (done; the block store needs set_swa_ring 0); later a `gemma4-assistant` draft head if one appears (llama.cpp
   supports it).
 
 ### Web service: nginx -> Perl, SSE — DONE ✅ (2026-10-22)

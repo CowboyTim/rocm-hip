@@ -11,9 +11,9 @@ plan skip_all => 'set ROCM_INFERENCE_TEST_MODEL to a GGUF model to run' unless $
 my $dir = tempdir('rocm-inference-store-XXXXXX', DIR => (-d '/dev/shm' ? '/dev/shm' : undef), CLEANUP => 1);
 
 my $m = load_model($path);
-# Gemma-4's sliding-window layers keep a ring of their last positions, which a block store cannot hold: one
-# cache of every layer's history instead (no effect on other models)
-local $ENV{INFERENCE_SWA_FULL} = 1;
+# Gemma-4's sliding-window layers keep a ring of their last positions, which a block store cannot hold: every
+# layer's whole history instead (no effect on other models)
+set_swa_ring($m, 0);
 kv_cache_init($m, 4096);
 store_open($m, $dir, 2);
 my $st = store_stats($m);

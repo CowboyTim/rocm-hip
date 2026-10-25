@@ -805,18 +805,31 @@ void inference_free_tokens(int32_t* tokens, int len) {
 // positions (a power of two >= window + the prefill batch, since a batch writes all its positions before it
 // attends), one block that kernels address with block stride 0, so position p lands in slot p % R. The global
 // layers keep the block cache, with rows of their own width. 0 when the model has no sliding layers or
-// INFERENCE_SWA_FULL=1 asks for one cache of every layer (what the block store needs).
+// inference_set_swa_ring(m, 0) asks for one cache of every layer (what the block store needs); a larger ring
+// (inference_set_swa_ring(m, N)) keeps more history for prefix reuse.
 static int swa_ring_size(const inference_model_t* m, int n_ctx, int* window) {
     *window = 0;
     if (!m->gemma4) return 0;
     for (const LayerWeights& L : m->layers) *window = std::max(*window, L.window);
-    const char* full = getenv("INFERENCE_SWA_FULL");
-    if (*window <= 0 || (full && atoi(full) != 0)) return 0;
-    const int need = *window + prefill_batch_tokens(m);
+    if (*window <= 0 || m->swa_ring_opt == 0) return 0;
+    const int need = std::max(*window + prefill_batch_tokens(m), m->swa_ring_opt);
     int R = 256;
     while (R < need) R *= 2;
     return R < n_ctx ? R : 0;  // no gain when the context is that short
 }
+
+int inference_set_swa_ring(inference_model_t* m, int positions) {
+    clear_error();
+    if (!m || positions < -1 || positions > (1 << 24)) {
+        set_error("sliding-window ring: -1 (automatic), 0 (none) or at least that many positions");
+        return INFERENCE_ERR_INVALID_ARG;
+    }
+    if (m->qwen) { set_error("sliding-window ring: call before inference_kv_cache_init"); return -1; }
+    m->swa_ring_opt = positions;
+    return 0;
+}
+
+int inference_swa_ring(const inference_model_t* m) { return m ? m->swa_ring : 0; }
 
 int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
     clear_error();
@@ -1500,8 +1513,8 @@ int inference_store_open(inference_model_t* m, const char* dir, int snapshot_eve
         return INFERENCE_ERR_INVALID_ARG;
     }
     if (m->kvc_swa) {  // a block holds only the global layers; the ring keeps no history to store
-        set_error("store: the sliding-window layers' KV cache is a ring (set INFERENCE_SWA_FULL=1 before "
-                  "inference_kv_cache_init to keep every layer's KV cache and use a block store)");
+        set_error("store: the sliding-window layers' KV cache is a ring (inference_set_swa_ring(m, 0) before "
+                  "inference_kv_cache_init keeps every layer's history, as a block store needs)");
         return INFERENCE_ERR_INVALID_ARG;
     }
     inference_store_close(m);

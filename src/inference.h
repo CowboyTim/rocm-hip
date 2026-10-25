@@ -84,6 +84,17 @@ int inference_set_draft_model(inference_model_t* model, const char* path);
 // Must be called before inference_kv_cache_init (the scratch is allocated there). Returns 0, negative on error.
 int inference_set_prefill_batch(inference_model_t* model, int n_tokens);
 
+// Models with sliding-window attention layers (Gemma-4) keep those layers' K / V in a ring of their last positions
+// instead of the whole context: at 128k positions 3 GB instead of 31 GB for Gemma-4 26B-A4B. positions: -1 (the
+// default) a ring of the smallest power of two >= window + prefill batch; N > 0 at least N positions (more history:
+// prefix reuse continues a sequence only where the ring still holds the window before the reused prefix, else
+// the prompt is processed from the start); 0 no ring, every layer keeps its full history (needed for a block
+// store, inference_store_open). No ring either when it would not be smaller than the context. Must be called
+// before inference_kv_cache_init. Returns 0, negative on error. inference_swa_ring: the ring's positions after
+// inference_kv_cache_init (0: no ring).
+int inference_set_swa_ring(inference_model_t* model, int positions);
+int inference_swa_ring(const inference_model_t* model);
+
 // Drafts per pass with a draft head: the head chains them (each from its own output), the model verifies them
 // with the current token in one pass. More drafts give more tokens per pass when they are accepted, at the cost
 // of a longer pass. 1..3: that many; 0 (default): 2 or 3, chosen per pass from the recent acceptance of each

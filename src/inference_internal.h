@@ -235,6 +235,7 @@ struct inference_model {
     inference_kv_cache_t* kvc_swa = nullptr;
     int swa_ring = 0;                                   // ring positions (0: no ring, one cache for all layers)
     int swa_window = 0;                                 // the sliding window
+    int swa_ring_opt = -1;                              // inference_set_swa_ring: -1 auto, 0 no ring, N >= N positions
     float embd_scale = 1.0f;                            // token embeddings * sqrt(n_embd)
     float logit_softcap = 0.0f;                         // final_logit_softcapping (0: none)
 };

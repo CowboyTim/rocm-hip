@@ -10,7 +10,12 @@ plan skip_all => 'set ROCM_INFERENCE_TEST_MODEL to a GGUF model to run' unless $
 
 my $m = load_model($path);
 is(set_prefill_batch($m, 512), 0, 'set_prefill_batch before kv_cache_init');
+ok(!eval { set_swa_ring($m, -2); 1 }, 'set_swa_ring: a bad value dies');
+is(set_swa_ring($m, -1), 0, 'set_swa_ring before kv_cache_init');
 kv_cache_init($m, 2048);
+# (Gemma-4 at 2048 positions: a ring of window + batch would not be smaller than the context: none)
+is(swa_ring($m), 0, 'swa_ring: none at this context');
+ok(!eval { set_swa_ring($m, 0); 1 }, 'set_swa_ring after kv_cache_init dies');
 is(n_ctx($m), 2048, 'n_ctx');
 my $err = eval { set_prefill_batch($m, 1024); 1 } ? '' : $@;
 like($err, qr/set_prefill_batch/, 'set_prefill_batch after kv_cache_init dies');

@@ -13,7 +13,7 @@ use Web::Route;
 
 my %o = (listen => './rocm-inference.sock', ctx => 8192, max_tokens => 4096);
 GetOptions(\%o, 'model=s', 'listen=s', 'mode=s', 'ctx=i', 'name=s', 'draft=s', 'store=s', 'max_tokens=i',
-           'thinking!', 'log!', 'help') or pod2usage(2);
+           'swa-ring=i', 'thinking!', 'log!', 'help') or pod2usage(2);
 pod2usage(-verbose => 2, -exitval => 0) if $o{help};
 pod2usage("--model is required\n") unless $o{model};
 ROCm::Inference::_require_minijinja()
@@ -22,8 +22,12 @@ ROCm::Inference::_require_minijinja()
 my $name = $o{name} // basename($o{model}) =~ s/(?:-\d{5}-of-\d{5})?\.gguf\z//r;
 print STDERR "loading $o{model} ...\n";
 my $m = load_model($o{model}) // die "cannot load $o{model}: " . last_error() . "\n";
+# a block store needs every layer's history: no sliding-window ring unless asked for
+my $ring = $o{'swa-ring'} // ($o{store} ? 0 : -1);
+set_swa_ring($m, $ring);
 kv_cache_init($m, $o{ctx});
 set_draft_model($m, $o{draft}) if $o{draft};
+die "--store needs every layer's KV history: --swa-ring 0 (the default with --store)\n" if $o{store} && swa_ring($m);
 store_open($m, $o{store}) if $o{store};
 my $created = time;
 my $J = JSON::PP->new->utf8->canonical;
@@ -206,6 +210,13 @@ The socket file's permissions (nginx's user must be able to write to it).
 =item --ctx N
 
 Context length (8192).
+
+=item --swa-ring N
+
+Models with sliding-window attention (Gemma-4): the KV cache of those layers as a ring of at least N positions
+(C<set_swa_ring>): -1 (the default) the smallest that works, a few thousand positions; larger keeps more history
+for reusing a conversation's prefix; 0 no ring, every layer's whole history (the default with C<--store>, which
+needs it). At 128k context about 3 GB instead of 31 GB for Gemma-4 26B-A4B.
 
 =item --name NAME
 

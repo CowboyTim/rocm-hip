@@ -156,6 +156,24 @@ set_prefill_batch(h, n)
     RETVAL
 
 int
+set_swa_ring(h, n)
+    SV* h
+    int n
+  CODE:
+    RETVAL = inference_set_swa_ring(handle_ptr(aTHX_ h, 0), n);
+    if (RETVAL < 0) croak_last(aTHX_ "set_swa_ring", RETVAL);
+  OUTPUT:
+    RETVAL
+
+int
+swa_ring(h)
+    SV* h
+  CODE:
+    RETVAL = inference_swa_ring(handle_ptr(aTHX_ h, 0));
+  OUTPUT:
+    RETVAL
+
+int
 set_draft_tokens(h, n)
     SV* h
     int n
