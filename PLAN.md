@@ -2462,6 +2462,17 @@ ggml-cpu `ssm_scan_f32`.
 - **Steps:** (1) tokenizer (done); (2) loader + forward (done); (3) speed (Super: profile generation and prefill;
   a chunked scan for prefill if the scan shows up); (4) Super (done).
 
+### Huge pages for /dev/shm (2026-10-25)
+
+The engine's buffers (KV cache block files, scratch, recurrent state) and models copied to /dev/shm are tmpfs
+pages that hipHostRegister pins; on 2 MB pages that is 512x fewer faults. Setup (user, Docker): a host tmpfs
+`mount -t tmpfs -o size=110g,mode=1777,huge=always tmpfs /srv/llm-shm` bind-mounted as the container's /dev/shm
+(Docker's --tmpfs rejects `huge`); on kernel 6.17 also `/sys/kernel/mm/transparent_hugepage/shmem_enabled` =
+always (the per-size `hugepages-2048kB/shmem_enabled` is `inherit`: with `never` the mount's huge= is ignored) and
+`defrag` = always (else allocations fall back to 4 KB pages once the page cache fragments memory). Copy models
+with `dd` or `cat`: `cp` (copy_file_range) does not get huge pages. Measured: Nemotron-3-Nano (33 GB) load + pin
+from /dev/shm 1.5 -> **0.6 s**; a 32 GB KV cache (Gemma-4 at 128k, no ring) 23.6 -> **2.8 s**.
+
 ### BF16 dense prefill (ABC.gguf, a Qwen3.5 27B in BF16, 2026-10-25)
 
 Correct output; generation 4.1 tok/s (54 GB per token: the bandwidth); prefill **7.8 tok/s** (2,661 tokens in
