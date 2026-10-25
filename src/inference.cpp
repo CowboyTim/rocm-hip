@@ -806,7 +806,7 @@ inference_model_t* inference_load_model_ex(const char* gguf_path, const inferenc
 }
 
 static kv_cache_config_t mtp_kv_config(const inference_model* m, int n_ctx) {
-    return kv_cache_config_t{1, n_ctx, m->n_embd, m->head_dim, m->n_head, m->n_head_kv, 0};
+    return kv_cache_config_t{1, n_ctx, m->n_embd, m->head_dim, m->n_head, m->n_head_kv, 0, m->kv_type};
 }
 
 static void free_mtp(inference_model* m) {
@@ -972,6 +972,17 @@ int inference_set_swa_ring(inference_model_t* m, int positions) {
 
 int inference_swa_ring(const inference_model_t* m) { return m ? m->swa_ring : 0; }
 
+int inference_set_kv_type(inference_model_t* m, int kv_type) {
+    clear_error();
+    if (!m || (kv_type != INFERENCE_KV_F16 && kv_type != INFERENCE_KV_Q8_0)) {
+        set_error("KV cache type: INFERENCE_KV_F16 or INFERENCE_KV_Q8_0");
+        return INFERENCE_ERR_INVALID_ARG;
+    }
+    if (m->qwen) { set_error("KV cache type: call before inference_kv_cache_init"); return -1; }
+    m->kv_type = kv_type == INFERENCE_KV_Q8_0 ? KV_CACHE_Q8_0 : KV_CACHE_F16;
+    return 0;
+}
+
 int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
     clear_error();
     if (!m) { set_error("NULL model"); return -1; }
@@ -982,7 +993,7 @@ int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
     m->swa_window = window;
     // One KV layer per full-attention layer (LayerWeights::kv_slot); DeltaNet layers keep recurrent state instead
     kv_cache_config_t cfg{m->n_kv_layers > 0 ? m->n_kv_layers : 1, n_ctx, m->n_embd,
-                          m->kv_head_dim > 0 ? m->kv_head_dim : m->head_dim, m->n_head, m->n_head_kv};
+                          m->kv_head_dim > 0 ? m->kv_head_dim : m->head_dim, m->n_head, m->n_head_kv, 0, m->kv_type};
     if (m->gemma4) {  // number the layers' KV slots: in the ring and the block cache, or all in the block cache
         int n_ring = 0, n_glob = 0, ring_hd = 0, ring_kv = 0, glob_hd = 0, glob_kv = 0;
         for (LayerWeights& L : m->layers) {
@@ -992,8 +1003,8 @@ int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
             (L.kv_ring ? ring_kv : glob_kv) = L.n_head_kv;
         }
         if (R > 0) {
-            cfg = kv_cache_config_t{std::max(1, n_glob), n_ctx, m->n_embd, glob_hd, m->n_head, glob_kv};
-            const kv_cache_config_t rcfg{n_ring, R, m->n_embd, ring_hd, m->n_head, ring_kv, R};
+            cfg = kv_cache_config_t{std::max(1, n_glob), n_ctx, m->n_embd, glob_hd, m->n_head, glob_kv, 0, m->kv_type};
+            const kv_cache_config_t rcfg{n_ring, R, m->n_embd, ring_hd, m->n_head, ring_kv, R, m->kv_type};
             m->kvc_swa = kv_cache_create("/dev/shm", &rcfg);
             if (!m->kvc_swa) { set_error("kv_cache_create (sliding-window ring) failed"); return -1; }
         }
@@ -1684,7 +1695,7 @@ int inference_store_open(inference_model_t* m, const char* dir, int snapshot_eve
     const void* gbase = gguf_map_base(m->gguf, &gsize);
     const uint64_t layout[] = {(uint64_t)gsize, (uint64_t)kv_cache_block_tokens(m->kvc), (uint64_t)m->n_kv_layers,
                                (uint64_t)kv_cache_d_kv(m->kvc), (uint64_t)kv_cache_block_bytes(m->kvc),
-                               (uint64_t)state_bytes(m)};
+                               (uint64_t)state_bytes(m), (uint64_t)kv_cache_type(m->kvc)};
     sha256_update(&c, layout, sizeof(layout));
     if (gbase) sha256_update(&c, gbase, std::min(gsize, (size_t)4 << 20));
     for (int i = 1; i < gguf_n_maps(m->gguf); ++i) {  // the other files of a split model: their sizes

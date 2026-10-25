@@ -17,7 +17,7 @@ BEGIN {  # at compile time: the constants below call into the XS
 # The C library (libinference.so) mapped one function per C call; plus the plain-Perl chat helpers below
 our @EXPORT_OK = qw(
     load_model free_model kv_cache_init set_lm_head_q8 set_draft_model set_draft_tokens set_prefill_batch
-    set_swa_ring swa_ring stage_info
+    set_swa_ring swa_ring stage_info set_kv_type
     tokenize detokenize chat_template bos_id eos_id token_is_eog vocab_size
     n_ctx n_past reset prefill decode_token get_logits
     generate last_prompt_stats last_error
@@ -495,6 +495,12 @@ Larger batches speed up long prompts on MoE models (up to ~10%: each expert's we
 at the cost of scratch memory (about 1 MB per token on Qwen3.8-Flash-Next; Gemma-4's sliding-window ring also
 grows with it); no gain for dense models. Before C<kv_cache_init>; dies after it.
 
+=item set_kv_type($m, 'f16' | 'q8_0')
+
+The KV cache's element type: C<f16> (the default) or C<q8_0>, int8 with an fp16 scale per 32 values as llama.cpp's
+C<-ctk q8_0 -ctv q8_0>: about half the memory, so twice the context in the same RAM, at about the same speed
+(Qwen3.6-35B at 32k: 640 -> 340 MB). Before C<kv_cache_init>; dies after it.
+
 =item set_swa_ring($m, $positions), swa_ring($m)
 
 Models with sliding-window attention layers (Gemma-4) keep those layers' KV cache as a ring of their last
@@ -540,7 +546,7 @@ the templates trim them, so the deltas of a kind add up to the message's field) 
 
 =item chat_template($m [, $name]), bos_id, eos_id, token_is_eog, vocab_size, n_ctx, n_past, reset,
 prefill, decode_token, get_logits, last_prompt_stats, set_lm_head_q8, set_draft_model, set_draft_tokens,
-set_prefill_batch, set_swa_ring, swa_ring, last_error
+set_prefill_batch, set_swa_ring, swa_ring, set_kv_type, last_error
 
 As the C functions of the same name (C<inference_*>). C<get_logits> returns packed floats
 (C<unpack 'f*'>).

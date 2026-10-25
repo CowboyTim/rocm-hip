@@ -398,14 +398,23 @@ struct QwenModel {
         head_mem.free();
         rs.free();
         s.mem.free();
-        gpu_ops_free();
-        attention_free();
-        deltanet_free();
-        qmatvec_free();
+        // the kernel modules are the process's, shared by every model: unloaded with the last one (freeing one
+        // model of two left the other without kernels)
+        if (counted && --g_live_models == 0) {
+            gpu_ops_free();
+            attention_free();
+            deltanet_free();
+            qmatvec_free();
+        }
     }
+
+    static int g_live_models;  // QwenModels initialized and not yet freed (they share the kernel modules)
+    bool counted = false;
 
     bool init(inference_model* model) {
         eng = model;
+        ++g_live_models;
+        counted = true;
         if (qmatvec_init("matvec_q.co") != 0 || gpu_ops_init("gpu_ops.co") != 0) {
             qwen_set_error("cannot load matvec_q.co / gpu_ops.co (run from build/co)");
             return false;
@@ -573,10 +582,15 @@ struct QwenModel {
         __half* V = kv_cache_v_row(kvc, L.kv_slot, 0);
         if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
         const qmatvec_q8* q8 = q8_for(DQ, T);
-        if (!check(attention_forward(s.qfull, s.k, s.v, L.q_norm, L.k_norm, K, V, kv_cache_block_shift(kvc),
-                                     kv_cache_block_stride(kvc), HQ, HKV, eng->n_rot, pos0, T,
-                                     eng->rope_freq_base, (float)eng->eps, s.q, s.part_ml, s.part_acc, s.attn,
-                                     eng->head_dim, eng->attn_gated ? 1 : 0, q8, 0),
+        attention_opts o = {};
+        o.head_dim = eng->head_dim;
+        o.gated = eng->attn_gated ? 1 : 0;
+        o.kv_stride = kv_cache_row_halves(kvc);
+        o.kv_q8 = kv_cache_type(kvc) == KV_CACHE_Q8_0;
+        if (!check(attention_forward_opts(s.qfull, s.k, s.v, L.q_norm, L.k_norm, K, V, kv_cache_block_shift(kvc),
+                                          kv_cache_block_stride(kvc), HQ, HKV, eng->n_rot, pos0, T,
+                                          eng->rope_freq_base, (float)eng->eps, s.q, s.part_ml, s.part_acc, s.attn, &o,
+                                          q8, 0),
                    "attention kernels"))
             return false;
         mark(s.attn, DQ, T, q8);
@@ -944,7 +958,8 @@ struct QwenModel {
         if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
         attention_opts o = {};
         o.head_dim = L.head_dim;
-        o.kv_stride = kv_cache_d_kv(kvc);
+        o.kv_stride = kv_cache_row_halves(kvc);
+        o.kv_q8 = kv_cache_type(kvc) == KV_CACHE_Q8_0;
         o.rot_pairs = L.rot_pairs;
         o.v_norm = 1;
         o.window = L.window;
@@ -1164,7 +1179,8 @@ struct QwenModel {
         if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
         attention_opts o = {};
         o.head_dim = HD;
-        o.kv_stride = kv_cache_d_kv(kvc);
+        o.kv_stride = kv_cache_row_halves(kvc);
+        o.kv_q8 = kv_cache_type(kvc) == KV_CACHE_Q8_0;
         o.no_qk_norm = 1;  // and no RoPE (n_rot 0)
         const qmatvec_q8* q8 = q8_for(DQ, T);
         if (!check(attention_forward_opts(s.qfull, s.k, s.v, nullptr, nullptr, K, V, kv_cache_block_shift(kvc),
@@ -1737,6 +1753,8 @@ qwen_model_t* qwen_model_create(inference_model_t* engine_model) {
     if (!m->init(engine_model)) { delete m; return nullptr; }
     return m;
 }
+
+int QwenModel::g_live_models = 0;
 
 void qwen_model_free(qwen_model_t* model) {
     delete model;

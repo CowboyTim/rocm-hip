@@ -38,7 +38,12 @@ typedef struct {
     int n_heads_q;     /* query heads */
     int n_heads_kv;    /* key/value heads (GQA: may be < n_heads_q) */
     int block_tokens;  /* positions per block, a power of two; 0: KV_CACHE_DEFAULT_BLOCK */
+    int kv_type;       /* KV_CACHE_F16 (0) or KV_CACHE_Q8_0: rows of int8 values then an fp16 scale per 32
+                          (d_kv a multiple of 256; attention_opts.kv_q8) */
 } kv_cache_config_t;
+
+#define KV_CACHE_F16 0
+#define KV_CACHE_Q8_0 1
 
 #define KV_CACHE_DEFAULT_BLOCK 256
 
@@ -51,7 +56,10 @@ void kv_cache_free(inference_kv_cache_t *cache);
 
 int    kv_cache_n_layers(const inference_kv_cache_t *c);
 int    kv_cache_n_ctx(const inference_kv_cache_t *c);
-int    kv_cache_d_kv(const inference_kv_cache_t *c);   /* __half values per token row = n_heads_kv*head_dim */
+int    kv_cache_d_kv(const inference_kv_cache_t *c);   /* values per token row = n_heads_kv*head_dim */
+/* A row's size in __half units (the kernels' kv_stride): d_kv for F16, d_kv * 17 / 32 for Q8_0; its type */
+int    kv_cache_row_halves(const inference_kv_cache_t *c);
+int    kv_cache_type(const inference_kv_cache_t *c);
 size_t kv_cache_total_bytes(const inference_kv_cache_t *c);
 
 /* Block geometry (see the layout comment): positions per block, its log2, bytes per block (all layers' K and V), and

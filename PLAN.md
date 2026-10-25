@@ -2490,6 +2490,21 @@ first stage 21.2 s, reused **2.1 s** (same tokens every way). A stage holds its 
 84 GB stage in /dev/shm a direct load of the same GGUF (another 83 GB pinned) thrashes; load it staged or delete
 the stage first.
 
+### Q8_0 KV cache — DONE ✅ (2026-10-25, user: "implement 4")
+
+`inference_set_kv_type(m, INFERENCE_KV_Q8_0)` / Perl `set_kv_type($m, 'q8_0')` / server `--kv-type q8_0` /
+qwen_demo `--kv-q8`: cache rows of int8 values then an fp16 scale per 32 (ggml's q8_0 rounding: d = amax / 127,
+rint), 17/16 bytes per value instead of 2; rows stay addressed in halves (`kv_cache_row_halves`), needs rows of a
+multiple of 256 values (all models here). attn_prep quantizes (a wave = one 32-value block); attn_partial and every
+attn_flash kernel have `_q8` twins (template KQ: K / V dequantized as read, `kv_load8`), so the F16 kernels are
+unchanged. Main cache, Gemma's ring and the MTP head's cache all follow; the block store's layout hash has the type.
+Verified: Nemotron-3-Nano each block on the reference (F16 KV) 0.99992, logits 0.99935; Gemma-4 worst block
+0.9975 (unscaled scores: q / k norms, scale 1 make 8-bit K error show more; gemma4_verify's bar 0.995 with
+GEMMA4_VERIFY_KV_Q8), logits 0.9988, same top tokens; prefill vs token by token 0.9993 / 0.9997. Memory halves
+(Qwen3.6-35B at 32k: 640 -> 340 MB); speed about equal (27k-token prompt, generation: 35B 41.0 -> 39.2, Gemma 32.0 ->
+33.2 tok/s; the decode kernel's V loop dequantizes per element: a candidate). **Fixed on the way:** freeing one model
+unloaded the process's kernel modules under any other model still loaded (now counted: the last one unloads).
+
 ### BF16 dense prefill (ABC.gguf, a Qwen3.5 27B in BF16, 2026-10-25)
 
 Correct output; generation 4.1 tok/s (54 GB per token: the bandwidth); prefill **7.8 tok/s** (2,661 tokens in

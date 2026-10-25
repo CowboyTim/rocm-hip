@@ -110,6 +110,14 @@ int inference_set_prefill_batch(inference_model_t* model, int n_tokens);
 int inference_set_swa_ring(inference_model_t* model, int positions);
 int inference_swa_ring(const inference_model_t* model);
 
+// The KV cache's element type: INFERENCE_KV_F16 (the default) or INFERENCE_KV_Q8_0 (int8 with an fp16 scale per 32
+// values, as llama.cpp's -ctk/-ctv q8_0: 1.06 bytes per value instead of 2, so about half the memory and the
+// attention reads of long contexts; the cache rows must hold a multiple of 256 values). Must be called before
+// inference_kv_cache_init. Returns 0, negative on error.
+#define INFERENCE_KV_F16 0
+#define INFERENCE_KV_Q8_0 1
+int inference_set_kv_type(inference_model_t* model, int kv_type);
+
 // Drafts per pass with a draft head: the head chains them (each from its own output), the model verifies them
 // with the current token in one pass. More drafts give more tokens per pass when they are accepted, at the cost
 // of a longer pass. 1..3: that many; 0 (default): 2 or 3, chosen per pass from the recent acceptance of each

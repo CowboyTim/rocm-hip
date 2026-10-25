@@ -13,7 +13,7 @@ use Web::Route;
 
 my %o = (listen => './rocm-inference.sock', ctx => 8192, max_tokens => 4096);
 GetOptions(\%o, 'model=s', 'listen=s', 'mode=s', 'ctx=i', 'name=s', 'draft=s', 'store=s', 'max_tokens=i',
-           'swa-ring=i', 'stage=s', 'thinking!', 'log!', 'help') or pod2usage(2);
+           'swa-ring=i', 'stage=s', 'kv-type=s', 'thinking!', 'log!', 'help') or pod2usage(2);
 pod2usage(-verbose => 2, -exitval => 0) if $o{help};
 pod2usage("--model is required\n") unless $o{model};
 ROCm::Inference::_require_minijinja()
@@ -26,6 +26,7 @@ print STDERR "stage: ", stage_info($m), "\n" if $o{stage};
 # a block store needs every layer's history: no sliding-window ring unless asked for
 my $ring = $o{'swa-ring'} // ($o{store} ? 0 : -1);
 set_swa_ring($m, $ring);
+set_kv_type($m, $o{'kv-type'}) if $o{'kv-type'};
 kv_cache_init($m, $o{ctx});
 set_draft_model($m, $o{draft}) if $o{draft};
 die "--store needs every layer's KV history: --swa-ring 0 (the default with --store)\n" if $o{store} && swa_ring($m);
@@ -216,6 +217,10 @@ Context length (8192).
 
 Copy the model's GPU tensors to a stage file in F<dir> (a huge-page tmpfs such as F</dev/shm>) and run from there
 (C<load_model>'s C<stage>): later starts reuse it and pin in a fraction of the time.
+
+=item --kv-type f16|q8_0
+
+The KV cache's element type (C<set_kv_type>): C<q8_0> takes about half the memory of C<f16>, the default.
 
 =item --swa-ring N
 

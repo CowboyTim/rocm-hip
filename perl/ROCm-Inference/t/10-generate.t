@@ -11,11 +11,23 @@ plan skip_all => 'set ROCM_INFERENCE_TEST_MODEL to a GGUF model to run' unless $
 my $m = load_model($path);
 is(set_prefill_batch($m, 512), 0, 'set_prefill_batch before kv_cache_init');
 ok(!eval { set_swa_ring($m, -2); 1 }, 'set_swa_ring: a bad value dies');
+ok(!eval { set_kv_type($m, 'q4'); 1 }, 'set_kv_type: an unknown type dies');
 is(set_swa_ring($m, -1), 0, 'set_swa_ring before kv_cache_init');
 kv_cache_init($m, 2048);
 # (Gemma-4 at 2048 positions: a ring of window + batch would not be smaller than the context: none)
 is(swa_ring($m), 0, 'swa_ring: none at this context');
 ok(!eval { set_swa_ring($m, 0); 1 }, 'set_swa_ring after kv_cache_init dies');
+ok(!eval { set_kv_type($m, 'q8_0'); 1 }, 'set_kv_type after kv_cache_init dies');
+
+# A Q8_0 KV cache: the same greedy continuation of a plain prompt (quantization noise only)
+{
+    my $q = load_model($path);
+    is(set_kv_type($q, 'q8_0'), 0, 'set_kv_type q8_0');
+    kv_cache_init($q, 2048);
+    my $p = tokenize($q, 'The capital of France is');
+    my ($o) = generate($q, $p, { max_new_tokens => 12, temperature => 0, ignore_eog => 1 });
+    like(detokenize($q, $o), qr/Paris/, 'Q8_0 KV cache: ' . detokenize($q, $o));
+}
 is(n_ctx($m), 2048, 'n_ctx');
 my $err = eval { set_prefill_batch($m, 1024); 1 } ? '' : $@;
 like($err, qr/set_prefill_batch/, 'set_prefill_batch after kv_cache_init dies');

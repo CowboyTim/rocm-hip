@@ -118,7 +118,13 @@ inference_kv_cache_t *kv_cache_create(const char *shm_path, const kv_cache_confi
     c->cfg.n_ctx = (f.n_ctx + B - 1) / B * B;  // whole blocks
     c->block_tokens = B;
     while ((1 << c->block_shift) < B) ++c->block_shift;
-    c->row_bytes = (size_t)f.n_heads_kv * f.head_dim * sizeof(__half);
+    const size_t d_kv = (size_t)f.n_heads_kv * f.head_dim;
+    if (f.kv_type == KV_CACHE_Q8_0 && d_kv % 256 != 0) {
+        INFER_LOG("kv_cache: Q8_0 rows need a multiple of 256 values (%zu)\n", d_kv);
+        delete c;
+        return nullptr;
+    }
+    c->row_bytes = f.kv_type == KV_CACHE_Q8_0 ? d_kv + d_kv / 32 * sizeof(__half) : d_kv * sizeof(__half);
     // A block is mapped from its own file, so it is padded to whole pages (the stride kernels use includes it)
     const size_t page = (size_t)sysconf(_SC_PAGESIZE);
     c->block_bytes = (2 * (size_t)f.n_layers * B * c->row_bytes + page - 1) / page * page;
@@ -242,6 +248,8 @@ int kv_cache_slot_publish(inference_kv_cache_t *c, int slot, const char *path) {
 int kv_cache_n_layers(const inference_kv_cache_t *c) { return c ? c->cfg.n_layers : 0; }
 int kv_cache_n_ctx(const inference_kv_cache_t *c)    { return c ? c->cfg.n_ctx : 0; }
 int kv_cache_d_kv(const inference_kv_cache_t *c)     { return c ? c->cfg.n_heads_kv * c->cfg.head_dim : 0; }
+int kv_cache_row_halves(const inference_kv_cache_t *c) { return c ? (int)(c->row_bytes / sizeof(__half)) : 0; }
+int kv_cache_type(const inference_kv_cache_t *c)     { return c ? c->cfg.kv_type : 0; }
 size_t kv_cache_total_bytes(const inference_kv_cache_t *c) { return c ? c->total_bytes : 0; }
 int kv_cache_block_tokens(const inference_kv_cache_t *c) { return c ? c->block_tokens : 0; }
 int kv_cache_block_shift(const inference_kv_cache_t *c) { return c ? c->block_shift : 0; }

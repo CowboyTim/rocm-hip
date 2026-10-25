@@ -254,6 +254,7 @@ struct inference_model {
     int swa_ring = 0;                                   // ring positions (0: no ring, one cache for all layers)
     int swa_window = 0;                                 // the sliding window
     int swa_ring_opt = -1;                              // inference_set_swa_ring: -1 auto, 0 no ring, N >= N positions
+    int kv_type = 0;                                    // inference_set_kv_type: KV_CACHE_F16 / KV_CACHE_Q8_0
     float embd_scale = 1.0f;                            // token embeddings * sqrt(n_embd)
     // Nemotron-H (nemotron_h_moe): ssm_* above describe its Mamba-2 layers (n_head = ssm_dt_rank)
     bool nemotron = false;

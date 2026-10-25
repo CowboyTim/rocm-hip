@@ -86,6 +86,11 @@ int main(int argc, char** argv) {
 
     inference_model_t* m = inference_load_model(argv[1]);
     if (!m) { fprintf(stderr, "load failed: %s\n", inference_get_last_error()); return 1; }
+    // GEMMA4_VERIFY_KV_Q8=1: a Q8_0 KV cache (inference_set_kv_type)
+    if (getenv("GEMMA4_VERIFY_KV_Q8") && inference_set_kv_type(m, INFERENCE_KV_Q8_0) != 0) {
+        fprintf(stderr, "kv type: %s\n", inference_get_last_error());
+        return 1;
+    }
     if (inference_kv_cache_init(m, 4096) != 0) { fprintf(stderr, "kv init: %s\n", inference_get_last_error()); return 1; }
     qwen_model_t* q = inference_get_qwen_model(m);
     const int V = inference_vocab_size(m);
@@ -163,7 +168,9 @@ int main(int argc, char** argv) {
         if (verbose) printf("  layer %2d alone on the reference input: worst cos %.6f\n", l, lw);
         if (lw < tf_worst) tf_worst = lw, tf_layer = l;
     }
-    const bool tf_ok = tf_worst >= 0.999;
+    // (a Q8_0 KV cache vs the reference's F16 one: Gemma-4's unscaled scores (q / k norms, scale 1) make its 8-bit K
+    // error show more, worst layer 0.9975)
+    const bool tf_ok = tf_worst >= (getenv("GEMMA4_VERIFY_KV_Q8") ? 0.995 : 0.999);
     fail += !tf_ok;
     printf("  [%s] each layer on the reference's input: worst cos %.6f (layer %d)\n", tf_ok ? "PASS" : "FAIL", tf_worst,
            tf_layer);

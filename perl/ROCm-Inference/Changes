@@ -24,6 +24,7 @@ Revision history for ROCm-Inference
       chat_render leaves out the template's <bos> when tokenize adds one.
     - load_model($path, { stage => $dir }): the GPU tensors staged in a huge-page tmpfs and reused by later
       loads; stage_info; rocm-inference-server --stage. Nemotron-3 (nemotron_h_moe) models.
+    - set_kv_type($m, 'q8_0'): a Q8_0 KV cache (half the memory); rocm-inference-server --kv-type.
     - Chat templates are rendered with trim_blocks and lstrip_blocks, as transformers' apply_chat_template
       (Nemotron-3's template depends on them).
     - set_swa_ring / swa_ring: the sliding-window layers' KV cache as a ring (the default) or every layer's

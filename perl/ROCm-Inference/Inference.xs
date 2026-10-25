@@ -182,6 +182,19 @@ set_swa_ring(h, n)
     RETVAL
 
 int
+set_kv_type(h, type)
+    SV* h
+    const char* type
+  CODE:
+    /* 'f16' or 'q8_0' */
+    int t = !strcmp(type, "f16") ? INFERENCE_KV_F16 : !strcmp(type, "q8_0") ? INFERENCE_KV_Q8_0 : -1;
+    if (t < 0) croak("set_kv_type: 'f16' or 'q8_0', not '%s'", type);
+    RETVAL = inference_set_kv_type(handle_ptr(aTHX_ h, 0), t);
+    if (RETVAL < 0) croak_last(aTHX_ "set_kv_type", RETVAL);
+  OUTPUT:
+    RETVAL
+
+int
 swa_ring(h)
     SV* h
   CODE:
