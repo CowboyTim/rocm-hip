@@ -52,6 +52,7 @@ ok($r->{usage}{prompt_tokens} > 0 && $r->{usage}{completion_tokens} > 0, 'usage'
 my $head;
 ($st, $body, $head) = http(POST => '/v1/chat/completions', { temperature => 0, max_tokens => 200, stream => JSON::PP::true,
     max_thinking_tokens => 16, stream_options => { include_usage => JSON::PP::true },
+    chat_template_kwargs => { enable_thinking => JSON::PP::true },
     messages => [ { role => 'user', content => 'Is 91 prime? One sentence.' } ] });
 like($head, qr{Content-Type: text/event-stream}, 'an event stream');
 my @ev = map { /^data: (.*)/ ? $1 : () } split /\n\n/, $body;

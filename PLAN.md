@@ -2307,10 +2307,23 @@ one BF16 layer). Reference: `llama.cpp/src/models/gemma4.cpp` + `gemma4-common.h
     EOS is `<eos>`, its turn end `<turn|>`). Speed with the GPU shared with another job: Q8 file 43 tok/s, FP4
     file 59 tok/s generation; prefill 130-255 tok/s on these short prompts (the global layers and the sliding
     ones' ratio-2 heads take the per-token attention path: no flash kernel yet).
+- **Step 4 — DONE ✅ (2026-10-25): chat in ROCm::Inference** (Perl only). `%REPLY_TAG_SETS` (qwen, gemma4) and
+  `reply_tags($m)`, which picks the set whose tags the chat template writes; Gemma-4's reasoning
+  `<|channel>thought` ... `<channel|>`, tool calls `<|tool_call>call:name{key:value,...}<tool_call|>` parsed by
+  `_parse_gemma_value` (`<|"|>` strings, bare / quoted keys, nested `{}` / `[]`, numbers, true / false / null);
+  the thinking budget closes with the set's own text. `chat_render` drops the template's leading `<bos>` when
+  tokenize adds one (as llama.cpp's common/chat.cpp): before, Gemma prompts started with BOS twice. The EOG
+  list was step 1 (`<|tool_response>` ends a tool-call turn, as the template expects). Tests: `t/16-reply.t`
+  Gemma cases; `t/10-generate.t`, `t/20-chat.t`, `t/60-server.t` format-independent. The full suite passes with
+  both Gemma files, Qwen3.5-4B and Qwen3.6-35B-A3B (997 tests each; the server's tool-call round trip included).
+  By hand (FP4 file): get_weather call -> `{city: Gent, unit: C}` with thinking off and on, the tool's result
+  rendered back as `<|tool_response>response:get_weather{value:...}`, answer "14°C with rain"; a thinking
+  budget of 20 cuts the reasoning and the answer follows. (Qwen3-0.6B fails one of t/10-generate.t's checks on
+  a hand-written prompt: the model says "Secondary colors are red and yellow"; not this change.)
 - **Steps:** (1) tokenizer `gemma4` + `tokenizer_gguf_verify` against llama.cpp ids (done); (2) forward (done); (2) loader + a
   `gemma_model.cpp` forward (decode first) on shared kernels, with the new ops, verified per layer against
   `ref_dump` on the Q8 file (CPU reference build has gemma4); (3) batched prefill (WMMA), then the FP4 file
-  (Q5_1 int8 / WMMA kernels); (4) chat: per-family reply tags, the Gemma tool-call parser, EOG list; (5)
+  (Q5_1 int8 / WMMA kernels); (4) chat: per-family reply tags, the Gemma tool-call parser, EOG list (done); (5)
   sliding-window ring KV + block store; later a `gemma4-assistant` draft head if one appears (llama.cpp
   supports it).
 

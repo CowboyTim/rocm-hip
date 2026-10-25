@@ -2,6 +2,7 @@ use strict;
 use warnings;
 use utf8;
 use Test::More;
+use JSON::PP ();
 
 use ROCm::Inference;
 
@@ -9,10 +10,12 @@ use ROCm::Inference;
 # must not depend on how the text is cut into pieces, and the deltas of a kind add up to the message's field
 binmode Test::More->builder->$_, ':encoding(UTF-8)' for qw(output failure_output todo_output);
 
+our $TAGS;  # the tag set (default: Qwen's)
+
 sub split_reply {
     my ($start, @pieces) = @_;
     my %deltas;
-    my $s = ROCm::Inference::_reply_splitter($start, sub { $deltas{ $_[1] } .= $_[0]; 0 });
+    my $s = ROCm::Inference::_reply_splitter($start, sub { $deltas{ $_[1] } .= $_[0]; 0 }, $TAGS);
     $s->{feed}->($_) for @pieces;
     return ($s->{finish}->(), \%deltas);
 }
@@ -64,6 +67,28 @@ check('multi-line value', 'content',
       { role => 'assistant', content => '',
         tool_calls => [ { type => 'function', function => { name => 'write',
                                                              arguments => { text => "line 1\n\nline 2" } } } ] });
+
+# Gemma-4: <|channel>thought ... <channel|>, <|tool_call>call:name{...}<tool_call|>
+{
+    local $TAGS = $ROCm::Inference::REPLY_TAG_SETS{gemma4};
+    check('Gemma-4: thinking', 'content', "<|channel>thought\nThe user wants colors.\n<channel|>Red, blue, yellow.",
+          { role => 'assistant', reasoning_content => 'The user wants colors.', content => 'Red, blue, yellow.' });
+    check('Gemma-4: thinking off (empty channel in the prompt)', 'content', "Paris.",
+          { role => 'assistant', content => 'Paris.' });
+    check('Gemma-4: Qwen tags are text', 'content', "<think>no</think> <tool_call>x</tool_call>",
+          { role => 'assistant', content => '<think>no</think> <tool_call>x</tool_call>' });
+    check('Gemma-4: tool calls', 'content',
+          qq[<|channel>thought\nWeather.\n<channel|><|tool_call>call:weather{city:<|"|>Gent, BE<|"|>,days:2,]
+          . qq[metric:true,opts:{hours:[6,12.5],note:<|"|>a {b}: [c]<|"|>},none:null}<tool_call|>]
+          . qq[<|tool_call>call:time{}<tool_call|>],
+          { role => 'assistant', reasoning_content => 'Weather.', content => '',
+            tool_calls => [ { type => 'function', function => { name => 'weather', arguments => {
+                                  city => 'Gent, BE', days => 2, metric => JSON::PP::true(),
+                                  opts => { hours => [6, 12.5], note => 'a {b}: [c]' }, none => undef } } },
+                            { type => 'function', function => { name => 'time', arguments => {} } } ] });
+    check('Gemma-4: a tool call that does not parse', 'content', "Ok<|tool_call>call:x{a:<|\"|>open<tool_call|>",
+          { role => 'assistant', content => 'Ok', invalid_tool_calls => ['call:x{a:<|"|>open'] });
+}
 
 # on_delta asking to stop is reported by feed
 my $s = ROCm::Inference::_reply_splitter('content', sub { $_[0] =~ /stop/ });

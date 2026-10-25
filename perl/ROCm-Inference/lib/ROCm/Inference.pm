@@ -21,7 +21,7 @@ our @EXPORT_OK = qw(
     n_ctx n_past reset prefill decode_token get_logits
     generate last_prompt_stats last_error
     store_open store_close store_stats store_block_names
-    chat_render chat
+    chat_render chat reply_tags
     STOP_NONE STOP_EOG STOP_MAX_TOKENS STOP_STRING STOP_CALLBACK STOP_CONTEXT_FULL
 );
 our %EXPORT_TAGS = (all => \@EXPORT_OK);
@@ -129,7 +129,8 @@ sub _require_minijinja { eval { require Minijinja; Minijinja->VERSION($MINIJINJA
 # chat_render($model, \@messages, %vars): the conversation as prompt text, rendered with the model's own chat
 # template (the GGUF's tokenizer.chat_template) by Minijinja. Template variables: messages, bos_token,
 # eos_token, add_generation_prompt (default 1), and any %vars (e.g. enable_thinking => 0, tools => [...]);
-# template_name => 'name' picks tokenizer.chat_template.<name>.
+# template_name => 'name' picks tokenizer.chat_template.<name>. When tokenize adds a BOS (Gemma), the text
+# goes without the template's leading one, so that tokenize($m, $text) has it once.
 sub chat_render {
     my ($m, $messages, %vars) = @_;
     _require_minijinja() or croak "ROCm::Inference::chat_render needs the Minijinja module $MINIJINJA_VERSION: $@";
@@ -145,7 +146,12 @@ sub chat_render {
         eos_token             => $eos >= 0 ? detokenize($m, [$eos]) : '',
         %vars,
     );
-    return _render_template($tmpl, \%ctx);
+    my $text = _render_template($tmpl, \%ctx);
+    # tokenize adds the BOS itself when the model wants one (Gemma): drop the template's, as llama.cpp does
+    my $add = tokenize($m, '');
+    substr($text, 0, length $ctx{bos_token}, '')
+        if length $ctx{bos_token} && @$add && $add->[0] == $bos && index($text, $ctx{bos_token}) == 0;
+    return $text;
 }
 
 # A chat template rendered by Minijinja with the Python methods (%PY_METHODS) and tojson
@@ -166,8 +172,28 @@ sub _render_template {
     return $text;
 }
 
-# The tags that mark a reply's reasoning and its tool calls (Qwen, Nemotron, ...); everything else is content
-our %REPLY_TAGS = (reasoning => ['<think>', '</think>'], tool_call => ['<tool_call>', '</tool_call>']);
+# The tags that mark a reply's reasoning and its tool calls; everything else is content. reasoning's third
+# entry is the text that closes it when max_thinking_tokens runs out. %REPLY_TAGS is the Qwen / Nemotron set
+# (the default); %REPLY_TAG_SETS has one set per chat format, and reply_tags($m) picks the model's
+our %REPLY_TAGS = (reasoning => ['<think>', '</think>', "\n</think>\n\n"], tool_call => ['<tool_call>', '</tool_call>']);
+our %REPLY_TAG_SETS = (
+    qwen   => \%REPLY_TAGS,
+    # Gemma-4: <|channel>thought\n...<channel|>, <|tool_call>call:name{key:value,...}<tool_call|>
+    gemma4 => { reasoning => ['<|channel>thought', '<channel|>', "\n<channel|>"],
+                tool_call => ['<|tool_call>', '<tool_call|>'] },
+);
+
+# reply_tags($m): the tag set (%REPLY_TAG_SETS) of the model's chat format, from the tags its chat template
+# writes; the default %REPLY_TAGS when there is no template or no other set matches
+sub reply_tags {
+    my ($m) = @_;
+    my $tmpl = eval { chat_template($m) } // '';
+    for my $name (grep { $_ ne 'qwen' } sort keys %REPLY_TAG_SETS) {
+        my $set = $REPLY_TAG_SETS{$name};
+        return $set unless grep { index($tmpl, $_) < 0 } map { @{$_}[0, 1] } values %$set;
+    }
+    return \%REPLY_TAGS;
+}
 
 # A splitter for a reply's text as it streams: feed($text) takes the next piece (true when on_delta asked to
 # stop), finish() the end. Pieces go to on_delta($text, $kind) by kind: 'reasoning', 'content' or 'tool_call'
@@ -242,10 +268,17 @@ sub _reply_splitter {
 }
 
 # A tool call block's text as { type => 'function', function => { name, arguments => {...} } }: Qwen3.5+ XML
-# (<function=name> <parameter=p>value</parameter>, values as written) or Qwen3 JSON ({"name", "arguments"});
-# undef when it is neither
+# (<function=name> <parameter=p>value</parameter>, values as written), Qwen3 JSON ({"name", "arguments"}) or
+# Gemma-4 (call:name{key:value,...}); undef when it is none of those
 sub _parse_tool_call {
     my ($t) = @_;
+    if ($t =~ /^\s*call:([^{\s]+)\{/gc) {
+        my $name = $1;
+        pos($t) -= 1;
+        my ($args) = _parse_gemma_value(\$t);
+        return undef unless ref $args eq 'HASH' && $t =~ /\G\s*\z/gc;
+        return { type => 'function', function => { name => $name, arguments => $args } };
+    }
     if ($t =~ /<function=([^>\n]+)>(.*?)(?:<\/function>|\z)/s) {
         my ($name, $body, %args) = ($1, $2);
         $args{$1} = $2 while $body =~ /<parameter=([^>\n]+)>\n?(.*?)\n?<\/parameter>/sg;
@@ -257,6 +290,45 @@ sub _parse_tool_call {
     my $args = $j->{arguments} // {};
     $args = eval { JSON::PP->new->decode($args) } // $args unless ref $args;  # arguments as a JSON string
     return { type => 'function', function => { name => $j->{name}, arguments => $args } };
+}
+
+# Gemma-4's argument syntax, from pos($$t) on: <|"|>string<|"|>, {key:value,...} (keys bare or quoted),
+# [value,...], true / false / null, numbers, and other bare text up to the next , } or ] as a string. Returns
+# the value as a one-element list; an empty list (and pos unchanged) when it does not parse
+my $GQ = '<|"|>';
+sub _parse_gemma_value {
+    my ($t) = @_;
+    my $at = pos($$t) // 0;
+    my $end = qr/(?=\s*(?:[,}\]]|\z))/;
+    $$t =~ /\G\s*/gc;
+    return $1 if $$t =~ /\G\Q$GQ\E(.*?)\Q$GQ\E/gcs;
+    if ($$t =~ /\G([{\[])/gc) {
+        my ($obj, %h, @a) = ($1 eq '{');
+        my $close = $obj ? '}' : ']';
+        return $obj ? \%h : \@a if $$t =~ /\G\s*\Q$close\E/gc;
+        while (1) {
+            my $k;
+            if ($obj) {
+                $$t =~ /\G\s*/gc;
+                if ($$t =~ /\G\Q$GQ\E(.*?)\Q$GQ\E\s*:/gcs || $$t =~ /\G([^:{}\[\],]+?)\s*:/gc) { $k = $1 }
+                else { last }
+            }
+            my @v = _parse_gemma_value($t) or last;
+            $obj ? ($h{$k} = $v[0]) : push @a, $v[0];
+            next if $$t =~ /\G\s*,/gc;
+            return $obj ? \%h : \@a if $$t =~ /\G\s*\Q$close\E/gc;
+            last;
+        }
+    } elsif ($$t =~ /\G(true|false|null)$end/gc) {
+        require JSON::PP;
+        return $1 eq 'null' ? undef : $1 eq 'true' ? JSON::PP::true() : JSON::PP::false();
+    } elsif ($$t =~ /\G(-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][-+]?\d+)?)$end/gc) {
+        return 0 + $1;
+    } elsif ($$t =~ /\G([^,{}\[\]]+?)(?=\s*[,}\]])/gc) {
+        return $1;
+    }
+    pos($$t) = $at;
+    return;
 }
 
 # chat($model, \@messages, \%options): render the conversation, then generate the assistant's reply, reusing
@@ -274,10 +346,12 @@ sub chat {
     my ($on_delta, $budget, $on_token) = delete @o{qw(on_delta max_thinking_tokens on_token)};
     my $text = chat_render($m, $messages, %vars);
     # Does the generation prompt open the reasoning (Qwen3.5+ with thinking on ends it with "<think>\n")?
-    my ($open, $close) = @{ $REPLY_TAGS{reasoning} };
+    my $tags = reply_tags($m);
+    my ($open, $close, $closing) = @{ $tags->{reasoning} };
     my $history = eval { chat_render($m, $messages, %vars, add_generation_prompt => 0) } // '';
     my $gen = index($text, $history) == 0 ? substr($text, length $history) : $text;
-    my $split = _reply_splitter(rindex($gen, $open) > rindex($gen, $close) ? 'reasoning' : 'content', $on_delta);
+    my $split = _reply_splitter(rindex($gen, $open) > rindex($gen, $close) ? 'reasoning' : 'content', $on_delta,
+                                $tags);
 
     my ($max, $thinking, @ids, $reason) = ($o{max_new_tokens} // 256, 0);
     my %g = (reuse_prefix => 1, %o);
@@ -298,7 +372,7 @@ sub chat {
         last unless $budget_hit && !$stopped && $why == STOP_CALLBACK() && @ids < $max;
         # Out of thinking budget: close the reasoning as the model would and continue with the answer, right
         # after the tokens generated so far
-        my $closing = "\n$close\n\n";
+        $closing //= $close;
         $prompt = tokenize($m, $closing);
         $split->{feed}->($closing);
         $budget = undef;
@@ -421,13 +495,17 @@ C<lower>, C<get>, C<items>), C<tojson> as C<json.dumps> writes it, C<raise_excep
 values of C<enable_thinking> / C<add_generation_prompt> as booleans. Text is passed and returned as Perl
 character strings. Needs Minijinja 0.1.1 or later.
 
-C<chat> splits the reply at its tags (C<< <think> >> ... C<< </think> >>, C<< <tool_call> >> ...
-C<< </tool_call> >>; C<%ROCm::Inference::REPLY_TAGS>) into reasoning, content and tool calls; a generation
-prompt that opens the reasoning (Qwen3.5+ with thinking on) starts the reply in it. It returns the content,
+C<chat> splits the reply at its tags into reasoning, content and tool calls: Qwen / Nemotron's
+C<< <think> >> ... C<< </think> >> and C<< <tool_call> >> ... C<< </tool_call> >>
+(C<%ROCm::Inference::REPLY_TAGS>), or Gemma-4's C<< <|channel>thought >> ... C<< <channel|> >> and
+C<< <|tool_call> >> ... C<< <tool_call|> >>; C<reply_tags($m)> picks the set (C<%ROCm::Inference::REPLY_TAG_SETS>)
+whose tags the model's chat template writes. A generation prompt that opens the reasoning (Qwen3.5+ with
+thinking on) starts the reply in it. It returns the content,
 and in list context also the stop reason and the reply as a message to push onto the conversation:
 C<< { role => 'assistant', content, reasoning_content, tool_calls } >>, the tool calls as
 C<< { type => 'function', function => { name, arguments => { ... } } } >> (Qwen3.5+ XML parameters as the model
-wrote them, Qwen3 JSON decoded; blocks that parse as neither in C<invalid_tool_calls>). The templates render
+wrote them, Qwen3 JSON decoded, Gemma-4's C<< call:name{key:value,...} >> decoded; blocks that parse as none of
+those in C<invalid_tool_calls>). The templates render
 such a message back as the model wrote it, so the next turn reuses it. Options beyond C<generate>'s:
 C<vars> (template variables), C<on_delta> (C<< sub { my ($text, $kind) = @_; return $stop } >>: the reply
 streamed by kind, C<reasoning>, C<content> or C<tool_call>, without the tags; reasoning and content trimmed as

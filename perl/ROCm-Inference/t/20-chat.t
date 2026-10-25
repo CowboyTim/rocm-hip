@@ -17,11 +17,15 @@ my $m = load_model($path);
 kv_cache_init($m, 4096);
 my @messages = ({ role => 'system', content => 'Answer briefly.' },
                 { role => 'user', content => 'Name three primary colors.' });
+# the user turn and the generation prompt without thinking, as the chat format writes them (Qwen or Gemma-4)
+my $gemma = ROCm::Inference::reply_tags($m) == $ROCm::Inference::REPLY_TAG_SETS{gemma4};
+my ($user, $gen) = $gemma ? (qr/<\|turn>user\n(.*?)<turn\|>/s, qr/<\|turn>model\n<\|channel>thought\n<channel\|>\z/)
+                          : (qr/<\|im_start\|>user\n(.*?)<\|im_end\|>/s, qr/<\|im_start\|>assistant\n<think>\n\n<\/think>\n\n\z/);
 my $prompt = chat_render($m, \@messages, enable_thinking => 0);
-like($prompt, qr/<\|im_start\|>user\nName three primary colors\.<\|im_end\|>/, 'the template renders the user turn');
-like($prompt, qr/<\|im_start\|>assistant\n<think>\n\n<\/think>\n\n\z/, 'generation prompt without thinking');
-like(chat_render($m, [{ role => 'user', content => '你好, été' }]), qr/user\n你好, été<\|im_end\|>/,
-     'non-ASCII text renders intact');
+is(($prompt =~ $user)[0], 'Name three primary colors.', 'the template renders the user turn');
+like($prompt, $gen, 'generation prompt without thinking');
+is((chat_render($m, [{ role => 'user', content => '你好, été' }]) =~ $user)[0], '你好, été',
+   'non-ASCII text renders intact');
 
 my ($reply, $why) = chat($m, \@messages, { temperature => 0, max_new_tokens => 48, vars => { enable_thinking => 0 } });
 is($why, STOP_EOG, 'the reply ends at end-of-turn');
@@ -42,7 +46,7 @@ my ($content, $why3, $msg) = chat($m, $q, { temperature => 0, max_new_tokens => 
 is($why3, STOP_EOG, 'thinking budget: the answer ends at end-of-turn');
 is("@kinds", 'reasoning content', 'streamed: reasoning, then content');
 ok(length $msg->{reasoning_content}, "reasoning: " . short($msg->{reasoning_content}));
-unlike($content, qr/<\/?think>/, "content without tags: " . short($content));
+unlike($content, qr/<\/?think>|<\|channel>|<channel\|>/, "content without tags: " . short($content));
 is($deltas{reasoning}, $msg->{reasoning_content}, 'the reasoning deltas add up to reasoning_content');
 is($deltas{content}, $content, 'the content deltas add up to the content');
 

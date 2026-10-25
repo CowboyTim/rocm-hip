@@ -19,14 +19,17 @@ ok(token_is_eog($m, eos_id($m)), 'EOS ends generation');
 
 my $ids = tokenize($m, 'The capital of France is');
 ok(@$ids > 3, 'tokenize');
-is(detokenize($m, $ids), 'The capital of France is', 'detokenize round trip');
+# (models that want a BOS, Gemma, get one added: it detokenizes as <bos>)
+sub text_ids { my $t = tokenize($m, shift); shift @$t if @$t && $t->[0] == bos_id($m); $t }
+is(detokenize($m, text_ids('The capital of France is')), 'The capital of France is', 'detokenize round trip');
 my $u = "Gr\x{fc}\x{df}e aus K\x{f6}ln \x{2603}";
-is(detokenize($m, tokenize($m, $u)), $u, 'non-ASCII text round trip (character strings)');
+is(detokenize($m, text_ids($u)), $u, 'non-ASCII text round trip (character strings)');
 
-# Greedy, streamed: the callback text adds up to the detokenized tokens
+# Greedy, streamed: the callback text adds up to the detokenized tokens (an instruction-tuned model may end
+# its turn early on a plain prompt: ignore_eog)
 my $streamed = '';
 my ($out, $why) = generate($m, $ids, {
-    max_new_tokens => 12, temperature => 0,
+    max_new_tokens => 12, temperature => 0, ignore_eog => 1,
     on_token => sub { $streamed .= $_[1]; 0 },
 });
 is(scalar @$out, 12, '12 tokens');
@@ -37,7 +40,7 @@ is(n_past($m), @$ids + 12, 'n_past counts the prompt and the emitted tokens');
 
 # Repeatable from a reset; a stop string; the callback stops it; a die in the callback propagates
 reset($m);
-my ($again) = generate($m, $ids, { max_new_tokens => 12, temperature => 0 });
+my ($again) = generate($m, $ids, { max_new_tokens => 12, temperature => 0, ignore_eog => 1 });
 is_deeply($again, $out, 'greedy is repeatable after reset');
 reset($m);
 my $text = '';
