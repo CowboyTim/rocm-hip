@@ -2322,8 +2322,19 @@ one BF16 layer). Reference: `llama.cpp/src/models/gemma4.cpp` + `gemma4-common.h
     (generation unchanged). matvec_verify (Q5_1 int8 path, batched 11 = single, 70 tokens through WMMA with
     K 2112), gemma4_verify on both files (WMMA; NO_WMMA: prefill = token by token bit for bit), forward_verify
     4B / 0.6B / 35B, qwen4exp_verify: PASS.
-  - **Next:** attention, now about half of the prefill: no flash kernel for D 512 (global layers, 16 q / 2 kv)
-    or D 256 with ratio 2 (sliding: 16 q / 8 kv) or for sliding windows.
+  - **Done: flash attention for Gemma-4.** `attn_flash_body<D, NG, NH, TT, DS>`: NH query heads x TT 16-token
+    tiles per workgroup on one KV head, the D output dims split over DS workgroups (all compute the scores),
+    sliding-window masking (blocks before every token's window skipped). `attn_flash_256_h2t2` (sliding: ratio
+    2, 64 query rows per staged K/V block, 52 KB LDS) and `attn_flash_512_h2s2` (global: D split in 2 so the
+    accumulators fit 128 VGPRs, 59 KB LDS); the Qwen kernels are the same template (<D, 1, 4, 1, 1>, 128_g2
+    <128, 2, 4, 1, 1>; K and V staged in one loop when DS = 1, else Qwen3.6-35B prefill lost 1.5%). Checked on
+    the 2,792-token prompt (the window active past 1,024): the attention output of a sliding (16) and a global
+    (5) layer, run on the same input, vs attn_partial: cos >= 0.999999 for every token (whole layers 0.992 -
+    0.999: MoE near-ties amplify the FP16 rounding); forward_verify 4B / 0.6B / 35B, gemma4_verify PASS.
+    **Prefill: FP4 file 758 -> 1,386 tok/s, Q8 file 692 -> 1,104 tok/s** (2,792 tokens; generation 44 / 35).
+    Qwen3.6-35B unchanged (2,066 tok/s on its 2,661 tokens).
+  - **Left (profile, FP4 file, 2.0 s):** attn_flash 512 0.32 s + 256 0.24 s, the WMMA matmuls ~1.0 s (ROCmFP4,
+    Q5_K dense and experts), add_rmsnorm_rows 0.08 s. Generation (44 / 35 tok/s) not looked at yet.
 - **Step 4 — DONE ✅ (2026-10-25): chat in ROCm::Inference** (Perl only). `%REPLY_TAG_SETS` (qwen, gemma4) and
   `reply_tags($m)`, which picks the set whose tags the chat template writes; Gemma-4's reasoning
   `<|channel>thought` ... `<channel|>`, tool calls `<|tool_call>call:name{key:value,...}<tool_call|>` parsed by

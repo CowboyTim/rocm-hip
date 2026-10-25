@@ -13,8 +13,9 @@
 static hipModule_t g_mod = nullptr;
 // [0]: head_dim 128 (attn_*_128), [1]: 256, [2]: 512 (no attn_flash_512)
 static hipFunction_t g_prep[3], g_partial[3], g_combine[3], g_flash[3];
-// attn_flash_128_g2: 2 KV heads per workgroup, for a query / KV head ratio of 2 (Qwen3)
-static hipFunction_t g_flash128_g2 = nullptr;
+// attn_flash_128_g2: 2 KV heads per workgroup, for a query / KV head ratio of 2 (Qwen3); attn_flash_256_h2t2
+// (ratio 2: Gemma-4's sliding layers) and attn_flash_512_h2s2 (Gemma-4's global layers, D split in 2)
+static hipFunction_t g_flash128_g2 = nullptr, g_flash256_h2t2 = nullptr, g_flash512_h2s2 = nullptr;
 
 // attn_flash takes batches of at least this many tokens. QMATVEC_NO_WMMA (qmatvec.h) also turns it off, so
 // that prefill can be compared bit for bit with token by token.
@@ -45,6 +46,8 @@ int attention_init(const char* co_path) {
         }
     }
     if (hipModuleGetFunction(&g_flash128_g2, g_mod, "attn_flash_128_g2") != hipSuccess) g_flash128_g2 = nullptr;
+    if (hipModuleGetFunction(&g_flash256_h2t2, g_mod, "attn_flash_256_h2t2") != hipSuccess) g_flash256_h2t2 = nullptr;
+    if (hipModuleGetFunction(&g_flash512_h2s2, g_mod, "attn_flash_512_h2s2") != hipSuccess) g_flash512_h2s2 = nullptr;
     g_flash_off = getenv("QMATVEC_NO_WMMA") != nullptr || getenv("ATTN_NO_FLASH") != nullptr;  // A/B: attention only
     return 0;
 }
@@ -53,7 +56,7 @@ void attention_free(void) {
     if (g_mod) (void)hipModuleUnload(g_mod);
     g_mod = nullptr;
     for (int i = 0; i < 3; ++i) g_prep[i] = g_partial[i] = g_combine[i] = g_flash[i] = nullptr;
-    g_flash128_g2 = nullptr;
+    g_flash128_g2 = g_flash256_h2t2 = g_flash512_h2s2 = nullptr;
 }
 
 hipError_t attention_forward(const float* qfull, const float* k, const float* v, const float* q_norm,
@@ -103,22 +106,25 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
     const float* qc = q;
     qmatvec_q8_out o = qmatvec_q8_outputs(q8);
 
-    // attn_flash: 4 query heads per workgroup, sharing one KV head (ratio a multiple of 4) or, head_dim 128,
-    // two (ratio 2); other ratios, head_dim 512 and sliding windows take attn_partial
+    // attn_flash: NH query heads x TT tiles of 16 tokens per workgroup, sharing one KV head: 4 x 1 (ratio a
+    // multiple of 4), head_dim 128 with ratio 2: 4 heads of two KV heads, 256: 2 x 2, 512: 2 x 1 with the D
+    // output dims split over DS = 2 workgroups. Other ratios take attn_partial.
     const int ratio = n_q / n_kv;
-    hipFunction_t flash = window > 0 || !g_flash[hi]              ? nullptr
-                          : ratio % 4 == 0                          ? g_flash[hi]
-                          : D == 128 && ratio == 2 && n_q % 4 == 0 ? g_flash128_g2
-                                                                   : nullptr;
+    hipFunction_t flash = nullptr;
+    int nh = 4, tt = 1, ds = 1;
+    if (D < 512 && ratio % 4 == 0) flash = g_flash[hi];
+    else if (D == 128 && ratio == 2 && n_q % 4 == 0) flash = g_flash128_g2;
+    else if (D == 256 && ratio % 2 == 0) flash = g_flash256_h2t2, nh = 2, tt = 2;
+    else if (D == 512 && ratio % 2 == 0) flash = g_flash512_h2s2, nh = 2, ds = 2;
     if (T >= kFlashMinT && !g_flash_off && flash) {
         // Up to ATTN_MAX_SPLITS ranges per token, each a multiple of 16 positions
         int n_split = std::min(nc, ATTN_MAX_SPLITS);
         int chunk = ((n_last + n_split - 1) / n_split + 15) / 16 * 16;
         n_split = (n_last + chunk - 1) / chunk;
-        void* a_flash[] = {(void*)&qc, &K, &V, &kv_stride, &kv_shift, &kv_bstride, &pos0, &T, &n_q, &n_kv, &chunk, &scale, &part_ml, &part_acc};
-        e = hipModuleLaunchKernel(flash, (unsigned)(n_q / 4), (unsigned)((T + 15) / 16), (unsigned)n_split,
-                                  128, 1,
-                                  1, 0, stream, a_flash, nullptr);
+        void* a_flash[] = {(void*)&qc, &K, &V, &kv_stride, &kv_shift, &kv_bstride, &pos0, &T, &n_q, &n_kv, &chunk,
+                           &scale, &part_ml, &part_acc, &window};
+        e = hipModuleLaunchKernel(flash, (unsigned)(n_q / nh * ds), (unsigned)((T + 16 * tt - 1) / (16 * tt)),
+                                  (unsigned)n_split, (unsigned)(32 * nh * tt), 1, 1, 0, stream, a_flash, nullptr);
         if (e != hipSuccess) return e;
         void* a_comb[] = {&part_ml, &part_acc, &n_split, &n_q, (void*)&qfull, &out, &o, &gated};
         return hipModuleLaunchKernel(g_combine[hi], (unsigned)NB, (unsigned)T, 1, 256, 1, 1, 0, stream, a_comb,
