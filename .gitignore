@@ -57,3 +57,4 @@ perl/*/MYMETA.*
 perl/*/pm_to_blib
 perl/*/*.c
 perl/*/*.bs
+refdata/
