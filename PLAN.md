@@ -2345,6 +2345,15 @@ one BF16 layer). Reference: `llama.cpp/src/models/gemma4.cpp` + `gemma4-common.h
   - **Done: default prefill batch 2048 for MoE models** (`prefill_batch_tokens`, 1024 for dense; the ring
     follows: 4,096 positions, 800 MB): Gemma FP4 1,540 -> **1,595 tok/s**, Qwen3.6-35B 2,134 -> 2,217, Qwen3.5-4B
     unchanged (batch 4096: Gemma 1,634).
+  - **Done: skip the flash rescale when no row's maximum changed** (`__ballot`; the alphas collected per block,
+    one rescale after the softmax: a per-row ballot raised the D 256 kernels to 256 VGPRs with spills): Gemma FP4
+    1,595 -> **1,634 tok/s**, Qwen3.6-35B 2,217 -> 2,247.
+  - **Flash attention, measured (rocprofv3 --pmc):** the kernels wait on global memory ~half their wave cycles
+    (SQ_WAIT_CNT_VMVS / SQ_WAVE_CYCLES: D 256 45%, D 512 53%), LDS waits 12-14%, barriers minor. Tried: K of the
+    next block prefetched into registers (D <= 256): 13 VGPRs spilled, no gain; reverted. D 512 (attn_flash_512_h2s2,
+    0.26 s): 2-wave workgroups at 59 KB LDS, one wave per SIMD; every alternative that shares a staged K/V block
+    among more rows needs more LDS for Q (16.6 KB per 16 rows x 512), and the in-workgroup D split (scores once)
+    keeps the occupancy: a rewrite has a low ceiling (~5% of prefill), not done.
   - **Left (profile, FP4 file, 2.0 s):** attn_flash 512 0.32 s + 256 0.24 s, the WMMA matmuls ~1.0 s (ROCmFP4,
     Q5_K dense and experts), add_rmsnorm_rows 0.08 s. Generation (44 / 35 tok/s) not looked at yet.
 - **Step 5 — DONE ✅ (2026-10-25): sliding-window ring KV cache.** `inference_kv_cache_init` puts the 25

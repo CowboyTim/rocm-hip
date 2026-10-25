@@ -321,6 +321,8 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
         }
 
         // Online softmax; this lane holds position P0 + i of token rows 2 r + hi
+        float alpha[8];
+        bool rescale = false;
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             const int pz = pos0 + z0 + 2 * r + hi, pp = P0 + i;
@@ -329,16 +331,23 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
 #pragma unroll
             for (int off = 1; off < 16; off <<= 1) mx = fmaxf(mx, __shfl_xor(mx, off, 32));
             const float mn = fmaxf(m[r], mx);
-            const float alpha = mn == -INFINITY ? 1.0f : __expf(m[r] - mn);
+            alpha[r] = mn == -INFINITY || mn == m[r] ? 1.0f : __expf(m[r] - mn);
+            rescale |= alpha[r] != 1.0f;
             const float p = sv == -INFINITY ? 0.0f : __expf(sv - mn);
             float ps = p;
 #pragma unroll
             for (int off = 1; off < 16; off <<= 1) ps += __shfl_xor(ps, off, 32);
-            l[r] = l[r] * alpha + ps;
+            l[r] = l[r] * alpha[r] + ps;
             m[r] = mn;
-#pragma unroll
-            for (int dt = 0; dt < DH / 16; ++dt) acc[dt][r] *= alpha;
             sP[w][2 * r + hi][i] = (_Float16)p;
+        }
+        // The previous acc rescaled by exp(m_old - m_new): skipped (wave-uniform) when no row of the wave has a
+        // new maximum, as in most blocks once the running maxima settle; the same values as multiplying by 1.0
+        if (__ballot(rescale) != 0) {
+#pragma unroll
+            for (int dt = 0; dt < DH / 16; ++dt)
+#pragma unroll
+                for (int r = 0; r < 8; ++r) acc[dt][r] *= alpha[r];
         }
         __syncthreads();  // sP rows are read by other lanes
 
