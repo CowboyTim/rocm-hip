@@ -2280,7 +2280,34 @@ one BF16 layer). Reference: `llama.cpp/src/models/gemma4.cpp` + `gemma4-common.h
   `<turn|>` 106 in both files. `tests/data/gemma4_tokenizer.tsv` (27 prompts: the corpus + Gemma's special
   tokens, newline / space runs, a literal U+2581, `</s>` / `<eos>` in text): both Gemma files and both Qwen
   tokenizers pass. The round-trip check skips an added BOS and, for SentencePiece-style spaces, a literal U+2581.
-- **Steps:** (1) tokenizer `gemma4` + `tokenizer_gguf_verify` against llama.cpp ids (done); (2) loader + a
+- **Step 2 — DONE ✅ (2026-10-25): forward pass** (decode and batched prefill), inside QwenModel (`forward_gemma`,
+  dispatched like qwen4exp's hyper-connection path, so generation, prefix reuse and the block store work as is).
+  Loader `load_gemma4` / `load_layer_gemma4` (per-layer shapes from `sliding_window_pattern` / `head_count_kv`,
+  `rope_freqs` -> 64 rotated pairs, V from K without `attn_v`); model `head_dim` / `n_head_kv` are the maxima
+  (512 / 8, scratch), `kv_head_dim` 256 makes the cache rows 8 x 256 (a global layer uses half). New kernels:
+  `attention_forward_opts` (D 512, kv_stride, rot_pairs, V norm, sliding window, scale 1; commit 00bbefd),
+  `gpu_add_normed` (residual + RMSNorm(a) * w, times the layer output scale), `gpu_geglu` (GELU-tanh, strided for the
+  fused gate|up expert rows), `gpu_softcap`; `moe_router` without a shared gate, `moe_combine_scaled` (per-expert
+  scales). Router gammas `ffn_gate_inp.scale / sqrt(E)` precomputed in pinned memory.
+  - **Verified** (`tests/gemma4_verify`, reference `ref_dump acts`, prompt "The capital of France is Paris. The
+    capital of Germany is", 13 tokens): each layer on the reference's input (teacher forcing): worst cos 0.99996
+    (Q8 file) / 0.99911 (FP4 file); logits cos 0.99991 / 0.99960, top token ' Berlin' in both; token by token =
+    prefill bit for bit with QMATVEC_NO_WMMA (cos 0.9999 / 0.9992 with WMMA, batches of 8+ take the WMMA expert
+    kernels). Chained over 30 layers the residual drifts to 0.96 / 0.84 on a few tokens (MoE routing near-ties;
+    0.94 vs 0.96 from summation order alone), reported as information. Attention checked against Qcur_pos /
+    kqv_out on a sliding and a global layer (>= 0.9995).
+  - **Reference bug (the ROCmFPX fork, not upstream):** `build_moe_ffn` applied `ffn_down_exps.scale` twice
+    (in `build_lora_mm_id` and again as "per-expert scale2"), squaring Gemma-4's expert scales; upstream llama.cpp
+    applies it once. Patched out in this checkout's `llama.cpp/src/llama-graph.cpp` (reference only) and rebuilt
+    build-cpu; the engine applies it once. The user's docker image builds the same fork: its llama-server has the
+    bug for Gemma-4 (no Qwen GGUF here has expert scales).
+  - **Generation:** raw text continuations are odd (the -it model; llama.cpp's own next token for "The three most
+    important inventions of the 20th century were" is 'ment'), in its chat format correct (airplane / transistor /
+    internet, one line each, then `<turn|>`). qwen_demo now stops at any end-of-generation token (the FP4 file's
+    EOS is `<eos>`, its turn end `<turn|>`). Speed with the GPU shared with another job: Q8 file 43 tok/s, FP4
+    file 59 tok/s generation; prefill 130-255 tok/s on these short prompts (the global layers and the sliding
+    ones' ratio-2 heads take the per-token attention path: no flash kernel yet).
+- **Steps:** (1) tokenizer `gemma4` + `tokenizer_gguf_verify` against llama.cpp ids (done); (2) forward (done); (2) loader + a
   `gemma_model.cpp` forward (decode first) on shared kernels, with the new ops, verified per layer against
   `ref_dump` on the Q8 file (CPU reference build has gemma4); (3) batched prefill (WMMA), then the FP4 file
   (Q5_1 int8 / WMMA kernels); (4) chat: per-family reply tags, the Gemma tool-call parser, EOG list; (5)

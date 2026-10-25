@@ -182,19 +182,18 @@ int main(int argc, char** argv) {
     int next = pick();
     inference_free_tokens(tokens, n_tokens);
 
-    // Generation; stops at n_gen tokens or EOS
+    // Generation; stops at n_gen tokens or an end-of-generation token (EOS, or e.g. Gemma-4's <turn|>)
     qwen_model_profile_reset(model);
     t0 = now();
     int n_fwd = 0;
     tokenizer_t* tok = inference_get_tokenizer(engine);
-    const int eos = tokenizer_eos_id(tok);
     std::string text;
     char piece[256];
     for (int i = 0; i < n_gen; ++i) {
         tokenizer_decode(tok, &next, 1, piece, sizeof(piece));
         text += piece;
         printf("Generated token %d: %d '%s'\n", i, next, piece);
-        if (next == eos || i + 1 == n_gen) break;
+        if (tokenizer_is_eog(tok, next) || i + 1 == n_gen) break;
         if (qwen_model_forward(model, next, n_tokens + i, nullptr) != 0) {
             fprintf(stderr, "Generation failed: %s\n", inference_get_last_error());
             break;

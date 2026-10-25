@@ -11,6 +11,7 @@ static hipFunction_t g_norm_rows = nullptr;
 static hipFunction_t g_norm = nullptr, g_swiglu = nullptr, g_router = nullptr, g_combine = nullptr, g_group = nullptr;
 static hipFunction_t g_hc_norm = nullptr, g_hc_lowrank = nullptr, g_hc_mix = nullptr, g_ple_gate = nullptr,
                      g_ple_conv = nullptr, g_mtp_concat = nullptr;
+static hipFunction_t g_add_normed = nullptr, g_geglu = nullptr, g_softcap = nullptr;
 
 int gpu_ops_init(const char* co_path) {
     if (g_mod) return 0;
@@ -30,7 +31,10 @@ int gpu_ops_init(const char* co_path) {
         hipModuleGetFunction(&g_hc_mix, g_mod, "hc_mix") != hipSuccess ||
         hipModuleGetFunction(&g_ple_gate, g_mod, "ple_gate") != hipSuccess ||
         hipModuleGetFunction(&g_ple_conv, g_mod, "ple_conv") != hipSuccess ||
-        hipModuleGetFunction(&g_mtp_concat, g_mod, "mtp_concat") != hipSuccess) {
+        hipModuleGetFunction(&g_mtp_concat, g_mod, "mtp_concat") != hipSuccess ||
+        hipModuleGetFunction(&g_add_normed, g_mod, "add_normed") != hipSuccess ||
+        hipModuleGetFunction(&g_geglu, g_mod, "geglu") != hipSuccess ||
+        hipModuleGetFunction(&g_softcap, g_mod, "softcap") != hipSuccess) {
         INFER_LOG("[gpu_ops] kernels missing in %s\n", co_path);
         gpu_ops_free();
         return -1;
@@ -43,6 +47,7 @@ void gpu_ops_free(void) {
     g_mod = nullptr;
     g_norm = g_norm_rows = g_swiglu = g_router = g_combine = g_group = nullptr;
     g_hc_norm = g_hc_lowrank = g_hc_mix = g_ple_gate = g_ple_conv = g_mtp_concat = nullptr;
+    g_add_normed = g_geglu = g_softcap = nullptr;
 }
 
 hipError_t gpu_add_rmsnorm(const float* x_in, const float* add, float* x_out, const float* w, float* y, int n, int T,
@@ -80,8 +85,16 @@ hipError_t gpu_moe_router(const float* logits, const float* x, const float* w_sh
 
 hipError_t gpu_moe_combine(const float* down, const float* wts, const float* shared, const float* sg, float* out,
                            int n_used, int n, int T, hipStream_t stream) {
+    return gpu_moe_combine_scaled(down, wts, shared, sg, nullptr, nullptr, out, n_used, n, T, stream);
+}
+
+hipError_t gpu_moe_combine_scaled(const float* down, const float* wts, const float* shared, const float* sg,
+                                  const int* ids, const float* exp_scale, float* out, int n_used, int n, int T,
+                                  hipStream_t stream) {
     if (!g_combine) return hipErrorInvalidDeviceFunction;
-    void* args[] = {(void*)&down, (void*)&wts, (void*)&shared, (void*)&sg, &out, &n_used, &n};
+    if (exp_scale && !ids) return hipErrorInvalidValue;
+    void* args[] = {(void*)&down, (void*)&wts, (void*)&shared, (void*)&sg, &out, &n_used, &n, (void*)&ids,
+                    (void*)&exp_scale};
     return hipModuleLaunchKernel(g_combine, (unsigned)((n + 255) / 256), (unsigned)T, 1, 256, 1, 1, 0, stream, args,
                                  nullptr);
 }
@@ -155,4 +168,30 @@ hipError_t gpu_mtp_concat(const float* e, const float* h, float* out, int n, int
     void* args[] = {(void*)&e, (void*)&h, &out, &n, &hc};
     return hipModuleLaunchKernel(g_mtp_concat, (unsigned)((2 * n + 255) / 256), (unsigned)(T * hc), 1, 256, 1, 1, 0,
                                  stream, args, nullptr);
+}
+
+hipError_t gpu_add_normed(const float* base, const float* a, const float* w, const float* scale, float* out, int n,
+                          int T, float eps, hipStream_t stream) {
+    if (!g_add_normed) return hipErrorInvalidDeviceFunction;
+    if (T <= 0 || n % 256 != 0 || n > 256 * 16 || a == out) return hipErrorInvalidValue;  // 16 = NORM_MAXV
+    void* args[] = {(void*)&base, (void*)&a, (void*)&w, (void*)&scale, &out, &n, &eps};
+    return hipModuleLaunchKernel(g_add_normed, (unsigned)T, 1, 1, 256, 1, 1, 0, stream, args, nullptr);
+}
+
+hipError_t gpu_geglu(const float* gate, const float* up, float* out, int rows, int h, int gate_stride, int up_stride,
+                     const qmatvec_q8* q8, hipStream_t stream) {
+    if (!g_geglu) return hipErrorInvalidDeviceFunction;
+    int n = rows * h;
+    if (rows <= 0 || h <= 0 || gate_stride < h || up_stride < h || (q8 && (n % 32 != 0 || n > q8->max_k)))
+        return hipErrorInvalidValue;
+    qmatvec_q8_out o = qmatvec_q8_outputs(q8);
+    void* args[] = {(void*)&gate, (void*)&up, &out, &n, &h, &gate_stride, &up_stride, &o};
+    return hipModuleLaunchKernel(g_geglu, (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1, 0, stream, args, nullptr);
+}
+
+hipError_t gpu_softcap(float* x, int n, float cap, hipStream_t stream) {
+    if (!g_softcap) return hipErrorInvalidDeviceFunction;
+    if (n <= 0 || cap <= 0.0f) return hipErrorInvalidValue;
+    void* args[] = {&x, &n, &cap};
+    return hipModuleLaunchKernel(g_softcap, (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1, 0, stream, args, nullptr);
 }

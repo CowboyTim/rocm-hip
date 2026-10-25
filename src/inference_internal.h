@@ -95,6 +95,23 @@ struct LayerWeights {
     const float* ple_norm_query = nullptr;
     const float* ple_norm_conv = nullptr;
     const uint16_t* ple_conv1d = nullptr;             // F16 [n_hc * n_embd][ple_conv_kernel], taps contiguous
+
+    // Gemma-4 (gemma4): this layer's attention (sliding-window or global), the norms around attention and FFN,
+    // the dense GeGLU MLP (W_gate / W_up / W_down, ffn_norm before it) next to the experts. llama.cpp gemma4.cpp
+    int head_dim = 0, n_head_kv = 0, n_rot = 0;        // 0: the model's
+    int rot_pairs = 0;                                // NeoX pairs that rotate (rope_freqs; 0: all)
+    int window = 0;                                   // sliding window (0: global attention)
+    float rope_base = 0.0f;                           // 0: the model's rope_freq_base
+    bool v_from_k = false;                            // no attn_v: V is the raw K projection (global layers)
+    const float* post_attn_norm = nullptr;            // post_attention_norm [n_embd]: on the attention output
+    const float* pre_ffw_norm2 = nullptr;             // pre_ffw_norm_2: the experts' input norm
+    const float* post_ffw_norm1 = nullptr;            // post_ffw_norm_1: on the dense MLP's output
+    const float* post_ffw_norm2 = nullptr;            // post_ffw_norm_2: on the experts' output
+    const float* post_ffw_norm = nullptr;             // post_ffw_norm: on their sum, before the residual add
+    const float* router_scale = nullptr;              // ffn_gate_inp.scale [n_embd]: the router input's gamma (/ sqrt(E))
+    const float* exp_scale = nullptr;                 // ffn_down_exps.scale [n_expert]: per-expert output scale
+    const float* out_scale = nullptr;                 // layer_output_scale [1]: the layer output's scale
+    QuantWeight We_gate_up;                           // ffn_gate_up_exps [n_expert * 2 n_ff_exp x n_embd]: [gate | up]
 };
 
 // MTP draft head (a qwen4exp nextn sidecar GGUF, inference_set_draft_model): one more full-attention MoE block
@@ -207,6 +224,13 @@ struct inference_model {
     double eps = 1e-5;                                  // normalization epsilon
     int full_attention_interval = 0;                   // informational only; use LayerWeights::kind
     int n_kv_layers = 0;                                // full-attention layers, i.e. KV cache layers
+
+    // Gemma-4 (gemma4). head_dim / n_head_kv are then the largest of its layers' (scratch sizes); the KV cache rows
+    // are n_head_kv * kv_head_dim values (8 x 256: a global layer's 2 x 512 use the first half of a row)
+    bool gemma4 = false;
+    int kv_head_dim = 0;                                // KV cache head_dim (0: head_dim)
+    float embd_scale = 1.0f;                            // token embeddings * sqrt(n_embd)
+    float logit_softcap = 0.0f;                         // final_logit_softcapping (0: none)
 };
 
 #endif // INFERENCE_INTERNAL_H

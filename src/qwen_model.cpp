@@ -134,6 +134,7 @@ struct Scratch {
     float* moe_u = nullptr;     // expert up projections [n_used * n_ff_exp]
     float* moe_act = nullptr;   // SiLU(gate) * up per expert [n_used * n_ff_exp]
     float* moe_down = nullptr;  // expert down projections [n_used * n_embd]
+    float* moe_gu = nullptr;    // Gemma-4: fused expert gate|up projections [n_used * 2 n_ff_exp]
     float* sh_out = nullptr;    // shared expert output [n_embd]
     // MoE prefill grouping (gpu_moe_group): entries sorted by expert, and tiles of up to g_tile of them
     int g_tile = 0;
@@ -172,6 +173,7 @@ struct Scratch {
         const int HCD = m->n_hc * E, NHC = m->n_hc, R = m->hc_rank, PE = m->ple_table.data ? E : 0;
         const int RP = (R + 127) / 128 * 128;  // QwenModel::hc_up_pad
         const int PHCD = m->ple_table.data ? HCD : 0;
+        const int GU = m->gemma4 ? 2 * FE : 0;  // Gemma-4's fused gate|up expert rows
         B = rows;
         const size_t b = (size_t)rows;
         q8_max_k = (std::max({E, HQ * HD, DI, FF, NU * FE, HCD}) + 255) / 256 * 256 * rows;
@@ -181,9 +183,9 @@ struct Scratch {
                                 b * conv_dim, b * conv_dim, b * DI, b * NV, b * NV, b * DI,
                                 b * NE, b * NU, b * NU, b, b * NU * FE, b * NU * FE, b * NU * FE, b * NU * E, b * E,
                                 b * NU, b * NU, 1, b * NU, b * NU, b * NU,
-                                attention_part_ml_floats(HQ, n_ctx, rows), attention_part_acc_floats(HQ, n_ctx, rows),
+                                attention_part_ml_floats(HQ, n_ctx, rows), attention_part_acc_floats_d(HQ, n_ctx, rows, HD),
                                 b * HCD, b * HCD, b * HCD, b * R, b * RP, b * HCD, b * NHC,
-                                b * PE, b * PHCD, b * PE, b * PHCD, b * PHCD,
+                                b * PE, b * PHCD, b * PE, b * PHCD, b * PHCD, b * NU * GU,
                                 (qmatvec_q8_bytes(q8_max_k) + 3) / 4};
         float *ids_f = nullptr, *gt = nullptr, *gp = nullptr, *gn = nullptr, *ge = nullptr, *gs = nullptr, *gc = nullptr;
         float** const ptrs[] = {&x, &x_alt, &xn, &qfull, &q, &k, &v, &attn, &proj, &ffg, &ffu, &act, &logits,
@@ -192,7 +194,7 @@ struct Scratch {
                                 &gt, &gp, &gn, &ge, &gs, &gc,
                                 &part_ml, &part_acc,
                                 &res, &res_alt, &hxn, &hlo, &hlo_pad, &hgate, &inj,
-                                &ple_emb, &ple_key, &ple_val, &ple_gated, &ple_normed,
+                                &ple_emb, &ple_key, &ple_val, &ple_gated, &ple_normed, &moe_gu,
                                 &q8mem};
         static_assert(sizeof(sizes) / sizeof(sizes[0]) == sizeof(ptrs) / sizeof(ptrs[0]), "scratch table");
         if (!mem.alloc("/dev/shm/qwen_scratch.bin", sizes, ptrs, sizeof(sizes) / sizeof(sizes[0]),
@@ -381,6 +383,7 @@ struct QwenModel {
     }
 
     ~QwenModel() {
+        gemma_mem.free();
         mtp_free();
         hc_pad_mem.free();
         head_mem.free();
@@ -412,9 +415,10 @@ struct QwenModel {
             }
         }
         if (eng->n_kv_layers > 0) {
-            if ((eng->head_dim != 128 && eng->head_dim != 256) || eng->n_head % (256 / eng->head_dim) != 0) {
-                qwen_set_error("head_dim %d / %d heads: the attention kernels are built for head_dim 128 or 256",
-                               eng->head_dim, eng->n_head);
+            const int hd = eng->head_dim;
+            if ((hd != 128 && hd != 256 && !(hd == 512 && eng->gemma4)) || (long long)eng->n_head * hd % 256 != 0) {
+                qwen_set_error("head_dim %d / %d heads: the attention kernels are built for head_dim 128 or 256 "
+                               "(and 512 for Gemma-4)", hd, eng->n_head);
                 return false;
             }
             if (attention_init("attention.co") != 0) {
@@ -428,7 +432,7 @@ struct QwenModel {
         // whatever n_ctx) would exceed ~256 MB per 1024 tokens
         const int n_ctx = kv_cache_n_ctx(eng->kvc);
         const size_t part_per_token =  // ATTN_MAX_SPLITS slots
-            attention_part_acc_floats(eng->n_head, ATTN_CHUNK * ATTN_MAX_SPLITS, 1) * sizeof(float);
+            attention_part_acc_floats_d(eng->n_head, ATTN_CHUNK * ATTN_MAX_SPLITS, 1, eng->head_dim) * sizeof(float);
         const int cap = eng->prefill_batch > 0 ? eng->prefill_batch : 1024;
         const size_t fit = ((size_t)256 << 20) / 1024 * (size_t)cap / std::max<size_t>(1, part_per_token);
         const int rows = (int)std::max<size_t>(1, std::min<size_t>((size_t)cap, fit));
@@ -444,6 +448,7 @@ struct QwenModel {
             qwen_set_error("hyper-connection up projections: padded copy failed");
             return false;
         }
+        if (eng->gemma4 && !gemma_setup()) return false;
         return true;
     }
 
@@ -765,6 +770,7 @@ struct QwenModel {
         }
 
         if (eng->n_hc > 0) return forward_hc(tokens, T, pos0, logits_out);
+        if (eng->gemma4) return forward_gemma(tokens, T, pos0, logits_out);
         prof.start();
         for (int t = 0; t < T; ++t) {
             if (tokens[t] < 0 || tokens[t] >= eng->vocab_size) { qwen_set_error("token %d out of range", tokens[t]); return -1; }
@@ -873,6 +879,199 @@ struct QwenModel {
         if (logits_out) memcpy(logits_out, logits, (size_t)eng->vocab_size * sizeof(float));
         prof.lap(P_HEAD);
         prof.tokens += T;
+        return 0;
+    }
+
+    // ------------------------------------------------------------ Gemma-4 (gemma4; llama.cpp gemma4.cpp)
+    //
+    // Per layer, from the residual x: attention on RMSNorm(x) * attn_norm (q / k norms, V normed, RoPE and sliding
+    // window per layer, scale 1), x' = x + RMSNorm(attn) * post_attention_norm; the dense GeGLU MLP on
+    // RMSNorm(x') * ffn_norm and the experts on RMSNorm(x') * pre_ffw_norm_2 (router input RMSNorm(x') *
+    // ffn_gate_inp.scale / sqrt(E); softmax top-k renormalized; fused gate|up; per-expert output scale), each
+    // normed, summed and normed again: x = (x' + RMSNorm(mlp_n + moe_n) * post_ffw_norm) * layer_output_scale.
+    // The embeddings are scaled by sqrt(E), the logits soft-capped.
+
+    ShmRegion gemma_mem;                 // the router inputs' gammas (ffn_gate_inp.scale / sqrt(E)), per layer
+    std::vector<const float*> router_w;  // [n_layer]: into gemma_mem, NULL without experts
+
+    bool gemma_setup() {
+        const int E = eng->n_embd, NL = eng->n_layer;
+        size_t floats = (size_t)NL * E;
+        float* base = nullptr;
+        float** const pp[] = {&base};
+        if (!gemma_mem.alloc("/dev/shm/qwen_gemma_router.bin", &floats, pp, 1, hipExtHostRegisterCoarseGrained)) {
+            qwen_set_error("Gemma-4 router gammas: allocation failed");
+            return false;
+        }
+        router_w.assign(NL, nullptr);
+        const float inv = 1.0f / sqrtf((float)E);
+        for (int l = 0; l < NL; ++l) {
+            const LayerWeights& L = eng->layers[l];
+            if (!L.moe) continue;
+            float* w = base + (size_t)l * E;
+            for (int i = 0; i < E; ++i) w[i] = L.router_scale[i] * inv;
+            router_w[l] = w;
+        }
+        return true;
+    }
+
+    // Attention for T tokens from s.xn (marked) into s.proj
+    bool gemma_attention(const LayerWeights& L, int pos0, int T) {
+        const int HQ = eng->n_head, DQ = HQ * L.head_dim;
+        if (L.v_from_k ? !matvec_multi({{&L.Wq, s.qfull}, {&L.Wk, s.k}}, s.xn, T, P_ATTN)
+                       : !matvec_multi({{&L.Wq, s.qfull}, {&L.Wk, s.k}, {&L.Wv, s.v}}, s.xn, T, P_ATTN))
+            return false;
+        inference_kv_cache_t* kvc = eng->kvc;
+        __half* K = kv_cache_k_row(kvc, L.kv_slot, 0);
+        __half* V = kv_cache_v_row(kvc, L.kv_slot, 0);
+        if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
+        attention_opts o = {};
+        o.head_dim = L.head_dim;
+        o.kv_stride = kv_cache_d_kv(kvc);
+        o.rot_pairs = L.rot_pairs;
+        o.v_norm = 1;
+        o.window = L.window;
+        o.scale = 1.0f;
+        const qmatvec_q8* q8 = q8_for(DQ, T);
+        if (!check(attention_forward_opts(s.qfull, s.k, L.v_from_k ? s.k : s.v, L.q_norm, L.k_norm, K, V,
+                                          kv_cache_block_shift(kvc), kv_cache_block_stride(kvc), HQ, L.n_head_kv,
+                                          L.n_rot, pos0, T, L.rope_base, (float)eng->eps, s.q, s.part_ml, s.part_acc,
+                                          s.attn, &o, q8, 0),
+                   "attention kernels"))
+            return false;
+        mark(s.attn, DQ, T, q8);
+        // GEMMA_DUMP_LAYER=<kv slot>: write Q (normed, rotated) and the attention output of that layer as raw floats
+        // to $GEMMA_DUMP_DIR/{q,attn}.f32 (debugging against llama.cpp's Qcur_pos / kqv_out)
+        static const char* dump = getenv("GEMMA_DUMP_LAYER");
+        if (dump && atoi(dump) == L.kv_slot) {
+            if (!sync()) return false;
+            const char* dir = getenv("GEMMA_DUMP_DIR") ? getenv("GEMMA_DUMP_DIR") : ".";
+            const std::pair<const char*, const float*> outs[] = {{"q", s.q}, {"attn", s.attn}};
+            for (const auto& o2 : outs) {
+                const std::string path = std::string(dir) + "/" + o2.first + ".f32";
+                if (FILE* f = fopen(path.c_str(), "wb")) {
+                    fwrite(o2.second, sizeof(float), (size_t)T * DQ, f);
+                    fclose(f);
+                }
+            }
+        }
+        return matvec(L.Wo, s.attn, s.proj, T, P_ATTN);
+    }
+
+    // The layer after attention: s.x (layer input), s.proj (attention output) -> s.x (layer output); s.x_alt holds
+    // the post-attention residual
+    bool gemma_ffn(int l, const LayerWeights& L, int T) {
+        const int E = eng->n_embd, FF = eng->n_ff, NE = eng->n_expert, NU = eng->n_expert_used, FE = eng->n_ff_exp;
+        const float eps = (float)eng->eps;
+        const qmatvec_q8* qe = q8_for(E, T);
+        if (!check(gpu_add_normed(s.x, s.proj, L.post_attn_norm, nullptr, s.x_alt, E, T, eps, 0), "add_normed"))
+            return false;
+        // dense MLP -> s.proj
+        const qmatvec_q8* qf = q8_for(FF, T, true);
+        if (!check(gpu_add_rmsnorm(s.x_alt, nullptr, s.x_alt, L.ffn_norm, s.xn, E, T, eps, qe, 0), "rmsnorm"))
+            return false;
+        mark(s.xn, E, T, qe);
+        if (!matvec_pair(L.W_gate, L.W_up, s.xn, s.ffg, s.ffu, T, P_FFN) ||
+            !check(gpu_geglu(s.ffg, s.ffu, s.act, T, FF, FF, FF, qf, 0), "geglu"))
+            return false;
+        mark(s.act, FF, T, qf);
+        if (!matvec(L.W_down, s.act, s.proj, T, P_FFN)) return false;
+        const float* h = s.proj;  // what post_ffw_norm normalizes: the MLP output, or the sum of both normed
+        if (L.moe) {
+            // router (float: the router is F32) on its own norm of x' -> ids / wts
+            if (!check(gpu_add_rmsnorm(s.x_alt, nullptr, s.x_alt, router_w[l], s.sh_out, E, T, eps, nullptr, 0),
+                       "rmsnorm (router)") ||
+                !matvec(L.W_router, s.sh_out, s.r_logits, T, P_FFN) ||
+                !check(gpu_moe_router(s.r_logits, s.sh_out, nullptr, s.ids, s.wts, s.sg, NE, NU, E, T, 0, 0),
+                       "moe_router"))
+                return false;
+            const bool grouped = T >= 8;
+            if (grouped)
+                s.g_tile = std::min(qmatvec_id_batch_tile(L.We_gate_up.type, 2 * FE, E),
+                                    qmatvec_id_batch_tile(L.We_down.type, E, FE));
+            if (grouped && !check(gpu_moe_group(s.ids, T, NU, NE, s.g_tile, s.g_tok, s.g_pair, s.g_ntiles, s.g_tile_e,
+                                                s.g_tile_start, s.g_tile_n, 0),
+                                  "moe_group"))
+                return false;
+            // experts on x' normed by pre_ffw_norm_2: fused gate|up, GeGLU on the halves, down, combined -> s.sh_out
+            if (!check(gpu_add_rmsnorm(s.x_alt, nullptr, s.x_alt, L.pre_ffw_norm2, s.xn, E, T, eps, qe, 0),
+                       "rmsnorm (experts)"))
+                return false;
+            mark(s.xn, E, T, qe);
+            if (!matvec_id(L.We_gate_up, s.xn, 0, s.moe_gu, 2 * FE, T, grouped, P_FFN)) return false;
+            const qmatvec_q8* qx = q8_for(FE, T * NU, true);
+            if (!check(gpu_geglu(s.moe_gu, s.moe_gu + FE, s.moe_act, T * NU, FE, 2 * FE, 2 * FE, qx, 0),
+                       "geglu (experts)"))
+                return false;
+            mark(s.moe_act, FE, T * NU, qx);
+            if (!matvec_id(L.We_down, s.moe_act, 1, s.moe_down, E, T, grouped, P_FFN) ||
+                !check(gpu_moe_combine_scaled(s.moe_down, s.wts, nullptr, nullptr, s.ids, L.exp_scale, s.sh_out, NU,
+                                              E, T, 0),
+                       "moe_combine"))
+                return false;
+            // h = RMSNorm(mlp) * post_ffw_norm_1 + RMSNorm(moe) * post_ffw_norm_2, in s.attn (free after attn_output)
+            if (!check(gpu_add_rmsnorm(s.proj, nullptr, s.proj, L.post_ffw_norm1, s.attn, E, T, eps, nullptr, 0),
+                       "rmsnorm (mlp)") ||
+                !check(gpu_add_normed(s.attn, s.sh_out, L.post_ffw_norm2, nullptr, s.attn, E, T, eps, 0),
+                       "add_normed (experts)"))
+                return false;
+            h = s.attn;
+        }
+        return check(gpu_add_normed(s.x_alt, h, L.post_ffw_norm, L.out_scale, s.x, E, T, eps, 0), "add_normed (ffn)");
+    }
+
+    int forward_gemma(const int* tokens, int T, int pos0, float* logits_out) {
+        const int E = eng->n_embd, V = eng->vocab_size;
+        const float eps = (float)eng->eps;
+        prof.start();
+        for (int t = 0; t < T; ++t) {
+            if (tokens[t] < 0 || tokens[t] >= V) { qwen_set_error("token %d out of range", tokens[t]); return -1; }
+            float* xt = s.x + (size_t)t * E;
+            if (dbg_res_in) {  // qwen_model_run_layers: this residual instead of the embeddings
+                memcpy(xt, dbg_res_in + (size_t)t * E, sizeof(float) * E);
+                continue;
+            }
+            if (qt_to_float(eng->token_embd.type, eng->token_embd.row(tokens[t]), xt, E) != 0) {
+                qwen_set_error("cannot decode token_embd type %d", eng->token_embd.type);
+                return -1;
+            }
+            for (int i = 0; i < E; ++i) xt[i] *= eng->embd_scale;
+        }
+        prof.lap(P_EMBED);
+        const bool per_layer = layer_cb || qwen_debug();
+        const int l0 = dbg_res_in ? dbg_l0 : 0, l1 = dbg_res_in ? dbg_l1 : eng->n_layer;
+        for (int l = l0; l < l1; ++l) {
+            const LayerWeights& L = eng->layers[l];
+            const qmatvec_q8* qe = q8_for(E, T);
+            if (!check(gpu_add_rmsnorm(s.x, nullptr, s.x, L.attn_norm, s.xn, E, T, eps, qe, 0), "rmsnorm (attn)"))
+                return -1;
+            mark(s.xn, E, T, qe);
+            if (!gemma_attention(L, pos0, T) || !section(P_ATTN) || !gemma_ffn(l, L, T) || !section(P_FFN)) return -1;
+            if (per_layer) {
+                if (!sync()) return -1;
+                for (int t = 0; t < T; ++t) {
+                    const float* xt = s.x + (size_t)t * E;
+                    if (layer_cb) layer_cb(l, pos0 + t, xt, E, layer_cb_user);
+                    if (qwen_debug()) {
+                        double ss = 0.0;
+                        for (int i = 0; i < E; ++i) ss += (double)xt[i] * xt[i];
+                        fprintf(stderr, "[gemma] pos %d blk %2d %s rms(x)=%.5g x[0..3]=%.5g %.5g %.5g %.5g\n", pos0 + t, l,
+                                L.window ? "swa " : "full", sqrt(ss / E), xt[0], xt[1], xt[2], xt[3]);
+                    }
+                }
+                prof.start();
+            }
+        }
+        if (dbg_res_in) return sync() ? 0 : -1;  // no LM head
+        const qmatvec_q8* qe = q8_for(E, T);
+        if (!check(gpu_add_rmsnorm(s.x, nullptr, s.x, eng->output_norm, s.xn, E, T, eps, qe, 0), "rmsnorm (output)"))
+            return -1;
+        mark(s.xn, E, T, qe);
+        if (lm_head(T, nullptr) != 0) return -1;
+        if (eng->logit_softcap > 0.0f &&
+            (!check(gpu_softcap(s.logits, V, eng->logit_softcap, 0), "softcap") || !sync()))
+            return -1;
+        if (logits_out) memcpy(logits_out, s.logits, sizeof(float) * V);
         return 0;
     }
 
@@ -1381,7 +1580,8 @@ int qwen_model_prefill(qwen_model_t* model, const int* tokens, int n, int pos0, 
 }
 
 int qwen_model_run_layers(qwen_model_t* model, const int* tokens, int n, const float* res_in, int l0, int l1) {
-    if (!model || !tokens || !res_in || model->eng->n_hc <= 0 || l0 < 0 || l1 > model->eng->n_layer || l0 >= l1 ||
+    if (!model || !tokens || !res_in || (model->eng->n_hc <= 0 && !model->eng->gemma4) || l0 < 0 ||
+        l1 > model->eng->n_layer || l0 >= l1 ||
         n > model->s.B) {
         qwen_set_error("qwen_model_run_layers: bad arguments");
         return -1;

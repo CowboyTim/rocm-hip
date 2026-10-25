@@ -191,19 +191,22 @@ moe_router(const float* logits, const float* x, const float* w_shexp, int* ids, 
     logits += (size_t)t * n_expert;
     x += (size_t)t * n;
 
-    // Shared-expert gate first: its loads do not depend on the softmax, so they overlap the logits' loads
-    float d = 0.0f;
-    if (n % 1024 == 0 && (((uintptr_t)x | (uintptr_t)w_shexp) & 15) == 0) {  // uniform; 16-byte loads, unrolled
+    // Shared-expert gate first (none without w_shexp: Gemma-4): its loads do not depend on the softmax, so they
+    // overlap the logits' loads
+    if (w_shexp) {  // uniform
+        float d = 0.0f;
+        if (n % 1024 == 0 && (((uintptr_t)x | (uintptr_t)w_shexp) & 15) == 0) {  // uniform; 16-byte loads, unrolled
 #pragma unroll 4
-        for (int i = 4 * tid; i < n; i += 1024) {
-            const float4 a = *(const float4*)(x + i), b = *(const float4*)(w_shexp + i);
-            d += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            for (int i = 4 * tid; i < n; i += 1024) {
+                const float4 a = *(const float4*)(x + i), b = *(const float4*)(w_shexp + i);
+                d += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            }
+        } else {
+            for (int i = tid; i < n; i += 256) d += x[i] * w_shexp[i];
         }
-    } else {
-        for (int i = tid; i < n; i += 256) d += x[i] * w_shexp[i];
+        d = block256_sum(d, part);
+        if (tid == 0) sg[t] = 1.0f / (1.0f + expf(-d));
     }
-    d = block256_sum(d, part);
-    if (tid == 0) sg[t] = 1.0f / (1.0f + expf(-d));
 
     float mx = -INFINITY;
     for (int e = tid; e < n_expert; e += 256) mx = fmaxf(mx, logits[e]);
@@ -236,14 +239,20 @@ moe_router(const float* logits, const float* x, const float* w_shexp, int* ids, 
 
 }
 
+// moe_combine with per-expert output scales exp_scale[n_expert] (Gemma-4's ffn_down_exps.scale, applied to the
+// expert's output before its weight, as llama.cpp's build_moe_ffn) when set, and no shared expert when shared is NULL
 extern "C" __global__ void __launch_bounds__(256)
-moe_combine(const float* down, const float* wts, const float* shared, const float* sg, float* out, int n_used, int n) {
+moe_combine(const float* down, const float* wts, const float* shared, const float* sg, float* out, int n_used, int n,
+            const int* ids, const float* exp_scale) {
     const int t = blockIdx.y, i = blockIdx.x * 256 + threadIdx.x;
     if (i >= n) return;
     const float* d = down + (size_t)t * n_used * n + i;
-    float acc = wts[t * n_used] * d[0];
-    for (int j = 1; j < n_used; ++j) acc += wts[t * n_used + j] * d[(size_t)j * n];
-    out[(size_t)t * n + i] = acc + shared[(size_t)t * n + i] * sg[t];
+    const float* w = wts + t * n_used;
+    const int* e = ids + t * n_used;
+    float acc = exp_scale ? (d[0] * exp_scale[e[0]]) * w[0] : w[0] * d[0];
+    for (int j = 1; j < n_used; ++j)
+        acc += exp_scale ? (d[(size_t)j * n] * exp_scale[e[j]]) * w[j] : w[j] * d[(size_t)j * n];
+    out[(size_t)t * n + i] = shared ? acc + shared[(size_t)t * n + i] * sg[t] : acc;
 }
 
 // moe_group  grid 1, block 1024: group a prefill batch's (token, slot) entries by expert, for the expert-tiled
@@ -490,4 +499,65 @@ ple_conv(const float* normed, const float* gated, float* res, float* state, cons
         const int src = T + i;
         state[(size_t)i * m + ch] = src < H ? state[(size_t)src * m + ch] : normed[(size_t)(src - H) * m + ch];
     }
+}
+
+// ---------------------------------------------------------------- Gemma-4
+//
+// add_normed  grid T, block 256: out = (base + RMSNorm(a) * w) * (scale ? *scale : 1) per row of n values
+//             (n % 256 == 0, n <= 256 * NORM_MAXV): Gemma-4's norms after the attention and the FFN, added to the
+//             residual, and the layer's output scale. out may be base (each thread reads its values first).
+// geglu       out = GELU_tanh(g) * u (ggml_gelu's tanh form) on rows of h values: g / u row r at gate + r * gs /
+//             up + r * us, so the experts' fused gate|up rows ([gate h | up h]) need no copy; quantized into q8
+//             as swiglu when set.
+// softcap     x = cap * tanh(x / cap) (the final logits).
+extern "C" __global__ void __launch_bounds__(256)
+add_normed(const float* base, const float* a, const float* w, const float* scale, float* out, int n, float eps) {
+    __shared__ float part[8];
+    const long long row = (long long)blockIdx.x * n;
+    base += row;
+    a += row;
+    out += row;
+    const int t = threadIdx.x, nb = n / 256;
+    float x[NORM_MAXV];
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < NORM_MAXV; ++j)
+        if (j < nb) {
+            x[j] = a[t + 256 * j];
+            ss += x[j] * x[j];
+        }
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor(ss, off, 32);
+    if ((t & 31) == 0) part[t >> 5] = ss;
+    __syncthreads();
+    float tot = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) tot += part[k];
+    const float inv = rsqrtf(tot / n + eps), s = scale ? *scale : 1.0f;
+#pragma unroll
+    for (int j = 0; j < NORM_MAXV; ++j)
+        if (j < nb) {
+            const int k = t + 256 * j;
+            out[k] = (base[k] + x[j] * inv * w[k]) * s;
+        }
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+geglu(const float* gate, const float* up, float* out, int n, int h, int gs, int us, Q8Out o) {
+    __shared__ Q8Shared sh;
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    float v = 0.0f;
+    if (i < n) {
+        const int r = i / h, c = i % h;
+        const float x = gate[(size_t)r * gs + c];
+        const float g = 0.5f * x * (1.0f + tanhf(0.7978845608028654f * x * (1.0f + 0.044715f * x * x)));
+        v = g * up[(size_t)r * us + c];
+        out[i] = v;
+    }
+    if (o.qK) q8_block_value(v, i < n, blockIdx.x, threadIdx.x, sh, o);  // uniform; n % 32 == 0 when set
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+softcap(float* x, int n, float cap) {
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    if (i < n) x[i] = cap * tanhf(x[i] / cap);
 }

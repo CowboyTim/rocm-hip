@@ -30,7 +30,7 @@ hipError_t gpu_swiglu(const float* g, const float* u, float* out, int n, const q
 
 // MoE router for T tokens: logits [T][n_expert] (ffn_gate_inp output), x [T][n] (the FFN input) and the shared
 // expert's gate vector w_shexp [n] -> ids / wts [T][n_used] (selected experts, descending, and their
-// renormalized softmax weights) and sg [T] (sigmoid shared-expert gate). n_expert <= 1024, n_used <= 64.
+// renormalized softmax weights) and sg [T] (sigmoid shared-expert gate; not written without w_shexp). n_expert <= 1024, n_used <= 64.
 // ids_stride (0: n_used) > n_used: ids rows of ids_stride entries, the one after the selection set to -1 (the
 // shared expert as one more slot of the expert-indexed matvecs, qmatvec_launch_q8_id_x).
 hipError_t gpu_moe_router(const float* logits, const float* x, const float* w_shexp, int* ids, float* wts, float* sg,
@@ -39,6 +39,21 @@ hipError_t gpu_moe_router(const float* logits, const float* x, const float* w_sh
 // out [T][n] = sum_j wts[t][j] * down[t][j] + sg[t] * shared[t]; down [T][n_used][n]
 hipError_t gpu_moe_combine(const float* down, const float* wts, const float* shared, const float* sg, float* out,
                            int n_used, int n, int T, hipStream_t stream);
+// The same with each expert's output scaled by exp_scale[ids[t][j]] first (exp_scale NULL: none) and, with shared
+// NULL, no shared expert (Gemma-4: per-expert scales, no shared expert; w_shexp NULL in gpu_moe_router)
+hipError_t gpu_moe_combine_scaled(const float* down, const float* wts, const float* shared, const float* sg,
+                                  const int* ids, const float* exp_scale, float* out, int n_used, int n, int T,
+                                  hipStream_t stream);
+
+// Gemma-4 (gpu_ops.hip). gpu_add_normed: out = (base + RMSNorm(a) * w) * (*scale, or 1 if NULL) for T rows of n
+// values (n % 256 == 0, n <= 4096; out may be base, not a). gpu_geglu: out [rows][h] = GELU_tanh(g) * u, g / u row
+// r at gate + r * gate_stride / up + r * up_stride (the experts' fused [gate | up] rows: up = gate + h, strides
+// 2 h), quantized into q8 if set. gpu_softcap: x = cap * tanh(x / cap).
+hipError_t gpu_add_normed(const float* base, const float* a, const float* w, const float* scale, float* out, int n,
+                          int T, float eps, hipStream_t stream);
+hipError_t gpu_geglu(const float* gate, const float* up, float* out, int rows, int h, int gate_stride, int up_stride,
+                     const qmatvec_q8* q8, hipStream_t stream);
+hipError_t gpu_softcap(float* x, int n, float cap, hipStream_t stream);
 
 // Group T tokens' selected experts (ids [T][n_used]) by expert for the expert-tiled matmuls: see moe_group in
 // gpu_ops.hip. tok_rows / pair_rows [T * n_used]; tile_e / tile_start / tile_n need gpu_moe_max_tiles entries.

@@ -401,11 +401,157 @@ static bool load_layer(inference_model* m, gguf_model_t* g, int i, LayerWeights&
     return true;
 }
 
+// A small integer metadata array (BOOL / U8 / I32 / U32 elements), e.g. Gemma-4's per-layer head counts and
+// sliding-window pattern. Returns false if absent or of another type.
+static bool kv_int_array(gguf_model_t* gguf, const char* key, std::vector<int>& out) {
+    int32_t type = -1;
+    const void* data = nullptr;
+    size_t n = 0;
+    if (gguf_kv_get_array(gguf, key, &type, &data, &n) != 0) return false;
+    out.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        switch (type) {
+            case 0: case 7: out[i] = ((const uint8_t*)data)[i]; break;  // U8, BOOL
+            case 4: out[i] = (int)((const uint32_t*)data)[i]; break;
+            case 5: out[i] = ((const int32_t*)data)[i]; break;
+            default: return false;
+        }
+    }
+    return true;
+}
+
+// Gemma-4's per-layer attention shapes (llama.cpp gemma4.cpp): sliding-window layers (head_dim key_length_swa, RoPE
+// over rope.dimension_count_swa dims at base rope.freq_base_swa) and global ones (key_length, rope.dimension_count,
+// rope.freq_base, rope_freqs), and the counts that vary per layer
+struct Gemma4Shape {
+    std::vector<int> swa, n_kv;
+    int hd = 0, hd_swa = 0, rot = 0, rot_swa = 0, window = 0, rot_pairs = 0;
+    float base = 0.0f, base_swa = 0.0f;
+};
+
+static bool load_gemma4(inference_model* m, Gemma4Shape& g) {
+    const std::string a = m->model_name + ".";
+    if (!kv_int_array(m->gguf, (a + "attention.sliding_window_pattern").c_str(), g.swa) ||
+        !kv_int_array(m->gguf, (a + "attention.head_count_kv").c_str(), g.n_kv) || (int)g.swa.size() != m->n_layer ||
+        (int)g.n_kv.size() != m->n_layer) {
+        set_error("gemma4: attention.sliding_window_pattern / head_count_kv must have %d entries", m->n_layer);
+        return false;
+    }
+    g.hd = (int)gguf_arch_int(m->gguf, "attention.key_length", 0);
+    g.hd_swa = (int)gguf_arch_int(m->gguf, "attention.key_length_swa", 0);
+    g.rot = (int)gguf_arch_int(m->gguf, "rope.dimension_count", g.hd);
+    g.rot_swa = (int)gguf_arch_int(m->gguf, "rope.dimension_count_swa", g.hd_swa);
+    g.window = (int)gguf_arch_int(m->gguf, "attention.sliding_window", 0);
+    g.base = gguf_arch_float(m->gguf, "rope.freq_base", 10000.0f);
+    g.base_swa = gguf_arch_float(m->gguf, "rope.freq_base_swa", 10000.0f);
+    if (gguf_arch_int(m->gguf, "attention.value_length", g.hd) != g.hd ||
+        gguf_arch_int(m->gguf, "attention.value_length_swa", g.hd_swa) != g.hd_swa || g.hd <= 0 || g.hd_swa <= 0 ||
+        g.window <= 0) {
+        set_error("gemma4: needs key_length == value_length (%d, swa %d) and a sliding window", g.hd, g.hd_swa);
+        return false;
+    }
+    if (gguf_arch_int(m->gguf, "embedding_length_per_layer_input", 0) != 0 ||
+        gguf_arch_int(m->gguf, "attention.shared_kv_layers", 0) != 0) {
+        set_error("gemma4: per-layer inputs and shared KV layers (E2B / E4B) are not supported");
+        return false;
+    }
+    // rope_freqs (global layers): factor 1 for the first pairs, ~1e30 (no rotation) for the rest
+    const float* ff = nullptr;
+    if (!bind_norm(m->gguf, "rope_freqs.weight", g.rot / 2, ff, false)) return false;
+    g.rot_pairs = g.rot / 2;
+    if (ff) {
+        g.rot_pairs = 0;
+        while (g.rot_pairs < g.rot / 2 && ff[g.rot_pairs] == 1.0f) ++g.rot_pairs;
+        for (int i = g.rot_pairs; i < g.rot / 2; ++i)
+            if (ff[i] < 1e20f) {
+                set_error("rope_freqs: factor %g at pair %d (only 1 then 'no rotation' is supported)", ff[i], i);
+                return false;
+            }
+    }
+    m->gemma4 = true;
+    m->embd_scale = sqrtf((float)m->n_embd);
+    m->logit_softcap = gguf_arch_float(m->gguf, "final_logit_softcapping", 0.0f);
+    // scratch for the largest layer, KV cache rows of the widest (n_kv * head_dim) one
+    int kv_row = 0;
+    m->n_head_kv = 0;
+    for (int i = 0; i < m->n_layer; ++i) {
+        m->n_head_kv = std::max(m->n_head_kv, g.n_kv[i]);
+        kv_row = std::max(kv_row, g.n_kv[i] * (g.swa[i] ? g.hd_swa : g.hd));
+    }
+    m->head_dim = std::max(g.hd, g.hd_swa);
+    m->kv_head_dim = kv_row / m->n_head_kv;
+    if (m->kv_head_dim * m->n_head_kv != kv_row) { set_error("gemma4: KV rows of %d values", kv_row); return false; }
+    m->attn_gated = false;
+    m->n_rot = g.rot;
+    m->rope_freq_base = g.base;
+    return true;
+}
+
+// Gemma-4 block i: attention (sliding or global) with q / k norms, post-attention norm, then the dense GeGLU MLP and
+// (if ffn_gate_inp is there) the experts, each with its own norms, their sum normed, and the layer output scale
+static bool load_layer_gemma4(inference_model* m, int i, LayerWeights& L, const Gemma4Shape& g) {
+    gguf_model_t* f = m->gguf;
+    const int E = m->n_embd, HQ = m->n_head, FF = m->n_ff;
+    char name[128];
+    auto nm = [&](const char* t) { snprintf(name, sizeof(name), "blk.%d.%s", i, t); return name; };
+    L.kind = LAYER_FULL_ATTN;
+    L.kv_slot = m->n_kv_layers++;
+    const bool swa = g.swa[i] != 0;
+    L.head_dim = swa ? g.hd_swa : g.hd;
+    L.n_head_kv = g.n_kv[i];
+    L.n_rot = swa ? g.rot_swa : g.rot;
+    L.rot_pairs = swa ? L.n_rot / 2 : g.rot_pairs;
+    L.window = swa ? g.window : 0;
+    L.rope_base = swa ? g.base_swa : g.base;
+    const int HD = L.head_dim, HKV = L.n_head_kv;
+    L.v_from_k = find_tensor_index(f, nm("attn_v.weight")) < 0;
+    if (!bind_norm(f, nm("attn_norm.weight"), E, L.attn_norm, true) ||
+        !bind_weight(f, nm("attn_q.weight"), L.Wq, true) || !bind_weight(f, nm("attn_k.weight"), L.Wk, true) ||
+        (!L.v_from_k && !bind_weight(f, nm("attn_v.weight"), L.Wv, true)) ||
+        !bind_weight(f, nm("attn_output.weight"), L.Wo, true) ||
+        !bind_norm(f, nm("attn_q_norm.weight"), HD, L.q_norm, true) ||
+        !bind_norm(f, nm("attn_k_norm.weight"), HD, L.k_norm, true) ||
+        !bind_norm(f, nm("post_attention_norm.weight"), E, L.post_attn_norm, true) ||
+        !bind_norm(f, nm("ffn_norm.weight"), E, L.ffn_norm, true) ||
+        !bind_weight(f, nm("ffn_gate.weight"), L.W_gate, true) || !bind_weight(f, nm("ffn_up.weight"), L.W_up, true) ||
+        !bind_weight(f, nm("ffn_down.weight"), L.W_down, true) ||
+        !bind_norm(f, nm("post_ffw_norm.weight"), E, L.post_ffw_norm, true) ||
+        !bind_norm(f, nm("layer_output_scale.weight"), 1, L.out_scale, false))
+        return false;
+    if (!check_shape("attn_q", i, L.Wq, HQ * HD, E) || !check_shape("attn_k", i, L.Wk, HKV * HD, E) ||
+        (!L.v_from_k && !check_shape("attn_v", i, L.Wv, HKV * HD, E)) ||
+        !check_shape("attn_output", i, L.Wo, E, HQ * HD) || !check_shape("ffn_gate", i, L.W_gate, FF, E) ||
+        !check_shape("ffn_up", i, L.W_up, FF, E) || !check_shape("ffn_down", i, L.W_down, E, FF))
+        return false;
+    L.moe = find_tensor_index(f, nm("ffn_gate_inp.weight")) >= 0;
+    if (!L.moe) return true;
+    const int NE = m->n_expert, FE = m->n_ff_exp;
+    if (NE <= 0 || m->n_expert_used <= 0 || m->n_expert_used > NE || FE <= 0) {
+        set_error("blk.%d: bad MoE hparams (experts %d used %d ff_exp %d)", i, NE, m->n_expert_used, FE);
+        return false;
+    }
+    if (!bind_weight(f, nm("ffn_gate_inp.weight"), L.W_router, true) ||
+        !bind_norm(f, nm("ffn_gate_inp.scale"), E, L.router_scale, true) ||
+        !bind_norm(f, nm("pre_ffw_norm_2.weight"), E, L.pre_ffw_norm2, true) ||
+        !bind_norm(f, nm("post_ffw_norm_1.weight"), E, L.post_ffw_norm1, true) ||
+        !bind_norm(f, nm("post_ffw_norm_2.weight"), E, L.post_ffw_norm2, true) ||
+        !bind_weight(f, nm("ffn_gate_up_exps.weight"), L.We_gate_up, true) ||
+        !bind_weight(f, nm("ffn_down_exps.weight"), L.We_down, true) ||
+        !bind_norm(f, nm("ffn_down_exps.scale"), NE, L.exp_scale, false))
+        return false;
+    return check_shape("ffn_gate_inp", i, L.W_router, NE, E) &&
+           check_shape("ffn_gate_up_exps", i, L.We_gate_up, NE * 2 * FE, E) &&
+           check_shape("ffn_down_exps", i, L.We_down, NE * E, FE);
+}
+
 // Bind every per-layer tensor, classify each block, and check shapes against the hyperparameters
 static bool load_model_weights(inference_model* m, const std::vector<int>& ple_layers) {
     m->layers.resize(m->n_layer);
+    Gemma4Shape g4;
+    if (m->model_name == "gemma4" && !load_gemma4(m, g4)) return false;
     for (int i = 0; i < m->n_layer; ++i)
-        if (!load_layer(m, m->gguf, i, m->layers[i], ple_layers)) return false;
+        if (!(m->gemma4 ? load_layer_gemma4(m, i, m->layers[i], g4) : load_layer(m, m->gguf, i, m->layers[i], ple_layers)))
+            return false;
     return true;
 }
 
@@ -658,8 +804,8 @@ int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
     clear_error();
     if (!m) { set_error("NULL model"); return -1; }
     // One KV layer per full-attention layer (LayerWeights::kv_slot); DeltaNet layers keep recurrent state instead
-    kv_cache_config_t cfg{m->n_kv_layers > 0 ? m->n_kv_layers : 1, n_ctx, m->n_embd, m->head_dim, m->n_head,
-                          m->n_head_kv};
+    kv_cache_config_t cfg{m->n_kv_layers > 0 ? m->n_kv_layers : 1, n_ctx, m->n_embd,
+                          m->kv_head_dim > 0 ? m->kv_head_dim : m->head_dim, m->n_head, m->n_head_kv};
     m->kvc = kv_cache_create("/dev/shm", &cfg);
     if (!m->kvc) { set_error("kv_cache_create failed"); return -1; }
     if (m->mtp) {
