@@ -2342,6 +2342,9 @@ one BF16 layer). Reference: `llama.cpp/src/models/gemma4.cpp` + `gemma4-common.h
     speed-neutral. The flash kernels use 225 - 247 VGPRs and 52 - 59 KB LDS: 2 waves per SIMD, no prefetch of
     the next K/V block (no registers left): ~5 TFLOPS of ~59. Attention outputs vs attn_partial still >= 0.999999,
     forward_verify (64-token blocks: the split path) and gemma4_verify PASS.
+  - **Done: default prefill batch 2048 for MoE models** (`prefill_batch_tokens`, 1024 for dense; the ring
+    follows: 4,096 positions, 800 MB): Gemma FP4 1,540 -> **1,595 tok/s**, Qwen3.6-35B 2,134 -> 2,217, Qwen3.5-4B
+    unchanged (batch 4096: Gemma 1,634).
   - **Left (profile, FP4 file, 2.0 s):** attn_flash 512 0.32 s + 256 0.24 s, the WMMA matmuls ~1.0 s (ROCmFP4,
     Q5_K dense and experts), add_rmsnorm_rows 0.08 s. Generation (44 / 35 tok/s) not looked at yet.
 - **Step 5 — DONE ✅ (2026-10-25): sliding-window ring KV cache.** `inference_kv_cache_init` puts the 25

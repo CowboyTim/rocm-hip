@@ -190,7 +190,7 @@ struct inference_model {
 
     inference_kv_cache_t* kvc = nullptr;               // KV cache manager handle
     MtpHead* mtp = nullptr;                            // MTP draft head, if loaded (inference_set_draft_model)
-    int prefill_batch = 0;                             // tokens per prefill micro-batch (0: 1024; set_prefill_batch)
+    int prefill_batch = 0;                             // tokens per prefill micro-batch (0: prefill_batch_tokens())
     int spec_drafts = 0;                               // drafts per pass (inference_set_draft_tokens; 0: adaptive)
     float spec_acc[3] = {0.8f, 0.8f, 0.8f};            // adaptive: acceptance of draft j given drafts < j accepted
     float spec_ms[3] = {0.0f, 0.0f, 0.0f};             // adaptive: time of a pass with j + 1 drafts, ms (0: not yet)
@@ -238,5 +238,11 @@ struct inference_model {
     float embd_scale = 1.0f;                            // token embeddings * sqrt(n_embd)
     float logit_softcap = 0.0f;                         // final_logit_softcapping (0: none)
 };
+
+// Tokens per prefill micro-batch: inference_set_prefill_batch's, else 2048 for MoE models (each expert's weights
+// are read once per batch: Gemma-4 26B-A4B +4%, Qwen3.6-35B-A3B +4% over 1024) and 1024 for dense ones
+static inline int prefill_batch_tokens(const inference_model* m) {
+    return m->prefill_batch > 0 ? m->prefill_batch : m->n_expert > 0 ? 2048 : 1024;
+}
 
 #endif // INFERENCE_INTERNAL_H

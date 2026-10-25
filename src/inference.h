@@ -75,8 +75,8 @@ int inference_set_lm_head_q8(inference_model_t* model, int enable);
 // called before or after inference_kv_cache_init. Returns 0, negative on error (the file is not a matching
 // head).
 int inference_set_draft_model(inference_model_t* model, const char* path);
-// Tokens per prefill micro-batch (16 .. 8192; 0: the default, 1024). Bigger batches read each MoE expert's
-// weights once for more tokens: with 4096, long prompts on MoE models are up to ~10% faster (Qwen3.8-Flash-Next
+// Tokens per prefill micro-batch (16 .. 8192; 0: the default, 2048 for MoE models, 1024 for dense ones). Bigger
+// batches read each MoE expert's weights once for more tokens: with 4096, long prompts on MoE models are up to ~10% faster (Qwen3.8-Flash-Next
 // 7,281 tokens 725 -> 795 tok/s, Qwen3.5-122B-A10B 2,427 tokens 608 -> 674, Qwen3.6-35B-A3B +4-7%); dense models
 // gain nothing. The scratch memory grows with it (~1 MB per token on Qwen3.8: ~1 GB at 1024, ~4 GB at 4096). The
 // output does not depend on it beyond the float summation order of the WMMA kernels (exactly the same with

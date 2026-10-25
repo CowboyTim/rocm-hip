@@ -812,7 +812,7 @@ static int swa_ring_size(const inference_model_t* m, int n_ctx, int* window) {
     for (const LayerWeights& L : m->layers) *window = std::max(*window, L.window);
     const char* full = getenv("INFERENCE_SWA_FULL");
     if (*window <= 0 || (full && atoi(full) != 0)) return 0;
-    const int need = *window + (m->prefill_batch > 0 ? m->prefill_batch : 1024);
+    const int need = *window + prefill_batch_tokens(m);
     int R = 256;
     while (R < need) R *= 2;
     return R < n_ctx ? R : 0;  // no gain when the context is that short

@@ -477,9 +477,10 @@ guesses well. Dies when the file is not a head for this model. Before or after C
 
 =item set_prefill_batch($m, $n_tokens)
 
-Tokens per prefill micro-batch, 16 to 8192, or 0 for the default (1024). Larger batches speed up long prompts
-on MoE models (up to ~10%: each expert's weights are read once per batch) at the cost of scratch memory (about
-1 MB per token on Qwen3.8-Flash-Next); no gain for dense models. Before C<kv_cache_init>; dies after it.
+Tokens per prefill micro-batch, 16 to 8192, or 0 for the default (2048 for MoE models, 1024 for dense ones).
+Larger batches speed up long prompts on MoE models (up to ~10%: each expert's weights are read once per batch)
+at the cost of scratch memory (about 1 MB per token on Qwen3.8-Flash-Next; Gemma-4's sliding-window ring also
+grows with it); no gain for dense models. Before C<kv_cache_init>; dies after it.
 
 =item set_draft_tokens($m, $n)
 
