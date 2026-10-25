@@ -16,6 +16,7 @@
 
 #include "inference.h"       // opaque handle typedefs
 #include "gguf_mmap.h"        // gguf_model_t* forward decl
+#include "model_stage.h"      // ModelStage
 #include "kv_cache.h"         // inference_kv_cache_t* forward decl
 #include "tokenizer.h"        // tokenizer_t typedef
 
@@ -183,6 +184,8 @@ struct inference_model {
     std::mutex mtx;                                     // thread safety mutex
 
     std::vector<std::pair<void*, size_t>> pinned;      // registered (read-only) ranges of the GGUF mappings
+    ModelStage stage;                                  // the GPU tensors' stage copy (inference_load_opts.stage_dir)
+    std::string stage_info;                            // inference_stage_info
     size_t pinned_bytes = 0, unpinned_bytes = 0;       // registered / left to the CPU (token_embd, the PLE table)
 
     QuantWeight token_embd;                            // [vocab x n_embd]; rows decoded on the CPU per token

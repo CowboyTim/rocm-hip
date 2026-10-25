@@ -13,7 +13,7 @@ use Web::Route;
 
 my %o = (listen => './rocm-inference.sock', ctx => 8192, max_tokens => 4096);
 GetOptions(\%o, 'model=s', 'listen=s', 'mode=s', 'ctx=i', 'name=s', 'draft=s', 'store=s', 'max_tokens=i',
-           'swa-ring=i', 'thinking!', 'log!', 'help') or pod2usage(2);
+           'swa-ring=i', 'stage=s', 'thinking!', 'log!', 'help') or pod2usage(2);
 pod2usage(-verbose => 2, -exitval => 0) if $o{help};
 pod2usage("--model is required\n") unless $o{model};
 ROCm::Inference::_require_minijinja()
@@ -21,7 +21,8 @@ ROCm::Inference::_require_minijinja()
 
 my $name = $o{name} // basename($o{model}) =~ s/(?:-\d{5}-of-\d{5})?\.gguf\z//r;
 print STDERR "loading $o{model} ...\n";
-my $m = load_model($o{model}) // die "cannot load $o{model}: " . last_error() . "\n";
+my $m = load_model($o{model}, { stage => $o{stage} }) // die "cannot load $o{model}: " . last_error() . "\n";
+print STDERR "stage: ", stage_info($m), "\n" if $o{stage};
 # a block store needs every layer's history: no sliding-window ring unless asked for
 my $ring = $o{'swa-ring'} // ($o{store} ? 0 : -1);
 set_swa_ring($m, $ring);
@@ -210,6 +211,11 @@ The socket file's permissions (nginx's user must be able to write to it).
 =item --ctx N
 
 Context length (8192).
+
+=item --stage F<dir>
+
+Copy the model's GPU tensors to a stage file in F<dir> (a huge-page tmpfs such as F</dev/shm>) and run from there
+(C<load_model>'s C<stage>): later starts reuse it and pin in a fraction of the time.
 
 =item --swa-ring N
 

@@ -2473,6 +2473,23 @@ always (the per-size `hugepages-2048kB/shmem_enabled` is `inherit`: with `never`
 with `dd` or `cat`: `cp` (copy_file_range) does not get huge pages. Measured: Nemotron-3-Nano (33 GB) load + pin
 from /dev/shm 1.5 -> **0.6 s**; a 32 GB KV cache (Gemma-4 at 128k, no ring) 23.6 -> **2.8 s**.
 
+### Model staging to a huge-page tmpfs — DONE ✅ (2026-10-25, user: "auto copy to /dev/shm and mmap")
+
+`inference_load_model_ex(path, {stage_dir})` / Perl `load_model($path, { stage => '/dev/shm' })` / server
+`--stage DIR`: before any tensor is bound, the tensors the GPU reads are copied (8 threads, 64 MB chunks, each
+tensor 2 MB-aligned; the source's page cache dropped behind with posix_fadvise / madvise) into
+`<dir>/rocm-inference-stage-<sha256 of the files' dev/inode/size/mtime + the tensor list>.bin`, written under a
+temporary name and renamed when complete; `gguf_set_tensor_staged` points the GGUF's tensors at the copies and
+pinning registers the stage instead of the GGUF maps. Left on disk (CPU only): Qwen3.8's PLE table, token_embd when
+the LM head is separate, the nextn blocks past the stack. A later load of the same files maps the stage again
+without copying. No room in the directory or memory (MemAvailable < size + 4 GB): mapped directly, and
+`inference_stage_info` / Perl `stage_info` say why. t/70-stage.t (staged = direct tokens, reuse, fallback).
+Measured (warm page cache; a cold disk copies at disk speed once): Gemma-4 FP4 17.4 GB: direct 1.3 s, first stage
+1.5 s, reused 0.5 s; Nemotron-3-Nano 31.7 GB: direct 14.6 s, first stage 1.4 s, reused 0.6 s; Nemotron-3-Super 79.3 GB: direct 30.6 s,
+first stage 21.2 s, reused **2.1 s** (same tokens every way). A stage holds its RAM until deleted: with Super's
+84 GB stage in /dev/shm a direct load of the same GGUF (another 83 GB pinned) thrashes; load it staged or delete
+the stage first.
+
 ### BF16 dense prefill (ABC.gguf, a Qwen3.5 27B in BF16, 2026-10-25)
 
 Correct output; generation 4.1 tok/s (54 GB per token: the bandwidth); prefill **7.8 tok/s** (2,661 tokens in

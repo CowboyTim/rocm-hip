@@ -17,5 +17,6 @@ t/30-store.t
 t/40-store-policy.t
 t/50-draft.t
 t/60-server.t
+t/70-stage.t
 xt/pod-coverage.t
 xt/pod.t

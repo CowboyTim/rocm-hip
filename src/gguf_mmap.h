@@ -99,6 +99,15 @@ const void* gguf_map_base(const gguf_model_t *model, size_t* out_size);
 int          gguf_n_maps(const gguf_model_t *model);
 const void*  gguf_map_at(const gguf_model_t *model, int i, size_t* out_size);
 
+/* Model staging (model_stage.cpp): tensor idx's bytes in its file's mapping (whatever was staged), its size, its
+ * file (its size: gguf_tensor_nbytes); a copy elsewhere that gguf_get_tensor_ptr returns from now on (NULL: the mapping again); file i's path and
+ * identity at open (device, inode, size, mtime in ns). */
+const void*  gguf_tensor_source(const gguf_model_t *model, int64_t idx);
+int          gguf_tensor_split(const gguf_model_t *model, int64_t idx);
+void         gguf_set_tensor_staged(gguf_model_t *model, int64_t idx, const void *p);
+const char*  gguf_file_path(const gguf_model_t *model, int i);
+int          gguf_file_identity(const gguf_model_t *model, int i, uint64_t out[4]);
+
 /* --- Quantization type helpers --- */
 
 /* Check if a tensor type stores scales internally (self-contained).

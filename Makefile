@@ -191,7 +191,7 @@ $(ATTN_VERIFY): $(TESTSDIR)/attn_verify.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/kv_
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/attn_verify.cpp $(SRCDIR)/kv_cache.cpp $(LDFLAGS) -o $@
 
 # Phase 4: Inference engine static library
-$(INFERENCE_LIB): $(SRCDIR)/inference.cpp $(SRCDIR)/inference.h $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/gguf_mmap.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/quant_types.h $(SRCDIR)/kv_cache.cpp $(SRCDIR)/kv_cache.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/tokenizer.h $(SRCDIR)/unicode_flags.inc $(SRCDIR)/sampler.cpp $(SRCDIR)/sampler.h $(SRCDIR)/qwen_model.h $(SRCDIR)/sha256.cpp $(SRCDIR)/sha256.h $(SRCDIR)/inference_internal.h
+$(INFERENCE_LIB): $(SRCDIR)/inference.cpp $(SRCDIR)/inference.h $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/gguf_mmap.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/quant_types.h $(SRCDIR)/kv_cache.cpp $(SRCDIR)/kv_cache.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/tokenizer.h $(SRCDIR)/unicode_flags.inc $(SRCDIR)/sampler.cpp $(SRCDIR)/sampler.h $(SRCDIR)/qwen_model.h $(SRCDIR)/sha256.cpp $(SRCDIR)/sha256.h $(SRCDIR)/inference_internal.h $(SRCDIR)/model_stage.cpp $(SRCDIR)/model_stage.h
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/inference.cpp -o $(OBJDIR)/inference.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/gguf_mmap.cpp -o $(OBJDIR)/gguf_mmap.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/quant_types.cpp -o $(OBJDIR)/quant_types.o
@@ -199,8 +199,9 @@ $(INFERENCE_LIB): $(SRCDIR)/inference.cpp $(SRCDIR)/inference.h $(SRCDIR)/gguf_m
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/tokenizer.cpp -o $(OBJDIR)/tokenizer.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/sampler.cpp -o $(OBJDIR)/sampler.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/sha256.cpp -o $(OBJDIR)/sha256.o
+	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/model_stage.cpp -o $(OBJDIR)/model_stage.o
 	rm -f $@
-	ar rcs $@ $(OBJDIR)/inference.o $(OBJDIR)/gguf_mmap.o $(OBJDIR)/quant_types.o $(OBJDIR)/kv_cache.o $(OBJDIR)/tokenizer.o $(OBJDIR)/sampler.o $(OBJDIR)/sha256.o
+	ar rcs $@ $(OBJDIR)/inference.o $(OBJDIR)/gguf_mmap.o $(OBJDIR)/quant_types.o $(OBJDIR)/kv_cache.o $(OBJDIR)/tokenizer.o $(OBJDIR)/sampler.o $(OBJDIR)/sha256.o $(OBJDIR)/model_stage.o
 
 # Inference engine shared library (versioned): the whole engine (both archives, kernels embedded), exporting only
 # the public C API (src/libinference.map: inference_*, tokenizer_*, sampler_*)

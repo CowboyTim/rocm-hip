@@ -103,6 +103,17 @@ static void unpin(std::vector<std::pair<void*, size_t>>& pinned) {
 }
 
 static bool pin_model_memory(inference_model* m) {
+    if (m->stage.base) {  // every tensor the GPU reads is in the stage: pin it, leave the GGUF mapping to the CPU
+        const hipError_t e = hipHostRegister(m->stage.base, m->stage.bytes, hipHostRegisterReadOnly);
+        if (e != hipSuccess) {
+            INFER_LOG("[pin_model] hipHostRegister(stage, %zu bytes) failed: %s\n", m->stage.bytes, hipGetErrorString(e));
+            return false;
+        }
+        m->pinned.push_back({m->stage.base, m->stage.bytes});
+        m->pinned_bytes = m->stage.bytes;
+        INFER_LOG("[pin_model] stage: %zu MB registered\n", m->pinned_bytes >> 20);
+        return true;
+    }
     std::vector<const QuantWeight*> cpu_only = {&m->ple_table};
     if (m->output.data != m->token_embd.data) cpu_only.push_back(&m->token_embd);
     return pin_gguf(m->gguf, cpu_only, m->pinned, m->pinned_bytes, m->unpinned_bytes);
@@ -654,7 +665,36 @@ static bool load_model_weights(inference_model* m, const std::vector<int>& ple_l
 
 // ======================== C API IMPLEMENTATION ========================
 
-inference_model_t* inference_load_model(const char* gguf_path) {
+inference_model_t* inference_load_model(const char* gguf_path) { return inference_load_model_ex(gguf_path, nullptr); }
+
+const char* inference_stage_info(const inference_model_t* m) { return m ? m->stage_info.c_str() : ""; }
+
+// The tensors staged (inference_load_opts.stage_dir): what the GPU reads. Not the PLE table, nor the token
+// embeddings when the LM head is a tensor of its own (the CPU decodes their rows), nor the MTP (nextn) blocks after
+// the decoder stack
+static void stage_model_tensors(inference_model* m, const char* dir) {
+    const bool own_head = find_tensor_index(m->gguf, "output.weight") >= 0;
+    const int n_layer = m->n_layer;
+    auto keep = [&](const char* name) {
+        if (!strcmp(name, "per_layer_token_embd.weight")) return false;
+        if (own_head && !strcmp(name, "token_embd.weight")) return false;
+        int blk = -1;
+        if (sscanf(name, "blk.%d.", &blk) == 1 && blk >= n_layer) return false;
+        return true;
+    };
+    std::string why;
+    char b[512];
+    if (model_stage(m->gguf, dir, keep, m->stage, why)) {
+        snprintf(b, sizeof b, "%s %s (%zu MB)", m->stage.reused ? "reused" : "staged", m->stage.path.c_str(),
+                 m->stage.staged >> 20);
+    } else {
+        snprintf(b, sizeof b, "not staged: %s", why.c_str());
+    }
+    m->stage_info = b;
+    INFER_LOG("[stage] %s\n", b);
+}
+
+inference_model_t* inference_load_model_ex(const char* gguf_path, const inference_load_opts* opts) {
     clear_error();
     if (!gguf_path) { set_error("NULL path"); return nullptr; }
 
@@ -720,6 +760,9 @@ inference_model_t* inference_load_model(const char* gguf_path) {
             m->n_embd, m->n_head, m->n_head_kv, m->head_dim, m->n_ff, m->n_rot, m->rope_freq_base, m->eps);
 
     m->n_ctx = (int)ctx_len;
+
+    // Staging: before any tensor is bound, so that every weight pointer is the stage copy's
+    if (opts && opts->stage_dir && opts->stage_dir[0]) stage_model_tensors(m, opts->stage_dir);
 
     // Token embeddings: any decodable type; rows are decoded per token in the forward pass
     if (!bind_weight(m->gguf, "token_embd.weight", m->token_embd, true) ||
@@ -868,6 +911,7 @@ void inference_free_model(inference_model_t* m) {
     // whose device pointers point into the layer scratch buffers we're about to free.
     INFER_LOG("[CLEANUP] Unpinning model memory\n");
     unpin_model_memory(m);
+    model_stage_unmap(m->stage);
     inference_store_close(m);
     if (m->kvc) { INFER_LOG("[CLEANUP] Freeing KV cache\n"); kv_cache_free(m->kvc); }
     if (m->kvc_swa) kv_cache_free(m->kvc_swa);

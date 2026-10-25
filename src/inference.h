@@ -38,6 +38,21 @@ typedef struct inference_model inference_model_t;
 // Returns NULL on failure (check inference_get_last_error()).
 inference_model_t* inference_load_model(const char* gguf_path);
 
+// Load options. stage_dir: copy the tensors the GPU reads into one stage file in this directory (a tmpfs, best one
+// mounted huge=always: /dev/shm) and map them from there; what only the CPU reads (the token embeddings when the LM
+// head is separate, Qwen3.8's PLE table) stays mapped from the GGUF on disk. The stage file
+// (rocm-inference-stage-<hash>.bin, the hash of the source files' identity and the staged tensors) is kept: a later
+// load of the same files maps it again without copying. Not staged (the GGUF mapped directly, as without the option)
+// when there is not enough room in the directory or memory: inference_stage_info says what happened. NULL options or
+// stage_dir: no staging.
+typedef struct inference_load_opts {
+    const char* stage_dir;
+} inference_load_opts;
+inference_model_t* inference_load_model_ex(const char* gguf_path, const inference_load_opts* opts);
+// One line about staging for this model ("staged 31234 MB in <path>", "reused <path> (31234 MB)", "not staged: ..."),
+// or "" when it was not asked for. Valid while the model is.
+const char* inference_stage_info(const inference_model_t* model);
+
 // Reference counting for shared ownership
 void inference_model_retain(inference_model_t* model);
 void inference_model_release(inference_model_t* model);

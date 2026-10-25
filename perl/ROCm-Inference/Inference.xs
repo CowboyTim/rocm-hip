@@ -98,12 +98,28 @@ MODULE = ROCm::Inference    PACKAGE = ROCm::Inference
 PROTOTYPES: DISABLE
 
 SV*
-load_model(path)
+load_model(path, opts = NULL)
     const char* path
+    SV* opts
   CODE:
-    inference_model_t* m = inference_load_model(path);
+    /* opts: { stage => '/dev/shm' } (inference_load_opts) */
+    inference_load_opts lo = {0};
+    if (opts && SvOK(opts)) {
+        if (!SvROK(opts) || SvTYPE(SvRV(opts)) != SVt_PVHV) croak("load_model: options must be a hash reference");
+        SV** sv = hv_fetchs((HV*)SvRV(opts), "stage", 0);
+        if (sv && SvOK(*sv)) lo.stage_dir = SvPV_nolen(*sv);
+    }
+    inference_model_t* m = inference_load_model_ex(path, &lo);
     if (!m) croak_last(aTHX_ "load_model", INFERENCE_ERR_MODEL_LOAD);
     RETVAL = sv_setref_pv(newSV(0), HANDLE_CLASS, (void*)m);
+  OUTPUT:
+    RETVAL
+
+const char*
+stage_info(h)
+    SV* h
+  CODE:
+    RETVAL = inference_stage_info(handle_ptr(aTHX_ h, 0));
   OUTPUT:
     RETVAL
 

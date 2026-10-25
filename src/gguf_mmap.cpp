@@ -91,6 +91,7 @@ struct tensor_meta {
     int          type;         /* ggml_type enum value */
     uint64_t     data_offset;  /* byte offset from start of data blob */
     int          split;        /* the file (split) holding it: 0 = the one opened */
+    const void  *staged;       /* a copy elsewhere (gguf_set_tensor_staged) that gguf_get_tensor_ptr returns */
 };
 
 /* KV scalar value with explicit type tag for correct retrieval */
@@ -137,6 +138,8 @@ struct gguf_model {
     void           *maps[GGUF_MAX_SPLITS];
     size_t          map_sizes[GGUF_MAX_SPLITS];
     size_t          data_offs[GGUF_MAX_SPLITS];
+    char           *paths[GGUF_MAX_SPLITS];     /* each file's path */
+    uint64_t        ids[GGUF_MAX_SPLITS][4];    /* each file's device, inode, size, mtime (ns) at open */
 };
 
 /* ---------------------------------------------------------------------------
@@ -309,6 +312,11 @@ static gguf_model_t *load_gguf(const char *path) {
     model->maps[0] = mapped;
     model->map_sizes[0] = st.st_size;
     model->data_offs[0] = model->data_off;
+    model->paths[0] = strdup(path);
+    model->ids[0][0] = (uint64_t)st.st_dev;
+    model->ids[0][1] = (uint64_t)st.st_ino;
+    model->ids[0][2] = (uint64_t)st.st_size;
+    model->ids[0][3] = (uint64_t)st.st_mtim.tv_sec * 1000000000ull + (uint64_t)st.st_mtim.tv_nsec;
     return model;
 
 fail:
@@ -327,6 +335,7 @@ fail:
 
 /* Free a parsed file's metadata (not its mappings) */
 static void free_meta(gguf_model_t *model) {
+    for (int i = 0; i < GGUF_MAX_SPLITS; ++i) free(model->paths[i]);
     for (int64_t i = 0; i < model->n_kv; ++i) {
         free(model->kvs[i].str_val);
         if (model->kvs[i].arr_strings) {
@@ -390,6 +399,9 @@ static gguf_model_t *load_gguf_splits(const char *path) {
         model->maps[i] = sub->map_ptr;
         model->map_sizes[i] = sub->map_size;
         model->data_offs[i] = sub->data_off;
+        model->paths[i] = sub->paths[0];
+        sub->paths[0] = NULL;
+        memcpy(model->ids[i], sub->ids[0], sizeof(model->ids[i]));
         model->n_maps = i + 1;
         sub->n_maps = 0;  /* the mapping now belongs to model */
         free_meta(sub);
@@ -898,10 +910,35 @@ const void* gguf_get_tensor_ptr(const gguf_model_t *m, const char* name, size_t*
                 *out_bytes = (size_t)total_elems * ts;
             }
 
+            if (tm->staged) return tm->staged;
             return (const char*)model->maps[tm->split] + model->data_offs[tm->split] + tm->data_offset;
         }
     }
     return nullptr;
+}
+
+const void* gguf_tensor_source(const gguf_model_t *m, int64_t idx) {
+    if (!m || idx < 0 || idx >= m->n_tensors) return NULL;
+    const struct tensor_meta *tm = &m->tensors[idx];
+    return (const char*)m->maps[tm->split] + m->data_offs[tm->split] + tm->data_offset;
+}
+
+int gguf_tensor_split(const gguf_model_t *m, int64_t idx) {
+    return m && idx >= 0 && idx < m->n_tensors ? m->tensors[idx].split : -1;
+}
+
+void gguf_set_tensor_staged(gguf_model_t *m, int64_t idx, const void *p) {
+    if (m && idx >= 0 && idx < m->n_tensors) m->tensors[idx].staged = p;
+}
+
+const char* gguf_file_path(const gguf_model_t *m, int i) {
+    return m && i >= 0 && i < m->n_maps ? m->paths[i] : NULL;
+}
+
+int gguf_file_identity(const gguf_model_t *m, int i, uint64_t out[4]) {
+    if (!m || i < 0 || i >= m->n_maps) return -1;
+    memcpy(out, m->ids[i], sizeof(m->ids[i]));
+    return 0;
 }
 
 /* --- Low-level mmap access (for inference engine) --- */

@@ -17,7 +17,7 @@ BEGIN {  # at compile time: the constants below call into the XS
 # The C library (libinference.so) mapped one function per C call; plus the plain-Perl chat helpers below
 our @EXPORT_OK = qw(
     load_model free_model kv_cache_init set_lm_head_q8 set_draft_model set_draft_tokens set_prefill_batch
-    set_swa_ring swa_ring
+    set_swa_ring swa_ring stage_info
     tokenize detokenize chat_template bos_id eos_id token_is_eog vocab_size
     n_ctx n_past reset prefill decode_token get_logits
     generate last_prompt_stats last_error
@@ -435,9 +435,17 @@ character strings, token lists as array references. Chat templates are rendered 
 
 =over
 
-=item load_model($path) / free_model($m)
+=item load_model($path [, { stage => $dir }]) / free_model($m)
 
 Load a GGUF model (memory-mapped, zero-copy). The handle frees itself when it goes out of scope.
+
+C<stage>: copy the tensors the GPU reads into one stage file in C<$dir> (a tmpfs, best mounted C<huge=always>, e.g.
+F</dev/shm>) and map them from there, leaving what only the CPU reads (token embeddings with a separate LM head,
+Qwen3.8's PLE table) mapped from the GGUF on disk. On 2 MB pages the model is pinned much faster, and the stage file
+stays: a later load of the same files maps it again without copying (it is named after the files' identity and
+the tensors staged; delete F<$dir/rocm-inference-stage-*.bin> to free it). Without room in C<$dir> or in memory the
+GGUF is mapped directly, as without the option. C<stage_info($m)> says which: C<"staged PATH (N MB)">,
+C<"reused PATH (N MB)"> or C<"not staged: WHY"> (C<""> when not asked for).
 
 =item kv_cache_init($m, $n_ctx)
 
