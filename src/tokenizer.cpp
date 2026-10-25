@@ -10,6 +10,11 @@
 //   4. BPE: adjacent symbols are merged lowest merge rank first (leftmost on ties) until no pair is in
 //      the merge table; each final symbol is looked up in the vocab.
 // Supported pre-tokenizers: qwen35, qwen2 (and models that share their regex).
+//
+// tokenizer.ggml.model = "gemma4" is SentencePiece-style BPE instead (llama.cpp's LLAMA_VOCAB_PRE_TYPE_GEMMA4):
+// stage 2 splits only into runs of newlines and runs of other text, after every space became U+2581; stage 3
+// is skipped (the vocab and merges are raw UTF-8); a newline run that is a token is taken whole; a symbol not
+// in the vocab falls back to <0xXX> byte tokens; BOS is always added. Decoding turns U+2581 back into spaces.
 
 #include "inference_log.h"
 #include "tokenizer.h"
@@ -124,7 +129,7 @@ uint32_t ascii_lower(uint32_t c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
 
 // ---------------------------------------------------------------- pre-tokenizers
 
-enum PreType { PRE_QWEN2, PRE_QWEN35 };
+enum PreType { PRE_QWEN2, PRE_QWEN35, PRE_GEMMA4 };
 
 // Word lengths (in codepoints) for llama.cpp's qwen2 / qwen35 regex:
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N} | ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
@@ -245,10 +250,19 @@ struct tokenizer {
             if (id >= 0 && id < (int)vocab.size()) eog.push_back(id);
         for (const char* t : kText) {
             const int id = lookup(t);
-            if (id >= 0) eog.push_back(id);
+            if (id < 0) continue;
+            eog.push_back(id);
+            if (type[id] != TT_CONTROL) type[id] = TT_CONTROL;  // as llama.cpp: an end-of-turn marker is a control token
         }
         std::sort(eog.begin(), eog.end());
         eog.erase(std::unique(eog.begin(), eog.end()), eog.end());
+        // llama.cpp's workaround for Gemma-4: with <|tool_response> among them, </s> is no end of generation and
+        // becomes a normal token (so </s> in text is no longer a special token either)
+        const int tr = lookup("<|tool_response>"), s_end = lookup("</s>");
+        if (tr >= 0 && s_end >= 0 && is_eog(tr) && is_eog(s_end)) {
+            eog.erase(std::find(eog.begin(), eog.end(), s_end));
+            type[s_end] = TT_NORMAL;
+        }
     }
 
     bool is_eog(int id) const { return std::binary_search(eog.begin(), eog.end(), id); }
@@ -298,14 +312,41 @@ struct tokenizer {
             const int id = lookup(s);
             if (id >= 0) { out.push_back(id); continue; }
             for (char ch : s) {  // byte fallback, as llama.cpp: single-byte tokens if the vocab has them
-                const int b = lookup(std::string(1, ch));
+                const int b = lookup(pre == PRE_GEMMA4 ? hex_byte_token((unsigned char)ch) : std::string(1, ch));
                 if (b >= 0) out.push_back(b);
             }
         }
     }
 
+    static std::string hex_byte_token(unsigned char ch) {
+        static const char* hex = "0123456789ABCDEF";
+        return std::string("<0x") + hex[ch >> 4] + hex[ch & 15] + ">";
+    }
+
+    // Gemma-4: spaces as U+2581, then runs of newlines and runs of other text, BPE'd as raw UTF-8 (invalid
+    // UTF-8 as U+FFFD first, as llama.cpp's codepoint split leaves it)
+    void encode_text_gemma4(const std::string& text, std::vector<int>& out) const {
+        std::string esc;
+        esc.reserve(text.size() + text.size() / 4);
+        for (uint32_t c : utf8_to_cpts(text)) {
+            if (c == ' ') esc += "\xe2\x96\x81";
+            else append_utf8(esc, c);
+        }
+        for (size_t pos = 0; pos < esc.size();) {
+            const bool nl = esc[pos] == '\n';
+            size_t end = pos;
+            while (end < esc.size() && (esc[end] == '\n') == nl) ++end;
+            const std::string word = esc.substr(pos, end - pos);
+            pos = end;
+            const int whole = nl ? lookup(word) : -1;
+            if (whole >= 0) out.push_back(whole);
+            else bpe_word(word, out);
+        }
+    }
+
     // Pre-tokenize + byte-encode + BPE one span of plain text
     void encode_text(const std::string& text, std::vector<int>& out) const {
+        if (pre == PRE_GEMMA4) { encode_text_gemma4(text, out); return; }
         const std::vector<uint32_t> cpts = utf8_to_cpts(text);
         const std::vector<size_t> words = split_qwen(cpts, pre == PRE_QWEN35);
         const ByteMap& bm = byte_map();
@@ -354,6 +395,17 @@ struct tokenizer {
         if (id < 0 || id >= (int)vocab.size()) return;
         const std::string& t = vocab[id];
         if (type[id] == TT_CONTROL || type[id] == TT_USER_DEFINED || type[id] == TT_UNKNOWN) { out += t; return; }
+        if (pre == PRE_GEMMA4) {
+            if (type[id] == TT_BYTE && t.size() == 6 && t.compare(0, 3, "<0x") == 0) {
+                out += (char)std::stoi(t.substr(3, 2), nullptr, 16);
+                return;
+            }
+            for (size_t i = 0; i < t.size();) {  // U+2581 back to spaces
+                if (t.compare(i, 3, "\xe2\x96\x81") == 0) { out += ' '; i += 3; }
+                else out += t[i++];
+            }
+            return;
+        }
         const ByteMap& bm = byte_map();
         for (uint32_t c : utf8_to_cpts(t)) {
             auto it = bm.cpt_to_byte.find(c);
@@ -452,13 +504,15 @@ tokenizer_t* tokenizer_load_from_gguf(void* gguf_model) {
     if (!m) return nullptr;
 
     const char* model = gguf_tokenizer_type(m);
-    if (!model || strcmp(model, "gpt2") != 0) {
-        INFER_LOG("[tokenizer] unsupported tokenizer.ggml.model '%s' (only gpt2 BPE)\n", model ? model : "");
+    const bool gemma4 = model && strcmp(model, "gemma4") == 0;
+    if (!model || (strcmp(model, "gpt2") != 0 && !gemma4)) {
+        INFER_LOG("[tokenizer] unsupported tokenizer.ggml.model '%s' (gpt2 BPE, gemma4)\n", model ? model : "");
         return nullptr;
     }
     const char* pre = gguf_pre_type(m);
     PreType pt;
-    if (pre && strcmp(pre, "qwen35") == 0) pt = PRE_QWEN35;
+    if (gemma4) pt = PRE_GEMMA4;
+    else if (pre && strcmp(pre, "qwen35") == 0) pt = PRE_QWEN35;
     else if (pre && strcmp(pre, "qwen2") == 0) pt = PRE_QWEN2;
     else {
         INFER_LOG("[tokenizer] unsupported tokenizer.ggml.pre '%s' (supported: qwen35, qwen2)\n", pre ? pre : "");
@@ -487,18 +541,17 @@ tokenizer_t* tokenizer_load_from_gguf(void* gguf_model) {
             t->type[i] = v;
         }
     }
-    t->build_specials();
-
     t->bos_id = (int)kv_int(m, "tokenizer.ggml.bos_token_id", -1);
     t->eos_id = (int)kv_int(m, "tokenizer.ggml.eos_token_id", -1);
     t->pad_id = (int)kv_int(m, "tokenizer.ggml.padding_token_id", -1);
     t->unk_id = (int)kv_int(m, "tokenizer.ggml.unknown_token_id", -1);
-    t->add_bos = kv_bool(m, "tokenizer.ggml.add_bos_token", false);
+    t->add_bos = kv_bool(m, "tokenizer.ggml.add_bos_token", false) || pt == PRE_GEMMA4;  // as llama.cpp forces it
     std::vector<int> eog_ids = {t->eos_id};
     for (const char* key : {"tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id", "tokenizer.ggml.fim_pad_token_id",
                             "tokenizer.ggml.fim_rep_token_id", "tokenizer.ggml.fim_sep_token_id"})
         eog_ids.push_back((int)kv_int(m, key, -1));
     t->build_eog(eog_ids);
+    t->build_specials();  // after build_eog, which can turn a special token into a normal one
     return t;
 }
 

@@ -9,6 +9,7 @@
 #include "gguf_mmap.h"
 #include "tokenizer.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -62,6 +63,17 @@ int main(int argc, char** argv) {
     if (!tok) { fprintf(stderr, "tokenizer_load_from_gguf failed\n"); return 1; }
     printf("tokenizer_gguf_verify: %s, vocab %zu, eos %d\n", argv[1], tokenizer_vocab_size(tok), tokenizer_eos_id(tok));
 
+    // A tokenizer that adds BOS (Gemma-4) encodes "" to that one id: it is not part of the prompt's text.
+    // One that writes spaces as U+2581 (SentencePiece style) decodes a literal U+2581 as a space too.
+    int probe[4];
+    const bool adds_bos = tokenizer_encode(tok, "", probe, 4) == 1 && probe[0] == tokenizer_bos_id(tok);
+    const char* lower_block = "\xe2\x96\x81";
+    std::vector<int> lb(8);
+    lb.resize(std::max(0, tokenizer_encode(tok, lower_block, lb.data(), (int)lb.size())));
+    char lbd[16] = {0};
+    tokenizer_decode(tok, lb.data() + (adds_bos ? 1 : 0), (int)lb.size() - (adds_bos ? 1 : 0), lbd, sizeof(lbd));
+    const bool spm_spaces = std::string(lbd) == " ";
+
     std::ifstream f(argv[2]);
     if (!f) { fprintf(stderr, "cannot read %s\n", argv[2]); return 1; }
     int n = 0, fail = 0;
@@ -80,9 +92,13 @@ int main(int argc, char** argv) {
         bool ok = k >= 0 && got == want;
 
         std::string dec(prompt.size() * 4 + 64, '\0');
-        const int dl = tokenizer_decode(tok, want.data(), (int)want.size(), &dec[0], (int)dec.size());
+        const int skip = adds_bos && !want.empty() && want[0] == tokenizer_bos_id(tok) ? 1 : 0;
+        const int dl = tokenizer_decode(tok, want.data() + skip, (int)want.size() - skip, &dec[0], (int)dec.size());
         dec.resize(dl < 0 ? 0 : dl);
-        const bool rt = !valid_utf8(prompt) || dec == prompt;
+        std::string expect = prompt;
+        if (spm_spaces)
+            for (size_t p; (p = expect.find(lower_block)) != std::string::npos;) expect.replace(p, 3, " ");
+        const bool rt = !valid_utf8(prompt) || dec == expect;
         ok = ok && rt;
 
         ++n;

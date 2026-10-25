@@ -33,6 +33,13 @@ PROMPTS = [
     b"x",
     b" ",
     b"\n",
+    # Gemma-4 (SentencePiece-style BPE): its special tokens, runs of newlines and spaces, a leading space
+    b"<bos><|turn>user\nHello  world<turn|>\n<|turn>model\n<|channel>thought\n<channel|>Hi!",
+    b"<|tool_call>call:get_weather{city:<|\"|>Ghent<|\"|>}<tool_call|>",
+    b"a\n\n\n\n\nb\n\n c   d    e",
+    b" leading space, two  spaces,   three",
+    b"\xe2\x96\x81 literal lower one eighth block \xe2\x96\x81\xe2\x96\x81",
+    b"text</s>more <eos> and <pad>",
 ]
 
 

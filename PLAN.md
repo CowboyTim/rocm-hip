@@ -2272,7 +2272,15 @@ one BF16 layer). Reference: `llama.cpp/src/models/gemma4.cpp` + `gemma4-common.h
   BF16 batched (one layer of the UD file).
 - **Cost estimate:** ~3.7 B parameters read per token (experts 1.4 B, attention 1.0 B, dense FFN 0.5 B, LM
   head 0.74 B): Q8 file ~4 GB/token (~45-50 tok/s at ~200 GB/s), FP4 file ~2.2 GB (~80 tok/s bound).
-- **Steps:** (1) tokenizer `gemma4` + `tokenizer_gguf_verify` against llama.cpp ids; (2) loader + a
+- **Step 1 — DONE ✅ (2026-10-25): tokenizer `gemma4`** (`src/tokenizer.cpp`, PRE_GEMMA4): spaces as U+2581, runs of
+  newlines / other text, raw-UTF-8 BPE (invalid UTF-8 as U+FFFD first), whole newline-run tokens, `<0xXX>` byte
+  fallback, BOS always added, decoding U+2581 -> space and byte tokens. Also llama.cpp's EOG rules by text: every
+  end-of-turn marker becomes a control token (the UD file has `<eos>` typed NORMAL) and, with
+  `<|tool_response>` present, `</s>` is no EOG and a normal token: EOG = `<eos>` 1, `<|tool_response>` 50,
+  `<turn|>` 106 in both files. `tests/data/gemma4_tokenizer.tsv` (27 prompts: the corpus + Gemma's special
+  tokens, newline / space runs, a literal U+2581, `</s>` / `<eos>` in text): both Gemma files and both Qwen
+  tokenizers pass. The round-trip check skips an added BOS and, for SentencePiece-style spaces, a literal U+2581.
+- **Steps:** (1) tokenizer `gemma4` + `tokenizer_gguf_verify` against llama.cpp ids (done); (2) loader + a
   `gemma_model.cpp` forward (decode first) on shared kernels, with the new ops, verified per layer against
   `ref_dump` on the Q8 file (CPU reference build has gemma4); (3) batched prefill (WMMA), then the FP4 file
   (Q5_1 int8 / WMMA kernels); (4) chat: per-family reply tags, the Gemma tool-call parser, EOG list; (5)
