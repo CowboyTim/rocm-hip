@@ -246,9 +246,14 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
                                                 int n_kv_heads, int chunk, float scale, float* part_ml,
                                                 float* part_acc, int window) {
     constexpr int NW = NH * TT, NTH = 32 * NW, DH = D / DS;  // waves, threads, output dims per workgroup
-    constexpr int QP = D + 8;  // padded LDS row of Q / K (halves)
+    // KG: K is not staged; each lane reads its position's K row from global memory (L2) as the WMMA operand,
+    // which frees LDS for more workgroups per WGP (the Q rows then padded by 4 halves, not 8). D 512 (2 -> 3
+    // workgroups per WGP: Gemma-4 prefill +5%) and D 128 (Qwen3-0.6B +9%); neutral for D 256, which keeps the
+    // staging (half the L2 reads of K)
+    constexpr bool KG = DS > 1 || D <= 128;
+    constexpr int QP = D + (KG ? 4 : 8);  // padded LDS row of Q / K (halves)
     __shared__ __attribute__((aligned(16))) _Float16 sQ[NW][FT][QP];
-    __shared__ __attribute__((aligned(16))) _Float16 sK[NG][FB][QP];
+    __shared__ __attribute__((aligned(16))) _Float16 sK[KG ? 1 : NG][KG ? 1 : FB][KG ? 8 : QP];
     __shared__ __attribute__((aligned(16))) _Float16 sVt[NG][DH][FB];  // V blocks transposed: [dim][position]
     __shared__ __attribute__((aligned(16))) _Float16 sP[NW][FT][FB];
     const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31, i = lane & 15, hi = lane >> 4;
@@ -287,7 +292,7 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
         // (single halves from lanes 8 dims apart hit one LDS bank 32 times). Positions no token of the tiles
         // sees are zeroed: they are masked, but 0 * (stale V) must stay 0.
 #pragma unroll
-        for (int k = 0; k < NG * FB * D / 8 / NTH; ++k) {
+        for (int k = 0; k < (KG ? 0 : NG * FB * D / 8 / NTH); ++k) {
             const int idx = tid + NTH * k, gl = idx / (FB * D / 8), r = idx % (FB * D / 8);
             const int p = r / (D / 8), d = 8 * (r % (D / 8));
             uint4 ku = make_uint4(0, 0, 0, 0);
@@ -313,11 +318,23 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
 
         // S = Q K^T for this wave's 16 tokens x 16 positions
         v8f s = {};
+        if constexpr (KG) {  // B column i: position P0 + i's K row (zeros past the last position: masked)
+            const bool kin = P0 + i <= pos0 + zmax;
+            const v16h* kr = (const v16h*)(K + kv_row(kin ? P0 + i : 0, kv_stride, kv_shift, kv_bstride) +
+                                           (size_t)(g0 + gw) * D);
 #pragma unroll
-        for (int kk = 0; kk < D / 16; ++kk) {
-            const v16h a = *(const v16h*)&sQ[w][i][kk * 16];
-            const v16h bk = *(const v16h*)&sK[gw][i][kk * 16];
-            s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bk, s);
+            for (int kk = 0; kk < D / 16; ++kk) {
+                const v16h a = *(const v16h*)&sQ[w][i][kk * 16];
+                const v16h bk = kin ? kr[kk] : (v16h){};
+                s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bk, s);
+            }
+        } else {
+#pragma unroll
+            for (int kk = 0; kk < D / 16; ++kk) {
+                const v16h a = *(const v16h*)&sQ[w][i][kk * 16];
+                const v16h bk = *(const v16h*)&sK[gw][i][kk * 16];
+                s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bk, s);
+            }
         }
 
         // Online softmax; this lane holds position P0 + i of token rows 2 r + hi

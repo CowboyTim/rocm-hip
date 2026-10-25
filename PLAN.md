@@ -2354,6 +2354,12 @@ one BF16 layer). Reference: `llama.cpp/src/models/gemma4.cpp` + `gemma4-common.h
     0.26 s): 2-wave workgroups at 59 KB LDS, one wave per SIMD; every alternative that shares a staged K/V block
     among more rows needs more LDS for Q (16.6 KB per 16 rows x 512), and the in-workgroup D split (scores once)
     keeps the occupancy: a rewrite has a low ceiling (~5% of prefill), not done.
+  - **Done (2026-10-25, user: "continue on the attention rewrite if still needed"): K from L2, not LDS** (`KG`
+    in attn_flash_body): each lane reads its position's K row as the WMMA B operand; sK is gone, the Q rows padded
+    by 4 halves. D 512: 59 -> 42 KB LDS, 2 -> 3 workgroups per WGP, 247 -> 234 VGPRs: Gemma FP4 1,634 -> **1,731
+    tok/s**, Q8 1,195 -> 1,273. D 128 (Qwen3-0.6B, ratio 2) 8,640 -> 9,435. D 256 measured neutral (Qwen3.6-35B
+    2,247 vs 2,230, Gemma sliding): keeps the staging. Attention outputs vs attn_partial >= 0.999999,
+    forward_verify (batched attention at 2,460..2,499) and gemma4_verify PASS.
   - **Left (profile, FP4 file, 2.0 s):** attn_flash 512 0.32 s + 256 0.24 s, the WMMA matmuls ~1.0 s (ROCmFP4,
     Q5_K dense and experts), add_rmsnorm_rows 0.08 s. Generation (44 / 35 tok/s) not looked at yet.
 - **Step 5 — DONE ✅ (2026-10-25): sliding-window ring KV cache.** `inference_kv_cache_init` puts the 25
