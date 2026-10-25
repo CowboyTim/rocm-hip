@@ -22,6 +22,8 @@ Revision history for ROCm-Inference
     - Gemma-4: chat's reply tags and tool calls in Gemma's format (<|channel>thought ... <channel|>,
       <|tool_call>call:name{...}<tool_call|>), chosen by reply_tags from the model's chat template;
       chat_render leaves out the template's <bos> when tokenize adds one.
+    - Chat templates are rendered with trim_blocks and lstrip_blocks, as transformers' apply_chat_template
+      (Nemotron-3's template depends on them).
     - set_swa_ring / swa_ring: the sliding-window layers' KV cache as a ring (the default) or every layer's
       whole history (0, needed by a block store); rocm-inference-server --swa-ring.
     - Makefile.PL finds libinference through ROCM_INFERENCE_PREFIX, pkg-config (rocm-inference) or the

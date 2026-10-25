@@ -252,7 +252,8 @@ moe_combine(const float* down, const float* wts, const float* shared, const floa
     float acc = exp_scale ? (d[0] * exp_scale[e[0]]) * w[0] : w[0] * d[0];
     for (int j = 1; j < n_used; ++j)
         acc += exp_scale ? (d[(size_t)j * n] * exp_scale[e[j]]) * w[j] : w[j] * d[(size_t)j * n];
-    out[(size_t)t * n + i] = shared ? acc + shared[(size_t)t * n + i] * sg[t] : acc;
+    // (Nemotron-H: an ungated shared expert, sg NULL)
+    out[(size_t)t * n + i] = shared ? (sg ? acc + shared[(size_t)t * n + i] * sg[t] : acc + shared[(size_t)t * n + i]) : acc;
 }
 
 // moe_group  grid 1, block 1024: group a prefill batch's (token, slot) entries by expert, for the expert-tiled
@@ -666,4 +667,165 @@ extern "C" __global__ void __launch_bounds__(256)
 softcap(float* x, int n, float cap) {
     const int i = blockIdx.x * 256 + threadIdx.x;
     if (i < n) x[i] = cap * tanhf(x[i] / cap);
+}
+
+// ---------------------------------------------------------------- Nemotron-H (nemotron_h_moe)
+//
+// Mamba-2 mixer (llama.cpp build_mamba2_layer, ggml_ssm_conv / ggml_ssm_scan), per token row of zx = ssm_in's output
+// [z d_inner | xBC conv_dim | dt n_head] (row stride ld):
+// mamba_conv        grid (conv_dim / 256, T), block 256: xbc_out[t][c] = SiLU(sum_i window_i w[c][i] + b[c]), the
+//                   window the d_conv - 1 inputs before token t (from zx, or the conv state before the batch) and
+//                   token t's own, oldest first (ggml_ssm_conv's order).
+// mamba_conv_state  grid conv_dim / 256: the conv state after the T tokens (their last d_conv - 1 inputs).
+// mamba_scan        grid n_head, block 256: head h's state [P dims][d_state] in registers (thread t: dim t / 4,
+//                   states 32 (t % 4) ..), the tokens in order: dt = softplus(dt_t + dt_b[h]), dA = exp(dt A[h]);
+//                   s = s dA + B (x dt), y = sum_j s_j C_j (B, C of group h / (n_head / n_group)); out = y + x D[h].
+// mamba_gnorm       grid (n_group, T), block 256: v = y SiLU(z) over a group of d_inner / n_group (= 512) values,
+//                   v * rsqrt(mean(v^2) + eps) * w (ssm_norm), quantized for ssm_out when o.qK.
+// FFN: moe_router_sigmoid (grid T, block 256): p = sigmoid(logits); the n_used largest p + bias (ties to the lower
+// index); their weights p (without the bias), normalized by max(sum, 6.103515625e-5) if norm, times scale
+// (llama.cpp build_moe_ffn, LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID). relu2: out = max(x, 0)^2 on rows of h values
+// (row r at in + r * stride), quantized when o.qK.
+#define MAMBA_DS 128   // d_state
+#define MAMBA_P 64     // dims per head: 256 threads x 32 states
+#define MAMBA_MAXC 8   // d_conv
+
+__device__ __forceinline__ float mamba_silu(float x) { return x / (1.0f + expf(-x)); }
+
+extern "C" __global__ void __launch_bounds__(256)
+mamba_conv(const float* zx, long long ld, int x_off, const float* conv_state, const float* w, const float* bias,
+           float* out, int conv_dim, int d_conv) {
+    const int c = blockIdx.x * 256 + threadIdx.x, t = blockIdx.y, ns = d_conv - 1;
+    if (c >= conv_dim) return;
+    float s = 0.0f;
+    for (int i = 0; i < ns; ++i) {
+        const int tt = t - ns + i;
+        const float h = tt >= 0 ? zx[(size_t)tt * ld + x_off + c] : conv_state[(size_t)c * ns + ns + tt];
+        s += h * w[(size_t)c * d_conv + i];
+    }
+    s += zx[(size_t)t * ld + x_off + c] * w[(size_t)c * d_conv + ns];
+    out[(size_t)t * conv_dim + c] = mamba_silu(s + bias[c]);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+mamba_conv_state(const float* zx, long long ld, int x_off, float* conv_state, int conv_dim, int d_conv, int T) {
+    const int c = blockIdx.x * 256 + threadIdx.x, ns = d_conv - 1;
+    if (c >= conv_dim) return;
+    float* st = conv_state + (size_t)c * ns;
+    float h[MAMBA_MAXC];
+    for (int i = 0; i < ns; ++i) {
+        const int tt = T - ns + i;
+        h[i] = tt >= 0 ? zx[(size_t)tt * ld + x_off + c] : st[i + T];
+    }
+    for (int i = 0; i < ns; ++i) st[i] = h[i];
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+mamba_scan(float* state, const float* xbc, const float* zx, long long ld, int dt_off, const float* dt_b,
+           const float* A, const float* D, float* y, int d_inner, int n_group, int T) {
+    const int h = blockIdx.x, tid = threadIdx.x, i = tid >> 2, q = tid & 3, nh = gridDim.x;
+    const int g = h / (nh / n_group), conv_dim = d_inner + 2 * n_group * MAMBA_DS;
+    float* st = state + ((size_t)h * MAMBA_P + i) * MAMBA_DS + 32 * q;
+    float s[32];
+#pragma unroll
+    for (int j = 0; j < 32; ++j) s[j] = st[j];
+    const float a = A[h], dh = D[h], db = dt_b[h];
+    for (int t = 0; t < T; ++t) {
+        const float* row = xbc + (size_t)t * conv_dim;
+        const float dv = zx[(size_t)t * ld + dt_off + h] + db;
+        const float sp = dv > 20.0f ? dv : log1pf(expf(dv));  // ggml_compute_softplus_f32
+        const float dA = expf(sp * a);
+        const float x = row[h * MAMBA_P + i], xdt = x * sp;
+        const float* Bp = row + d_inner + g * MAMBA_DS + 32 * q;
+        const float* Cp = row + d_inner + (n_group + g) * MAMBA_DS + 32 * q;
+        float acc = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            s[j] = s[j] * dA + Bp[j] * xdt;
+            acc = fmaf(s[j], Cp[j], acc);
+        }
+        acc += __shfl_xor(acc, 1, 32);
+        acc += __shfl_xor(acc, 2, 32);
+        if (q == 0) y[(size_t)t * d_inner + h * MAMBA_P + i] = acc + x * dh;
+    }
+#pragma unroll
+    for (int j = 0; j < 32; ++j) st[j] = s[j];
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+mamba_gnorm(const float* y, const float* zx, long long ld, const float* w, float* out, int d_inner, float eps,
+            Q8Out o) {
+    __shared__ float part[8];
+    __shared__ Q8Shared sh;
+    const int g = blockIdx.x, t = blockIdx.y, tid = threadIdx.x, gs = d_inner / gridDim.x, nb = gs / 256;
+    float v[4];
+    float ss = 0.0f;
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj)
+        if (jj < nb) {
+            const int k = g * gs + tid + 256 * jj;
+            v[jj] = y[(size_t)t * d_inner + k] * mamba_silu(zx[(size_t)t * ld + k]);
+            ss += v[jj] * v[jj];
+        }
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor(ss, off, 32);
+    if ((tid & 31) == 0) part[tid >> 5] = ss;
+    __syncthreads();
+    float tot = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) tot += part[k];
+    const float inv = rsqrtf(tot / gs + eps);
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj)
+        if (jj < nb) {  // uniform
+            const int k = g * gs + tid + 256 * jj;
+            const float r = v[jj] * inv * w[k];
+            out[(size_t)t * d_inner + k] = r;
+            if (o.qK) q8_block_value(r, true, (t * d_inner + g * gs) / 256 + jj, tid, sh, o);
+        }
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+moe_router_sigmoid(const float* logits, const float* bias, int* ids, float* wts, int n_expert, int n_used, int norm,
+                   float scale) {
+    __shared__ __attribute__((aligned(16))) float sel[MOE_MAX_EXPERTS];
+    __shared__ float p[MOE_MAX_EXPERTS];
+    __shared__ float sel_w[64];
+    __shared__ int sel_id[64];
+    const int t = blockIdx.x, tid = threadIdx.x;
+    logits += (size_t)t * n_expert;
+    for (int e = tid; e < n_expert; e += 256) {
+        p[e] = 1.0f / (1.0f + expf(-logits[e]));
+        sel[e] = p[e] + bias[e];
+    }
+    __syncthreads();
+    if (tid < 32) {
+        if (n_expert <= 512) router_select<16>(sel, n_expert, n_used, sel_id, sel_w, tid);
+        else router_select<MOE_MAX_EXPERTS / 32>(sel, n_expert, n_used, sel_id, sel_w, tid);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float ws = 0.0f;
+        for (int r = 0; r < n_used; ++r) ws += p[sel_id[r]];
+        ws = fmaxf(ws, 6.103515625e-5f);
+        for (int r = 0; r < n_used; ++r) {
+            float wr = p[sel_id[r]];
+            if (norm) wr = wr / ws;
+            ids[t * n_used + r] = sel_id[r];
+            wts[t * n_used + r] = scale != 1.0f ? wr * scale : wr;
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+relu2(const float* in, float* out, int n, int h, int stride, Q8Out o) {
+    __shared__ Q8Shared sh;
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    float v = 0.0f;
+    if (i < n) {
+        const float x = in[(size_t)(i / h) * stride + i % h];
+        const float r = x > 0.0f ? x : 0.0f;
+        v = r * r;
+        out[i] = v;
+    }
+    if (o.qK) q8_block_value(v, i < n, blockIdx.x, threadIdx.x, sh, o);  // uniform; n % 32 == 0 when set
 }

@@ -104,6 +104,26 @@ hipError_t gpu_ple_conv(const float* normed, const float* gated, float* res, flo
 // out [T][hc][2n])
 hipError_t gpu_mtp_concat(const float* e, const float* h, float* out, int n, int hc, int T, hipStream_t stream);
 
+// Nemotron-H (gpu_ops.hip): the Mamba-2 mixer on T tokens of zx (ssm_in's rows, stride ld: [z | xBC | dt]).
+// gpu_mamba_conv: xBC (at x_off) through the causal conv1d (+ bias, SiLU) into out [T][conv_dim], then the conv state
+// [conv_dim][d_conv - 1] advanced. gpu_mamba_scan: the selective scan (state [n_head][64][128], d_state 128, 64 dims
+// per head) on out's x / B / C and zx's dt (at dt_off): y [T][d_inner] = scan + D x. gpu_mamba_gnorm: out =
+// RMSNorm(y * SiLU(z)) * w per group of d_inner / n_group values (z at zx's row start), quantized into q8 if set.
+hipError_t gpu_mamba_conv(const float* zx, long long ld, int x_off, float* conv_state, const float* w, const float* bias,
+                          float* out, int conv_dim, int d_conv, int T, hipStream_t stream);
+hipError_t gpu_mamba_scan(float* state, const float* xbc, const float* zx, long long ld, int dt_off, const float* dt_b,
+                          const float* A, const float* D, float* y, int n_head, int d_inner, int n_group, int T,
+                          hipStream_t stream);
+hipError_t gpu_mamba_gnorm(const float* y, const float* zx, long long ld, const float* w, float* out, int d_inner,
+                           int n_group, int T, float eps, const qmatvec_q8* q8, hipStream_t stream);
+// The sigmoid router: the n_used largest sigmoid(logits) + bias per token; ids, and weights sigmoid(logits)
+// (normalized to sum 1 if norm) * scale. gpu_relu2: out [rows][h] = max(x, 0)^2, row r of x at in + r * stride,
+// quantized into q8 if set.
+hipError_t gpu_moe_router_sigmoid(const float* logits, const float* bias, int* ids, float* wts, int n_expert,
+                                  int n_used, int norm, float scale, int T, hipStream_t stream);
+hipError_t gpu_relu2(const float* in, float* out, int rows, int h, int stride, const qmatvec_q8* q8,
+                     hipStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

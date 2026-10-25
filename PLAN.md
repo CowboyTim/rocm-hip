@@ -2418,7 +2418,7 @@ one BF16 layer). Reference: `llama.cpp/src/models/gemma4.cpp` + `gemma4-common.h
   sliding-window ring KV (done; the block store needs set_swa_ring 0); later a `gemma4-assistant` draft head if one appears (llama.cpp
   supports it).
 
-### Nemotron-3 (`nemotron_h_moe`) — in progress (2026-10-25)
+### Nemotron-3 (`nemotron_h_moe`) — Nano runs (2026-10-25)
 
 Files: `/models/Nemotron-3-Nano-30B-A3B-Q8_0.gguf` (verification: Q8_0 + F32) and
 `/models/NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_XL-*` (Q8_0 / Q4_K / Q5_1 / BF16 / Q5_K: all with int8 / WMMA
@@ -2436,9 +2436,24 @@ ggml-cpu `ssm_scan_f32`.
 - **Tokenizer — DONE ✅:** gpt2 BPE, pre `pixtral` = llama.cpp's LLAMA3 (qwen2's regex with \p{N}{1,3},
   ignore_merges, BOS): `PRE_LLAMA3`; `tests/data/nemotron3_tokenizer.tsv` 27/27, the others unchanged.
 - **Chat:** ChatML + `<think>` + the Qwen3.5 XML tool calls: the existing reply tags.
-- **Steps:** (1) tokenizer (done); (2) loader + forward (Mamba-2 kernels: conv, scan, gated grouped norm; the
-  MoE variant; attention reuses attention_forward), verified per layer vs `ref_dump` on Nano; (3) speed (a
-  chunked scan for prefill); (4) Super (latent MoE).
+- **Step 2 — DONE ✅ (2026-10-25): loader + forward on Nano.** `load_nemotron` / `load_layer_nemotron` (kinds
+  from the per-layer arrays: LAYER_MAMBA2, LAYER_FULL_ATTN, LAYER_FFN), `forward_nemotron` (norm -> op -> + x;
+  the normed input quantized by a separate launch: n_embd 2688 is not a multiple of 256). Kernels (gpu_ops.hip):
+  `mamba_conv` / `mamba_conv_state` (strided xBC, bias, SiLU), `mamba_scan` (a head per workgroup, its 64 x 128
+  state in registers, tokens in order), `mamba_gnorm` (y SiLU(z), RMSNorm per group of 512, quantized),
+  `moe_router_sigmoid` (choice by sigmoid + exp_probs_b, weights the plain sigmoid, normalized, x 2.5), `relu2`;
+  `moe_combine` with an ungated shared expert; attention: `attention_opts.no_qk_norm` (Nemotron's attention has no
+  RoPE and no q/k norm). The Mamba states live in the recurrent state (checkpoints / prefix reuse as DeltaNet's).
+  **Fixed on the way:** `gguf_arch_int` read BOOL keys as 0 (expert_weights_norm: the expert weights were not
+  normalized); Minijinja now renders with trim_blocks + lstrip_blocks as transformers / llama.cpp do (Nemotron's
+  template relies on them: stray whitespace in re-rendered history broke turn 2 and prefix reuse).
+  **Verified** (gemma4_verify, now also for Nemotron-H: block outputs `nemotron_h_block_out-N`, input `embd`): each
+  block on the reference's input worst cos 0.999998; logits cos 0.99925 (NO_WMMA 0.99947), top token ' Berlin' as
+  the reference; NO_WMMA prefill = token by token bit for bit (WMMA 0.99900: the check's bar is now 0.998). Chained
+  over 52 blocks 0.98 (MoE near-ties). Generation 55.6 tok/s, prefill 2,260 tok/s (2,755 tokens). Perl suite
+  passes on Nemotron (chat, thinking budget, tool round trip with prefix reuse), Gemma-4 and Qwen3.5-4B.
+- **Steps:** (1) tokenizer (done); (2) loader + forward (done); (3) speed (a chunked scan for prefill, if
+  needed); (4) Super (latent MoE: ffn_latent_down / up around 512 experts).
 
 ### BF16 dense prefill (ABC.gguf, a Qwen3.5 27B in BF16, 2026-10-25)
 

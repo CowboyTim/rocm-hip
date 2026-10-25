@@ -135,6 +135,7 @@ struct Scratch {
     float* moe_act = nullptr;   // SiLU(gate) * up per expert [n_used * n_ff_exp]
     float* moe_down = nullptr;  // expert down projections [n_used * n_embd]
     float* moe_gu = nullptr;    // Gemma-4: fused expert gate|up projections [n_used * 2 n_ff_exp]
+    float* zx = nullptr;        // Nemotron-H: ssm_in's output [z d_inner | xBC conv_dim | dt n_head]
     float* sh_out = nullptr;    // shared expert output [n_embd]
     // MoE prefill grouping (gpu_moe_group): entries sorted by expert, and tiles of up to g_tile of them
     int g_tile = 0;
@@ -174,6 +175,7 @@ struct Scratch {
         const int RP = (R + 127) / 128 * 128;  // QwenModel::hc_up_pad
         const int PHCD = m->ple_table.data ? HCD : 0;
         const int GU = m->gemma4 ? 2 * FE : 0;  // Gemma-4's fused gate|up expert rows
+        const int ZX = m->nemotron ? DI + conv_dim + NV : 0;  // Nemotron-H's ssm_in rows
         B = rows;
         const size_t b = (size_t)rows;
         q8_max_k = (std::max({E, HQ * HD, DI, FF, NU * FE, HCD}) + 255) / 256 * 256 * rows;
@@ -185,7 +187,7 @@ struct Scratch {
                                 b * NU, b * NU, 1, b * NU, b * NU, b * NU,
                                 attention_part_ml_floats(HQ, n_ctx, rows), attention_part_acc_floats_d(HQ, n_ctx, rows, HD),
                                 b * HCD, b * HCD, b * HCD, b * R, b * RP, b * HCD, b * NHC,
-                                b * PE, b * PHCD, b * PE, b * PHCD, b * PHCD, b * NU * GU,
+                                b * PE, b * PHCD, b * PE, b * PHCD, b * PHCD, b * NU * GU, b * ZX,
                                 (qmatvec_q8_bytes(q8_max_k) + 3) / 4};
         float *ids_f = nullptr, *gt = nullptr, *gp = nullptr, *gn = nullptr, *ge = nullptr, *gs = nullptr, *gc = nullptr;
         float** const ptrs[] = {&x, &x_alt, &xn, &qfull, &q, &k, &v, &attn, &proj, &ffg, &ffu, &act, &logits,
@@ -194,7 +196,7 @@ struct Scratch {
                                 &gt, &gp, &gn, &ge, &gs, &gc,
                                 &part_ml, &part_acc,
                                 &res, &res_alt, &hxn, &hlo, &hlo_pad, &hgate, &inj,
-                                &ple_emb, &ple_key, &ple_val, &ple_gated, &ple_normed, &moe_gu,
+                                &ple_emb, &ple_key, &ple_val, &ple_gated, &ple_normed, &moe_gu, &zx,
                                 &q8mem};
         static_assert(sizeof(sizes) / sizeof(sizes[0]) == sizeof(ptrs) / sizeof(ptrs[0]), "scratch table");
         if (!mem.alloc("/dev/shm/qwen_scratch.bin", sizes, ptrs, sizeof(sizes) / sizeof(sizes[0]),
@@ -238,10 +240,13 @@ struct RecurrentState {
                 sizes.push_back((size_t)(eng->ple_conv - 1) * eng->ple_ngram * eng->n_hc * eng->n_embd);
                 ptrs.push_back(&ple[l]);
             }
-            if (eng->layers[l].kind != LAYER_LINEAR_ATTN) continue;
+            const LayerKind k = eng->layers[l].kind;
+            if (k != LAYER_LINEAR_ATTN && k != LAYER_MAMBA2) continue;
             sizes.push_back((size_t)conv_dim * (eng->ssm_d_conv - 1));
             ptrs.push_back(&conv[l]);
-            sizes.push_back((size_t)eng->ssm_dt_rank * eng->ssm_d_state * eng->ssm_d_state);
+            // DeltaNet: dt_rank heads of d_state x d_state; Mamba-2: d_inner rows of d_state
+            sizes.push_back(k == LAYER_MAMBA2 ? (size_t)eng->ssm_d_inner * eng->ssm_d_state
+                                              : (size_t)eng->ssm_dt_rank * eng->ssm_d_state * eng->ssm_d_state);
             ptrs.push_back(&ssm[l]);
         }
         if (eng->ple_table.data) {
@@ -776,6 +781,7 @@ struct QwenModel {
 
         if (eng->n_hc > 0) return forward_hc(tokens, T, pos0, logits_out);
         if (eng->gemma4) return forward_gemma(tokens, T, pos0, logits_out);
+        if (eng->nemotron) return forward_nemotron(tokens, T, pos0, logits_out);
         prof.start();
         for (int t = 0; t < T; ++t) {
             if (tokens[t] < 0 || tokens[t] >= eng->vocab_size) { qwen_set_error("token %d out of range", tokens[t]); return -1; }
@@ -1119,6 +1125,166 @@ struct QwenModel {
         if (eng->logit_softcap > 0.0f &&
             (!check(gpu_softcap(s.logits, V, eng->logit_softcap, 0), "softcap") || !sync()))
             return -1;
+        if (logits_out) memcpy(logits_out, s.logits, sizeof(float) * V);
+        return 0;
+    }
+
+    // ------------------------------------------------------------ Nemotron-H (nemotron_h_moe)
+    //
+    // One op per block (llama.cpp nemotron-h.cpp): RMSNorm(x) * attn_norm -> Mamba-2 / attention / FFN -> + x. The
+    // normed input s.xn is quantized by a separate launch (n_embd 2688 is not a multiple of 256: the Q8_0 rows only).
+
+    bool nemotron_mamba(int l, const LayerWeights& L, int T) {
+        const int DI = eng->ssm_d_inner, NG = eng->ssm_n_group, NH = eng->ssm_dt_rank;
+        const int conv_dim = DI + 2 * NG * eng->ssm_d_state, ZX = DI + conv_dim + NH;
+        const qmatvec_q8* qd = q8_for(DI, T);
+        if (!matvec(L.W_ssm_in, s.xn, s.zx, T, P_LIN) ||
+            !check(gpu_mamba_conv(s.zx, ZX, DI, rs.conv[l], L.ssm_conv1d, L.ssm_conv1d_b, s.conv, conv_dim,
+                                  eng->ssm_d_conv, T, 0),
+                   "mamba_conv") ||
+            !check(gpu_mamba_scan(rs.ssm[l], s.conv, s.zx, ZX, DI + conv_dim, L.ssm_dt, L.ssm_a, L.ssm_d, s.lin, NH, DI,
+                                  NG, T, 0),
+                   "mamba_scan") ||
+            !check(gpu_mamba_gnorm(s.lin, s.zx, ZX, L.ssm_norm, s.z, DI, NG, T, (float)eng->eps, qd, 0), "mamba_gnorm"))
+            return false;
+        mark(s.z, DI, T, qd);
+        return matvec(L.W_ssm_out, s.z, s.proj, T, P_LIN);
+    }
+
+    bool nemotron_attention(const LayerWeights& L, int pos0, int T) {
+        const int HQ = eng->n_head, HD = eng->head_dim, DQ = HQ * HD;
+        if (!matvec_multi({{&L.Wq, s.qfull}, {&L.Wk, s.k}, {&L.Wv, s.v}}, s.xn, T, P_ATTN)) return false;
+        inference_kv_cache_t* kvc = eng->kvc;
+        __half* K = kv_cache_k_row(kvc, L.kv_slot, 0);
+        __half* V = kv_cache_v_row(kvc, L.kv_slot, 0);
+        if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
+        attention_opts o = {};
+        o.head_dim = HD;
+        o.kv_stride = kv_cache_d_kv(kvc);
+        o.no_qk_norm = 1;  // and no RoPE (n_rot 0)
+        const qmatvec_q8* q8 = q8_for(DQ, T);
+        if (!check(attention_forward_opts(s.qfull, s.k, s.v, nullptr, nullptr, K, V, kv_cache_block_shift(kvc),
+                                          kv_cache_block_stride(kvc), HQ, L.n_head_kv, 0, pos0, T, eng->rope_freq_base,
+                                          (float)eng->eps, s.q, s.part_ml, s.part_acc, s.attn, &o, q8, 0),
+                   "attention kernels"))
+            return false;
+        mark(s.attn, DQ, T, q8);
+        return matvec(L.Wo, s.attn, s.proj, T, P_ATTN);
+    }
+
+    // Squared-ReLU FFN: dense (up, down), or the experts (sigmoid router with bias, up, down) plus the shared
+    // expert, summed without a gate -> s.proj
+    bool nemotron_ffn(const LayerWeights& L, int T) {
+        const int E = eng->n_embd, NE = eng->n_expert, NU = eng->n_expert_used, FE = eng->n_ff_exp;
+        if (!L.moe) {
+            const int FF = L.W_up.N;
+            const qmatvec_q8* qf = q8_for(FF, T, true);
+            if (!matvec(L.W_up, s.xn, s.ffu, T, P_FFN) || !check(gpu_relu2(s.ffu, s.act, T, FF, FF, qf, 0), "relu2"))
+                return false;
+            mark(s.act, FF, T, qf);
+            return matvec(L.W_down, s.act, s.proj, T, P_FFN);
+        }
+        const int FS = L.W_up.N;
+        // the shared expert's up, the router and the experts' up all read s.xn (its int8 form): before relu2
+        // quantizes anything else
+        if (!matvec(L.W_up, s.xn, s.ffu, T, P_FFN) || !matvec(L.W_router, s.xn, s.r_logits, T, P_FFN) ||
+            !check(gpu_moe_router_sigmoid(s.r_logits, L.exp_probs_b, s.ids, s.wts, NE, NU, eng->expert_weights_norm,
+                                          eng->expert_weights_scale, T, 0),
+                   "moe_router_sigmoid"))
+            return false;
+        const bool grouped = T >= 8;
+        if (grouped) {
+            s.g_tile = std::min(qmatvec_id_batch_tile(L.We_up.type, FE, E), qmatvec_id_batch_tile(L.We_down.type, E, FE));
+            if (!check(gpu_moe_group(s.ids, T, NU, NE, s.g_tile, s.g_tok, s.g_pair, s.g_ntiles, s.g_tile_e,
+                                     s.g_tile_start, s.g_tile_n, 0),
+                       "moe_group"))
+                return false;
+        }
+        if (!matvec_id(L.We_up, s.xn, 0, s.moe_u, FE, T, grouped, P_FFN)) return false;
+        const qmatvec_q8* qx = q8_for(FE, T * NU, true);
+        if (!check(gpu_relu2(s.moe_u, s.moe_act, T * NU, FE, FE, qx, 0), "relu2 (experts)")) return false;
+        mark(s.moe_act, FE, T * NU, qx);
+        if (!matvec_id(L.We_down, s.moe_act, 1, s.moe_down, E, T, grouped, P_FFN)) return false;
+        const qmatvec_q8* qs = q8_for(FS, T, true);
+        if (!check(gpu_relu2(s.ffu, s.act, T, FS, FS, qs, 0), "relu2 (shared)")) return false;
+        mark(s.act, FS, T, qs);
+        if (!matvec(L.W_down, s.act, s.sh_out, T, P_FFN) ||
+            !check(gpu_moe_combine_scaled(s.moe_down, s.wts, s.sh_out, nullptr, nullptr, nullptr, s.proj, NU, E, T, 0),
+                   "moe_combine"))
+            return false;
+        // NEMOTRON_DUMP_LAYER=<layer>: its router logits, ids, weights, shared expert and FFN output as raw files in
+        // $NEMOTRON_DUMP_DIR (debugging against llama.cpp's ffn_moe_logits / _weights_scaled / ffn_shexp / l_out)
+        static const char* dump = getenv("NEMOTRON_DUMP_LAYER");
+        if (dump && atoi(dump) == (int)(&L - eng->layers.data())) {
+            if (!sync()) return false;
+            const char* dir = getenv("NEMOTRON_DUMP_DIR") ? getenv("NEMOTRON_DUMP_DIR") : ".";
+            const std::pair<const char*, std::pair<const void*, size_t>> outs[] = {
+                {"logits", {s.r_logits, (size_t)T * NE * 4}}, {"ids", {s.ids, (size_t)T * NU * 4}},
+                {"wts", {s.wts, (size_t)T * NU * 4}}, {"shexp", {s.sh_out, (size_t)T * E * 4}},
+                {"moe_up", {s.moe_u, (size_t)T * NU * FE * 4}}, {"out", {s.proj, (size_t)T * E * 4}}};
+            for (const auto& o2 : outs)
+                if (FILE* f = fopen((std::string(dir) + "/" + o2.first + ".bin").c_str(), "wb")) {
+                    fwrite(o2.second.first, 1, o2.second.second, f);
+                    fclose(f);
+                }
+        }
+        return true;
+    }
+
+    int forward_nemotron(const int* tokens, int T, int pos0, float* logits_out) {
+        const int E = eng->n_embd, V = eng->vocab_size;
+        const float eps = (float)eng->eps;
+        prof.start();
+        for (int t = 0; t < T; ++t) {
+            if (tokens[t] < 0 || tokens[t] >= V) { qwen_set_error("token %d out of range", tokens[t]); return -1; }
+            float* xt = s.x + (size_t)t * E;
+            if (dbg_res_in) {  // qwen_model_run_layers: this residual instead of the embeddings
+                memcpy(xt, dbg_res_in + (size_t)t * E, sizeof(float) * E);
+                continue;
+            }
+            if (qt_to_float(eng->token_embd.type, eng->token_embd.row(tokens[t]), xt, E) != 0) {
+                qwen_set_error("cannot decode token_embd type %d", eng->token_embd.type);
+                return -1;
+            }
+        }
+        // a sequence starting at position 0 starts from zero recurrent state
+        if (pos0 == 0 && !check(rs.reset(), "recurrent state reset")) return -1;
+        prof.lap(P_EMBED);
+        const int l0 = dbg_res_in ? dbg_l0 : 0, l1 = dbg_res_in ? dbg_l1 : eng->n_layer;
+        if (!check(gpu_add_rmsnorm(s.x, nullptr, s.x, eng->layers[l0].attn_norm, s.xn, E, T, eps, nullptr, 0),
+                   "rmsnorm") ||
+            !produced(s.xn, E, T))
+            return -1;
+        const bool per_layer = layer_cb || qwen_debug();
+        for (int l = l0; l < l1; ++l) {
+            const LayerWeights& L = eng->layers[l];
+            const bool ok = L.kind == LAYER_MAMBA2      ? nemotron_mamba(l, L, T)
+                            : L.kind == LAYER_FULL_ATTN ? nemotron_attention(L, pos0, T)
+                                                        : nemotron_ffn(L, T);
+            if (!ok || !section(L.kind == LAYER_MAMBA2 ? P_LIN : L.kind == LAYER_FULL_ATTN ? P_ATTN : P_FFN)) return -1;
+            // + residual, then the next block's input norm (the output norm after the last)
+            const float* w_next = l + 1 < eng->n_layer ? eng->layers[l + 1].attn_norm : eng->output_norm;
+            if (!check(gpu_add_rmsnorm(s.x, s.proj, s.x_alt, w_next, s.xn, E, T, eps, nullptr, 0), "add_rmsnorm"))
+                return -1;
+            std::swap(s.x, s.x_alt);
+            if (!produced(s.xn, E, T)) return -1;
+            if (per_layer) {
+                if (!sync()) return -1;
+                for (int t = 0; t < T; ++t) {
+                    const float* xt = s.x + (size_t)t * E;
+                    if (layer_cb) layer_cb(l, pos0 + t, xt, E, layer_cb_user);
+                    if (qwen_debug()) {
+                        double ss = 0.0;
+                        for (int i = 0; i < E; ++i) ss += (double)xt[i] * xt[i];
+                        fprintf(stderr, "[nemotron] pos %d blk %2d kind %d rms(x)=%.5g x[0..3]=%.5g %.5g %.5g %.5g\n",
+                                pos0 + t, l, (int)L.kind, sqrt(ss / E), xt[0], xt[1], xt[2], xt[3]);
+                    }
+                }
+                prof.start();
+            }
+        }
+        if (dbg_res_in) return sync() ? 0 : -1;  // no LM head
+        if (lm_head(T, nullptr) != 0) return -1;
         if (logits_out) memcpy(logits_out, s.logits, sizeof(float) * V);
         return 0;
     }
@@ -1633,7 +1799,7 @@ int qwen_model_prefill(qwen_model_t* model, const int* tokens, int n, int pos0, 
 }
 
 int qwen_model_run_layers(qwen_model_t* model, const int* tokens, int n, const float* res_in, int l0, int l1) {
-    if (!model || !tokens || !res_in || (model->eng->n_hc <= 0 && !model->eng->gemma4) || l0 < 0 ||
+    if (!model || !tokens || !res_in || (model->eng->n_hc <= 0 && !model->eng->gemma4 && !model->eng->nemotron) || l0 < 0 ||
         l1 > model->eng->n_layer || l0 >= l1 ||
         n > model->s.B) {
         qwen_set_error("qwen_model_run_layers: bad arguments");

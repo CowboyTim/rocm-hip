@@ -71,6 +71,7 @@ typedef struct {
     int v_norm;      // RMSNorm (no gamma) of each V head before it is cached
     int window;      // sliding window: a token at p attends to positions > p - window only; 0: all before it
     float scale;     // the scores' scale; 0: 1 / sqrt(head_dim) (Gemma-4: 1, its q / k norms replace it)
+    int no_qk_norm;  // Q and K as they come (no RMSNorm; Nemotron-H), q_norm / k_norm unused
 } attention_opts;
 
 hipError_t attention_forward_opts(const float* qfull, const float* k, const float* v, const float* q_norm,

@@ -80,7 +80,7 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
                                   const qmatvec_q8* q8, hipStream_t stream) {
     if (!opts) return hipErrorInvalidValue;
     const int D = opts->head_dim, hi = D == 128 ? 0 : D == 256 ? 1 : D == 512 ? 2 : -1;
-    int gated = opts->gated, window = opts->window, v_norm = opts->v_norm;
+    int gated = opts->gated, window = opts->window, v_norm = opts->v_norm, qk_norm = !opts->no_qk_norm;
     int rot_pairs = opts->rot_pairs > 0 ? opts->rot_pairs : n_rot / 2;
     if (hi < 0) return hipErrorInvalidValue;
     if (!g_prep[hi]) return hipErrorInvalidDeviceFunction;
@@ -95,7 +95,7 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
 
     void* a_prep[] = {(void*)&qfull, (void*)&k, (void*)&v, (void*)&q_norm, (void*)&k_norm, &q, &K, &V, &kv_stride,
                       &kv_shift, &kv_bstride, &n_q, &n_kv, &n_rot, &pos0, &freq_base, &eps, &gated, &rot_pairs,
-                      &v_norm};
+                      &v_norm, &qk_norm};
     hipError_t e = hipModuleLaunchKernel(g_prep[hi], (unsigned)(n_q + n_kv), (unsigned)T, 1, (unsigned)D, 1, 1, 0,
                                          stream,
                                          a_prep, nullptr);

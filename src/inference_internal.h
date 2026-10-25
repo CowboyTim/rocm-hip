@@ -43,6 +43,8 @@ struct QuantWeight {
 enum LayerKind : int8_t {
     LAYER_FULL_ATTN   = 0,  // attn_q/attn_k/attn_v/attn_output (+ q/k norm, gated Q)
     LAYER_LINEAR_ATTN = 1,  // Gated DeltaNet: attn_qkv, attn_gate, ssm_* tensors
+    LAYER_MAMBA2      = 2,  // Nemotron-H: a Mamba-2 mixer (ssm_in, conv1d, the selective scan, ssm_out), no FFN
+    LAYER_FFN         = 3,  // Nemotron-H: an FFN block alone (MoE or dense, squared ReLU), no token mixer
 };
 
 // Hyper-connection mixer (qwen4exp): the residual is n_hc parallel streams of n_embd. In place of every RMSNorm,
@@ -113,6 +115,17 @@ struct LayerWeights {
     const float* exp_scale = nullptr;                 // ffn_down_exps.scale [n_expert]: per-expert output scale
     const float* out_scale = nullptr;                 // layer_output_scale [1]: the layer output's scale
     QuantWeight We_gate_up;                           // ffn_gate_up_exps [n_expert * 2 n_ff_exp x n_embd]: [gate | up]
+
+    // Nemotron-H (nemotron_h_moe): one op per block, attn_norm before it. A full-attention block has no RoPE and no
+    // q/k norm. Mamba-2 (LAYER_MAMBA2): ssm_in -> [z d_inner | xBC conv_dim | dt n_head], conv1d (+ bias, SiLU) on
+    // xBC, the scan over n_head heads of d_inner / n_head dims with a d_state state, + D x, * SiLU(z), RMSNorm per
+    // group of d_inner / n_group (ssm_norm), ssm_out. FFN (LAYER_FFN): squared-ReLU experts (We_up, We_down; no
+    // gate) chosen by sigmoid + exp_probs_b, and the shared expert (W_up, W_down); dense: W_up, W_down.
+    // ssm_conv1d / ssm_dt / ssm_a / ssm_norm / W_ssm_out as for DeltaNet above (ssm_a = -exp(A_log) per head).
+    QuantWeight W_ssm_in;                             // ssm_in [2 d_inner + 2 n_group d_state + n_head x n_embd]
+    const float* ssm_conv1d_b = nullptr;              // [conv_dim]
+    const float* ssm_d = nullptr;                     // [n_head]: y += D x
+    const float* exp_probs_b = nullptr;               // [n_expert]: added to the router's sigmoid for the choice only
 };
 
 // MTP draft head (a qwen4exp nextn sidecar GGUF, inference_set_draft_model): one more full-attention MoE block
@@ -237,6 +250,10 @@ struct inference_model {
     int swa_window = 0;                                 // the sliding window
     int swa_ring_opt = -1;                              // inference_set_swa_ring: -1 auto, 0 no ring, N >= N positions
     float embd_scale = 1.0f;                            // token embeddings * sqrt(n_embd)
+    // Nemotron-H (nemotron_h_moe): ssm_* above describe its Mamba-2 layers (n_head = ssm_dt_rank)
+    bool nemotron = false;
+    float expert_weights_scale = 1.0f;                  // MoE: the chosen experts' weights * this (2.5)
+    bool expert_weights_norm = true;                    // MoE: the chosen sigmoid weights normalized to sum 1
     float logit_softcap = 0.0f;                         // final_logit_softcapping (0: none)
 };
 

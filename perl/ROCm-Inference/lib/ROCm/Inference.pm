@@ -165,6 +165,10 @@ sub _render_template {
         $ctx{$_} = $ctx{$_} ? JSON::PP::true() : JSON::PP::false();
     }
     my $env = Minijinja::minijinja();
+    # as transformers' apply_chat_template (and llama.cpp) render chat templates: a block tag's newline and the
+    # whitespace before it on its line go (Nemotron-3's template depends on it; Qwen's and Gemma's use {%- -%})
+    Minijinja::set_trim_blocks($env, 1);
+    Minijinja::set_lstrip_blocks($env, 1);
     Minijinja::add_filter($env, "py_$_", $PY_METHODS{$_}) for grep { ref $PY_METHODS{$_} } keys %PY_METHODS;
     Minijinja::add_filter($env, 'tojson', \&_py_tojson);
     Minijinja::add_function($env, 'raise_exception', sub { die(($_[0] // 'template error') . "\n") });

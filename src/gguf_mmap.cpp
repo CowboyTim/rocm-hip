@@ -665,6 +665,7 @@ static int64_t kv_as_int64(const gguf_model_t *m, int64_t idx) {
         case GGUF_TYPE_INT32:  return (int64_t)kv->scalar.v_i32;
         case GGUF_TYPE_UINT64: return (int64_t)kv->scalar.v_u64;
         case GGUF_TYPE_INT64:  return kv->scalar.v_i64;
+        case GGUF_TYPE_BOOL:   return kv->scalar.v_bool ? 1 : 0;
         default:               return 0;
     }
 }

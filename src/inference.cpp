@@ -545,12 +545,107 @@ static bool load_layer_gemma4(inference_model* m, int i, LayerWeights& L, const 
 }
 
 // Bind every per-layer tensor, classify each block, and check shapes against the hyperparameters
+// Nemotron-H (nemotron_h_moe; llama.cpp nemotron-h.cpp): a block's kind from the per-layer arrays, as llama.cpp
+// classifies it: head_count_kv[i] == 0 and feed_forward_length[i] == 0: Mamba-2; feed_forward_length[i] == 0:
+// attention; else an FFN block
+struct NemotronShape {
+    std::vector<int> n_kv, n_ff;
+};
+
+static bool load_nemotron(inference_model* m, NemotronShape& g) {
+    const std::string a = m->model_name + ".";
+    if (!kv_int_array(m->gguf, (a + "attention.head_count_kv").c_str(), g.n_kv) ||
+        !kv_int_array(m->gguf, (a + "feed_forward_length").c_str(), g.n_ff) || (int)g.n_kv.size() < m->n_layer ||
+        (int)g.n_ff.size() < m->n_layer) {
+        set_error("nemotron_h: per-layer head_count_kv / feed_forward_length missing");
+        return false;
+    }
+    if (gguf_arch_int(m->gguf, "moe_latent_size", 0) > 0) {
+        set_error("nemotron_h: the latent MoE (Nemotron-3-Super) is not supported yet");
+        return false;
+    }
+    m->nemotron = true;
+    m->n_head_kv = *std::max_element(g.n_kv.begin(), g.n_kv.begin() + m->n_layer);
+    m->n_ff = 0;
+    m->n_rot = 0;  // no RoPE: the Mamba-2 layers carry the positions
+    m->attn_gated = false;
+    m->expert_weights_scale = gguf_arch_float(m->gguf, "expert_weights_scale", 1.0f);
+    m->expert_weights_norm = gguf_arch_int(m->gguf, "expert_weights_norm", 1) != 0;
+    const int DI = m->ssm_d_inner, NH = m->ssm_dt_rank, NG = m->ssm_n_group, DS = m->ssm_d_state;
+    if (m->ssm_d_conv < 2 || DI <= 0 || NH <= 0 || NG <= 0 || DS != 128 || DI % NH != 0 || NH % NG != 0 ||
+        DI % NG != 0 || (DI / NG) % 256 != 0 || m->head_dim != 128) {
+        set_error("nemotron_h: Mamba-2 shape (d_inner %d, heads %d, groups %d, d_state %d, head_dim %d) not supported",
+                  DI, NH, NG, DS, m->head_dim);
+        return false;
+    }
+    return true;
+}
+
+static bool load_layer_nemotron(inference_model* m, int i, LayerWeights& L, const NemotronShape& g) {
+    gguf_model_t* f = m->gguf;
+    const int E = m->n_embd, HQ = m->n_head, HD = m->head_dim;
+    const int DI = m->ssm_d_inner, NH = m->ssm_dt_rank, NG = m->ssm_n_group, DS = m->ssm_d_state;
+    const int conv_dim = DI + 2 * NG * DS;
+    char name[128];
+    auto nm = [&](const char* t) { snprintf(name, sizeof(name), "blk.%d.%s", i, t); return name; };
+    if (!bind_norm(f, nm("attn_norm.weight"), E, L.attn_norm, true)) return false;
+    if (g.n_kv[i] == 0 && g.n_ff[i] == 0) {
+        L.kind = LAYER_MAMBA2;
+        if (!bind_weight(f, nm("ssm_in.weight"), L.W_ssm_in, true) ||
+            !bind_weight(f, nm("ssm_out.weight"), L.W_ssm_out, true) ||
+            !bind_f32(f, nm("ssm_conv1d.weight"), m->ssm_d_conv, conv_dim, L.ssm_conv1d) ||
+            !bind_norm(f, nm("ssm_conv1d.bias"), conv_dim, L.ssm_conv1d_b, true) ||
+            !bind_norm(f, nm("ssm_dt.bias"), NH, L.ssm_dt, true) ||
+            !bind_f32(f, nm("ssm_a"), 1, NH, L.ssm_a) || !bind_f32(f, nm("ssm_d"), 1, NH, L.ssm_d) ||
+            !bind_f32(f, nm("ssm_norm.weight"), DI / NG, NG, L.ssm_norm))
+            return false;
+        return check_shape("ssm_in", i, L.W_ssm_in, 2 * DI + 2 * NG * DS + NH, E) &&
+               check_shape("ssm_out", i, L.W_ssm_out, E, DI);
+    }
+    if (g.n_ff[i] == 0) {  // attention: no RoPE, no q/k norm, no gate
+        L.kind = LAYER_FULL_ATTN;
+        L.kv_slot = m->n_kv_layers++;
+        L.n_head_kv = g.n_kv[i];
+        if (!bind_weight(f, nm("attn_q.weight"), L.Wq, true) || !bind_weight(f, nm("attn_k.weight"), L.Wk, true) ||
+            !bind_weight(f, nm("attn_v.weight"), L.Wv, true) || !bind_weight(f, nm("attn_output.weight"), L.Wo, true))
+            return false;
+        return check_shape("attn_q", i, L.Wq, HQ * HD, E) && check_shape("attn_k", i, L.Wk, L.n_head_kv * HD, E) &&
+               check_shape("attn_v", i, L.Wv, L.n_head_kv * HD, E) && check_shape("attn_output", i, L.Wo, E, HQ * HD);
+    }
+    L.kind = LAYER_FFN;
+    L.moe = find_tensor_index(f, nm("ffn_gate_inp.weight")) >= 0;
+    if (!L.moe) {
+        if (!bind_weight(f, nm("ffn_up.weight"), L.W_up, true) || !bind_weight(f, nm("ffn_down.weight"), L.W_down, true))
+            return false;
+        return check_shape("ffn_up", i, L.W_up, g.n_ff[i], E) && check_shape("ffn_down", i, L.W_down, E, g.n_ff[i]);
+    }
+    const int NE = m->n_expert, FE = m->n_ff_exp, FS = m->n_ff_shexp;
+    if (NE <= 0 || m->n_expert_used <= 0 || m->n_expert_used > NE || FE <= 0 || FS <= 0) {
+        set_error("blk.%d: bad MoE hparams (experts %d used %d ff_exp %d ff_shexp %d)", i, NE, m->n_expert_used, FE, FS);
+        return false;
+    }
+    if (!bind_weight(f, nm("ffn_gate_inp.weight"), L.W_router, true) ||
+        !bind_norm(f, nm("exp_probs_b.bias"), NE, L.exp_probs_b, true) ||
+        !bind_weight(f, nm("ffn_up_exps.weight"), L.We_up, true) ||
+        !bind_weight(f, nm("ffn_down_exps.weight"), L.We_down, true) ||
+        !bind_weight(f, nm("ffn_up_shexp.weight"), L.W_up, true) ||
+        !bind_weight(f, nm("ffn_down_shexp.weight"), L.W_down, true))
+        return false;
+    return check_shape("ffn_gate_inp", i, L.W_router, NE, E) && check_shape("ffn_up_exps", i, L.We_up, NE * FE, E) &&
+           check_shape("ffn_down_exps", i, L.We_down, NE * E, FE) && check_shape("ffn_up_shexp", i, L.W_up, FS, E) &&
+           check_shape("ffn_down_shexp", i, L.W_down, E, FS);
+}
+
 static bool load_model_weights(inference_model* m, const std::vector<int>& ple_layers) {
     m->layers.resize(m->n_layer);
     Gemma4Shape g4;
+    NemotronShape gn;
     if (m->model_name == "gemma4" && !load_gemma4(m, g4)) return false;
+    if (m->model_name == "nemotron_h_moe" && !load_nemotron(m, gn)) return false;
     for (int i = 0; i < m->n_layer; ++i)
-        if (!(m->gemma4 ? load_layer_gemma4(m, i, m->layers[i], g4) : load_layer(m, m->gguf, i, m->layers[i], ple_layers)))
+        if (!(m->gemma4     ? load_layer_gemma4(m, i, m->layers[i], g4)
+              : m->nemotron ? load_layer_nemotron(m, i, m->layers[i], gn)
+                            : load_layer(m, m->gguf, i, m->layers[i], ple_layers)))
             return false;
     return true;
 }

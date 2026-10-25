@@ -17,10 +17,11 @@ my $m = load_model($path);
 kv_cache_init($m, 4096);
 my @messages = ({ role => 'system', content => 'Answer briefly.' },
                 { role => 'user', content => 'Name three primary colors.' });
-# the user turn and the generation prompt without thinking, as the chat format writes them (Qwen or Gemma-4)
+# the user turn and the generation prompt without thinking (an empty think block), as the chat format writes them
+# (Qwen / Nemotron-3 or Gemma-4)
 my $gemma = ROCm::Inference::reply_tags($m) == $ROCm::Inference::REPLY_TAG_SETS{gemma4};
 my ($user, $gen) = $gemma ? (qr/<\|turn>user\n(.*?)<turn\|>/s, qr/<\|turn>model\n<\|channel>thought\n<channel\|>\z/)
-                          : (qr/<\|im_start\|>user\n(.*?)<\|im_end\|>/s, qr/<\|im_start\|>assistant\n<think>\n\n<\/think>\n\n\z/);
+                          : (qr/<\|im_start\|>user\n(.*?)<\|im_end\|>/s, qr/<\|im_start\|>assistant\n<think>\s*<\/think>\s*\z/);
 my $prompt = chat_render($m, \@messages, enable_thinking => 0);
 is(($prompt =~ $user)[0], 'Name three primary colors.', 'the template renders the user turn');
 like($prompt, $gen, 'generation prompt without thinking');

@@ -78,15 +78,18 @@ __device__ float block_max(float v) {
     return m;
 }
 
-// RMSNorm (gamma w; none if NULL) then NeoX RoPE of one head held one value per thread (D threads); returns this
-// thread's value. Pairs (i, i + n_rot / 2) with i < rot_pairs rotate (theta_i = pos * base^(-2 i / n_rot)), the
-// others stay as they are; n_rot 0: no RoPE.
+// RMSNorm (gamma w; none if NULL; no norm at all unless norm) then NeoX RoPE of one head held one value per thread
+// (D threads); returns this thread's value. Pairs (i, i + n_rot / 2) with i < rot_pairs rotate (theta_i = pos *
+// base^(-2 i / n_rot)), the others stay as they are; n_rot 0: no RoPE.
 template <int D>
-__device__ float norm_rope(float x, const float* w, int n_rot, int rot_pairs, int pos, float freq_base, float eps) {
+__device__ float norm_rope(float x, const float* w, int n_rot, int rot_pairs, int pos, float freq_base, float eps,
+                           bool norm = true) {
     __shared__ float v[D];
     const int d = threadIdx.x;
-    const float ss = block_sum<D>(x * x);
-    x = x * rsqrtf(ss / D + eps) * (w ? w[d] : 1.0f);
+    if (norm) {  // uniform
+        const float ss = block_sum<D>(x * x);
+        x = x * rsqrtf(ss / D + eps) * (w ? w[d] : 1.0f);
+    }
     v[d] = x;
     __syncthreads();
     const int half = n_rot / 2;
@@ -107,7 +110,7 @@ __device__ __forceinline__ void attn_prep_body(const float* qfull, const float* 
                                                const float* k_norm, float* q_out, __half* K, __half* V, int kv_stride,
                                                int kv_shift, long long kv_bstride, int n_q, int n_kv, int n_rot,
                                                int pos0, float freq_base, float eps, int gated, int rot_pairs,
-                                               int v_norm) {
+                                               int v_norm, int qk_norm) {
     const int b = blockIdx.x, d = threadIdx.x, z = blockIdx.y, pos = pos0 + z;
     const int qs = gated ? 2 * D : D;  // a head's stride in attn_q's output
     qfull += (size_t)z * n_q * qs;
@@ -118,10 +121,10 @@ __device__ __forceinline__ void attn_prep_body(const float* qfull, const float* 
     __half* v_row = V + kv_row(pos, kv_stride, kv_shift, kv_bstride);
     if (b < n_q) {
         const float x = qfull[(size_t)b * qs + d];
-        q_out[b * D + d] = norm_rope<D>(x, q_norm, n_rot, rot_pairs, pos, freq_base, eps);
+        q_out[b * D + d] = norm_rope<D>(x, q_norm, n_rot, rot_pairs, pos, freq_base, eps, qk_norm);
     } else {
         const int g = b - n_q;
-        const float x = norm_rope<D>(k[g * D + d], k_norm, n_rot, rot_pairs, pos, freq_base, eps);
+        const float x = norm_rope<D>(k[g * D + d], k_norm, n_rot, rot_pairs, pos, freq_base, eps, qk_norm);
         k_row[g * D + d] = __float2half(x);
         const float vv = v[g * D + d];
         v_row[g * D + d] = __float2half(v_norm ? norm_rope<D>(vv, nullptr, 0, 0, pos, freq_base, eps) : vv);
@@ -398,9 +401,9 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
         attn_prep_##D(const float* qfull, const float* k, const float* v, const float* q_norm,                \
                       const float* k_norm, float* q_out, __half* K, __half* V, int kv_stride, int kv_shift,    \
                       long long kv_bstride, int n_q, int n_kv, int n_rot, int pos0, float freq_base, float eps, \
-                      int gated, int rot_pairs, int v_norm) {                                                \
+                      int gated, int rot_pairs, int v_norm, int qk_norm) {                                   \
         attn_prep_body<D>(qfull, k, v, q_norm, k_norm, q_out, K, V, kv_stride, kv_shift, kv_bstride, n_q, n_kv, \
-                          n_rot, pos0, freq_base, eps, gated, rot_pairs, v_norm);                            \
+                          n_rot, pos0, freq_base, eps, gated, rot_pairs, v_norm, qk_norm);                   \
     }                                                                                                        \
     extern "C" __global__ void __launch_bounds__(CH)                                                         \
         attn_partial_##D(const float* q, const __half* K, const __half* V, int kv_stride, int kv_shift,       \
