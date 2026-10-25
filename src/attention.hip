@@ -281,37 +281,33 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
         const int P0 = c * chunk + b * FB;
         if (P0 + FB <= lo0) continue;  // before every token's window (uniform)
         __syncthreads();  // the previous block's sK / sVt reads are done (and, the first time, sQ is written)
-        // Stage the NG KV heads' K blocks (16 positions x D dims) and V blocks (16 x the DH dims of slice ds),
-        // 8 halves per uint4. Positions no token of the tiles sees are zeroed: they are masked, but 0 * (stale
-        // V) must stay 0.
+        // Stage the NG KV heads' K blocks (16 positions x D dims; 8 halves per uint4, consecutive lanes on
+        // consecutive dims) and V blocks transposed (16 x the DH dims of slice ds): a thread takes positions 2 pp
+        // and 2 pp + 1 of 8 dims and writes each dim's pair as one dword, consecutive lanes on consecutive pairs
+        // (single halves from lanes 8 dims apart hit one LDS bank 32 times). Positions no token of the tiles
+        // sees are zeroed: they are masked, but 0 * (stale V) must stay 0.
 #pragma unroll
         for (int k = 0; k < NG * FB * D / 8 / NTH; ++k) {
             const int idx = tid + NTH * k, gl = idx / (FB * D / 8), r = idx % (FB * D / 8);
             const int p = r / (D / 8), d = 8 * (r % (D / 8));
-            uint4 ku = make_uint4(0, 0, 0, 0), vu = ku;
-            if (P0 + p <= pos0 + zmax) {
-                const size_t off = kv_row(P0 + p, kv_stride, kv_shift, kv_bstride) + (size_t)(g0 + gl) * D + d;
-                ku = *(const uint4*)(K + off);
-                if constexpr (DS == 1) vu = *(const uint4*)(V + off);
-            }
+            uint4 ku = make_uint4(0, 0, 0, 0);
+            if (P0 + p <= pos0 + zmax)
+                ku = *(const uint4*)(K + kv_row(P0 + p, kv_stride, kv_shift, kv_bstride) + (size_t)(g0 + gl) * D + d);
             *(uint4*)&sK[gl][p][d] = ku;
-            if constexpr (DS == 1) {  // the whole V row: staged with K
-                const _Float16* vh = (const _Float16*)&vu;
-#pragma unroll
-                for (int e = 0; e < 8; ++e) sVt[gl][d + e][p] = vh[e];
-            }
         }
 #pragma unroll
-        for (int k = 0; k < (DS == 1 ? 0 : NG * FB * DH / 8 / NTH); ++k) {
-            const int idx = tid + NTH * k, gl = idx / (FB * DH / 8), r = idx % (FB * DH / 8);
-            const int p = r / (DH / 8), d = 8 * (r % (DH / 8));
-            uint4 vu = make_uint4(0, 0, 0, 0);
-            if (P0 + p <= pos0 + zmax)
-                vu = *(const uint4*)(V + kv_row(P0 + p, kv_stride, kv_shift, kv_bstride) + (size_t)(g0 + gl) * D +
-                                     ds * DH + d);
-            const _Float16* vh = (const _Float16*)&vu;
+        for (int k = 0; k < NG * (FB / 2) * (DH / 8) / NTH; ++k) {
+            const int idx = tid + NTH * k, pp = idx % (FB / 2), r = idx / (FB / 2);
+            const int gl = r / (DH / 8), d = 8 * (r % (DH / 8));
+            uint4 v0 = make_uint4(0, 0, 0, 0), v1 = v0;
+            const size_t col = (size_t)(g0 + gl) * D + ds * DH + d;
+            if (P0 + 2 * pp <= pos0 + zmax) v0 = *(const uint4*)(V + kv_row(P0 + 2 * pp, kv_stride, kv_shift, kv_bstride) + col);
+            if (P0 + 2 * pp + 1 <= pos0 + zmax)
+                v1 = *(const uint4*)(V + kv_row(P0 + 2 * pp + 1, kv_stride, kv_shift, kv_bstride) + col);
+            const uint16_t* a0 = (const uint16_t*)&v0;
+            const uint16_t* a1 = (const uint16_t*)&v1;
 #pragma unroll
-            for (int e = 0; e < 8; ++e) sVt[gl][d + e][p] = vh[e];
+            for (int e = 0; e < 8; ++e) ((uint32_t*)&sVt[gl][d + e][0])[pp] = (uint32_t)a0[e] | ((uint32_t)a1[e] << 16);
         }
         __syncthreads();
 

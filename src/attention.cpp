@@ -20,6 +20,8 @@ static hipFunction_t g_flash128_g2 = nullptr, g_flash256_h2t2 = nullptr, g_flash
 // attn_flash takes batches of at least this many tokens. QMATVEC_NO_WMMA (qmatvec.h) also turns it off, so
 // that prefill can be compared bit for bit with token by token.
 static const int kFlashMinT = 16;
+// attn_flash splits a token's positions until the launch has this many workgroups (4 per WGP of the 20)
+static const long long kFlashWgs = 160;
 static bool g_flash_off = false;
 
 int attention_init(const char* co_path) {
@@ -117,8 +119,14 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
     else if (D == 256 && ratio % 2 == 0) flash = g_flash256_h2t2, nh = 2, tt = 2;
     else if (D == 512 && ratio % 2 == 0) flash = g_flash512_h2s2, nh = 2, ds = 2;
     if (T >= kFlashMinT && !g_flash_off && flash) {
-        // Up to ATTN_MAX_SPLITS ranges per token, each a multiple of 16 positions
-        int n_split = std::min(nc, ATTN_MAX_SPLITS);
+        // Ranges of positions per token (each a multiple of 16 positions, at most ATTN_MAX_SPLITS): only as many
+        // as it takes to give the GPU ~kFlashWgs workgroups. A prefill batch has enough without splitting, and
+        // every split costs partial results written and merged (one split: Gemma-4 prefill +10%, Qwen3.6 +4%);
+        // a few tokens at a long context need them
+        const long long wgs = (long long)(n_q / nh * ds) * ((T + 16 * tt - 1) / (16 * tt));
+        int n_split = 1;
+        while (n_split < std::min(nc, ATTN_MAX_SPLITS) && wgs * n_split < kFlashWgs) n_split *= 2;
+        n_split = std::min(n_split, std::min(nc, ATTN_MAX_SPLITS));
         int chunk = ((n_last + n_split - 1) / n_split + 15) / 16 * 16;
         n_split = (n_last + chunk - 1) / chunk;
         void* a_flash[] = {(void*)&qc, &K, &V, &kv_stride, &kv_shift, &kv_bstride, &pos0, &T, &n_q, &n_kv, &chunk,

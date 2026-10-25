@@ -2333,6 +2333,15 @@ one BF16 layer). Reference: `llama.cpp/src/models/gemma4.cpp` + `gemma4-common.h
     0.999: MoE near-ties amplify the FP16 rounding); forward_verify 4B / 0.6B / 35B, gemma4_verify PASS.
     **Prefill: FP4 file 758 -> 1,386 tok/s, Q8 file 692 -> 1,104 tok/s** (2,792 tokens; generation 44 / 35).
     Qwen3.6-35B unchanged (2,066 tok/s on its 2,661 tokens).
+  - **Done: fewer flash splits.** attn_flash split every token's positions into up to ATTN_MAX_SPLITS = 8 ranges,
+    each written as partial results and merged by attn_combine (~100+ MB per layer); a prefill batch has enough
+    workgroups without. Now the fewest splits that give ~160 workgroups (kFlashWgs; a 1,024-token batch: 1).
+    Prefill: Gemma FP4 1,388 -> **1,540 tok/s**, Q8 1,104 -> 1,195, Qwen3.6-35B 2,066 -> 2,134, Qwen3.5-4B 1,826
+    -> 1,864 (measured with ATTN_FLASH_SPLITS 8 / 4 / 2 / 1 first). The V block transpose now writes position
+    pairs as dwords from consecutive lanes (was single halves 64 dwords apart: 32-way LDS bank conflicts):
+    speed-neutral. The flash kernels use 225 - 247 VGPRs and 52 - 59 KB LDS: 2 waves per SIMD, no prefetch of
+    the next K/V block (no registers left): ~5 TFLOPS of ~59. Attention outputs vs attn_partial still >= 0.999999,
+    forward_verify (64-token blocks: the split path) and gemma4_verify PASS.
   - **Left (profile, FP4 file, 2.0 s):** attn_flash 512 0.32 s + 256 0.24 s, the WMMA matmuls ~1.0 s (ROCmFP4,
     Q5_K dense and experts), add_rmsnorm_rows 0.08 s. Generation (44 / 35 tok/s) not looked at yet.
 - **Step 5 — DONE ✅ (2026-10-25): sliding-window ring KV cache.** `inference_kv_cache_init` puts the 25
