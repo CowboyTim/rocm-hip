@@ -129,13 +129,14 @@ uint32_t ascii_lower(uint32_t c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
 
 // ---------------------------------------------------------------- pre-tokenizers
 
-enum PreType { PRE_QWEN2, PRE_QWEN35, PRE_GEMMA4 };
+enum PreType { PRE_QWEN2, PRE_QWEN35, PRE_GEMMA4, PRE_LLAMA3 };
 
 // Word lengths (in codepoints) for llama.cpp's qwen2 / qwen35 regex:
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N} | ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
-// qwen35 treats combining marks (\p{M}) as letters in the letter run and the punctuation run.
-// Port of unicode_regex_split_custom_qwen2/_qwen35.
-std::vector<size_t> split_qwen(const std::vector<uint32_t>& cpts, bool marks) {
+// qwen35 treats combining marks (\p{M}) as letters in the letter run and the punctuation run. llama3 (also
+// llama.cpp's pre-tokenizer for pixtral, Nemotron-3) is qwen2's with \p{N}{1,3}: digits in runs of up to max_digits.
+// Port of unicode_regex_split_custom_qwen2/_qwen35/_llama3.
+std::vector<size_t> split_qwen(const std::vector<uint32_t>& cpts, bool marks, int max_digits = 1) {
     std::vector<size_t> words;
     const size_t end = cpts.size();
     const uint16_t letter = marks ? (CPT_LETTER | CPT_ACCENT_MARK) : CPT_LETTER;
@@ -177,8 +178,14 @@ std::vector<size_t> split_qwen(const std::vector<uint32_t>& cpts, bool marks) {
             }
         }
 
-        // \p{N}
-        if (f & CPT_NUMBER) { add(++pos); continue; }
+        // \p{N}{1,max_digits}
+        if (f & CPT_NUMBER) {
+            size_t n = 0;
+            while ((int)n < max_digits && (flags(pos + n) & CPT_NUMBER)) n++;
+            pos += n;
+            add(pos);
+            continue;
+        }
 
         // <space>?[^\s\p{L}(\p{M})\p{N}]+[\r\n]*
         const uint16_t stop = CPT_WHITESPACE | letter | CPT_NUMBER;
@@ -348,7 +355,7 @@ struct tokenizer {
     void encode_text(const std::string& text, std::vector<int>& out) const {
         if (pre == PRE_GEMMA4) { encode_text_gemma4(text, out); return; }
         const std::vector<uint32_t> cpts = utf8_to_cpts(text);
-        const std::vector<size_t> words = split_qwen(cpts, pre == PRE_QWEN35);
+        const std::vector<size_t> words = split_qwen(cpts, pre == PRE_QWEN35, pre == PRE_LLAMA3 ? 3 : 1);
         const ByteMap& bm = byte_map();
         size_t start = 0;
         for (size_t len : words) {
@@ -356,7 +363,10 @@ struct tokenizer {
             for (size_t i = start; i < start + len; ++i) append_utf8(raw, cpts[i]);
             start += len;
             for (unsigned char ch : raw) enc += bm.byte_to_utf8[ch];
-            bpe_word(enc, out);
+            // llama3 sets ignore_merges: a word that is a token is that token, without merging
+            const int whole = pre == PRE_LLAMA3 ? lookup(enc) : -1;
+            if (whole >= 0) out.push_back(whole);
+            else bpe_word(enc, out);
         }
     }
 
@@ -514,8 +524,12 @@ tokenizer_t* tokenizer_load_from_gguf(void* gguf_model) {
     if (gemma4) pt = PRE_GEMMA4;
     else if (pre && strcmp(pre, "qwen35") == 0) pt = PRE_QWEN35;
     else if (pre && strcmp(pre, "qwen2") == 0) pt = PRE_QWEN2;
+    else if (pre && (!strcmp(pre, "llama3") || !strcmp(pre, "llama-v3") || !strcmp(pre, "llama-bpe") ||
+                     !strcmp(pre, "pixtral")))
+        pt = PRE_LLAMA3;
     else {
-        INFER_LOG("[tokenizer] unsupported tokenizer.ggml.pre '%s' (supported: qwen35, qwen2)\n", pre ? pre : "");
+        INFER_LOG("[tokenizer] unsupported tokenizer.ggml.pre '%s' (supported: qwen35, qwen2, llama3, pixtral)\n",
+                  pre ? pre : "");
         return nullptr;
     }
 
@@ -545,7 +559,8 @@ tokenizer_t* tokenizer_load_from_gguf(void* gguf_model) {
     t->eos_id = (int)kv_int(m, "tokenizer.ggml.eos_token_id", -1);
     t->pad_id = (int)kv_int(m, "tokenizer.ggml.padding_token_id", -1);
     t->unk_id = (int)kv_int(m, "tokenizer.ggml.unknown_token_id", -1);
-    t->add_bos = kv_bool(m, "tokenizer.ggml.add_bos_token", false) || pt == PRE_GEMMA4;  // as llama.cpp forces it
+    // llama.cpp forces BOS for gemma4; llama3 / pixtral default to it unless the GGUF says otherwise
+    t->add_bos = kv_bool(m, "tokenizer.ggml.add_bos_token", pt == PRE_LLAMA3) || pt == PRE_GEMMA4;
     std::vector<int> eog_ids = {t->eos_id};
     for (const char* key : {"tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id", "tokenizer.ggml.fim_pad_token_id",
                             "tokenizer.ggml.fim_rep_token_id", "tokenizer.ggml.fim_sep_token_id"})

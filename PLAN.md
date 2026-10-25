@@ -2418,6 +2418,34 @@ one BF16 layer). Reference: `llama.cpp/src/models/gemma4.cpp` + `gemma4-common.h
   sliding-window ring KV (done; the block store needs set_swa_ring 0); later a `gemma4-assistant` draft head if one appears (llama.cpp
   supports it).
 
+### Nemotron-3 (`nemotron_h_moe`) — in progress (2026-10-25)
+
+Files: `/models/Nemotron-3-Nano-30B-A3B-Q8_0.gguf` (verification: Q8_0 + F32) and
+`/models/NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_XL-*` (Q8_0 / Q4_K / Q5_1 / BF16 / Q5_K: all with int8 / WMMA
+kernels already). Reference: `llama.cpp/src/models/nemotron-h.cpp`, `mamba-base.cpp` (build_mamba2_layer),
+ggml-cpu `ssm_scan_f32`.
+- **Shape (Nano):** 52 blocks of one kind each (norm -> op -> residual): 23 Mamba-2 (`ssm_*`: in_proj 2688 ->
+  10304 = z 4096 | xBC 6144 | dt 64; conv1d k 4 + bias + SiLU on xBC; 64 heads x 64 dims, d_state 128, 8 groups;
+  y = scan + D x, * SiLU(z), grouped RMSNorm (8 groups of 512, `ssm_norm`), out_proj 4096 -> 2688); 23 MoE (128
+  experts top-6, sigmoid router with `exp_probs_b` bias for the choice, weights normalized and * 2.5, squared-ReLU
+  up -> down, no gate; shared expert up 3712 / down, squared ReLU); 6 attention (32 q / 2 kv heads x 128, RoPE
+  over 84 dims, base 10k, no q/k norm). Vocab 131,072, untied output. Super (88 blocks): 512 experts in a 1024-dim
+  latent (`ffn_latent_down` / `ffn_latent_up` around the experts).
+- **Scan (per token):** per head dA = exp(softplus(dt + dt_b) A); per (head, dim) row of the 128-wide state:
+  s = s dA + B (x dt), y = sum(s C) (B, C per group); state 64 x 64 x 128 floats per layer (2 MB).
+- **Tokenizer — DONE ✅:** gpt2 BPE, pre `pixtral` = llama.cpp's LLAMA3 (qwen2's regex with \p{N}{1,3},
+  ignore_merges, BOS): `PRE_LLAMA3`; `tests/data/nemotron3_tokenizer.tsv` 27/27, the others unchanged.
+- **Chat:** ChatML + `<think>` + the Qwen3.5 XML tool calls: the existing reply tags.
+- **Steps:** (1) tokenizer (done); (2) loader + forward (Mamba-2 kernels: conv, scan, gated grouped norm; the
+  MoE variant; attention reuses attention_forward), verified per layer vs `ref_dump` on Nano; (3) speed (a
+  chunked scan for prefill); (4) Super (latent MoE).
+
+### BF16 dense prefill (ABC.gguf, a Qwen3.5 27B in BF16, 2026-10-25)
+
+Correct output; generation 4.1 tok/s (54 GB per token: the bandwidth); prefill **7.8 tok/s** (2,661 tokens in
+342 s): dense BF16 runs matmul_f_bf16 (float, 8 tokens per weight read). Needs a BF16 WMMA matmul
+(v_wmma_f32_16x16x16_bf16, activations rounded to BF16 as ggml does). Not started.
+
 ### Web service: nginx -> Perl, SSE — DONE ✅ (2026-10-22)
 
 Built as designed below (user, 2026-10-22: a unix socket, nginx does the hard work; the route helpers a
