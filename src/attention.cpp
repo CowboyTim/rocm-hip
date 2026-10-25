@@ -141,6 +141,7 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
             oz.d0 += blk * 8;
             oz.dK += blk;
             oz.bsK += blk * 16;
+            oz.s0 += blk * 8;
         }
         void* a_part[] = {(void*)&qz, &K, &V, &kv_stride, &kv_shift, &kv_bstride, (void*)&p0, &n_q, &n_kv, &scale,
                           &part_ml, &part_acc, &window};

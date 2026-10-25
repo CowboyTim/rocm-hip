@@ -3,7 +3,8 @@
 //
 // One 256-value block, one value per thread of a 256-thread group, into both of ggml's activation formats:
 //   Q8_0 (ROCmFP4 weights): 32-value blocks, d = amax / 127 stored as FP16, q = round-half-even(x * 127 / amax)
-//                           (the x86 SIMD quantize_row_q8_0 the reference runs, not the _ref variant).
+//                           (the x86 SIMD quantize_row_q8_0 the reference runs, not the _ref variant), plus
+//                           the sum of each block's q (for the offsets of Q5_1 weights: ggml's Q8_1 s / d).
 //   Q8_K (K-quant weights): d = 1 / (-127 / max) with max the signed value of largest |x| (first on ties),
 //                           q = min(127, round-half-even(x * -127 / max)), plus the sum of every 16 q values.
 // Bit-identical to ggml's CPU quantizers, so each block's integer dot product matches the reference exactly.
@@ -21,6 +22,7 @@ struct Q8Out {
     int8_t* qK;
     float* dK;
     int* bsK;
+    int* s0;  // sums of each Q8_0 block's 32 q values
 };
 
 // Shared scratch for one 256-thread group
@@ -39,10 +41,16 @@ __device__ __forceinline__ void q8_block_value(float v, bool active, int b, int 
     // Q8_0 over the wave's 32 values
     float am = a;
     for (int off = 16; off > 0; off >>= 1) am = fmaxf(am, __shfl_xor(am, off, 32));
+    const float id0 = am != 0.0f ? 127.0f / am : 0.0f;
+    const int q0 = active ? (int)rintf(v * id0) : 0;
+    int s0 = q0;
+    for (int off = 16; off > 0; off >>= 1) s0 += __shfl_xor(s0, off, 32);
     if (active) {
-        const float id0 = am != 0.0f ? 127.0f / am : 0.0f;
-        o.q0[i] = (int8_t)(int)rintf(v * id0);
-        if (lane == 0) o.d0[b * 8 + w] = __half2float(__float2half(am / 127.0f));
+        o.q0[i] = (int8_t)q0;
+        if (lane == 0) {
+            o.d0[b * 8 + w] = __half2float(__float2half(am / 127.0f));
+            o.s0[b * 8 + w] = s0;
+        }
     }
 
     // Q8_K over the block's 256 values: largest |x|, lowest index on ties

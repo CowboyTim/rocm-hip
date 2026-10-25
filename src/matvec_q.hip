@@ -713,15 +713,13 @@ matmul_f32_tile(const uint8_t *W, long long row_bytes, const float *x, float *y,
     }
 }
 
-extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
-matvec_bf16(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K) {
-    const int lane = threadIdx.x & 31;
-    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
-    if (row >= N) return;
-    const uint8_t *wr = W + (long long)row * row_bytes;
+// One lane's share of a BF16 row's dot product with x (the wave reduction follows): 16-byte chunks lane,
+// lane + 32, ... when the row and x are 16-byte aligned (the same for every lane), then the rest one value per
+// lane. Every BF16 kernel sums a (row, token) this way, so prefill and decoding give the same bits.
+__device__ __forceinline__ float bf16_lane_dot(const uint8_t *wr, const float *x, int K, int lane) {
     float acc = 0.0f;
     int k0 = 0;
-    if ((((uintptr_t)wr | (uintptr_t)x) & 15) == 0) {  // uniform per row
+    if ((((uintptr_t)wr | (uintptr_t)x) & 15) == 0) {
         const int n8 = K / 8;
         for (int i = lane; i < n8; i += 32) {
             const uint4 u = ((const uint4 *)wr)[i];
@@ -733,9 +731,35 @@ matvec_bf16(const uint8_t *W, long long row_bytes, const float *x, float *y, int
         k0 = n8 * 8;
     }
     for (int k = k0 + lane; k < K; k += 32) acc += bf16(wr + 2 * k) * bf16_round(x[k]);
+    return acc;
+}
+
+extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
+matvec_bf16(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= N) return;
+    float acc = bf16_lane_dot(W + (long long)row * row_bytes, x, K, lane);
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
     if (lane == 0) y[row] = acc;
 }
+
+// Several tokens: grid (ceil(N / ROWS_PER_BLOCK), ceil(T / MMF_TT)), each wave's row read once per tile (from
+// cache for all but the first token: the lanes' chunks are the same) and every token summed as matvec_bf16
+extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
+matmul_f_bf16(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K, int T) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= N) return;
+    const int t0 = blockIdx.y * MMF_TT, nt = min(MMF_TT, T - t0);
+    const uint8_t *wr = W + (long long)row * row_bytes;
+    for (int j = 0; j < nt; ++j) {
+        float a = bf16_lane_dot(wr, x + (size_t)(t0 + j) * K, K, lane);
+        for (int off = 16; off > 0; off >>= 1) a += __shfl_xor(a, off, 32);
+        if (lane == 0) y[(size_t)(t0 + j) * N + row] = a;
+    }
+}
+
 MATVEC_KERNEL(q4_0, BlkQ4_0)
 MATVEC_KERNEL(q4_1, BlkQ4_1)
 MATVEC_KERNEL(q5_0, BlkQ5_0)
@@ -780,7 +804,6 @@ __device__ void matvec_id_impl(const uint8_t *W, long long row_bytes, const int 
 
 MATVEC_ID_KERNEL(f32, BlkF32, false)
 MATVEC_ID_KERNEL(f16, BlkF16, false)
-MATVEC_ID_KERNEL(bf16, BlkBF16, false)
 MATVEC_ID_KERNEL(q4_0, BlkQ4_0, false)
 MATVEC_ID_KERNEL(q4_1, BlkQ4_1, false)
 MATVEC_ID_KERNEL(q5_0, BlkQ5_0, false)
@@ -793,6 +816,84 @@ MATVEC_ID_KERNEL(q5_K, BlkQ5_KCoop, true)
 MATVEC_ID_KERNEL(q6_K, BlkQ6_KCoop, true)
 MATVEC_ID_KERNEL(q4_0_rocmfp4, BlkROCmFP4, false)
 MATVEC_ID_KERNEL(q4_0_rocmfp4_fast, BlkROCmFP4Fast, false)
+
+// BF16 experts: as matvec_bf16 (bf16_lane_dot), so that the expert-tiled batch below gives decoding's bits
+extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
+matvec_id_bf16(const uint8_t *W, long long row_bytes, const int *ids, int n_used, int x_per_slot, const float *x,
+               float *y, int N, int K) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= N) return;
+    const int slot = blockIdx.y, t = blockIdx.z, e = ids[t * n_used + slot];
+    const float *xr = x + (x_per_slot ? (long long)t * n_used + slot : t) * K;
+    float acc = bf16_lane_dot(W + ((long long)e * N + row) * row_bytes, xr, K, lane);
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
+    if (lane == 0) y[((long long)t * n_used + slot) * N + row] = acc;
+}
+
+// Float experts for a batch (MoE prefill on the float path): grid (ceil(N / ROWS_PER_BLOCK), max_tiles) over
+// moe_group's tiles of up to MMF_ID_TB (token, slot) entries of one expert (the int8 matmul_q8_id_<type>
+// convention: x rows in_rows[], y rows out_rows[]), so each expert row is read once per tile; each entry is
+// summed as matvec_id_<type> sums it.
+#define MMF_ID_TB 16  // QMV_MM_TB in qmatvec.cpp
+#define MMF_ID_ARGS                                                                                         \
+    const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K, const int *n_tiles,          \
+        const int *tile_e, const int *tile_start, const int *tile_n, const int *in_rows, const int *out_rows
+
+template <typename B>
+__device__ void matmul_f_id_impl(MMF_ID_ARGS) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5), k = blockIdx.y;
+    if (row >= N || k >= *n_tiles) return;
+    const int nt = tile_n[k], *in = in_rows + tile_start[k], *out = out_rows + tile_start[k];
+    const uint8_t *wr = W + ((long long)tile_e[k] * N + row) * row_bytes;
+    const int nb = K / B::QK;
+    float acc[MMF_ID_TB];
+#pragma unroll
+    for (int j = 0; j < MMF_ID_TB; ++j) acc[j] = 0.0f;
+    for (int ib = lane; ib < nb; ib += 32) {
+        const uint8_t *wb = wr + (long long)ib * B::BYTES;
+#pragma unroll
+        for (int j = 0; j < MMF_ID_TB; ++j)
+            if (j < nt) acc[j] += B::dot(wb, x + (long long)in[j] * K + (long long)ib * B::QK);
+    }
+#pragma unroll
+    for (int j = 0; j < MMF_ID_TB; ++j) {
+        float a = acc[j];
+        for (int off = 16; off > 0; off >>= 1) a += __shfl_xor(a, off, 32);
+        if (lane == 0 && j < nt) y[(long long)out[j] * N + row] = a;
+    }
+}
+
+#define MATMUL_F_ID_KERNEL(name, B)                                                                       \
+    extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matmul_f_id_##name(MMF_ID_ARGS) {   \
+        matmul_f_id_impl<B>(W, row_bytes, x, y, N, K, n_tiles, tile_e, tile_start, tile_n, in_rows, out_rows); \
+    }
+
+MATMUL_F_ID_KERNEL(f32, BlkF32)
+MATMUL_F_ID_KERNEL(f16, BlkF16)
+MATMUL_F_ID_KERNEL(q4_0, BlkQ4_0)
+MATMUL_F_ID_KERNEL(q4_1, BlkQ4_1)
+MATMUL_F_ID_KERNEL(q5_0, BlkQ5_0)
+MATMUL_F_ID_KERNEL(q5_1, BlkQ5_1)
+MATMUL_F_ID_KERNEL(q8_0, BlkQ8_0)
+MATMUL_F_ID_KERNEL(q2_K, BlkQ2_K)
+MATMUL_F_ID_KERNEL(q3_K, BlkQ3_K)
+MATMUL_F_ID_KERNEL(q4_0_rocmfp4, BlkROCmFP4)
+MATMUL_F_ID_KERNEL(q4_0_rocmfp4_fast, BlkROCmFP4Fast)
+
+extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matmul_f_id_bf16(MMF_ID_ARGS) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5), k = blockIdx.y;
+    if (row >= N || k >= *n_tiles) return;
+    const int nt = tile_n[k], *in = in_rows + tile_start[k], *out = out_rows + tile_start[k];
+    const uint8_t *wr = W + ((long long)tile_e[k] * N + row) * row_bytes;
+    for (int j = 0; j < nt; ++j) {
+        float a = bf16_lane_dot(wr, x + (long long)in[j] * K, K, lane);
+        for (int off = 16; off > 0; off >>= 1) a += __shfl_xor(a, off, 32);
+        if (lane == 0) y[(long long)out[j] * N + row] = a;
+    }
+}
 
 // ================================================================ int8 path (Phase 20 speed work)
 //
@@ -1006,6 +1107,55 @@ __device__ __forceinline__ float mv_q8_0(const uint8_t *wr, const int8_t *q8, co
     return acc;
 }
 
+// Q5_1 (24-byte blocks, 4-aligned: F16 d, F16 m, the 32 fifth bits qh, 16 bytes of nibbles) x Q8_0: values
+// j (0..15) are the low nibbles with bit j of qh as bit 4, values j + 16 the high nibbles with bit j + 16; each
+// q (0..31) * d + m. As ggml's vec_dot_q5_1_q8_1: (d_w * d_x) * (float)sumi + m_w * (d_x * sum of the block's
+// x q) per block, the sums from the quantizer (qmatvec_q8.s0; ggml keeps them as Q8_1's s).
+__device__ __forceinline__ uint32_t q5_1_hbits(uint32_t h) {  // 4 bits -> bit 4 of 4 bytes
+    return ((h & 1u) << 4) | ((h & 2u) << 11) | ((h & 4u) << 18) | ((h & 8u) << 25);
+}
+
+__device__ __forceinline__ void q5_1_decode(const uint32_t w[6], uint32_t q[8], float &d, float &m) {
+    d = __half2float(__ushort_as_half((uint16_t)(w[0] & 0xFFFF)));
+    m = __half2float(__ushort_as_half((uint16_t)(w[0] >> 16)));
+    const uint32_t qh = w[1];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        q[k] = (w[2 + k] & 0x0F0F0F0Fu) | q5_1_hbits(qh >> (4 * k));
+        q[4 + k] = ((w[2 + k] >> 4) & 0x0F0F0F0Fu) | q5_1_hbits(qh >> (16 + 4 * k));
+    }
+}
+
+__device__ __forceinline__ void q5_1_block(const uint8_t *b, uint32_t q[8], float &d, float &m) {
+    uint32_t w[6];
+#pragma unroll
+    for (int k = 0; k < 6; ++k) w[k] = ld32(b + 4 * k);
+    q5_1_decode(w, q, d, m);
+}
+
+__device__ __forceinline__ float q5_1_q8_block(const uint32_t q[8], float d, float m, const int8_t *q8, float dx,
+                                               int sx) {
+    const int *x8 = (const int *)q8;
+    int s = 0;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) s = dot4((int)q[k], x8[k], s);
+    return d * dx * (float)s + m * (dx * (float)sx);
+}
+
+// bs: the Q8_0 block sums (s0). L lanes per row, a block per lane and step, as mv_q8_0
+__device__ __forceinline__ float mv_q5_1(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
+                                         int lane, int L) {
+    const int nb = K / 32;
+    float acc = 0.0f;
+    for (int ib = lane; ib < nb; ib += L) {
+        uint32_t q[8];
+        float d, m;
+        q5_1_block(wr + (long long)ib * 24, q, d, m);
+        acc += q5_1_q8_block(q, d, m, q8 + ib * 32, d8[ib], bs[ib]);
+    }
+    return acc;
+}
+
 // K-quant x Q8_K kernels: the wave works on 4 blocks at a time, 8 lanes per 256-value block, each lane on 16
 // consecutive quant bytes (16 or 32 values that share one scale group per nibble half). One lane per block
 // sub-group also adds that block's min / offset correction through the Q8_K group sums. (A first version
@@ -1123,8 +1273,8 @@ __device__ __forceinline__ float mv_q5_K(const uint8_t *wr, const int8_t *q8, co
         const uint8_t *wr = e >= 0 ? (m2 ? W2 : W) + ((long long)e * N + row) * row_bytes                \
                                    : (m2 ? W2x : Wx) + (long long)row * row_bytes;                        \
         const long long in_row = x_per_slot ? (long long)t * n_used + slot : t;                          \
-        float acc = FN(wr, q8 + in_row * K, d8 + in_row * (K / ((KQ) ? 256 : 32)), bs + in_row * (K / 16), \
-                       K, gl, L);                                                                        \
+        float acc = FN(wr, q8 + in_row * K, d8 + in_row * (K / ((KQ) == 1 ? 256 : 32)),                \
+                       bs + in_row * (K / ((KQ) == 2 ? 32 : 16)), K, gl, L);                             \
         Q8_REDUCE(acc)                                                                                   \
         if (gl == 0) (m2 ? y2 : y)[((long long)t * n_used + slot) * N + row] = acc;                      \
     }
@@ -1303,6 +1453,7 @@ matvec_q8_lr_q4_0_rocmfp4_fast(const uint8_t *W, long long row_bytes, const floa
 MATVEC_Q8_KERNELS(q4_0_rocmfp4, mv_rocmfp4, 0)
 MATVEC_Q8_KERNELS(q4_0_rocmfp4_fast, mv_rocmfp4_fast, 0)
 MATVEC_Q8_KERNELS(q8_0, mv_q8_0, 0)
+MATVEC_Q8_KERNELS(q5_1, mv_q5_1, 2)
 MATVEC_Q8_KERNELS(q4_K, mv_q4_K, 1)
 MATVEC_Q8_KERNELS(q5_K, mv_q5_K, 1)
 MATVEC_Q8_KERNELS(q6_K, mv_q6_K, 1)
@@ -1557,6 +1708,25 @@ __device__ __forceinline__ void mmb_q8_0(MM_BARGS, const RM &rm) {
     MM_STORE
 }
 
+// bs: the Q8_0 block sums (s0), [T][K / 32]
+template <class RM>
+__device__ __forceinline__ void mmb_q5_1(MM_BARGS, const RM &rm) {
+    MM_ROW_SETUP
+    const int nb = K / 32;
+    for (int ib = lane; ib < nb; ib += 32) {
+        uint32_t q[8];
+        float d, m;
+        q5_1_block(wr + (long long)ib * 24, q, d, m);
+        // Not unrolled: see matmul_q8_q4_0_rocmfp4
+        for (int j = 0; j < MM_TB; ++j) {
+            if (j >= nt) break;
+            const long long t = rm.in(j);
+            acc[j] += q5_1_q8_block(q, d, m, q8 + t * K + ib * 32, d8[t * nb + ib], bs[t * nb + ib]);
+        }
+    }
+    MM_STORE
+}
+
 __device__ __forceinline__ void mmb_q4_K_lin(MM_BARGS, const RowsLinear &rm) { mmb_kquant<false>(W, row_bytes, q8, d8, bs, y, ldy, N, K, rm); }
 __device__ __forceinline__ void mmb_q5_K_lin(MM_BARGS, const RowsLinear &rm) { mmb_kquant<true>(W, row_bytes, q8, d8, bs, y, ldy, N, K, rm); }
 __device__ __forceinline__ void mmb_q4_K_exp(MM_BARGS, const RowsExpert &rm) { mmb_kquant<false>(W, row_bytes, q8, d8, bs, y, ldy, N, K, rm); }
@@ -1588,6 +1758,7 @@ __device__ __forceinline__ void mmb_q5_K_exp(MM_BARGS, const RowsExpert &rm) { m
 MATMUL_Q8_KERNELS(q4_0_rocmfp4, mmb_rocmfp4<RowsLinear>, mmb_rocmfp4<RowsExpert>)
 MATMUL_Q8_KERNELS(q4_0_rocmfp4_fast, mmb_rocmfp4_fast<RowsLinear>, mmb_rocmfp4_fast<RowsExpert>)
 MATMUL_Q8_KERNELS(q8_0, mmb_q8_0<RowsLinear>, mmb_q8_0<RowsExpert>)
+MATMUL_Q8_KERNELS(q5_1, mmb_q5_1<RowsLinear>, mmb_q5_1<RowsExpert>)
 MATMUL_Q8_KERNELS(q6_K, mmb_q6_K<RowsLinear>, mmb_q6_K<RowsExpert>)
 MATMUL_Q8_KERNELS(q4_K, mmb_q4_K_lin, mmb_q4_K_exp)
 MATMUL_Q8_KERNELS(q5_K, mmb_q5_K_lin, mmb_q5_K_exp)
@@ -1607,7 +1778,9 @@ MATMUL_Q8_KERNELS(q5_K, mmb_q5_K_lin, mmb_q5_K_exp)
 // float accumulation order differs from the dot4 kernels.
 // WMMA wave32 layout (tests/wmma_layout_verify): A row i / B column i in lanes i and i + 16, 16 int8 each;
 // C column l % 16, row 2r + l / 16.
-// grid (ceil(N / WM_ROWS), ceil(T / 64)), block WM_THREADS. Requires K % 128 == 0.
+// Q5_1 (BLOCK_SCALE with MIN): the block's offset m adds m * d_x * (sum of the block's x q) per block, from the
+// quantizer's block sums. grid (ceil(N / WM_ROWS), ceil(T / 64)), block WM_THREADS. K % 128 == 0, or K % 64 == 0
+// for the policies of 2 blocks per thread (all but ROCmFP4_FAST): the last chunk is then half, the rest zeros.
 
 typedef int v4i_t __attribute__((ext_vector_type(4)));
 typedef int v8i_t __attribute__((ext_vector_type(8)));
@@ -1620,7 +1793,7 @@ typedef int v8i_t __attribute__((ext_vector_type(8)));
 // (so the next chunk's loads overlap this chunk's WMMAs), store() decodes them to int8 in LDS and writes the two
 // half-block scales of each block.
 struct WStageFP4 {  // Q4_0_ROCMFP4: 18-byte blocks (2-aligned), a UE4M3 scale per 16 values
-    static constexpr bool BLOCK_SCALE = false;
+    static constexpr bool BLOCK_SCALE = false, MIN = false;
     uint32_t q[2][5];
     __device__ void load(const uint8_t *W, long long rb, int row, bool ok, int b0, int wb) {
 #pragma unroll
@@ -1654,7 +1827,7 @@ struct WStageFP4 {  // Q4_0_ROCMFP4: 18-byte blocks (2-aligned), a UE4M3 scale p
 struct WStageFast {  // Q4_0_ROCMFP4_FAST: 17-byte blocks, one UE4M3 scale per 32 values. The chunk's 4 blocks
                      // of a row are a 68-byte, 4-aligned quad; a thread's two blocks (wb = 0 or 2) are its bytes
                      // 17 wb .. 17 wb + 33: load the 9 dwords from byte 16 wb on, extract with v_alignbyte.
-    static constexpr bool BLOCK_SCALE = true;  // both half-blocks share it: one int32 dot per block
+    static constexpr bool BLOCK_SCALE = true, MIN = false;  // both half-blocks share it: one int32 dot per block
     uint32_t w[10];
     int sh;  // byte offset of the thread's first block in w: 17 wb - 16 wb
     __device__ void load(const uint8_t *W, long long rb, int row, bool ok, int b0, int wb) {
@@ -1686,7 +1859,7 @@ struct WStageFast {  // Q4_0_ROCMFP4_FAST: 17-byte blocks, one UE4M3 scale per 3
 struct WStageQ8_0 {  // Q8_0: 34-byte blocks, an F16 scale per 32 int8 values (no decode: copied as they are).
                      // A thread's two blocks (wb = 0 or 2) are the 68-byte, 4-aligned pair at byte 34 wb of the
                      // chunk's 4 blocks.
-    static constexpr bool BLOCK_SCALE = true;
+    static constexpr bool BLOCK_SCALE = true, MIN = false;
     uint32_t qs[2][8];
     float e[2];
     __device__ void load(const uint8_t *W, long long rb, int row, bool ok, int b0, int wb) {
@@ -1710,6 +1883,37 @@ struct WStageQ8_0 {  // Q8_0: 34-byte blocks, an F16 scale per 32 int8 values (n
             erow[(wb + j) * 2] = e[j];
             erow[(wb + j) * 2 + 1] = e[j];
         }
+    }
+};
+
+struct WStageQ5_1 {  // Q5_1: 24-byte blocks (4-aligned), an F16 scale d and offset m per 32 values (0..31 after
+                     // decoding, so int8 as they are). store_min writes the blocks' m.
+    static constexpr bool BLOCK_SCALE = true, MIN = true;
+    uint32_t w[2][6];
+    __device__ void load(const uint8_t *W, long long rb, int row, bool ok, int b0, int wb) {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const uint8_t *b = W + (long long)row * rb + (long long)(b0 + wb + j) * 24;
+#pragma unroll
+            for (int k = 0; k < 6; ++k) w[j][k] = ok ? ld32(b + 4 * k) : 0;
+        }
+    }
+    __device__ void store(int8_t *srow, float *erow, int wb) const {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            uint32_t q[8];
+            float d, m;
+            q5_1_decode(w[j], q, d, m);
+            uint32_t *dst = (uint32_t *)(srow + (wb + j) * 32);
+#pragma unroll
+            for (int k = 0; k < 8; ++k) dst[k] = q[k];
+            erow[(wb + j) * 2] = d;
+            erow[(wb + j) * 2 + 1] = d;
+        }
+    }
+    __device__ void store_min(float *mrow, int wb) const {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) mrow[wb + j] = __half2float(__ushort_as_half((uint16_t)(w[j][0] >> 16)));
     }
 };
 
@@ -1748,13 +1952,20 @@ struct WmmaSmem {
     // token block scales, block c of token 16 n + 2 r + hi at [c][16 n + 8 hi + r]: a lane's 8 C rows are adjacent
     float sdx[WM_KC / 32][WM_TILE];
 };
+// Policies with offsets (MIN): also the weight blocks' m and the tokens' d_x * (block sum), laid out as sew / sdx
+struct WmmaSmemMin : WmmaSmem {
+    float smw[WM_ROWS][WM_KC / 32];
+    float sxs[WM_KC / 32][WM_TILE];
+};
+template <bool MIN> struct WmmaSmemSel { typedef WmmaSmem type; };
+template <> struct WmmaSmemSel<true> { typedef WmmaSmemMin type; };
 
 // NT: 16-token sub-tiles per workgroup (4: 64 tokens of a dense prefill; an expert tile of up to 64 entries takes
 // the fewest that cover it). No per-sub-tile branches: uniform branches between the WMMAs cost a dense
 // prefill 17%. Each value is the same sum in the same order whichever NT computes it.
-template <class WS, int NT, class RM>
+template <class WS, int NT, class RM, class SM>
 __device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8,
-                                         float *y, long long ldy, int N, int K, const RM &rm, WmmaSmem &sm) {
+                                         const int *bs, float *y, long long ldy, int N, int K, const RM &rm, SM &sm) {
     constexpr int TOK = 16 * NT;
     auto &sw = sm.sw;
     auto &sx = sm.sx;
@@ -1777,26 +1988,32 @@ __device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, 
     WS ws;
     uint4 gx[XC];
     const int wr_row = tid >> 1, wr_b = 2 * (tid & 1);
+    // (K % 128 == 64: the last chunk's blocks 2 and 3, a thread's both or neither, and their activations are
+    // zeros)
     auto load_chunk = [&](int k0) {
-        ws.load(Wb, row_bytes, r0 + wr_row, r0 + wr_row < N, k0 / 32, wr_b);
+        ws.load(Wb, row_bytes, r0 + wr_row, r0 + wr_row < N && k0 / 32 + wr_b < nb, k0 / 32, wr_b);
 #pragma unroll
         for (int c = 0; c < XC; ++c) {
-            const int task = tid + WM_THREADS * c, tt = task >> 3;
-            gx[c] = tt < T ? *(const uint4 *)(q8 + rm.in(tt) * K + k0 + 16 * (task & 7)) : uint4{0, 0, 0, 0};
+            const int task = tid + WM_THREADS * c, tt = task >> 3, kk = k0 + 16 * (task & 7);
+            gx[c] = tt < T && kk < K ? *(const uint4 *)(q8 + rm.in(tt) * K + kk) : uint4{0, 0, 0, 0};
         }
     };
     auto store_chunk = [&](int k0) {
         const int b0 = k0 / 32;
         ws.store(&sw[wr_row][0], &sew[wr_row][0], wr_b);
+        if constexpr (WS::MIN) ws.store_min(&sm.smw[wr_row][0], wr_b);
 #pragma unroll
         for (int c = 0; c < XC; ++c) {
             const int task = tid + WM_THREADS * c;
             if (task < TOK * 8) *(uint4 *)&sx[task >> 3][16 * (task & 7)] = gx[c];
         }
-        // token block scales: TOK tokens x 4 blocks
+        // token block scales (MIN: and d_x * block sum): TOK tokens x 4 blocks
         for (int task = tid; task < TOK * 4; task += WM_THREADS) {
-            const int tt = task >> 2, c = task & 3;
-            sdx[c][(tt & ~15) + 8 * (tt & 1) + ((tt & 15) >> 1)] = tt < T ? d8[rm.in(tt) * nb + b0 + c] : 0.0f;
+            const int tt = task >> 2, c = task & 3, at = (tt & ~15) + 8 * (tt & 1) + ((tt & 15) >> 1);
+            const bool ok = tt < T && b0 + c < nb;
+            const float dx = ok ? d8[rm.in(tt) * nb + b0 + c] : 0.0f;
+            sdx[c][at] = dx;
+            if constexpr (WS::MIN) sm.sxs[c][at] = ok ? dx * (float)bs[rm.in(tt) * nb + b0 + c] : 0.0f;
         }
     };
 
@@ -1830,6 +2047,13 @@ __device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, 
                     token_scales(&sdx[j][16 * n + 8 * hi], dx);
 #pragma unroll
                     for (int r = 0; r < 8; ++r) acc[n][r] += (ew * dx[r]) * (float)c[n][r];
+                    if constexpr (WS::MIN) {  // + m_w * d_x * (block sum)
+                        const float mw = sm.smw[16 * w + i][j];
+                        float xs[8];
+                        token_scales(&sm.sxs[j][16 * n + 8 * hi], xs);
+#pragma unroll
+                        for (int r = 0; r < 8; ++r) acc[n][r] += mw * xs[r];
+                    }
                 }
             }
         } else {
@@ -1887,32 +2111,32 @@ __device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, 
 // batch reads each expert's weights once per 64 of its entries; same arguments as matmul_q8_id_<type>.
 #define MATMUL_WMMA_Q80_KERNELS(name, WS)                                                                    \
     extern "C" __global__ void __launch_bounds__(WM_THREADS)                                                 \
-        matmul_wmma_##name(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, float *y, \
-                           long long ldy, int N, int K, int T) {                                             \
-        __shared__ __attribute__((aligned(16))) WmmaSmem sm;                                                 \
+        matmul_wmma_##name(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8,          \
+                           const int *bs, float *y, long long ldy, int N, int K, int T) {                    \
+        __shared__ __attribute__((aligned(16))) WmmaSmemSel<WS::MIN>::type sm;                               \
         const int t0 = blockIdx.y * WM_TILE;                                                                 \
         const WRowsLinear rm{t0, min(WM_TILE, T - t0)};                                                      \
-        wmma_q80<WS, 4>(W, row_bytes, q8, d8, y, ldy, N, K, rm, sm);                                         \
+        wmma_q80<WS, 4>(W, row_bytes, q8, d8, bs, y, ldy, N, K, rm, sm);                                     \
     }                                                                                                        \
     extern "C" __global__ void __launch_bounds__(WM_THREADS) matmul_wmma_id_##name(MMID_ARGS) {               \
-        (void)bs;                                                                                            \
-        __shared__ __attribute__((aligned(16))) WmmaSmem sm;                                                 \
+        __shared__ __attribute__((aligned(16))) WmmaSmemSel<WS::MIN>::type sm;                               \
         const int k = blockIdx.y;                                                                            \
         if (k >= *n_tiles) return;                                                                           \
         const WRowsExpert rm{tile_e[k], tile_n[k], in_rows + tile_start[k], out_rows + tile_start[k]};       \
         if (rm.nt <= 16)                                                                                     \
-            wmma_q80<WS, 1>(W, row_bytes, q8, d8, y, N, N, K, rm, sm);                                       \
+            wmma_q80<WS, 1>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                                   \
         else if (rm.nt <= 32)                                                                                \
-            wmma_q80<WS, 2>(W, row_bytes, q8, d8, y, N, N, K, rm, sm);                                       \
+            wmma_q80<WS, 2>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                                   \
         else if (rm.nt <= 48)                                                                                \
-            wmma_q80<WS, 3>(W, row_bytes, q8, d8, y, N, N, K, rm, sm);                                       \
+            wmma_q80<WS, 3>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                                   \
         else                                                                                                 \
-            wmma_q80<WS, 4>(W, row_bytes, q8, d8, y, N, N, K, rm, sm);                                       \
+            wmma_q80<WS, 4>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                                   \
     }
 
 MATMUL_WMMA_Q80_KERNELS(q4_0_rocmfp4, WStageFP4)
 MATMUL_WMMA_Q80_KERNELS(q4_0_rocmfp4_fast, WStageFast)
 MATMUL_WMMA_Q80_KERNELS(q8_0, WStageQ8_0)
+MATMUL_WMMA_Q80_KERNELS(q5_1, WStageQ5_1)
 
 // ---------------------------------------------------------------- WMMA for K-quants x Q8_K (Phase 20 W3)
 //

@@ -616,6 +616,11 @@ struct QwenModel {
                                            s.g_pair, 0);
         else if (q8)
             e = qmatvec_launch_q8_id(W.type, W.data, W.row_bytes, s.ids, NU, x_per_slot, &s.q8, y, N, K, T, 0);
+        else if (grouped && qmatvec_id_batch_f_supported(W.type))
+            e = qmatvec_launch_id_batch_f(W.type, W.data, W.row_bytes, x, y, N, K,
+                                          gpu_moe_max_tiles(T, NU, eng->n_expert, s.g_tile), s.g_tile, s.g_ntiles,
+                                          s.g_tile_e, s.g_tile_start, s.g_tile_n, x_per_slot ? s.g_pair : s.g_tok,
+                                          s.g_pair, 0);
         else
             e = qmatvec_launch_id(W.type, W.data, W.row_bytes, s.ids, NU, x_per_slot, x, y, N, K, T, 0);
         if (e != hipSuccess) {
@@ -863,6 +868,7 @@ struct QwenModel {
             last.d0 += r / 32;
             last.dK += r / 256;
             last.bsK += r / 16;
+            last.s0 += r / 32;
             last.max_k = E;
         }
         hipError_t e;

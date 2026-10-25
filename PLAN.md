@@ -2307,6 +2307,23 @@ one BF16 layer). Reference: `llama.cpp/src/models/gemma4.cpp` + `gemma4-common.h
     EOS is `<eos>`, its turn end `<turn|>`). Speed with the GPU shared with another job: Q8 file 43 tok/s, FP4
     file 59 tok/s generation; prefill 130-255 tok/s on these short prompts (the global layers and the sliding
     ones' ratio-2 heads take the per-token attention path: no flash kernel yet).
+- **Step 3 — in progress (2026-10-25): prefill speed.** Baseline (GPU idle, 2,792-token prompt): FP4 file
+  441 tok/s prefill / 44 tok/s generation, Q8 file 369 / 35. rocprofv3 on the FP4 file: the Q5_1 expert down
+  per token (`matvec_id_q5_1`, 24%), `attn_partial` 256 + 512 (35%), the Q8_0 downs on `matmul_q8` (14%: K = 704 /
+  2112 are not multiples of 128, so no WMMA), the Q5_1 dense down on `matmul_f` (6%); the Q8 file: its BF16
+  layer 29 (`matvec_bf16` per token + `matvec_id_bf16` per (token, slot): 3.2 of 6.5 s).
+  - **Done:** (a) the WMMA kernels of the 2-block staging policies (ROCmFP4, Q8_0, Q5_1) take K % 64 (a last
+    half chunk, zero-filled); (b) **Q5_1 int8**: the quantizer also writes each Q8_0 block's sum (`qmatvec_q8.s0`,
+    `Q8Out.s0`; ggml's Q8_1 s), Q5_1 x Q8_0 = d d_x sum(q x) + m d_x sum(x) (`matvec_q8[_id]_q5_1`,
+    `matmul_q8[_id]_q5_1`, `matmul_wmma[_id]_q5_1` with `WStageQ5_1` / `WmmaSmemMin`); (c) BF16 batched:
+    `bf16_lane_dot` shared by `matvec_bf16`, `matvec_id_bf16` (now rounds x to BF16 as the dense kernel and
+    ggml do), `matmul_f_bf16` and the expert-tiled `matmul_f_id_<type>` (float types, moe_group tiles of 16,
+    `qmatvec_launch_id_batch_f`). **Result:** FP4 file prefill 441 -> **758 tok/s**, Q8 file 369 -> **692 tok/s**
+    (generation unchanged). matvec_verify (Q5_1 int8 path, batched 11 = single, 70 tokens through WMMA with
+    K 2112), gemma4_verify on both files (WMMA; NO_WMMA: prefill = token by token bit for bit), forward_verify
+    4B / 0.6B / 35B, qwen4exp_verify: PASS.
+  - **Next:** attention, now about half of the prefill: no flash kernel for D 512 (global layers, 16 q / 2 kv)
+    or D 256 with ratio 2 (sliding: 16 q / 8 kv) or for sliding windows.
 - **Step 4 — DONE ✅ (2026-10-25): chat in ROCm::Inference** (Perl only). `%REPLY_TAG_SETS` (qwen, gemma4) and
   `reply_tags($m)`, which picks the set whose tags the chat template writes; Gemma-4's reasoning
   `<|channel>thought` ... `<channel|>`, tool calls `<|tool_call>call:name{key:value,...}<tool_call|>` parsed by

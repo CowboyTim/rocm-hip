@@ -28,6 +28,7 @@ static hipFunction_t g_fn_mm_id[QMV_MAX_TYPE];  // expert-tiled batched int8 ker
 static hipFunction_t g_fn_wmma[QMV_MAX_TYPE];   // WMMA tiled int8 kernels, matmul_wmma_<type> (Phase 20 W2)
 static hipFunction_t g_fn_wmma_id[QMV_MAX_TYPE];  // WMMA on MoE expert tiles, matmul_wmma_id_<type> (W4)
 static hipFunction_t g_fn_mmf[QMV_MAX_TYPE];     // batched float kernels, matmul_f_<type>
+static hipFunction_t g_fn_mmf_id[QMV_MAX_TYPE];  // expert-tiled batched float kernels, matmul_f_id_<type>
 static hipFunction_t g_lr_fast = nullptr;         // matvec_q8_lr_q4_0_rocmfp4_fast
 static hipFunction_t g_fn_q8t[QMV_MAX_TYPE];     // int8 kernels for 2..4 tokens, matvec_q8t_<type>
 static bool g_use_wmma = true;
@@ -40,6 +41,15 @@ static int g_wmma_min_t = 32;  // smaller batches, and N < 64 (a 64-row tile mos
 // The int8 kernels of the K-quants read the activations' Q8_K form; ROCmFP4, ROCmFP4_FAST and Q8_0 weights the
 // Q8_0 form
 static bool reads_q8k(int type) { return type == QT_Q4_K || type == QT_Q5_K || type == QT_Q6_K; }
+
+// The kernels' bs argument: the Q8_K group sums for K-quants, the Q8_0 block sums for Q5_1 (its offsets)
+static const int32_t *q8_sums(int type, const qmatvec_q8 *q) { return type == QT_Q5_1 ? q->s0 : q->bsK; }
+
+// The WMMA kernels of the Q8_0-activation types with 2 blocks per staging thread take K % 64 (a last half chunk);
+// ROCmFP4_FAST (block quads) and the K-quants K % 128
+static int wmma_k_multiple(int type) {
+    return type == QT_Q4_0_ROCMFP4 || type == QT_Q8_0 || type == QT_Q5_1 ? 64 : 128;
+}
 
 int qmatvec_init(const char *co_path) {
     if (g_mod) return 0;
@@ -57,6 +67,7 @@ int qmatvec_init(const char *co_path) {
     memset(g_fn_wmma, 0, sizeof(g_fn_wmma));
     memset(g_fn_wmma_id, 0, sizeof(g_fn_wmma_id));
     memset(g_fn_mmf, 0, sizeof(g_fn_mmf));
+    memset(g_fn_mmf_id, 0, sizeof(g_fn_mmf_id));
     memset(g_fn_q8t, 0, sizeof(g_fn_q8t));
     for (int t = 0; t < QMV_MAX_TYPE; ++t) {
         const qt_traits *tr = qt_get_traits(t);
@@ -82,6 +93,8 @@ int qmatvec_init(const char *co_path) {
         if (hipModuleGetFunction(&g_fn_q8t[t], g_mod, name) != hipSuccess) g_fn_q8t[t] = nullptr;
         snprintf(name, sizeof(name), "matmul_f_%s", tr->name);
         if (hipModuleGetFunction(&g_fn_mmf[t], g_mod, name) != hipSuccess) g_fn_mmf[t] = nullptr;
+        snprintf(name, sizeof(name), "matmul_f_id_%s", tr->name);
+        if (hipModuleGetFunction(&g_fn_mmf_id[t], g_mod, name) != hipSuccess) g_fn_mmf_id[t] = nullptr;
     }
     if (hipModuleGetFunction(&g_quant, g_mod, "quantize_q8") != hipSuccess) g_quant = nullptr;
     if (hipModuleGetFunction(&g_mm_f32, g_mod, "matmul_f32") != hipSuccess) g_mm_f32 = nullptr;
@@ -106,6 +119,7 @@ void qmatvec_free(void) {
     memset(g_fn_wmma, 0, sizeof(g_fn_wmma));
     memset(g_fn_wmma_id, 0, sizeof(g_fn_wmma_id));
     memset(g_fn_mmf, 0, sizeof(g_fn_mmf));
+    memset(g_fn_mmf_id, 0, sizeof(g_fn_mmf_id));
     memset(g_fn_q8t, 0, sizeof(g_fn_q8t));
     g_quant = nullptr;
     g_mm_f32 = g_mm_f32_tile = g_quant_rows_q8_0 = g_mv_q8_0s = g_lr_fast = nullptr;
@@ -192,7 +206,7 @@ static size_t align16(size_t n) { return (n + 15) & ~(size_t)15; }
 
 size_t qmatvec_q8_bytes(int max_k) {
     const size_t k = (size_t)max_k;
-    return 2 * align16(k) + align16(k / 32 * 4) + align16(k / 256 * 4) + align16(k / 16 * 4);
+    return 2 * align16(k) + 2 * align16(k / 32 * 4) + align16(k / 256 * 4) + align16(k / 16 * 4);
 }
 
 void qmatvec_q8_bind(qmatvec_q8 *q, void *mem, int max_k) {
@@ -207,6 +221,8 @@ void qmatvec_q8_bind(qmatvec_q8 *q, void *mem, int max_k) {
     q->dK = (float *)p;
     p += align16(k / 256 * 4);
     q->bsK = (int32_t *)p;
+    p += align16(k / 16 * 4);
+    q->s0 = (int32_t *)p;
     q->max_k = max_k;
 }
 
@@ -216,6 +232,7 @@ int qmatvec_q8_supported(int type, int K) {
     if (type < 0 || type >= QMV_MAX_TYPE || !g_fn_q8[type] || !g_quant) return 0;
     if (type == QT_Q4_0_ROCMFP4 || type == QT_Q8_0) return K % 64 == 0;  // lanes take block pairs (36 / 68 bytes)
     if (type == QT_Q4_0_ROCMFP4_FAST) return K % 128 == 0;  // lanes take 68-byte block quads
+    if (type == QT_Q5_1) return K % 32 == 0;                 // a block per lane
     return K % 256 == 0;
 }
 
@@ -234,6 +251,7 @@ static int q8_lanes_per_row(int type, int K, long long rows) {
     const bool kq = reads_q8k(type);
     const int tasks = type == QT_Q4_0_ROCMFP4 || type == QT_Q8_0 ? K / 64
                       : type == QT_Q4_0_ROCMFP4_FAST          ? K / 128
+                      : type == QT_Q5_1                       ? K / 32
                                                               : K / 256 * 8;
     int L = 32;
     while (L > (kq ? 8 : 4) && L / 2 >= tasks) L /= 2;
@@ -301,7 +319,7 @@ hipError_t qmatvec_launch_q8_multi_t(int type, int n, const void *const *Ws, con
     const bool kq = reads_q8k(type);  // K-quants read Q8_K, ROCmFP4 / Q8_0 weights Q8_0
     const int8_t *q8 = kq ? q->qK : q->q0;
     const float *d8 = kq ? q->dK : q->d0;
-    const int32_t *bs = q->bsK;
+    const int32_t *bs = q8_sums(type, q);
     long long rb = (long long)row_bytes;
     int L = q8_lanes_per_row(type, K, Nt);
     void *args[] = {(void *)&W[0], (void *)&W[1], (void *)&W[2], (void *)&W[3], &bound[0], &bound[1], &bound[2], &rb,
@@ -333,14 +351,12 @@ hipError_t qmatvec_launch_q8_batch(int type, const void *W, size_t row_bytes, co
     const bool kq = reads_q8k(type);
     const int8_t *q8 = kq ? q->qK : q->q0;
     const float *d8 = kq ? q->dK : q->d0;
-    const int32_t *bs = q->bsK;
+    const int32_t *bs = q8_sums(type, q);
     long long rb = (long long)row_bytes;
-    if (g_use_wmma && g_fn_wmma[type] && T >= g_wmma_min_t && N >= 64 && K % 128 == 0) {
-        // tiles of 64 tokens x 128 rows (ROCmFP4 types, 256 threads) or 64 rows (K-quants, 128 threads); the
-        // K-quant kernels also take the Q8_K group sums (for the mins)
-        void *wargs_q80[] = {(void *)&W, &rb, (void *)&q8, (void *)&d8, (void *)&y, &ldy, &N, &K, &T};
-        void *wargs_q8k[] = {(void *)&W, &rb, (void *)&q8, (void *)&d8, (void *)&bs, (void *)&y, &ldy, &N, &K, &T};
-        void **wargs = kq ? wargs_q8k : wargs_q80;
+    if (g_use_wmma && g_fn_wmma[type] && T >= g_wmma_min_t && N >= 64 && K % wmma_k_multiple(type) == 0) {
+        // tiles of 64 tokens x 128 rows (Q8_0-activation types, 256 threads) or 64 rows (K-quants, 128 threads);
+        // bs: the K-quants' group sums (for the mins), Q5_1's block sums (offsets)
+        void *wargs[] = {(void *)&W, &rb, (void *)&q8, (void *)&d8, (void *)&bs, (void *)&y, &ldy, &N, &K, &T};
         const int rows = kq ? 64 : QMV_WM_ROWS, threads = kq ? 128 : QMV_WM_THREADS;
         return hipModuleLaunchKernel(g_fn_wmma[type], (unsigned)((N + rows - 1) / rows), (unsigned)((T + 63) / 64), 1,
                                      (unsigned)threads, 1, 1, 0, stream, wargs, nullptr);
@@ -375,7 +391,7 @@ hipError_t qmatvec_launch_q8_id_x(int type, const void *W, const void *W2, const
     const bool kq = reads_q8k(type);
     const int8_t *q8 = kq ? q->qK : q->q0;
     const float *d8 = kq ? q->dK : q->d0;
-    const int32_t *bs = q->bsK;
+    const int32_t *bs = q8_sums(type, q);
     long long rb = (long long)row_bytes;
     int L = q8_lanes_per_row(type, K, (long long)N * n_used * (W2 ? 2 : 1) * T);
     if ((((uintptr_t)W2 | (uintptr_t)Wx | (uintptr_t)W2x) & 3) != 0) return hipErrorInvalidValue;
@@ -400,7 +416,7 @@ hipError_t qmatvec_launch_id(int type, const void *W, size_t row_bytes, const in
 }
 
 static bool wmma_id_ok(int type, int N, int K) {
-    return g_use_wmma && g_fn_wmma_id[type] && N >= 64 && K % 128 == 0;
+    return g_use_wmma && g_fn_wmma_id[type] && N >= 64 && K % wmma_k_multiple(type) == 0;
 }
 
 int qmatvec_id_batch_tile(int type, int N, int K) {
@@ -423,7 +439,7 @@ hipError_t qmatvec_launch_q8_id_batch(int type, const void *W, size_t row_bytes,
     const bool kq = reads_q8k(type);
     const int8_t *q8 = kq ? q->qK : q->q0;
     const float *d8 = kq ? q->dK : q->d0;
-    const int32_t *bs = q->bsK;
+    const int32_t *bs = q8_sums(type, q);
     long long rb = (long long)row_bytes;
     void *args[] = {(void *)&W, &rb, (void *)&q8, (void *)&d8, (void *)&bs, (void *)&y, &N, &K, (void *)&n_tiles,
                     (void *)&tile_e, (void *)&tile_start, (void *)&tile_n, (void *)&in_rows, (void *)&out_rows};
@@ -435,4 +451,22 @@ hipError_t qmatvec_launch_q8_id_batch(int type, const void *W, size_t row_bytes,
     const unsigned gx = (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);
     return hipModuleLaunchKernel(g_fn_mm_id[type], gx, (unsigned)max_tiles, 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream,
                                  args, nullptr);
+}
+
+int qmatvec_id_batch_f_supported(int type) { return type >= 0 && type < QMV_MAX_TYPE && g_fn_mmf_id[type] != nullptr; }
+
+hipError_t qmatvec_launch_id_batch_f(int type, const void *W, size_t row_bytes, const float *x, float *y, int N, int K,
+                                     int max_tiles, int tile, const int32_t *n_tiles, const int32_t *tile_e,
+                                     const int32_t *tile_start, const int32_t *tile_n, const int32_t *in_rows,
+                                     const int32_t *out_rows, hipStream_t stream) {
+    if (!qmatvec_id_batch_f_supported(type)) return hipErrorInvalidDeviceFunction;
+    const qt_traits *tr = qt_get_traits(type);
+    if (max_tiles <= 0 || tile <= 0 || tile > QMV_MM_TB || K % tr->blck_size != 0 || row_bytes != qt_row_size(type, K))
+        return hipErrorInvalidValue;
+    long long rb = (long long)row_bytes;
+    void *args[] = {(void *)&W, &rb, (void *)&x, (void *)&y, &N, &K, (void *)&n_tiles, (void *)&tile_e,
+                    (void *)&tile_start, (void *)&tile_n, (void *)&in_rows, (void *)&out_rows};
+    const unsigned gx = (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);
+    return hipModuleLaunchKernel(g_fn_mmf_id[type], gx, (unsigned)max_tiles, 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0,
+                                 stream, args, nullptr);
 }

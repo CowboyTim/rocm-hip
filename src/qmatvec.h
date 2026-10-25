@@ -52,6 +52,7 @@ typedef struct qmatvec_q8 {
     int8_t *qK;    // Q8_K values [K]
     float *dK;     // Q8_K scales [K / 256]
     int32_t *bsK;  // Q8_K sums of every 16 values [K / 16]
+    int32_t *s0;   // Q8_0 sums of every 32 values [K / 32] (Q5_1 weights' offsets)
     int max_k;
 } qmatvec_q8;
 
@@ -63,16 +64,18 @@ typedef struct qmatvec_q8_out {
     int8_t *qK;
     float *dK;
     int32_t *bsK;
+    int32_t *s0;
 } qmatvec_q8_out;
 
 static inline qmatvec_q8_out qmatvec_q8_outputs(const qmatvec_q8 *q) {
-    qmatvec_q8_out o = {0, 0, 0, 0, 0};
+    qmatvec_q8_out o = {0, 0, 0, 0, 0, 0};
     if (q) {
         o.q0 = q->q0;
         o.d0 = q->d0;
         o.qK = q->qK;
         o.dK = q->dK;
         o.bsK = q->bsK;
+        o.s0 = q->s0;
     }
     return o;
 }
@@ -82,7 +85,8 @@ static inline qmatvec_q8_out qmatvec_q8_outputs(const qmatvec_q8 *q) {
 size_t qmatvec_q8_bytes(int max_k);
 void qmatvec_q8_bind(qmatvec_q8 *q, void *mem, int max_k);
 
-// 1 if an int8 kernel handles this type at this K (ROCmFP4: K % 64, ROCmFP4_FAST: K % 128, K-quants: K % 256)
+// 1 if an int8 kernel handles this type at this K (ROCmFP4, Q8_0: K % 64, ROCmFP4_FAST: K % 128, Q5_1: K % 32,
+// K-quants: K % 256)
 int qmatvec_q8_supported(int type, int K);
 
 // Quantize x[K] into q (both formats). K % 32 == 0 (the Q8_K side is complete only for whole 256-value blocks),
@@ -146,6 +150,13 @@ hipError_t qmatvec_launch_q8_id_batch(int type, const void *W, size_t row_bytes,
                                       int K, int max_tiles, int tile, const int32_t *n_tiles, const int32_t *tile_e,
                                       const int32_t *tile_start, const int32_t *tile_n, const int32_t *in_rows,
                                       const int32_t *out_rows, hipStream_t stream);
+// The same on the float path (types without an int8 kernel, e.g. BF16): x rows in_rows[] of the float input,
+// tiles of up to 16 entries; each entry gets the bits qmatvec_launch_id gives it
+int qmatvec_id_batch_f_supported(int type);
+hipError_t qmatvec_launch_id_batch_f(int type, const void *W, size_t row_bytes, const float *x, float *y, int N, int K,
+                                     int max_tiles, int tile, const int32_t *n_tiles, const int32_t *tile_e,
+                                     const int32_t *tile_start, const int32_t *tile_n, const int32_t *in_rows,
+                                     const int32_t *out_rows, hipStream_t stream);
 
 #ifdef __cplusplus
 }
