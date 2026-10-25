@@ -1,5 +1,9 @@
 // attention.hip -- gated full-attention token mixer kernels, one token (Phase 20 speed work).
 //
+// Gemma-4 (attention_forward_opts): head_dim 512 as well (attn_prep / attn_partial / attn_combine only), a cache row
+// wider than the layer's n_kv * D (kv_stride), RoPE on the first rot_pairs NeoX pairs only, an RMSNorm of V before it
+// is cached (v_norm), a sliding window (a token attends to its last `window` positions) and any score scale.
+//
 // Queued between the q/k/v projections and attn_output, so an attention layer needs one CPU sync. Same math
 // as the CPU reference in qwen_ops.cpp (qwen_rmsnorm, qwen_rope_neox, qwen_attention), which follows
 // llama.cpp's qwen35 graph. Compiled for head_dim D = 256 (Qwen3.5 and later: gated, attn_q holds [Q | gate] per
@@ -74,17 +78,19 @@ __device__ float block_max(float v) {
     return m;
 }
 
-// RMSNorm (gamma w) then NeoX RoPE of one head held one value per thread (D threads); returns this thread's value
+// RMSNorm (gamma w; none if NULL) then NeoX RoPE of one head held one value per thread (D threads); returns this
+// thread's value. Pairs (i, i + n_rot / 2) with i < rot_pairs rotate (theta_i = pos * base^(-2 i / n_rot)), the
+// others stay as they are; n_rot 0: no RoPE.
 template <int D>
-__device__ float norm_rope(float x, const float* w, int n_rot, int pos, float freq_base, float eps) {
+__device__ float norm_rope(float x, const float* w, int n_rot, int rot_pairs, int pos, float freq_base, float eps) {
     __shared__ float v[D];
     const int d = threadIdx.x;
     const float ss = block_sum<D>(x * x);
-    x = x * rsqrtf(ss / D + eps) * w[d];
+    x = x * rsqrtf(ss / D + eps) * (w ? w[d] : 1.0f);
     v[d] = x;
     __syncthreads();
     const int half = n_rot / 2;
-    if (d < n_rot) {
+    if (d < n_rot && (d < half ? d : d - half) < rot_pairs) {
         const int i = d < half ? d : d - half;
         const float theta = (float)pos * powf(freq_base, -2.0f * (float)i / (float)n_rot);
         float sn, cs;
@@ -100,7 +106,8 @@ template <int D>
 __device__ __forceinline__ void attn_prep_body(const float* qfull, const float* k, const float* v, const float* q_norm,
                                                const float* k_norm, float* q_out, __half* K, __half* V, int kv_stride,
                                                int kv_shift, long long kv_bstride, int n_q, int n_kv, int n_rot,
-                                               int pos0, float freq_base, float eps, int gated) {
+                                               int pos0, float freq_base, float eps, int gated, int rot_pairs,
+                                               int v_norm) {
     const int b = blockIdx.x, d = threadIdx.x, z = blockIdx.y, pos = pos0 + z;
     const int qs = gated ? 2 * D : D;  // a head's stride in attn_q's output
     qfull += (size_t)z * n_q * qs;
@@ -111,33 +118,41 @@ __device__ __forceinline__ void attn_prep_body(const float* qfull, const float* 
     __half* v_row = V + kv_row(pos, kv_stride, kv_shift, kv_bstride);
     if (b < n_q) {
         const float x = qfull[(size_t)b * qs + d];
-        q_out[b * D + d] = norm_rope<D>(x, q_norm, n_rot, pos, freq_base, eps);
+        q_out[b * D + d] = norm_rope<D>(x, q_norm, n_rot, rot_pairs, pos, freq_base, eps);
     } else {
         const int g = b - n_q;
-        const float x = norm_rope<D>(k[g * D + d], k_norm, n_rot, pos, freq_base, eps);
+        const float x = norm_rope<D>(k[g * D + d], k_norm, n_rot, rot_pairs, pos, freq_base, eps);
         k_row[g * D + d] = __float2half(x);
-        v_row[g * D + d] = __float2half(v[g * D + d]);
+        const float vv = v[g * D + d];
+        v_row[g * D + d] = __float2half(v_norm ? norm_rope<D>(vv, nullptr, 0, 0, pos, freq_base, eps) : vv);
     }
 }
 
 template <int D>
 __device__ __forceinline__ void attn_partial_body(const float* q, const __half* K, const __half* V, int kv_stride,
                                                   int kv_shift, long long kv_bstride, int pos0, int n_q, int n_kv_heads,
-                                                  float scale, float* part_ml, float* part_acc) {
+                                                  float scale, float* part_ml, float* part_acc, int window) {
     __shared__ float sq[D], sw[CH];
     const int h = blockIdx.x, c = blockIdx.y, t = threadIdx.x, n_chunks = gridDim.y, z = blockIdx.z;
     const int n_kv = pos0 + z + 1;
+    const int lo = window > 0 ? n_kv - window : 0;  // first position this token sees (sliding window)
     q += (size_t)z * n_q * D;
     part_ml += (size_t)2 * z * n_q * n_chunks;
     part_acc += (size_t)z * n_q * n_chunks * D;
     const int g = h / (n_q / n_kv_heads);
-    if (t < D) sq[t] = q[h * D + t];
+    const size_t pc = (size_t)h * n_chunks + c;
+    if (c * CH + CH <= lo) {  // the whole chunk is before the window (uniform): it contributes nothing
+        for (int d = t; d < D; d += CH) part_acc[pc * D + d] = 0.0f;
+        if (t == 0) part_ml[2 * pc] = -INFINITY, part_ml[2 * pc + 1] = 0.0f;
+        return;
+    }
+    for (int d = t; d < D; d += CH) sq[d] = q[h * D + d];
     __syncthreads();
 
     // Score of position p = c * CH + t (thread per position); K row read as 8 halves at a time
     const int p = c * CH + t;
     float score = -INFINITY;
-    if (p < n_kv) {
+    if (p < n_kv && p >= lo) {
         const uint4* kr = (const uint4*)(K + kv_row(p, kv_stride, kv_shift, kv_bstride) + (size_t)g * D);
         float s = 0.0f;
 #pragma unroll 4
@@ -153,19 +168,18 @@ __device__ __forceinline__ void attn_partial_body(const float* q, const __half* 
         score = s * scale;
     }
     const float m = block_max<CH>(score);
-    const float e = p < n_kv ? __expf(score - m) : 0.0f;
+    const float e = score > -INFINITY ? __expf(score - m) : 0.0f;
     const float l = block_sum<CH>(e);
     sw[t] = e;
     __syncthreads();
 
-    // acc[d] over this chunk's positions (thread per dim)
-    const size_t pc = (size_t)h * n_chunks + c;
-    if (t < D) {
-        const int p0 = c * CH, np = max(0, min(CH, n_kv - p0));
-        const __half* vb = V + (size_t)g * D + t;
+    // acc[d] over this chunk's positions (thread per dim; D > CH: CH apart)
+    const int p0 = c * CH, i0 = max(0, lo - p0), np = max(0, min(CH, n_kv - p0));
+    for (int d = t; d < D; d += CH) {
+        const __half* vb = V + (size_t)g * D + d;
         float acc = 0.0f;
-        for (int i = 0; i < np; ++i) acc += sw[i] * __half2float(vb[kv_row(p0 + i, kv_stride, kv_shift, kv_bstride)]);
-        part_acc[pc * D + t] = acc;
+        for (int i = i0; i < np; ++i) acc += sw[i] * __half2float(vb[kv_row(p0 + i, kv_stride, kv_shift, kv_bstride)]);
+        part_acc[pc * D + d] = acc;
     }
     if (t == 0) {
         part_ml[2 * pc] = m;
@@ -177,8 +191,9 @@ template <int D>
 __device__ __forceinline__ void attn_combine_body(const float* part_ml, const float* part_acc, int n_chunks, int n_q,
                                                   const float* qfull, float* out, Q8Out o, int gated) {
     __shared__ Q8Shared sh;
-    constexpr int HP = 256 / D;  // heads per workgroup
-    const int h = blockIdx.x * HP + threadIdx.x / D, d = threadIdx.x % D, z = blockIdx.y;
+    // workgroup: 256 values of the token's n_q * D (256 / D heads, or 256 / D of one head for D 512)
+    const int e = blockIdx.x * 256 + threadIdx.x, h = e / D, d = e % D, z = blockIdx.y;
+    const int nb = n_q * D / 256;  // 256-value blocks per token
     part_ml += (size_t)2 * z * n_q * n_chunks;
     part_acc += (size_t)z * n_q * n_chunks * D;
     qfull += (size_t)z * (gated ? 2 : 1) * n_q * D;
@@ -195,7 +210,7 @@ __device__ __forceinline__ void attn_combine_body(const float* part_ml, const fl
     float r = num / den;
     if (gated) r /= 1.0f + __expf(-qfull[(size_t)h * 2 * D + D + d]);
     out[h * D + d] = r;
-    if (o.qK) q8_block_value(r, true, z * (n_q / HP) + blockIdx.x, threadIdx.x, sh, o);  // uniform: one 256-block
+    if (o.qK) q8_block_value(r, true, z * nb + blockIdx.x, threadIdx.x, sh, o);  // uniform: one 256-block
 }
 
 // ---------------------------------------------------------------- prefill: query-tiled flash attention
@@ -331,28 +346,31 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
     }
 }
 
-// The kernels for each head size: attn_<kernel>_128 (Qwen3), attn_<kernel>_256 (Qwen3.5 and later)
-#define ATTN_KERNELS(D)                                                                                       \
+// The kernels for each head size: attn_<kernel>_128 (Qwen3), attn_<kernel>_256 (Qwen3.5 and later, Gemma-4's
+// sliding layers), attn_<kernel>_512 (Gemma-4's global layers; no attn_flash_512: its LDS would exceed 64 KB)
+#define ATTN_DECODE_KERNELS(D)                                                                                \
     extern "C" __global__ void __launch_bounds__(D)                                                          \
         attn_prep_##D(const float* qfull, const float* k, const float* v, const float* q_norm,                \
                       const float* k_norm, float* q_out, __half* K, __half* V, int kv_stride, int kv_shift,    \
                       long long kv_bstride, int n_q, int n_kv, int n_rot, int pos0, float freq_base, float eps, \
-                      int gated) {                                                                           \
+                      int gated, int rot_pairs, int v_norm) {                                                \
         attn_prep_body<D>(qfull, k, v, q_norm, k_norm, q_out, K, V, kv_stride, kv_shift, kv_bstride, n_q, n_kv, \
-                          n_rot, pos0, freq_base, eps, gated);                                               \
+                          n_rot, pos0, freq_base, eps, gated, rot_pairs, v_norm);                            \
     }                                                                                                        \
     extern "C" __global__ void __launch_bounds__(CH)                                                         \
         attn_partial_##D(const float* q, const __half* K, const __half* V, int kv_stride, int kv_shift,       \
                          long long kv_bstride, int pos0, int n_q, int n_kv_heads, float scale, float* part_ml, \
-                         float* part_acc) {                                                                  \
+                         float* part_acc, int window) {                                                      \
         attn_partial_body<D>(q, K, V, kv_stride, kv_shift, kv_bstride, pos0, n_q, n_kv_heads, scale, part_ml, \
-                             part_acc);                                                                      \
+                             part_acc, window);                                                              \
     }                                                                                                        \
     extern "C" __global__ void __launch_bounds__(256)                                                        \
         attn_combine_##D(const float* part_ml, const float* part_acc, int n_chunks, int n_q, const float* qfull, \
                          float* out, Q8Out o, int gated) {                                                   \
         attn_combine_body<D>(part_ml, part_acc, n_chunks, n_q, qfull, out, o, gated);                         \
-    }                                                                                                        \
+    }
+#define ATTN_KERNELS(D)                                                                                       \
+    ATTN_DECODE_KERNELS(D)                                                                                    \
     ATTN_FLASH_KERNEL(D, 1)
 
 // attn_flash_<D> (ratio n_q / n_kv a multiple of 4), attn_flash_<D>_g<NG>: NG KV heads per workgroup
@@ -367,5 +385,6 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
 
 ATTN_KERNELS(128)
 ATTN_KERNELS(256)
+ATTN_DECODE_KERNELS(512)
 // Two KV heads per workgroup (Qwen3: ratio 2): head_dim 128 only (256 would need over 64 KB of LDS)
 ATTN_FLASH_KERNEL_NAMED(attn_flash_128_g2, 128, 2)

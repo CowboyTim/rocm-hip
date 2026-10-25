@@ -11,8 +11,8 @@
 #include <stdlib.h>
 
 static hipModule_t g_mod = nullptr;
-// [0]: head_dim 128 (attn_*_128), [1]: 256
-static hipFunction_t g_prep[2], g_partial[2], g_combine[2], g_flash[2];
+// [0]: head_dim 128 (attn_*_128), [1]: 256, [2]: 512 (no attn_flash_512)
+static hipFunction_t g_prep[3], g_partial[3], g_combine[3], g_flash[3];
 // attn_flash_128_g2: 2 KV heads per workgroup, for a query / KV head ratio of 2 (Qwen3)
 static hipFunction_t g_flash128_g2 = nullptr;
 
@@ -28,8 +28,8 @@ int attention_init(const char* co_path) {
         g_mod = nullptr;
         return -1;
     }
-    for (int i = 0; i < 2; ++i) {
-        const int d = i ? 256 : 128;
+    for (int i = 0; i < 3; ++i) {
+        const int d = 128 << i;
         char n[4][32];
         snprintf(n[0], sizeof(n[0]), "attn_prep_%d", d);
         snprintf(n[1], sizeof(n[1]), "attn_partial_%d", d);
@@ -38,7 +38,7 @@ int attention_init(const char* co_path) {
         if (hipModuleGetFunction(&g_prep[i], g_mod, n[0]) != hipSuccess ||
             hipModuleGetFunction(&g_partial[i], g_mod, n[1]) != hipSuccess ||
             hipModuleGetFunction(&g_combine[i], g_mod, n[2]) != hipSuccess ||
-            hipModuleGetFunction(&g_flash[i], g_mod, n[3]) != hipSuccess) {
+            (d < 512 && hipModuleGetFunction(&g_flash[i], g_mod, n[3]) != hipSuccess)) {
             INFER_LOG("[attention] kernels missing in %s\n", co_path);
             attention_free();
             return -1;
@@ -52,7 +52,7 @@ int attention_init(const char* co_path) {
 void attention_free(void) {
     if (g_mod) (void)hipModuleUnload(g_mod);
     g_mod = nullptr;
-    for (int i = 0; i < 2; ++i) g_prep[i] = g_partial[i] = g_combine[i] = g_flash[i] = nullptr;
+    for (int i = 0; i < 3; ++i) g_prep[i] = g_partial[i] = g_combine[i] = g_flash[i] = nullptr;
     g_flash128_g2 = nullptr;
 }
 
@@ -61,19 +61,36 @@ hipError_t attention_forward(const float* qfull, const float* k, const float* v,
                              int n_kv, int n_rot, int pos0, int T,
                              float freq_base, float eps, float* q, float* part_ml, float* part_acc, float* out,
                              int head_dim, int gated, const qmatvec_q8* q8, hipStream_t stream) {
-    const int hi = head_dim == 256 ? 1 : head_dim == 128 ? 0 : -1, D = head_dim;
+    attention_opts o = {};
+    o.head_dim = head_dim;
+    o.gated = gated;
+    return attention_forward_opts(qfull, k, v, q_norm, k_norm, K, V, kv_shift, kv_bstride, n_q, n_kv, n_rot, pos0, T,
+                                  freq_base, eps, q, part_ml, part_acc, out, &o, q8, stream);
+}
+
+hipError_t attention_forward_opts(const float* qfull, const float* k, const float* v, const float* q_norm,
+                                  const float* k_norm, __half* K, __half* V, int kv_shift, long long kv_bstride,
+                                  int n_q, int n_kv, int n_rot, int pos0, int T, float freq_base, float eps, float* q,
+                                  float* part_ml, float* part_acc, float* out, const attention_opts* opts,
+                                  const qmatvec_q8* q8, hipStream_t stream) {
+    if (!opts) return hipErrorInvalidValue;
+    const int D = opts->head_dim, hi = D == 128 ? 0 : D == 256 ? 1 : D == 512 ? 2 : -1;
+    int gated = opts->gated, window = opts->window, v_norm = opts->v_norm;
+    int rot_pairs = opts->rot_pairs > 0 ? opts->rot_pairs : n_rot / 2;
     if (hi < 0) return hipErrorInvalidValue;
     if (!g_prep[hi]) return hipErrorInvalidDeviceFunction;
-    const int HP = 256 / D;  // heads per attn_combine workgroup (one 256-value block)
-    if (kv_shift < 0 || kv_shift > 30 || n_kv <= 0 || n_q % n_kv != 0 || n_q % HP != 0 || n_rot > D ||
-        n_rot % 2 != 0 || pos0 < 0 || T <= 0)
+    int kv_stride = opts->kv_stride > 0 ? opts->kv_stride : n_kv * D;
+    if (kv_shift < 0 || kv_shift > 30 || n_kv <= 0 || n_q % n_kv != 0 || (long long)n_q * D % 256 != 0 ||
+        n_rot > D || n_rot % 2 != 0 || rot_pairs > n_rot / 2 || pos0 < 0 || T <= 0 || window < 0 ||
+        kv_stride < n_kv * D)
         return hipErrorInvalidValue;
     if (q8 && (long long)T * n_q * D > q8->max_k) return hipErrorInvalidValue;
-    int kv_stride = n_kv * D;
+    const int NB = n_q * D / 256;  // attn_combine workgroups per token (256 values each)
     const int n_last = pos0 + T;  // positions the last token attends to
 
     void* a_prep[] = {(void*)&qfull, (void*)&k, (void*)&v, (void*)&q_norm, (void*)&k_norm, &q, &K, &V, &kv_stride,
-                      &kv_shift, &kv_bstride, &n_q, &n_kv, &n_rot, &pos0, &freq_base, &eps, &gated};
+                      &kv_shift, &kv_bstride, &n_q, &n_kv, &n_rot, &pos0, &freq_base, &eps, &gated, &rot_pairs,
+                      &v_norm};
     hipError_t e = hipModuleLaunchKernel(g_prep[hi], (unsigned)(n_q + n_kv), (unsigned)T, 1, (unsigned)D, 1, 1, 0,
                                          stream,
                                          a_prep, nullptr);
@@ -82,14 +99,15 @@ hipError_t attention_forward(const float* qfull, const float* k, const float* v,
     // Partial-result slots the caller's buffers hold (attention_part_slots with n_ctx >= n_last)
     const int nc = (n_last + ATTN_CHUNK - 1) / ATTN_CHUNK;
     const long long slots = std::max<long long>(nc, (long long)T * std::min(nc, ATTN_MAX_SPLITS));
-    float scale = 1.0f / sqrtf((float)D);
+    float scale = opts->scale != 0.0f ? opts->scale : 1.0f / sqrtf((float)D);
     const float* qc = q;
     qmatvec_q8_out o = qmatvec_q8_outputs(q8);
 
     // attn_flash: 4 query heads per workgroup, sharing one KV head (ratio a multiple of 4) or, head_dim 128,
-    // two (ratio 2); other ratios take attn_partial
+    // two (ratio 2); other ratios, head_dim 512 and sliding windows take attn_partial
     const int ratio = n_q / n_kv;
-    hipFunction_t flash = ratio % 4 == 0                          ? g_flash[hi]
+    hipFunction_t flash = window > 0 || !g_flash[hi]              ? nullptr
+                          : ratio % 4 == 0                          ? g_flash[hi]
                           : D == 128 && ratio == 2 && n_q % 4 == 0 ? g_flash128_g2
                                                                    : nullptr;
     if (T >= kFlashMinT && !g_flash_off && flash) {
@@ -103,7 +121,7 @@ hipError_t attention_forward(const float* qfull, const float* k, const float* v,
                                   1, 0, stream, a_flash, nullptr);
         if (e != hipSuccess) return e;
         void* a_comb[] = {&part_ml, &part_acc, &n_split, &n_q, (void*)&qfull, &out, &o, &gated};
-        return hipModuleLaunchKernel(g_combine[hi], (unsigned)(n_q / HP), (unsigned)T, 1, 256, 1, 1, 0, stream, a_comb,
+        return hipModuleLaunchKernel(g_combine[hi], (unsigned)NB, (unsigned)T, 1, 256, 1, 1, 0, stream, a_comb,
                                      nullptr);
     }
 
@@ -115,22 +133,23 @@ hipError_t attention_forward(const float* qfull, const float* k, const float* v,
         const float* qz = qc + (size_t)z0 * n_q * D;
         const float* qfz = qfull + (size_t)z0 * (gated ? 2 : 1) * n_q * D;
         float* outz = out + (size_t)z0 * n_q * D;
-        qmatvec_q8_out oz = o;  // quantized blocks of tokens z0 ..: one 256-value block per HP heads
+        qmatvec_q8_out oz = o;  // quantized blocks of tokens z0 ..: NB 256-value blocks per token
         if (oz.qK) {
-            const size_t blk = (size_t)z0 * n_q / HP;
+            const size_t blk = (size_t)z0 * NB;
             oz.q0 += blk * 256;
             oz.qK += blk * 256;
             oz.d0 += blk * 8;
             oz.dK += blk;
             oz.bsK += blk * 16;
         }
-        void* a_part[] = {(void*)&qz, &K, &V, &kv_stride, &kv_shift, &kv_bstride, (void*)&p0, &n_q, &n_kv, &scale, &part_ml, &part_acc};
+        void* a_part[] = {(void*)&qz, &K, &V, &kv_stride, &kv_shift, &kv_bstride, (void*)&p0, &n_q, &n_kv, &scale,
+                          &part_ml, &part_acc, &window};
         e = hipModuleLaunchKernel(g_partial[hi], (unsigned)n_q, (unsigned)n_chunks, (unsigned)tg, ATTN_CHUNK, 1, 1, 0,
                                   stream, a_part, nullptr);
         if (e != hipSuccess) return e;
         int nch = n_chunks;
         void* a_comb[] = {&part_ml, &part_acc, &nch, &n_q, (void*)&qfz, &outz, &oz, &gated};
-        e = hipModuleLaunchKernel(g_combine[hi], (unsigned)(n_q / HP), (unsigned)tg, 1, 256, 1, 1, 0, stream, a_comb,
+        e = hipModuleLaunchKernel(g_combine[hi], (unsigned)NB, (unsigned)tg, 1, 256, 1, 1, 0, stream, a_comb,
                                   nullptr);
         if (e != hipSuccess) return e;
     }

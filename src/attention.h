@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define ATTN_HEAD_DIM 256       // the largest head_dim the kernels are compiled for (also 128)
+#define ATTN_HEAD_DIM 256       // head_dim of attention_part_acc_floats (the kernels: 128, 256 and 512)
 #define ATTN_CHUNK 256          // KV positions per attn_partial workgroup
 
 // Load attention.co. Returns 0 on success.
@@ -38,8 +38,11 @@ static inline size_t attention_part_slots(int n_ctx, int T) {
 static inline size_t attention_part_ml_floats(int n_q, int n_ctx, int T) {
     return 2 * attention_part_slots(n_ctx, T) * (size_t)n_q;
 }
+static inline size_t attention_part_acc_floats_d(int n_q, int n_ctx, int T, int head_dim) {
+    return attention_part_slots(n_ctx, T) * (size_t)n_q * (size_t)head_dim;
+}
 static inline size_t attention_part_acc_floats(int n_q, int n_ctx, int T) {
-    return attention_part_slots(n_ctx, T) * (size_t)n_q * ATTN_HEAD_DIM;
+    return attention_part_acc_floats_d(n_q, n_ctx, T, ATTN_HEAD_DIM);
 }
 
 // T tokens at positions pos0 .. pos0 + T - 1; token t attends to positions 0 .. pos0 + t. Per token row t:
@@ -56,6 +59,25 @@ hipError_t attention_forward(const float* qfull, const float* k, const float* v,
                              int n_kv, int n_rot, int pos0, int T,
                              float freq_base, float eps, float* q, float* part_ml, float* part_acc, float* out,
                              int head_dim, int gated, const qmatvec_q8* q8, hipStream_t stream);
+
+// What attention_forward_opts adds (Gemma-4); zeros give attention_forward's behaviour
+typedef struct {
+    int head_dim;    // 128, 256 or 512 (512: no attn_flash, every batch takes attn_partial)
+    int gated;       // attn_q holds [Q | gate] per head
+    int kv_stride;   // halves between the cache rows of two positions; 0: n_kv * head_dim (a layer that uses only
+                     // part of a wider cache row, as Gemma-4's global layers do, passes the row width)
+    int rot_pairs;   // NeoX pairs (of n_rot / 2) that rotate; 0: all. Gemma-4's global layers: 64 of 256, the
+                     // rest have frequency factor 1e30 (rope_freqs), which leaves them unrotated
+    int v_norm;      // RMSNorm (no gamma) of each V head before it is cached
+    int window;      // sliding window: a token at p attends to positions > p - window only; 0: all before it
+    float scale;     // the scores' scale; 0: 1 / sqrt(head_dim) (Gemma-4: 1, its q / k norms replace it)
+} attention_opts;
+
+hipError_t attention_forward_opts(const float* qfull, const float* k, const float* v, const float* q_norm,
+                                  const float* k_norm, __half* K, __half* V, int kv_shift, long long kv_bstride,
+                                  int n_q, int n_kv, int n_rot, int pos0, int T, float freq_base, float eps, float* q,
+                                  float* part_ml, float* part_acc, float* out, const attention_opts* opts,
+                                  const qmatvec_q8* q8, hipStream_t stream);
 
 #ifdef __cplusplus
 }
