@@ -2057,23 +2057,31 @@ __device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, 
                 }
             }
         } else {
+            // A scale per 16 values: the block's two half-block dots scaled by their own e_w, then by the
+            // token's d_x once, acc += d_x (e_w0 dot0 + e_w1 dot1) (5 VALU ops per pair of results, not 6)
 #pragma unroll 1
-            for (int h = 0; h < WM_KC / 16; ++h) {
-                const v4i_t a = *(const v4i_t *)&sw[16 * w + i][16 * h];
-                v8i_t c[NT];
+            for (int j = 0; j < WM_KC / 32; ++j) {
+                const v4i_t a0 = *(const v4i_t *)&sw[16 * w + i][32 * j];
+                const v4i_t a1 = *(const v4i_t *)&sw[16 * w + i][32 * j + 16];
+                v8i_t c0[NT], c1[NT];
 #pragma unroll
                 for (int n = 0; n < NT; ++n) {  // issue the WMMAs first, then their epilogues
-                    const v4i_t bx = *(const v4i_t *)&sx[16 * n + i][16 * h];
-                    c[n] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, bx, v8i_t{}, false);
+                    const v4i_t b0 = *(const v4i_t *)&sx[16 * n + i][32 * j];
+                    const v4i_t b1 = *(const v4i_t *)&sx[16 * n + i][32 * j + 16];
+                    c0[n] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, v8i_t{}, false);
+                    c1[n] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, v8i_t{}, false);
                 }
-                float ew[8];
+                float ew0[8], ew1[8];
 #pragma unroll
-                for (int r = 0; r < 8; ++r) ew[r] = sew[16 * w + 2 * r + hi][h];
+                for (int r = 0; r < 8; ++r) {
+                    ew0[r] = sew[16 * w + 2 * r + hi][2 * j];
+                    ew1[r] = sew[16 * w + 2 * r + hi][2 * j + 1];
+                }
 #pragma unroll
                 for (int n = 0; n < NT; ++n) {
-                    const float dx = sdx[h / 2][16 * n + 8 * (i & 1) + (i >> 1)];  // token 16 n + i
+                    const float dx = sdx[j][16 * n + 8 * (i & 1) + (i >> 1)];  // token 16 n + i
 #pragma unroll
-                    for (int r = 0; r < 8; ++r) acc[n][r] += (float)c[n][r] * (ew[r] * dx);
+                    for (int r = 0; r < 8; ++r) acc[n][r] += dx * ((float)c0[n][r] * ew0[r] + (float)c1[n][r] * ew1[r]);
                 }
             }
         }
@@ -2328,14 +2336,22 @@ __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, 
         for (int n = 0; n < NT; ++n)
 #pragma unroll
             for (int r = 0; r < 8; ++r) isum[n][r] = 0;
+        // Q4_K / Q5_K: one scale per 32-value sub-block, so its two 16-value WMMAs chain in the int32 accumulator
+        // and are scaled once (the same integer sums); Q6_K: a scale per 16 values
+        constexpr int GW = KT == 6 ? 1 : 2;  // WMMAs per scale group
 #pragma unroll 1
-        for (int g = 0; g < WM_KC / 16; ++g) {
-            const v4i_t a = *(const v4i_t *)&sw[16 * w + i][16 * g];
+        for (int g = 0; g < WM_KC / 16; g += GW) {
             v8i_t c[NT];
 #pragma unroll
-            for (int n = 0; n < NT; ++n) {
-                const v4i_t bx = *(const v4i_t *)&sx[16 * n + i][16 * g];
-                c[n] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, bx, v8i_t{}, false);
+            for (int n = 0; n < NT; ++n) c[n] = v8i_t{};
+#pragma unroll
+            for (int j = 0; j < GW; ++j) {
+                const v4i_t a = *(const v4i_t *)&sw[16 * w + i][16 * (g + j)];
+#pragma unroll
+                for (int n = 0; n < NT; ++n) {
+                    const v4i_t bx = *(const v4i_t *)&sx[16 * n + i][16 * (g + j)];
+                    c[n] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, bx, c[n], false);
+                }
             }
             int gs[8];
 #pragma unroll

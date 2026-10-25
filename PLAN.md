@@ -2360,6 +2360,12 @@ one BF16 layer). Reference: `llama.cpp/src/models/gemma4.cpp` + `gemma4-common.h
     tok/s**, Q8 1,195 -> 1,273. D 128 (Qwen3-0.6B, ratio 2) 8,640 -> 9,435. D 256 measured neutral (Qwen3.6-35B
     2,247 vs 2,230, Gemma sliding): keeps the staging. Attention outputs vs attn_partial >= 0.999999,
     forward_verify (batched attention at 2,460..2,499) and gemma4_verify PASS.
+  - **Done: WMMA matmul epilogues.** K-quant kernel (Q4_K / Q5_K): the two 16-value WMMAs of a 32-value
+    sub-block (one scale) chain in the int32 accumulator and are scaled once (same integer sums: the 70-token
+    matvec_verify difference is unchanged); ROCmFP4 (a scale per 16 values, VALU-bound: ~24 VALU instructions per
+    WMMA): acc += d_x (e_w0 dot0 + e_w1 dot1) per 32-value block (5 ops per pair, not 6). Gemma FP4 1,731 ->
+    **1,795 tok/s**, Qwen3.5-4B 1,880 -> 1,974, Qwen3.6-35B 2,247 -> 2,252. Measured: dense ROCmFP4 ~20 TOPS,
+    K-quants ~14, experts 13 - 18.5 (of ~55).
   - **Left (profile, FP4 file, 2.0 s):** attn_flash 512 0.32 s + 256 0.24 s, the WMMA matmuls ~1.0 s (ROCmFP4,
     Q5_K dense and experts), add_rmsnorm_rows 0.08 s. Generation (44 / 35 tok/s) not looked at yet.
 - **Step 5 — DONE ✅ (2026-10-25): sliding-window ring KV cache.** `inference_kv_cache_init` puts the 25
