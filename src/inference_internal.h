@@ -60,6 +60,7 @@ struct HcMix {
 struct LayerWeights {
     LayerKind kind = LAYER_FULL_ATTN;
     int kv_slot = -1;                                 // full attention: this layer's KV cache layer; else -1
+    bool kv_ring = false;                             // kv_slot is a layer of the sliding-window ring (kvc_swa)
     QuantWeight Wq, Wk, Wv, Wo;                       // full attention only; Wq rows are [Q | gate] per head
     QuantWeight W_gate, W_up, W_down;                 // MLP (SwiGLU); the shared expert when moe
     const float* attn_norm = nullptr;                 // [n_embd] F32, pre-mixer RMSNorm gamma
@@ -229,6 +230,11 @@ struct inference_model {
     // are n_head_kv * kv_head_dim values (8 x 256: a global layer's 2 x 512 use the first half of a row)
     bool gemma4 = false;
     int kv_head_dim = 0;                                // KV cache head_dim (0: head_dim)
+    // With the ring (inference_kv_cache_init): the sliding layers' K / V in kvc_swa, one block of swa_ring
+    // positions that position p uses slot p % swa_ring of; kvc holds the global layers only, rows of their width
+    inference_kv_cache_t* kvc_swa = nullptr;
+    int swa_ring = 0;                                   // ring positions (0: no ring, one cache for all layers)
+    int swa_window = 0;                                 // the sliding window
     float embd_scale = 1.0f;                            // token embeddings * sqrt(n_embd)
     float logit_softcap = 0.0f;                         // final_logit_softcapping (0: none)
 };

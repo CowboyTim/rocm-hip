@@ -773,6 +773,7 @@ void inference_free_model(inference_model_t* m) {
     unpin_model_memory(m);
     inference_store_close(m);
     if (m->kvc) { INFER_LOG("[CLEANUP] Freeing KV cache\n"); kv_cache_free(m->kvc); }
+    if (m->kvc_swa) kv_cache_free(m->kvc_swa);
     if (m->qwen) { INFER_LOG("[CLEANUP] Freeing qwen model\n"); qwen_model_free(m->qwen); }
     if (m->gguf) { INFER_LOG("[CLEANUP] Closing GGUF\n"); gguf_mmap_close(m->gguf); }
     INFER_LOG("[CLEANUP] Deleting model struct\n");
@@ -800,14 +801,58 @@ void inference_free_tokens(int32_t* tokens, int len) {
     delete[] tokens;
 }
 
+// Gemma-4's sliding-window layers only read their last `window` positions: their K / V go to a ring of R
+// positions (a power of two >= window + the prefill batch, since a batch writes all its positions before it
+// attends), one block that kernels address with block stride 0, so position p lands in slot p % R. The global
+// layers keep the block cache, with rows of their own width. 0 when the model has no sliding layers or
+// INFERENCE_SWA_FULL=1 asks for one cache of every layer (what the block store needs).
+static int swa_ring_size(const inference_model_t* m, int n_ctx, int* window) {
+    *window = 0;
+    if (!m->gemma4) return 0;
+    for (const LayerWeights& L : m->layers) *window = std::max(*window, L.window);
+    const char* full = getenv("INFERENCE_SWA_FULL");
+    if (*window <= 0 || (full && atoi(full) != 0)) return 0;
+    const int need = *window + (m->prefill_batch > 0 ? m->prefill_batch : 1024);
+    int R = 256;
+    while (R < need) R *= 2;
+    return R < n_ctx ? R : 0;  // no gain when the context is that short
+}
+
 int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
     clear_error();
     if (!m) { set_error("NULL model"); return -1; }
+    if (m->kvc_swa) { kv_cache_free(m->kvc_swa); m->kvc_swa = nullptr; }
+    int window = 0;
+    const int R = swa_ring_size(m, n_ctx, &window);
+    m->swa_ring = R;
+    m->swa_window = window;
     // One KV layer per full-attention layer (LayerWeights::kv_slot); DeltaNet layers keep recurrent state instead
     kv_cache_config_t cfg{m->n_kv_layers > 0 ? m->n_kv_layers : 1, n_ctx, m->n_embd,
                           m->kv_head_dim > 0 ? m->kv_head_dim : m->head_dim, m->n_head, m->n_head_kv};
+    if (m->gemma4) {  // number the layers' KV slots: in the ring and the block cache, or all in the block cache
+        int n_ring = 0, n_glob = 0, ring_hd = 0, ring_kv = 0, glob_hd = 0, glob_kv = 0;
+        for (LayerWeights& L : m->layers) {
+            L.kv_ring = R > 0 && L.window > 0;
+            L.kv_slot = R == 0 ? n_glob++ : L.kv_ring ? n_ring++ : n_glob++;
+            (L.kv_ring ? ring_hd : glob_hd) = L.head_dim;
+            (L.kv_ring ? ring_kv : glob_kv) = L.n_head_kv;
+        }
+        if (R > 0) {
+            cfg = kv_cache_config_t{std::max(1, n_glob), n_ctx, m->n_embd, glob_hd, m->n_head, glob_kv};
+            const kv_cache_config_t rcfg{n_ring, R, m->n_embd, ring_hd, m->n_head, ring_kv, R};
+            m->kvc_swa = kv_cache_create("/dev/shm", &rcfg);
+            if (!m->kvc_swa) { set_error("kv_cache_create (sliding-window ring) failed"); return -1; }
+        }
+    }
     m->kvc = kv_cache_create("/dev/shm", &cfg);
     if (!m->kvc) { set_error("kv_cache_create failed"); return -1; }
+    if (m->kvc_swa)
+        INFER_LOG("[KV_INIT] sliding-window ring: %d layers x %d positions (%.0f MB), %d global layers x %d (%.0f MB)\n",
+                  kv_cache_n_layers(m->kvc_swa), R, kv_cache_total_bytes(m->kvc_swa) / 1048576.0,
+                  kv_cache_n_layers(m->kvc), kv_cache_n_ctx(m->kvc), kv_cache_total_bytes(m->kvc) / 1048576.0);
+    else
+        INFER_LOG("[KV_INIT] KV cache: %d layers x %d positions (%.0f MB)\n", kv_cache_n_layers(m->kvc),
+                  kv_cache_n_ctx(m->kvc), kv_cache_total_bytes(m->kvc) / 1048576.0);
     if (m->mtp) {
         if (m->mtp->kvc) kv_cache_free(m->mtp->kvc);
         const kv_cache_config_t mcfg = mtp_kv_config(m, kv_cache_n_ctx(m->kvc));
@@ -843,6 +888,7 @@ int inference_set_lm_head_q8(inference_model_t* m, int enable) {
 
 void inference_kv_cache_free(inference_model_t* m) {
     if (m && m->kvc) { kv_cache_free(m->kvc); m->kvc = nullptr; }
+    if (m && m->kvc_swa) { kv_cache_free(m->kvc_swa); m->kvc_swa = nullptr; }
 }
 
 qwen_model_t* inference_get_qwen_model(inference_model_t* m) {
@@ -1412,6 +1458,8 @@ static int sync_prompt(inference_model_t* m, const int32_t* p, int n, int tail) 
         const int target = std::min((int)L, n - 1);
         if (!qwen_model_is_recurrent(m->qwen)) {
             start = target;
+            // the sliding-window ring must still hold the window before it; else from the start
+            if (!qwen_model_ring_reuse_ok(m->qwen, start)) start = 0;
         } else {
             for (size_t i = 0; i < m->ckpts.size(); ++i)
                 if (m->ckpts[i].pos <= target && (ck < 0 || m->ckpts[i].pos > m->ckpts[ck].pos)) ck = (int)i;
@@ -1449,6 +1497,11 @@ int inference_store_open(inference_model_t* m, const char* dir, int snapshot_eve
     clear_error();
     if (!m || !m->kvc || !m->qwen || !dir || !dir[0] || snapshot_every < 0) {
         set_error("Invalid state or arguments (call inference_kv_cache_init first)");
+        return INFERENCE_ERR_INVALID_ARG;
+    }
+    if (m->kvc_swa) {  // a block holds only the global layers; the ring keeps no history to store
+        set_error("store: the sliding-window layers' KV cache is a ring (set INFERENCE_SWA_FULL=1 before "
+                  "inference_kv_cache_init to keep every layer's KV cache and use a block store)");
         return INFERENCE_ERR_INVALID_ARG;
     }
     inference_store_close(m);

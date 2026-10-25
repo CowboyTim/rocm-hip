@@ -82,6 +82,11 @@ void qwen_model_set_layer_callback(qwen_model_t* model, qwen_layer_cb cb, void* 
 // queued in order with the forward passes; the KV cache needs nothing (later positions are just overwritten).
 // Return 0 on success, -1 on error. qwen_model_is_recurrent: 1 if there is recurrent state at all.
 int qwen_model_is_recurrent(const qwen_model_t* model);
+
+// With Gemma-4's sliding-window ring (inference_kv_cache_init): 1 if the sequence can continue at position `start`
+// (the ring still holds the window of positions before it: nothing there was overwritten since), else 0 (start
+// over at 0). Always 1 without a ring.
+int qwen_model_ring_reuse_ok(const qwen_model_t* model, int start);
 int qwen_model_state_save(qwen_model_t* model, int slot);
 int qwen_model_state_restore(qwen_model_t* model, int slot);
 // The whole recurrent state in host memory (pinned, coarse-grained; *bytes its size, 0 / NULL without recurrent

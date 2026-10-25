@@ -927,7 +927,8 @@ struct QwenModel {
         if (L.v_from_k ? !matvec_multi({{&L.Wq, s.qfull}, {&L.Wk, s.k}}, s.xn, T, P_ATTN)
                        : !matvec_multi({{&L.Wq, s.qfull}, {&L.Wk, s.k}, {&L.Wv, s.v}}, s.xn, T, P_ATTN))
             return false;
-        inference_kv_cache_t* kvc = eng->kvc;
+        // the sliding layers' ring (one block of swa_ring positions, block stride 0: position p in slot p % R)
+        inference_kv_cache_t* kvc = L.kv_ring ? eng->kvc_swa : eng->kvc;
         __half* K = kv_cache_k_row(kvc, L.kv_slot, 0);
         __half* V = kv_cache_v_row(kvc, L.kv_slot, 0);
         if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
@@ -940,16 +941,17 @@ struct QwenModel {
         o.scale = 1.0f;
         const qmatvec_q8* q8 = q8_for(DQ, T);
         if (!check(attention_forward_opts(s.qfull, s.k, L.v_from_k ? s.k : s.v, L.q_norm, L.k_norm, K, V,
-                                          kv_cache_block_shift(kvc), kv_cache_block_stride(kvc), HQ, L.n_head_kv,
+                                          kv_cache_block_shift(kvc), L.kv_ring ? 0 : kv_cache_block_stride(kvc), HQ,
+                                          L.n_head_kv,
                                           L.n_rot, pos0, T, L.rope_base, (float)eng->eps, s.q, s.part_ml, s.part_acc,
                                           s.attn, &o, q8, 0),
                    "attention kernels"))
             return false;
         mark(s.attn, DQ, T, q8);
-        // GEMMA_DUMP_LAYER=<kv slot>: write Q (normed, rotated) and the attention output of that layer as raw floats
+        // GEMMA_DUMP_LAYER=<layer>: write Q (normed, rotated) and the attention output of that layer as raw floats
         // to $GEMMA_DUMP_DIR/{q,attn}.f32 (debugging against llama.cpp's Qcur_pos / kqv_out)
         static const char* dump = getenv("GEMMA_DUMP_LAYER");
-        if (dump && atoi(dump) == L.kv_slot) {
+        if (dump && atoi(dump) == (int)(&L - eng->layers.data())) {
             if (!sync()) return false;
             const char* dir = getenv("GEMMA_DUMP_DIR") ? getenv("GEMMA_DUMP_DIR") : ".";
             const std::pair<const char*, const float*> outs[] = {{"q", s.q}, {"attn", s.attn}};
@@ -1026,9 +1028,14 @@ struct QwenModel {
         return check(gpu_add_normed(s.x_alt, h, L.post_ffw_norm, L.out_scale, s.x, E, T, eps, 0), "add_normed (ffn)");
     }
 
+    // The sliding-window ring's high-water mark: positions below ring_hi - swa_ring have been overwritten. A
+    // sequence that starts again at 0 starts it again (later slots hold old positions no token reads).
+    int ring_hi = 0;
+
     int forward_gemma(const int* tokens, int T, int pos0, float* logits_out) {
         const int E = eng->n_embd, V = eng->vocab_size;
         const float eps = (float)eng->eps;
+        ring_hi = pos0 == 0 ? T : std::max(ring_hi, pos0 + T);
         prof.start();
         for (int t = 0; t < T; ++t) {
             if (tokens[t] < 0 || tokens[t] >= V) { qwen_set_error("token %d out of range", tokens[t]); return -1; }
@@ -1552,6 +1559,11 @@ int qwen_model_set_lm_head_q8(qwen_model_t* model, int enable) {
 
 int qwen_model_is_recurrent(const qwen_model_t* model) {
     return model && model->rs.mem.base ? 1 : 0;
+}
+
+int qwen_model_ring_reuse_ok(const qwen_model_t* model, int start) {
+    if (!model || model->eng->swa_ring <= 0 || start <= 0) return 1;
+    return std::max(0, start - model->eng->swa_window) >= model->ring_hi - model->eng->swa_ring ? 1 : 0;
 }
 
 void* qwen_model_state_memory(qwen_model_t* model, size_t* bytes) {
