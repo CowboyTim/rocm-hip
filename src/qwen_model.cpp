@@ -968,16 +968,32 @@ struct QwenModel {
 
     // The layer after attention: s.x (layer input), s.proj (attention output) -> s.x (layer output); s.x_alt holds
     // the post-attention residual
+    // Gemma-4's norm chains fused for batches of 32+ tokens (gpu_gemma_attn_post / gpu_gemma_ffn_post: the same
+    // bits, fewer passes over the rows and launches); GEMMA_NO_FUSE=1 runs the separate kernels (A/B)
+    const bool gemma_fuse = getenv("GEMMA_NO_FUSE") == nullptr;
+    bool gemma_xn_ready = false;  // the last gemma_ffn already wrote the next layer's normed, quantized input
+
+    // FFN of layer l from x (s.x) and the attention output (s.proj): x' (s.x_alt), the dense MLP and the experts,
+    // then the new residual in s.x; fused, also the next layer's attention input (or the output norm's) in s.xn
     bool gemma_ffn(int l, const LayerWeights& L, int T) {
         const int E = eng->n_embd, FF = eng->n_ff, NE = eng->n_expert, NU = eng->n_expert_used, FE = eng->n_ff_exp;
         const float eps = (float)eng->eps;
         const qmatvec_q8* qe = q8_for(E, T);
-        if (!check(gpu_add_normed(s.x, s.proj, L.post_attn_norm, nullptr, s.x_alt, E, T, eps, 0), "add_normed"))
-            return false;
-        // dense MLP -> s.proj
+        // (a few tokens: the separate norm kernels spread a row over the GPU; one workgroup per row doing the whole
+        // chain made generating 11% slower)
+        const bool fuse = gemma_fuse && L.moe && T >= 32;
+        gemma_xn_ready = false;
+        // dense MLP -> s.proj (fused: the router's input in s.sh_out too)
         const qmatvec_q8* qf = q8_for(FF, T, true);
-        if (!check(gpu_add_rmsnorm(s.x_alt, nullptr, s.x_alt, L.ffn_norm, s.xn, E, T, eps, qe, 0), "rmsnorm"))
+        if (fuse) {
+            if (!check(gpu_gemma_attn_post(s.x, s.proj, L.post_attn_norm, s.x_alt, L.ffn_norm, s.xn, qe, router_w[l],
+                                           s.sh_out, E, T, eps, 0),
+                       "gemma_attn_post"))
+                return false;
+        } else if (!check(gpu_add_normed(s.x, s.proj, L.post_attn_norm, nullptr, s.x_alt, E, T, eps, 0), "add_normed") ||
+                   !check(gpu_add_rmsnorm(s.x_alt, nullptr, s.x_alt, L.ffn_norm, s.xn, E, T, eps, qe, 0), "rmsnorm")) {
             return false;
+        }
         mark(s.xn, E, T, qe);
         if (!matvec_pair(L.W_gate, L.W_up, s.xn, s.ffg, s.ffu, T, P_FFN) ||
             !check(gpu_geglu(s.ffg, s.ffu, s.act, T, FF, FF, FF, qf, 0), "geglu"))
@@ -987,8 +1003,9 @@ struct QwenModel {
         const float* h = s.proj;  // what post_ffw_norm normalizes: the MLP output, or the sum of both normed
         if (L.moe) {
             // router (float: the router is F32) on its own norm of x' -> ids / wts
-            if (!check(gpu_add_rmsnorm(s.x_alt, nullptr, s.x_alt, router_w[l], s.sh_out, E, T, eps, nullptr, 0),
-                       "rmsnorm (router)") ||
+            if ((!fuse &&
+                 !check(gpu_add_rmsnorm(s.x_alt, nullptr, s.x_alt, router_w[l], s.sh_out, E, T, eps, nullptr, 0),
+                        "rmsnorm (router)")) ||
                 !matvec(L.W_router, s.sh_out, s.r_logits, T, P_FFN) ||
                 !check(gpu_moe_router(s.r_logits, s.sh_out, nullptr, s.ids, s.wts, s.sg, NE, NU, E, T, 0, 0),
                        "moe_router"))
@@ -1012,6 +1029,19 @@ struct QwenModel {
                        "geglu (experts)"))
                 return false;
             mark(s.moe_act, FE, T * NU, qx);
+            if (fuse) {  // combine, norms, residual and the next layer's input norm in one pass
+                const bool last = l + 1 >= eng->n_layer;
+                const float* w_next = last ? eng->output_norm : eng->layers[l + 1].attn_norm;
+                if (!matvec_id(L.We_down, s.moe_act, 1, s.moe_down, E, T, grouped, P_FFN) ||
+                    !check(gpu_gemma_ffn_post(s.x_alt, s.proj, s.moe_down, s.wts, s.ids, L.exp_scale, NU,
+                                              L.post_ffw_norm1, L.post_ffw_norm2, L.post_ffw_norm, L.out_scale, s.x,
+                                              w_next, s.xn, qe, E, T, eps, 0),
+                           "gemma_ffn_post"))
+                    return false;
+                mark(s.xn, E, T, qe);
+                gemma_xn_ready = true;
+                return true;
+            }
             if (!matvec_id(L.We_down, s.moe_act, 1, s.moe_down, E, T, grouped, P_FFN) ||
                 !check(gpu_moe_combine_scaled(s.moe_down, s.wts, nullptr, nullptr, s.ids, L.exp_scale, s.sh_out, NU,
                                               E, T, 0),
@@ -1056,9 +1086,11 @@ struct QwenModel {
         for (int l = l0; l < l1; ++l) {
             const LayerWeights& L = eng->layers[l];
             const qmatvec_q8* qe = q8_for(E, T);
-            if (!check(gpu_add_rmsnorm(s.x, nullptr, s.x, L.attn_norm, s.xn, E, T, eps, qe, 0), "rmsnorm (attn)"))
-                return -1;
-            mark(s.xn, E, T, qe);
+            if (l == l0 || !gemma_xn_ready) {  // else the previous layer's gemma_ffn_post wrote it
+                if (!check(gpu_add_rmsnorm(s.x, nullptr, s.x, L.attn_norm, s.xn, E, T, eps, qe, 0), "rmsnorm (attn)"))
+                    return -1;
+                mark(s.xn, E, T, qe);
+            }
             if (!gemma_attention(L, pos0, T) || !section(P_ATTN) || !gemma_ffn(l, L, T) || !section(P_FFN)) return -1;
             if (per_layer) {
                 if (!sync()) return -1;
@@ -1077,9 +1109,12 @@ struct QwenModel {
         }
         if (dbg_res_in) return sync() ? 0 : -1;  // no LM head
         const qmatvec_q8* qe = q8_for(E, T);
-        if (!check(gpu_add_rmsnorm(s.x, nullptr, s.x, eng->output_norm, s.xn, E, T, eps, qe, 0), "rmsnorm (output)"))
-            return -1;
-        mark(s.xn, E, T, qe);
+        if (!gemma_xn_ready) {  // else the last layer's gemma_ffn_post wrote it
+            if (!check(gpu_add_rmsnorm(s.x, nullptr, s.x, eng->output_norm, s.xn, E, T, eps, qe, 0),
+                       "rmsnorm (output)"))
+                return -1;
+            mark(s.xn, E, T, qe);
+        }
         if (lm_head(T, nullptr) != 0) return -1;
         if (eng->logit_softcap > 0.0f &&
             (!check(gpu_softcap(s.logits, V, eng->logit_softcap, 0), "softcap") || !sync()))

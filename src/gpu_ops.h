@@ -51,6 +51,18 @@ hipError_t gpu_moe_combine_scaled(const float* down, const float* wts, const flo
 // 2 h), quantized into q8 if set. gpu_softcap: x = cap * tanh(x / cap).
 hipError_t gpu_add_normed(const float* base, const float* a, const float* w, const float* scale, float* out, int n,
                           int T, float eps, hipStream_t stream);
+// Gemma-4's norm chains, fused (the same bits as the separate kernels; n % 256 == 0, n <= 4096):
+// gpu_gemma_attn_post: x_out = x + RMSNorm(a) * w_a; y1 = RMSNorm(x_out) * w1 (quantized into q8 if set); y2 =
+// RMSNorm(x_out) * w2 if w2. gpu_gemma_ffn_post: the experts' outputs combined as gpu_moe_combine_scaled (down
+// [T * n_used][n], wts, ids, exp_scale), h = RMSNorm(mlp) * w1 + RMSNorm(combined) * w2, x_out = (x + RMSNorm(h) *
+// w_post) * (*scale, or 1), y = RMSNorm(x_out) * w_next (quantized into q8 if set).
+hipError_t gpu_gemma_attn_post(const float* x, const float* a, const float* w_a, float* x_out, const float* w1,
+                               float* y1, const qmatvec_q8* q8, const float* w2, float* y2, int n, int T, float eps,
+                               hipStream_t stream);
+hipError_t gpu_gemma_ffn_post(const float* x, const float* mlp, const float* down, const float* wts, const int* ids,
+                              const float* exp_scale, int n_used, const float* w1, const float* w2, const float* w_post,
+                              const float* scale, float* x_out, const float* w_next, float* y, const qmatvec_q8* q8,
+                              int n, int T, float eps, hipStream_t stream);
 hipError_t gpu_geglu(const float* gate, const float* up, float* out, int rows, int h, int gate_stride, int up_stride,
                      const qmatvec_q8* q8, hipStream_t stream);
 hipError_t gpu_softcap(float* x, int n, float cap, hipStream_t stream);

@@ -12,6 +12,7 @@ static hipFunction_t g_norm = nullptr, g_swiglu = nullptr, g_router = nullptr, g
 static hipFunction_t g_hc_norm = nullptr, g_hc_lowrank = nullptr, g_hc_mix = nullptr, g_ple_gate = nullptr,
                      g_ple_conv = nullptr, g_mtp_concat = nullptr;
 static hipFunction_t g_add_normed = nullptr, g_geglu = nullptr, g_softcap = nullptr;
+static hipFunction_t g_attn_post = nullptr, g_ffn_post = nullptr;
 
 int gpu_ops_init(const char* co_path) {
     if (g_mod) return 0;
@@ -33,6 +34,8 @@ int gpu_ops_init(const char* co_path) {
         hipModuleGetFunction(&g_ple_conv, g_mod, "ple_conv") != hipSuccess ||
         hipModuleGetFunction(&g_mtp_concat, g_mod, "mtp_concat") != hipSuccess ||
         hipModuleGetFunction(&g_add_normed, g_mod, "add_normed") != hipSuccess ||
+        hipModuleGetFunction(&g_attn_post, g_mod, "gemma_attn_post") != hipSuccess ||
+        hipModuleGetFunction(&g_ffn_post, g_mod, "gemma_ffn_post") != hipSuccess ||
         hipModuleGetFunction(&g_geglu, g_mod, "geglu") != hipSuccess ||
         hipModuleGetFunction(&g_softcap, g_mod, "softcap") != hipSuccess) {
         INFER_LOG("[gpu_ops] kernels missing in %s\n", co_path);
@@ -48,6 +51,7 @@ void gpu_ops_free(void) {
     g_norm = g_norm_rows = g_swiglu = g_router = g_combine = g_group = nullptr;
     g_hc_norm = g_hc_lowrank = g_hc_mix = g_ple_gate = g_ple_conv = g_mtp_concat = nullptr;
     g_add_normed = g_geglu = g_softcap = nullptr;
+    g_attn_post = g_ffn_post = nullptr;
 }
 
 hipError_t gpu_add_rmsnorm(const float* x_in, const float* add, float* x_out, const float* w, float* y, int n, int T,
@@ -176,6 +180,30 @@ hipError_t gpu_add_normed(const float* base, const float* a, const float* w, con
     if (T <= 0 || n % 256 != 0 || n > 256 * 16 || a == out) return hipErrorInvalidValue;  // 16 = NORM_MAXV
     void* args[] = {(void*)&base, (void*)&a, (void*)&w, (void*)&scale, &out, &n, &eps};
     return hipModuleLaunchKernel(g_add_normed, (unsigned)T, 1, 1, 256, 1, 1, 0, stream, args, nullptr);
+}
+
+hipError_t gpu_gemma_attn_post(const float* x, const float* a, const float* w_a, float* x_out, const float* w1,
+                               float* y1, const qmatvec_q8* q8, const float* w2, float* y2, int n, int T, float eps,
+                               hipStream_t stream) {
+    if (!g_attn_post) return hipErrorInvalidDeviceFunction;
+    if (T <= 0 || n % 256 != 0 || n > 256 * 16 || (q8 && (long long)n * T > q8->max_k) || x_out == x || x_out == a)
+        return hipErrorInvalidValue;  // 16 = NORM_MAXV
+    qmatvec_q8_out o = qmatvec_q8_outputs(q8);
+    void* args[] = {(void*)&x, (void*)&a, (void*)&w_a, &x_out, (void*)&w1, &y1, &o, (void*)&w2, &y2, &n, &eps};
+    return hipModuleLaunchKernel(g_attn_post, (unsigned)T, 1, 1, 256, 1, 1, 0, stream, args, nullptr);
+}
+
+hipError_t gpu_gemma_ffn_post(const float* x, const float* mlp, const float* down, const float* wts, const int* ids,
+                              const float* exp_scale, int n_used, const float* w1, const float* w2, const float* w_post,
+                              const float* scale, float* x_out, const float* w_next, float* y, const qmatvec_q8* q8,
+                              int n, int T, float eps, hipStream_t stream) {
+    if (!g_ffn_post) return hipErrorInvalidDeviceFunction;
+    if (T <= 0 || n_used <= 0 || n % 256 != 0 || n > 256 * 16 || (q8 && (long long)n * T > q8->max_k) || x_out == x)
+        return hipErrorInvalidValue;
+    qmatvec_q8_out o = qmatvec_q8_outputs(q8);
+    void* args[] = {(void*)&x, (void*)&mlp, (void*)&down, (void*)&wts, (void*)&ids, (void*)&exp_scale, &n_used,
+                    (void*)&w1, (void*)&w2, (void*)&w_post, (void*)&scale, &x_out, (void*)&w_next, &y, &o, &n, &eps};
+    return hipModuleLaunchKernel(g_ffn_post, (unsigned)T, 1, 1, 256, 1, 1, 0, stream, args, nullptr);
 }
 
 hipError_t gpu_geglu(const float* gate, const float* up, float* out, int rows, int h, int gate_stride, int up_stride,

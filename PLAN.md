@@ -2369,6 +2369,13 @@ one BF16 layer). Reference: `llama.cpp/src/models/gemma4.cpp` + `gemma4-common.h
     kernels): Gemma 1,795 -> 1,770, reverted. The expert kernels are not worse than the dense ones of their type
     (ROCmFP4 18.9 vs 21 TOPS, Q5_K 14.8 vs ~14): what limits both is the VALU epilogue (a scale per 16 values for
     ROCmFP4; isum scaling, mins and the float step per chunk for K-quants), not the expert tiling.
+  - **Done: Gemma-4 norm chains fused** for batches of 32+ tokens: `gemma_attn_post` (x' = x + norm(attn out),
+    the dense MLP's quantized input and the router's input from one read of x') and `gemma_ffn_post` (the experts
+    combined, norm(mlp) + norm(experts), the new residual times the layer scale, and the next layer's attention
+    input norm, or the output norm, quantized): 9 row kernels per layer -> 3. Each step summed as the separate
+    kernels: logits byte-identical (2,792 tokens in 29 chunks; GEMMA_NO_FUSE=1 for A/B). Prefill 1,790 ->
+    **1,819 tok/s** (+1.5%). One token stays on the separate kernels: one workgroup per row for the whole chain made
+    generating 11% slower (the separate norm kernels spread a row over the GPU).
   - **Left (profile, FP4 file, 2.0 s):** attn_flash 512 0.32 s + 256 0.24 s, the WMMA matmuls ~1.0 s (ROCmFP4,
     Q5_K dense and experts), add_rmsnorm_rows 0.08 s. Generation (44 / 35 tok/s) not looked at yet.
 - **Step 5 — DONE ✅ (2026-10-25): sliding-window ring KV cache.** `inference_kv_cache_init` puts the 25

@@ -541,6 +541,112 @@ add_normed(const float* base, const float* a, const float* w, const float* scale
         }
 }
 
+// Gemma-4's norm chains around the FFN, one workgroup per row (grid T, block 256), each step summed as the
+// separate kernels sum it (add_rmsnorm_rows / add_normed / moe_combine: the same bits, fewer passes over the rows):
+// gemma_attn_post  x_out = x + RMSNorm(a) * w_a (the attention output, post_attention_norm); y1 = RMSNorm(x_out) *
+//                  w1 quantized into o1 (the dense MLP's input); y2 = RMSNorm(x_out) * w2 if w2 (the router's).
+// gemma_ffn_post   c = the experts' outputs combined (moe_combine: exp_scale, wts); h = RMSNorm(mlp) * w1 +
+//                  RMSNorm(c) * w2; x_out = (x + RMSNorm(h) * w_post) * *scale; y = RMSNorm(x_out) * w_next quantized
+//                  into o (the next layer's attention input, or the output norm's).
+// The sum of squares of the thread's values x[0 .. nb) (values t + 256 j of the row), as add_rmsnorm_rows takes
+// it; part is reused, so the call ends with a barrier
+__device__ __forceinline__ float row_rms_inv(const float x[NORM_MAXV], int nb, int n, float eps, float* part) {
+    const int t = threadIdx.x;
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < NORM_MAXV; ++j)
+        if (j < nb) ss += x[j] * x[j];
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor(ss, off, 32);
+    if ((t & 31) == 0) part[t >> 5] = ss;
+    __syncthreads();
+    float tot = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) tot += part[k];
+    __syncthreads();
+    return rsqrtf(tot / n + eps);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+gemma_attn_post(const float* x, const float* a, const float* w_a, float* x_out, const float* w1, float* y1, Q8Out o1,
+                const float* w2, float* y2, int n, float eps) {
+    __shared__ float part[8];
+    __shared__ Q8Shared sh;
+    const long long row = (long long)blockIdx.x * n;
+    const int t = threadIdx.x, nb = n / 256;
+    float v[NORM_MAXV];
+#pragma unroll
+    for (int j = 0; j < NORM_MAXV; ++j)
+        if (j < nb) v[j] = a[row + t + 256 * j];
+    const float ia = row_rms_inv(v, nb, n, eps, part);
+#pragma unroll
+    for (int j = 0; j < NORM_MAXV; ++j)
+        if (j < nb) {
+            const int k = t + 256 * j;
+            v[j] = (x[row + k] + v[j] * ia * w_a[k]) * 1.0f;  // add_normed without a scale
+            x_out[row + k] = v[j];
+        }
+    const float inv = row_rms_inv(v, nb, n, eps, part);
+#pragma unroll
+    for (int j = 0; j < NORM_MAXV; ++j)
+        if (j < nb) {  // uniform
+            const int k = t + 256 * j;
+            const float y = v[j] * inv * w1[k];
+            y1[row + k] = y;
+            if (w2) y2[row + k] = v[j] * inv * w2[k];
+            if (o1.qK) q8_block_value(y, true, blockIdx.x * nb + j, t, sh, o1);
+        }
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+gemma_ffn_post(const float* x, const float* mlp, const float* down, const float* wts, const int* ids,
+               const float* exp_scale, int n_used, const float* w1, const float* w2, const float* w_post,
+               const float* scale, float* x_out, const float* w_next, float* y, Q8Out o, int n, float eps) {
+    __shared__ float part[8];
+    __shared__ Q8Shared sh;
+    const int tk = blockIdx.x;
+    const long long row = (long long)tk * n;
+    const int t = threadIdx.x, nb = n / 256;
+    float h[NORM_MAXV], c[NORM_MAXV];
+#pragma unroll
+    for (int j = 0; j < NORM_MAXV; ++j)
+        if (j < nb) h[j] = mlp[row + t + 256 * j];
+    const float im = row_rms_inv(h, nb, n, eps, part);
+    const float* wt = wts + tk * n_used;
+    const int* e = ids + tk * n_used;
+#pragma unroll
+    for (int j = 0; j < NORM_MAXV; ++j)
+        if (j < nb) {
+            const int k = t + 256 * j;
+            h[j] = h[j] * im * w1[k];
+            const float* d = down + (size_t)tk * n_used * n + k;  // moe_combine's sum
+            float acc = exp_scale ? (d[0] * exp_scale[e[0]]) * wt[0] : wt[0] * d[0];
+            for (int u = 1; u < n_used; ++u)
+                acc += exp_scale ? (d[(size_t)u * n] * exp_scale[e[u]]) * wt[u] : wt[u] * d[(size_t)u * n];
+            c[j] = acc;
+        }
+    const float ic = row_rms_inv(c, nb, n, eps, part);
+#pragma unroll
+    for (int j = 0; j < NORM_MAXV; ++j)
+        if (j < nb) h[j] = (h[j] + c[j] * ic * w2[t + 256 * j]) * 1.0f;
+    const float ih = row_rms_inv(h, nb, n, eps, part), sc = scale ? *scale : 1.0f;
+#pragma unroll
+    for (int j = 0; j < NORM_MAXV; ++j)
+        if (j < nb) {
+            const int k = t + 256 * j;
+            h[j] = (x[row + k] + h[j] * ih * w_post[k]) * sc;
+            x_out[row + k] = h[j];
+        }
+    const float inv = row_rms_inv(h, nb, n, eps, part);
+#pragma unroll
+    for (int j = 0; j < NORM_MAXV; ++j)
+        if (j < nb) {  // uniform
+            const int k = t + 256 * j;
+            const float v = h[j] * inv * w_next[k];
+            y[row + k] = v;
+            if (o.qK) q8_block_value(v, true, tk * nb + j, t, sh, o);
+        }
+}
+
 extern "C" __global__ void __launch_bounds__(256)
 geglu(const float* gate, const float* up, float* out, int n, int h, int gs, int us, Q8Out o) {
     __shared__ Q8Shared sh;
