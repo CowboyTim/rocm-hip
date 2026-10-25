@@ -136,6 +136,9 @@ struct Scratch {
     float* moe_down = nullptr;  // expert down projections [n_used * n_embd]
     float* moe_gu = nullptr;    // Gemma-4: fused expert gate|up projections [n_used * 2 n_ff_exp]
     float* zx = nullptr;        // Nemotron-H: ssm_in's output [z d_inner | xBC conv_dim | dt n_head]
+    float* lat = nullptr;       // Nemotron-3-Super: the experts' latent input [lat]
+    float* lat2 = nullptr;      // their combined output [lat]
+    float* latup = nullptr;     // ffn_latent_up's output [n_embd]
     float* sh_out = nullptr;    // shared expert output [n_embd]
     // MoE prefill grouping (gpu_moe_group): entries sorted by expert, and tiles of up to g_tile of them
     int g_tile = 0;
@@ -176,6 +179,7 @@ struct Scratch {
         const int PHCD = m->ple_table.data ? HCD : 0;
         const int GU = m->gemma4 ? 2 * FE : 0;  // Gemma-4's fused gate|up expert rows
         const int ZX = m->nemotron ? DI + conv_dim + NV : 0;  // Nemotron-H's ssm_in rows
+        const int LT = m->moe_latent, LU = m->moe_latent > 0 ? E : 0;
         B = rows;
         const size_t b = (size_t)rows;
         q8_max_k = (std::max({E, HQ * HD, DI, FF, NU * FE, HCD}) + 255) / 256 * 256 * rows;
@@ -188,7 +192,7 @@ struct Scratch {
                                 attention_part_ml_floats(HQ, n_ctx, rows), attention_part_acc_floats_d(HQ, n_ctx, rows, HD),
                                 b * HCD, b * HCD, b * HCD, b * R, b * RP, b * HCD, b * NHC,
                                 b * PE, b * PHCD, b * PE, b * PHCD, b * PHCD, b * NU * GU, b * ZX,
-                                (qmatvec_q8_bytes(q8_max_k) + 3) / 4};
+                                b * LT, b * LT, b * LU, (qmatvec_q8_bytes(q8_max_k) + 3) / 4};
         float *ids_f = nullptr, *gt = nullptr, *gp = nullptr, *gn = nullptr, *ge = nullptr, *gs = nullptr, *gc = nullptr;
         float** const ptrs[] = {&x, &x_alt, &xn, &qfull, &q, &k, &v, &attn, &proj, &ffg, &ffu, &act, &logits,
                                 &qkv, &conv, &z, &alpha, &beta, &lin,
@@ -197,7 +201,7 @@ struct Scratch {
                                 &part_ml, &part_acc,
                                 &res, &res_alt, &hxn, &hlo, &hlo_pad, &hgate, &inj,
                                 &ple_emb, &ple_key, &ple_val, &ple_gated, &ple_normed, &moe_gu, &zx,
-                                &q8mem};
+                                &lat, &lat2, &latup, &q8mem};
         static_assert(sizeof(sizes) / sizeof(sizes[0]) == sizeof(ptrs) / sizeof(ptrs[0]), "scratch table");
         if (!mem.alloc("/dev/shm/qwen_scratch.bin", sizes, ptrs, sizeof(sizes) / sizeof(sizes[0]),
                        hipExtHostRegisterCoarseGrained))
@@ -1185,33 +1189,50 @@ struct QwenModel {
             return matvec(L.W_down, s.act, s.proj, T, P_FFN);
         }
         const int FS = L.W_up.N;
-        // the shared expert's up, the router and the experts' up all read s.xn (its int8 form): before relu2
-        // quantizes anything else
+        // Super: the experts work in a latent width ME between ffn_latent_down and ffn_latent_up
+        const bool latent = L.W_lat_down.data != nullptr;
+        const int ME = latent ? L.W_lat_down.N : E;
+        // the shared expert's up, the router (and ffn_latent_down) read s.xn's int8 form: before anything else is
+        // quantized
         if (!matvec(L.W_up, s.xn, s.ffu, T, P_FFN) || !matvec(L.W_router, s.xn, s.r_logits, T, P_FFN) ||
             !check(gpu_moe_router_sigmoid(s.r_logits, L.exp_probs_b, s.ids, s.wts, NE, NU, eng->expert_weights_norm,
                                           eng->expert_weights_scale, T, 0),
                    "moe_router_sigmoid"))
             return false;
+        const float* xe = s.xn;  // the experts' input
+        if (latent) {
+            if (!matvec(L.W_lat_down, s.xn, s.lat, T, P_FFN) || !produced(s.lat, ME, T)) return false;
+            xe = s.lat;
+        }
         const bool grouped = T >= 8;
         if (grouped) {
-            s.g_tile = std::min(qmatvec_id_batch_tile(L.We_up.type, FE, E), qmatvec_id_batch_tile(L.We_down.type, E, FE));
+            s.g_tile = std::min(qmatvec_id_batch_tile(L.We_up.type, FE, ME), qmatvec_id_batch_tile(L.We_down.type, ME, FE));
             if (!check(gpu_moe_group(s.ids, T, NU, NE, s.g_tile, s.g_tok, s.g_pair, s.g_ntiles, s.g_tile_e,
                                      s.g_tile_start, s.g_tile_n, 0),
                        "moe_group"))
                 return false;
         }
-        if (!matvec_id(L.We_up, s.xn, 0, s.moe_u, FE, T, grouped, P_FFN)) return false;
+        if (!matvec_id(L.We_up, xe, 0, s.moe_u, FE, T, grouped, P_FFN)) return false;
         const qmatvec_q8* qx = q8_for(FE, T * NU, true);
         if (!check(gpu_relu2(s.moe_u, s.moe_act, T * NU, FE, FE, qx, 0), "relu2 (experts)")) return false;
         mark(s.moe_act, FE, T * NU, qx);
-        if (!matvec_id(L.We_down, s.moe_act, 1, s.moe_down, E, T, grouped, P_FFN)) return false;
+        if (!matvec_id(L.We_down, s.moe_act, 1, s.moe_down, ME, T, grouped, P_FFN)) return false;
         const qmatvec_q8* qs = q8_for(FS, T, true);
         if (!check(gpu_relu2(s.ffu, s.act, T, FS, FS, qs, 0), "relu2 (shared)")) return false;
         mark(s.act, FS, T, qs);
-        if (!matvec(L.W_down, s.act, s.sh_out, T, P_FFN) ||
-            !check(gpu_moe_combine_scaled(s.moe_down, s.wts, s.sh_out, nullptr, nullptr, nullptr, s.proj, NU, E, T, 0),
-                   "moe_combine"))
+        if (!matvec(L.W_down, s.act, s.sh_out, T, P_FFN)) return false;
+        if (latent) {  // experts combined in the latent width, ffn_latent_up, then + the shared expert
+            if (!check(gpu_moe_combine_scaled(s.moe_down, s.wts, nullptr, nullptr, nullptr, nullptr, s.lat2, NU, ME, T, 0),
+                       "moe_combine (latent)") ||
+                !produced(s.lat2, ME, T) || !matvec(L.W_lat_up, s.lat2, s.latup, T, P_FFN) ||
+                !check(gpu_moe_combine_scaled(s.latup, nullptr, s.sh_out, nullptr, nullptr, nullptr, s.proj, 1, E, T, 0),
+                       "moe_combine (+ shared)"))
+                return false;
+        } else if (!check(gpu_moe_combine_scaled(s.moe_down, s.wts, s.sh_out, nullptr, nullptr, nullptr, s.proj, NU, E,
+                                                 T, 0),
+                          "moe_combine")) {
             return false;
+        }
         // NEMOTRON_DUMP_LAYER=<layer>: its router logits, ids, weights, shared expert and FFN output as raw files in
         // $NEMOTRON_DUMP_DIR (debugging against llama.cpp's ffn_moe_logits / _weights_scaled / ffn_shexp / l_out)
         static const char* dump = getenv("NEMOTRON_DUMP_LAYER");

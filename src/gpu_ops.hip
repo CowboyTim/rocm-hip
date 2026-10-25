@@ -247,6 +247,12 @@ moe_combine(const float* down, const float* wts, const float* shared, const floa
     const int t = blockIdx.y, i = blockIdx.x * 256 + threadIdx.x;
     if (i >= n) return;
     const float* d = down + (size_t)t * n_used * n + i;
+    if (!wts) {  // weight 1 (Nemotron-3-Super: the latent MoE's output plus the shared expert)
+        float acc = d[0];
+        for (int j = 1; j < n_used; ++j) acc += d[(size_t)j * n];
+        out[(size_t)t * n + i] = shared ? acc + shared[(size_t)t * n + i] : acc;
+        return;
+    }
     const float* w = wts + t * n_used;
     const int* e = ids + t * n_used;
     float acc = exp_scale ? (d[0] * exp_scale[e[0]]) * w[0] : w[0] * d[0];

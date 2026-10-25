@@ -2418,7 +2418,7 @@ one BF16 layer). Reference: `llama.cpp/src/models/gemma4.cpp` + `gemma4-common.h
   sliding-window ring KV (done; the block store needs set_swa_ring 0); later a `gemma4-assistant` draft head if one appears (llama.cpp
   supports it).
 
-### Nemotron-3 (`nemotron_h_moe`) — Nano runs (2026-10-25)
+### Nemotron-3 (`nemotron_h_moe`) — Nano and Super run (2026-10-25)
 
 Files: `/models/Nemotron-3-Nano-30B-A3B-Q8_0.gguf` (verification: Q8_0 + F32) and
 `/models/NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_XL-*` (Q8_0 / Q4_K / Q5_1 / BF16 / Q5_K: all with int8 / WMMA
@@ -2452,8 +2452,15 @@ ggml-cpu `ssm_scan_f32`.
   the reference; NO_WMMA prefill = token by token bit for bit (WMMA 0.99900: the check's bar is now 0.998). Chained
   over 52 blocks 0.98 (MoE near-ties). Generation 55.6 tok/s, prefill 2,260 tok/s (2,755 tokens). Perl suite
   passes on Nemotron (chat, thinking budget, tool round trip with prefix reuse), Gemma-4 and Qwen3.5-4B.
-- **Steps:** (1) tokenizer (done); (2) loader + forward (done); (3) speed (a chunked scan for prefill, if
-  needed); (4) Super (latent MoE: ffn_latent_down / up around 512 experts).
+- **Step 4 — DONE ✅ (2026-10-25): Super (latent MoE).** `ffn_latent_down` (n_embd -> 1024) before the 512
+  experts, their combined output (in 1024) through `ffn_latent_up`, then + the shared expert (`moe_combine` with
+  no weights adds it: llama.cpp's moe_out + ffn_shexp). Verified on Super (88 blocks, Q4_K / Q5_1 / Q8_0 / BF16):
+  each block on the reference's input worst cos 0.999998; logits cos 0.999999, top ' Berlin'; token by token vs
+  prefill cos 0.999999 (NO_WMMA identical). Generation **16.2 tok/s**, prefill **464 tok/s** (2,755 tokens);
+  greedy text correct. Loading needs the whole 83 GB pinned: with 22 GB of other files in /dev/shm the machine
+  thrashed (pinning stalled at 75 GB); with them gone the verify takes 21 s.
+- **Steps:** (1) tokenizer (done); (2) loader + forward (done); (3) speed (Super: profile generation and prefill;
+  a chunked scan for prefill if the scan shows up); (4) Super (done).
 
 ### BF16 dense prefill (ABC.gguf, a Qwen3.5 27B in BF16, 2026-10-25)
 

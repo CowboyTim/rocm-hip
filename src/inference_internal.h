@@ -126,6 +126,8 @@ struct LayerWeights {
     const float* ssm_conv1d_b = nullptr;              // [conv_dim]
     const float* ssm_d = nullptr;                     // [n_head]: y += D x
     const float* exp_probs_b = nullptr;               // [n_expert]: added to the router's sigmoid for the choice only
+    QuantWeight W_lat_down, W_lat_up;                 // Super: ffn_latent_down [lat x n_embd] / _up [n_embd x lat]:
+                                                      // the experts work on (and output) lat-wide rows
 };
 
 // MTP draft head (a qwen4exp nextn sidecar GGUF, inference_set_draft_model): one more full-attention MoE block
@@ -254,6 +256,7 @@ struct inference_model {
     bool nemotron = false;
     float expert_weights_scale = 1.0f;                  // MoE: the chosen experts' weights * this (2.5)
     bool expert_weights_norm = true;                    // MoE: the chosen sigmoid weights normalized to sum 1
+    int moe_latent = 0;                                 // MoE: latent width of the experts (moe_latent_size; 0: n_embd)
     float logit_softcap = 0.0f;                         // final_logit_softcapping (0: none)
 };
 

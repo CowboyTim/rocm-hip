@@ -560,10 +560,7 @@ static bool load_nemotron(inference_model* m, NemotronShape& g) {
         set_error("nemotron_h: per-layer head_count_kv / feed_forward_length missing");
         return false;
     }
-    if (gguf_arch_int(m->gguf, "moe_latent_size", 0) > 0) {
-        set_error("nemotron_h: the latent MoE (Nemotron-3-Super) is not supported yet");
-        return false;
-    }
+    m->moe_latent = (int)gguf_arch_int(m->gguf, "moe_latent_size", 0);
     m->nemotron = true;
     m->n_head_kv = *std::max_element(g.n_kv.begin(), g.n_kv.begin() + m->n_layer);
     m->n_ff = 0;
@@ -619,11 +616,16 @@ static bool load_layer_nemotron(inference_model* m, int i, LayerWeights& L, cons
             return false;
         return check_shape("ffn_up", i, L.W_up, g.n_ff[i], E) && check_shape("ffn_down", i, L.W_down, E, g.n_ff[i]);
     }
-    const int NE = m->n_expert, FE = m->n_ff_exp, FS = m->n_ff_shexp;
+    const int NE = m->n_expert, FE = m->n_ff_exp, FS = m->n_ff_shexp, ME = m->moe_latent > 0 ? m->moe_latent : E;
     if (NE <= 0 || m->n_expert_used <= 0 || m->n_expert_used > NE || FE <= 0 || FS <= 0) {
         set_error("blk.%d: bad MoE hparams (experts %d used %d ff_exp %d ff_shexp %d)", i, NE, m->n_expert_used, FE, FS);
         return false;
     }
+    if (m->moe_latent > 0 &&  // the latent MoE (Super): the experts between ffn_latent_down and ffn_latent_up
+        (!bind_weight(f, nm("ffn_latent_down.weight"), L.W_lat_down, true) ||
+         !bind_weight(f, nm("ffn_latent_up.weight"), L.W_lat_up, true) ||
+         !check_shape("ffn_latent_down", i, L.W_lat_down, ME, E) || !check_shape("ffn_latent_up", i, L.W_lat_up, E, ME)))
+        return false;
     if (!bind_weight(f, nm("ffn_gate_inp.weight"), L.W_router, true) ||
         !bind_norm(f, nm("exp_probs_b.bias"), NE, L.exp_probs_b, true) ||
         !bind_weight(f, nm("ffn_up_exps.weight"), L.We_up, true) ||
@@ -631,8 +633,8 @@ static bool load_layer_nemotron(inference_model* m, int i, LayerWeights& L, cons
         !bind_weight(f, nm("ffn_up_shexp.weight"), L.W_up, true) ||
         !bind_weight(f, nm("ffn_down_shexp.weight"), L.W_down, true))
         return false;
-    return check_shape("ffn_gate_inp", i, L.W_router, NE, E) && check_shape("ffn_up_exps", i, L.We_up, NE * FE, E) &&
-           check_shape("ffn_down_exps", i, L.We_down, NE * E, FE) && check_shape("ffn_up_shexp", i, L.W_up, FS, E) &&
+    return check_shape("ffn_gate_inp", i, L.W_router, NE, E) && check_shape("ffn_up_exps", i, L.We_up, NE * FE, ME) &&
+           check_shape("ffn_down_exps", i, L.We_down, NE * ME, FE) && check_shape("ffn_up_shexp", i, L.W_up, FS, E) &&
            check_shape("ffn_down_shexp", i, L.W_down, E, FS);
 }
 
