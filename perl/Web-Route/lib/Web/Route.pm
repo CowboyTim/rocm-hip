@@ -13,7 +13,7 @@ use JSON::PP ();
 
 our $VERSION = '0.01';
 
-our @EXPORT    = qw(json text stream sse run);
+our @EXPORT    = qw(json text stream pull sse run);
 our @EXPORT_OK = qw(dispatch);
 
 # The route table: [method or undef for any, pattern, regex, [param names], handler]
@@ -79,6 +79,17 @@ sub stream {
     my ($status, $headers, $code) = @_;
     croak "Web::Route::stream: needs a code reference" unless ref $code eq 'CODE';
     return [ $status // 200, $headers // [ 'Content-Type' => 'application/octet-stream' ], $code ];
+}
+
+# pull($status, [headers], sub { ... }, on_close => sub { ... }): a body the server pulls without waiting for it,
+# serving other connections meanwhile (run's loop): the sub returns the next piece, '' when there is nothing yet,
+# undef at the end. on_close (optional) is called once when the client goes away before the end. With run's
+# tick => sub { ... } called once per round while any pull is open, many responses make progress together.
+sub pull {
+    my ($status, $headers, $code, %o) = @_;
+    croak "Web::Route::pull: needs a code reference" unless ref $code eq 'CODE';
+    return [ $status // 200, $headers // [ 'Content-Type' => 'application/octet-stream' ],
+             bless({ code => $code, on_close => $o{on_close} }, 'Web::Route::Pull') ];
 }
 
 # sse($data, %fields): one server-sent event; $data a string or a structure (sent as JSON), fields event / id /
@@ -218,7 +229,8 @@ sub _respond {
     my @h = @$headers;
     my %has = map { lc $h[ 2 * $_ ] => 1 } 0 .. $#h / 2;
     my $head = "HTTP/1.1 $status " . ($REASON{$status} // 'Unknown') . "\r\n";
-    my $streaming = ref $body eq 'CODE';
+    my $pulled = ref $body eq 'Web::Route::Pull';
+    my $streaming = ref $body eq 'CODE' || $pulled;
     if ($streaming) {
         # no length: the end of the connection ends the body; nginx must not buffer an event stream
         push @h, 'X-Accel-Buffering' => 'no', 'Cache-Control' => 'no-cache'
@@ -236,6 +248,7 @@ sub _respond {
     }
     _send($c, "$head\r\n") or return;
     return if $req && $req->{method} eq 'HEAD';
+    return 1 if $pulled;  # run's loop pulls the body
     if ($streaming) {
         my $ok = 1;
         eval { $body->(sub { $ok &&= _send($c, $_[0] // '') }); 1 }
@@ -262,7 +275,9 @@ sub _listen {
     return $s;
 }
 
-# run(listen => $socket, %options): serves the routes, one request at a time, until SIGINT / SIGTERM
+# run(listen => $socket, %options): serves the routes until SIGINT / SIGTERM. A request is read and dispatched as it
+# comes; a pull response stays open and is served by the loop together with the others (non-blocking writes), with
+# tick => sub { ... } called once per round while any is open (true: it did work, so do not wait for the sockets).
 sub run {
     my %o = (backlog => 128, timeout => 30, max_header => 65536, max_body => 16 << 20, log => 0, @_);
     my $srv = _listen(\%o);
@@ -270,15 +285,79 @@ sub run {
     local $SIG{PIPE} = 'IGNORE';
     local $SIG{INT} = local $SIG{TERM} = sub { $stop = 1 };
     $o{on_start}->($srv) if $o{on_start};
-    while (!$stop) {
-        my $c = $srv->accept or next;  # (a signal ends the wait)
-        my $t0 = Time::HiRes::time();
-        my ($req, $status, $msg) = _read_request($c, \%o);
-        my $res = $req ? dispatch($req) : $status ? json({ error => $msg }, $status) : undef;
-        _respond($c, $req, $res) if $res;
-        close $c;
+    my @live;  # open pull responses: { c, req, pull, out, done, t0, status }
+    my $log = sub {
+        my ($req, $status, $t0) = @_;
         printf STDERR "%s %s %s %d %.0f ms\n", scalar localtime, $req ? ($req->{method}, $req->{path}) : ('-', '-'),
-            $res->[0], 1000 * (Time::HiRes::time() - $t0) if $o{log} && $res;
+            $status, 1000 * (Time::HiRes::time() - $t0) if $o{log};
+    };
+    my $close = sub {  # gone: the client left before the end
+        my ($l, $gone) = @_;
+        if ($gone && $l->{pull}{on_close}) { eval { $l->{pull}{on_close}->(); 1 } or warn "Web::Route: on_close: $@" }
+        close $l->{c};
+        $log->($l->{req}, $l->{status}, $l->{t0});
+    };
+    while (!$stop) {
+        # new connections: block for one while nothing is open, else only take what is waiting
+        my $busy = @live && $o{tick} ? eval { $o{tick}->() } // do { warn "Web::Route: tick: $@" if $@; 0 } : 0;
+        my $sel = IO::Select->new($srv, map { $_->{c} } @live);
+        my @ready = @live ? $sel->can_read($busy ? 0 : 0.005) : ($srv);
+        last if $stop;
+        for my $r (@ready) {
+            if ($r == $srv) {
+                my $c = $srv->accept or next;  # (a signal ends the wait)
+                my $t0 = Time::HiRes::time();
+                my ($req, $status, $msg) = _read_request($c, \%o);
+                my $res = $req ? dispatch($req) : $status ? json({ error => $msg }, $status) : undef;
+                if ($res && ref $res->[2] eq 'Web::Route::Pull') {
+                    if (_respond($c, $req, $res) && $req->{method} ne 'HEAD') {
+                        $c->blocking(0);
+                        push @live, { c => $c, req => $req, pull => $res->[2], out => '', t0 => $t0, status => $res->[0] };
+                        next;
+                    }
+                    $res->[2]{on_close}->() if $res->[2]{on_close};
+                } elsif ($res) {
+                    _respond($c, $req, $res);
+                }
+                close $c;
+                $log->($req, $res->[0], $t0) if $res;
+            } else {  # an open response's client: readable means it closed (or sent more, which is ignored)
+                my ($l) = grep { $_->{c} == $r } @live;
+                my $n = sysread($r, my $junk, 4096);
+                $l->{gone} = 1 if defined $n && $n == 0;
+            }
+        }
+        for my $l (@live) {
+            next if $l->{gone};
+            if (!$l->{done}) {
+                my $piece = eval { $l->{pull}{code}->() };
+                if ($@) {
+                    warn "Web::Route: $l->{req}{method} $l->{req}{path}: pull: $@";
+                    $l->{done} = 1;
+                } elsif (!defined $piece) {
+                    $l->{done} = 1;
+                } else {
+                    utf8::encode($piece) if utf8::is_utf8($piece);
+                    $l->{out} .= $piece;
+                }
+            }
+            while (length $l->{out}) {
+                my $n = syswrite($l->{c}, $l->{out});
+                if (defined $n) { substr($l->{out}, 0, $n, ''); next }
+                $l->{gone} = 1 unless $!{EAGAIN} || $!{EWOULDBLOCK};
+                last;
+            }
+        }
+        @live = grep {
+            my $end = $_->{gone} || ($_->{done} && !length $_->{out});
+            $close->($_, $_->{gone} && !$_->{done}) if $end;
+            !$end
+        } @live;
+    }
+    for my $l (@live) {  # stopped: what is pending goes out (briefly), then the connections close
+        $l->{c}->blocking(1);
+        _send($l->{c}, $l->{out}) if length $l->{out};
+        $close->($l, !$l->{done});
     }
     close $srv;
     unlink $o{listen} if $o{listen} =~ m{/} && -S $o{listen};
@@ -387,6 +466,14 @@ C<< $write->($text) >> sends a piece at once and returns false once the client i
 length: closing the connection ends it. For C<text/event-stream>, C<X-Accel-Buffering: no> and
 C<Cache-Control: no-cache> are added, so nginx passes events on as they come even with buffering on.
 
+=item pull($status, [@headers], sub { ... }, on_close => sub { ... })
+
+A body the server pulls without waiting for it: C<run> keeps the connection open and calls the sub again each
+round, serving other connections in between, until it returns C<undef>. It returns the next piece, or C<''> when
+there is nothing yet. C<on_close> (optional) is called once if the client leaves first. Many such responses make
+progress together, typically fed by C<run>'s C<tick> (e.g. an inference server stepping one token of every open
+conversation per round). Writes are non-blocking; headers as for C<stream>.
+
 =item sse($data, %fields)
 
 One server-sent event as text: C<$data> a string or a structure (sent as JSON), fields C<event>, C<id>,
@@ -404,7 +491,9 @@ Serve until SIGINT or SIGTERM (after the current request). C<$where> is a socket
 replaced, and removed at the end) or C<host:port>. Options: C<mode> (the socket file's permissions, e.g.
 C<0660> for a group nginx is in), C<backlog> (128), C<timeout> (seconds to wait for a request's bytes, 30),
 C<max_header> (64 KB), C<max_body> (16 MB; 413 above), C<log> (a line per request on STDERR), C<on_start>
-(called with the listening socket). Request bodies come with a C<Content-Length>: nginx sends them so with
+(called with the listening socket), C<tick> (called once per round while any C<pull> response is open; returning
+true means it did work, so the loop does not wait on the sockets). Requests are read and dispatched one at a time
+as they come; only C<pull> bodies are served concurrently. Request bodies come with a C<Content-Length>: nginx sends them so with
 C<proxy_request_buffering on> (the default); a chunked request body gets 501.
 
 =item dispatch(\%req)

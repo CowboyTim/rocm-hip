@@ -6,3 +6,5 @@ Revision history for Web-Route
       clashes), requests as plain hashes, responses as [status, headers, body] (a hash becomes JSON,
       a string text), json / text / stream / sse helpers, and a small sequential HTTP/1.1 server on a unix
       socket (or host:port) for behind nginx: streamed responses, client-gone detection, limits, SIGTERM.
+    - pull responses: bodies the server pulls while serving other connections (non-blocking writes), with a
+      tick hook per round and on_close for clients that leave early: many slow responses at once.
