@@ -5,7 +5,8 @@ use Test::More;
 
 use ROCm::Inference qw(:all);
 
-# Sequences and step-wise generation: two conversations on one model, stepped in turn, give what each gives alone.
+# Sequences and step-wise generation: two conversations on one model, stepped in turn or batched (one forward pass
+# for both), give what each gives alone.
 # Needs a GPU, a model and the Minijinja module: ROCM_INFERENCE_TEST_MODEL=<gguf>
 my $path = $ENV{ROCM_INFERENCE_TEST_MODEL};
 plan skip_all => 'set ROCM_INFERENCE_TEST_MODEL to a GGUF model to run' unless $path && -f $path;
@@ -78,6 +79,48 @@ my ($reused) = last_prompt_stats($m);
 # (recurrent models resume at a saved checkpoint: the prompt's, when the re-rendered reply differs from the tokens)
 ok($reused > 0, "sequence $seqs[0] reuses its history: $reused tokens");
 like($r, qr/green|orange|purple/i, "and answers: $r");
+
+# the same two chats batched (step_chats: one forward pass for both)
+my @b;
+for my $i (0, 1) {
+    seq_select($m, $seqs[$i]);
+    reset($m);
+    push @b, chat_start($m, $q[$i], \%o);
+}
+my @bd = ('', '');
+for (my $going = 1; $going;) {
+    my @r = step_chats(@b);
+    $going = 0;
+    for my $i (0, 1) {
+        $bd[$i] .= join '', map { $_->[1] eq 'content' ? $_->[0] : '' } @{ $r[$i][0] };
+        $going ||= $r[$i][1];
+    }
+}
+for my $i (0, 1) {
+    my ($content, $why) = $b[$i]->result;
+    is($content, $alone[$i], "batched chat $i = alone");
+    is($bd[$i], $content, "batched chat $i: the deltas add up");
+}
+# and two streams
+my @p2 = map { tokenize($m, $_) } 'The capital of France is', 'Water boils at';
+my @alone2 = map { reset($m); (generate($m, $_, \%g))[0] } @p2;
+my @st2;
+for my $i (0, 1) {
+    seq_select($m, $seqs[$i]);
+    reset($m);
+    push @st2, stream_begin($m, $p2[$i], \%g);
+}
+my @t2 = ([], []);
+for (my $going = 1; $going;) {
+    my @r = step_streams(@st2);
+    $going = 0;
+    for my $i (0, 1) {
+        push @{ $t2[$i] }, $r[$i][0] if $r[$i][0] >= 0;
+        $going ||= $r[$i][2];
+    }
+}
+is("@{ $t2[$_] }", "@{ $alone2[$_] }", "step_streams: stream $_ = generate") for 0, 1;
+$_->free for @st2;
 
 seq_free($m, $_) for @seqs;
 ok(!eval { seq_select($m, $seqs[0]); 1 }, 'a freed sequence cannot be selected');

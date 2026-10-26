@@ -397,6 +397,7 @@ struct QwenModel {
         mtp_free();
         hc_pad_mem.free();
         head_mem.free();
+        seqs_logits_mem.free();
         rs.free();
         s.mem.free();
         for (size_t j = 1; j < seqs.size(); ++j) {
@@ -643,24 +644,43 @@ struct QwenModel {
     bool full_attention(const LayerWeights& L, int pos0, int T) {
         const int HQ = eng->n_head, HKV = eng->n_head_kv, DQ = HQ * eng->head_dim;
         if (!matvec_multi({{&L.Wq, s.qfull}, {&L.Wk, s.k}, {&L.Wv, s.v}}, s.xn, T, P_ATTN)) return false;
-        inference_kv_cache_t* kvc = kvc_cur ? kvc_cur : eng->kvc;
-        __half* K = kv_cache_k_row(kvc, L.kv_slot, 0);
-        __half* V = kv_cache_v_row(kvc, L.kv_slot, 0);
-        if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
-        const qmatvec_q8* q8 = q8_for(DQ, T);
-        attention_opts o = {};
-        o.head_dim = eng->head_dim;
-        o.gated = eng->attn_gated ? 1 : 0;
-        o.kv_stride = kv_cache_row_halves(kvc);
-        o.kv_q8 = kv_cache_type(kvc) == KV_CACHE_Q8_0;
-        if (!check(attention_forward_opts(s.qfull, s.k, s.v, L.q_norm, L.k_norm, K, V, kv_cache_block_shift(kvc),
-                                          kv_cache_block_stride(kvc), HQ, HKV, eng->n_rot, pos0, T,
-                                          eng->rope_freq_base, (float)eng->eps, s.q, s.part_ml, s.part_acc, s.attn, &o,
-                                          q8, 0),
-                   "attention kernels"))
+        if (!attention_rows(L, pos0, T, DQ, [&](size_t r, int pos, int Tr, const qmatvec_q8* q8) {
+                inference_kv_cache_t* kvc = kvc_cur ? kvc_cur : eng->kvc;
+                __half* K = kv_cache_k_row(kvc, L.kv_slot, 0);
+                __half* V = kv_cache_v_row(kvc, L.kv_slot, 0);
+                if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
+                attention_opts o = {};
+                o.head_dim = eng->head_dim;
+                o.gated = eng->attn_gated ? 1 : 0;
+                o.kv_stride = kv_cache_row_halves(kvc);
+                o.kv_q8 = kv_cache_type(kvc) == KV_CACHE_Q8_0;
+                return check(attention_forward_opts(s.qfull + r * L.Wq.N, s.k + r * L.Wk.N, s.v + r * L.Wv.N, L.q_norm,
+                                                    L.k_norm, K, V, kv_cache_block_shift(kvc),
+                                                    kv_cache_block_stride(kvc), HQ, HKV, eng->n_rot, pos, Tr,
+                                                    eng->rope_freq_base, (float)eng->eps, s.q, s.part_ml, s.part_acc,
+                                                    s.attn + r * DQ, &o, q8, 0),
+                             "attention kernels");
+            }))
             return false;
-        mark(s.attn, DQ, T, q8);
         return matvec(L.Wo, s.attn, s.proj, T, P_ATTN);
+    }
+
+    // The attention kernels (launch(row, pos, T, q8)) on T rows at pos0 .. (launch(0, pos0, T, ...)), or for a batch
+    // of sequences (bat) row by row, each with its sequence selected (launch(r, bat[r].pos, 1, NULL)); the output
+    // s.attn [T][DQ] marked (quantized) for the output projection
+    template <class F> bool attention_rows(const LayerWeights& L, int pos0, int T, int DQ, F launch) {
+        (void)L;
+        const qmatvec_q8* q8 = bat ? nullptr : q8_for(DQ, T);
+        if (!bat) {
+            if (!launch((size_t)0, pos0, T, q8)) return false;
+            mark(s.attn, DQ, T, q8);
+            return true;
+        }
+        for (int r = 0; r < T; ++r) {
+            use_seq(r);
+            if (!launch((size_t)r, bat[r].pos, 1, nullptr)) return false;
+        }
+        return produced(s.attn, DQ, T);
     }
 
     // Gated DeltaNet token mixer for T tokens, from s.xn; output in s.proj. Updates the layer's conv and
@@ -675,15 +695,23 @@ struct QwenModel {
         // g / sigmoid(beta) in place
         // a verify pass (spec_mid) also keeps the states after its first T - 1 tokens in rs_mid
         const deltanet_mid_states mc = mids(&RecurrentState::conv, l, T), ms = mids(&RecurrentState::ssm, l, T);
-        if (!check(deltanet_pre(s.qkv, rs.conv[l], L.ssm_conv1d, eng->ssm_d_conv, s.conv, NG, NV, s.alpha, s.beta,
-                                L.ssm_dt, L.ssm_a, s.alpha, s.beta, eps, T, spec_mid ? &mc : nullptr, 0),
-                   "deltanet_pre") ||
-            !check(deltanet_rule(rs.ssm[l], s.conv, s.alpha, s.beta, s.z, L.ssm_norm, s.lin, NG, NV, eps, T,
-                                 eng->gdn_sigmoid_gate ? 1 : 0, q8_for(eng->ssm_d_inner, T), spec_mid ? &ms : nullptr,
-                                 0),
-                   "deltanet_rule"))
-            return false;
-        mark(s.lin, eng->ssm_d_inner, T, q8_for(eng->ssm_d_inner, T));
+        // a batch of sequences (bat): each row on its own sequence's state, as that sequence's one token
+        const size_t CD = (size_t)L.W_qkv.N, DI = (size_t)eng->ssm_d_inner;
+        for (int r = 0; r < (bat ? T : 1); ++r) {
+            if (bat) use_seq(r);
+            const int Tr = bat ? 1 : T;
+            float *conv = s.conv + r * CD, *g = s.alpha + (size_t)r * NV, *b = s.beta + (size_t)r * NV;
+            if (!check(deltanet_pre(s.qkv + r * CD, rs.conv[l], L.ssm_conv1d, eng->ssm_d_conv, conv, NG, NV, g, b,
+                                    L.ssm_dt, L.ssm_a, g, b, eps, Tr, spec_mid ? &mc : nullptr, 0),
+                       "deltanet_pre") ||
+                !check(deltanet_rule(rs.ssm[l], conv, g, b, s.z + r * DI, L.ssm_norm, s.lin + r * DI, NG, NV, eps, Tr,
+                                     eng->gdn_sigmoid_gate ? 1 : 0, bat ? nullptr : q8_for(DI, T),
+                                     spec_mid ? &ms : nullptr, 0),
+                       "deltanet_rule"))
+                return false;
+        }
+        if (bat) { if (!produced(s.lin, (int)DI, T)) return false; }
+        else mark(s.lin, (int)DI, T, q8_for((int)DI, T));
         return matvec(L.W_ssm_out, s.lin, s.proj, T, P_LIN);
     }
 
@@ -876,7 +904,7 @@ struct QwenModel {
         }
         // A sequence starting at position 0 starts from zero recurrent state (the KV cache needs no reset:
         // attention only reads positions up to its own)
-        if (pos0 == 0 && !check(rs.reset(), "recurrent state reset")) return -1;
+        if (pos0 == 0 && !bat && !check(rs.reset(), "recurrent state reset")) return -1;
         if (!check(gpu_add_rmsnorm(s.x, nullptr, s.x, eng->layers[0].attn_norm, s.xn, E, T, eps, q8_for(E, T), 0),
                    "add_rmsnorm"))
             return -1;
@@ -907,7 +935,71 @@ struct QwenModel {
             }
         }
 
-        return lm_head(T, logits_out);
+        return bat ? lm_head_seqs(T) : lm_head(T, logits_out);
+    }
+
+    // ---- Batched decoding (qwen_model_forward_seqs): row r of a forward pass is one token of sequence bat[r].seq
+    // at bat[r].pos, on its KV caches. The matmuls take all rows at once (each weight read once for all
+    // sequences); attention and the recurrent layers run row by row, each with its sequence selected (use_seq).
+    const qwen_seq_token* bat = nullptr;
+    ShmRegion seqs_logits_mem;  // the LM head's rows, before they go to their sequences' logits
+    float* seqs_logits = nullptr;
+    int seqs_logits_rows = 0;
+
+    void use_seq(int r) {
+        seq_select(bat[r].seq);
+        eng->kvc = bat[r].kvc;
+        eng->kvc_swa = bat[r].kvc_swa;
+    }
+
+    int forward_seqs(const int32_t* tokens, const qwen_seq_token* rows, int n) {
+        if (eng->n_hc > 0 || eng->mtp) {
+            qwen_set_error("batched decoding: not for this architecture yet");
+            return INFERENCE_ERR_NOT_IMPLEMENTED;
+        }
+        if (n <= 0 || n > s.B) { qwen_set_error("batch of %d sequences (max %d)", n, s.B); return -1; }
+        for (int r = 0; r < n; ++r) {
+            bool dup = false;
+            for (int q = 0; q < r; ++q) dup |= rows[q].seq == rows[r].seq;
+            if (dup || rows[r].seq < 0 || rows[r].seq >= (int)seqs.size() || (rows[r].seq > 0 && !seqs[rows[r].seq].used) ||
+                !rows[r].kvc || rows[r].pos <= 0 || rows[r].pos >= kv_cache_n_ctx(rows[r].kvc)) {
+                qwen_set_error("batched decoding: row %d (sequence %d at %d)", r, rows[r].seq, rows[r].pos);
+                return -1;
+            }
+        }
+        if (n > seqs_logits_rows) {
+            seqs_logits_mem.free();
+            size_t floats = (size_t)n * eng->vocab_size;
+            float** const pp[] = {&seqs_logits};
+            if (!seqs_logits_mem.alloc("/dev/shm/qwen_seqs_logits.bin", &floats, pp, 1)) {
+                seqs_logits_rows = 0;
+                qwen_set_error("batched decoding: no memory for %d rows of logits", n);
+                return -1;
+            }
+            seqs_logits_rows = n;
+        }
+        const int cur = cur_seq;
+        inference_kv_cache_t *kvc = eng->kvc, *kvc_swa = eng->kvc_swa;
+        bat = rows;
+        const int rc = forward(tokens, n, 0, nullptr);
+        bat = nullptr;
+        seq_select(cur);
+        eng->kvc = kvc;
+        eng->kvc_swa = kvc_swa;
+        if (rc != 0) return rc;
+        const size_t V = (size_t)eng->vocab_size;
+        for (int r = 0; r < n; ++r)
+            memcpy(rows[r].seq == cur_seq ? s.logits : seqs[rows[r].seq].logits, seqs_logits + r * V,
+                   V * sizeof(float));
+        return 0;
+    }
+
+    // The LM head on all T rows of s.xn into seqs_logits, then the sync
+    int lm_head_seqs(int T) {
+        if (!matvec(eng->output, s.xn, seqs_logits, T, P_HEAD) || !sync()) return -1;
+        prof.lap(P_HEAD);
+        prof.tokens += T;
+        return 0;
     }
 
     // The LM head on the last of T tokens of s.xn (its row of the quantized buffer when s.q8 holds them), then
@@ -1017,28 +1109,29 @@ struct QwenModel {
         if (L.v_from_k ? !matvec_multi({{&L.Wq, s.qfull}, {&L.Wk, s.k}}, s.xn, T, P_ATTN)
                        : !matvec_multi({{&L.Wq, s.qfull}, {&L.Wk, s.k}, {&L.Wv, s.v}}, s.xn, T, P_ATTN))
             return false;
-        // the sliding layers' ring (one block of swa_ring positions, block stride 0: position p in slot p % R)
-        inference_kv_cache_t* kvc = L.kv_ring ? eng->kvc_swa : eng->kvc;
-        __half* K = kv_cache_k_row(kvc, L.kv_slot, 0);
-        __half* V = kv_cache_v_row(kvc, L.kv_slot, 0);
-        if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
-        attention_opts o = {};
-        o.head_dim = L.head_dim;
-        o.kv_stride = kv_cache_row_halves(kvc);
-        o.kv_q8 = kv_cache_type(kvc) == KV_CACHE_Q8_0;
-        o.rot_pairs = L.rot_pairs;
-        o.v_norm = 1;
-        o.window = L.window;
-        o.scale = 1.0f;
-        const qmatvec_q8* q8 = q8_for(DQ, T);
-        if (!check(attention_forward_opts(s.qfull, s.k, L.v_from_k ? s.k : s.v, L.q_norm, L.k_norm, K, V,
-                                          kv_cache_block_shift(kvc), L.kv_ring ? 0 : kv_cache_block_stride(kvc), HQ,
-                                          L.n_head_kv,
-                                          L.n_rot, pos0, T, L.rope_base, (float)eng->eps, s.q, s.part_ml, s.part_acc,
-                                          s.attn, &o, q8, 0),
-                   "attention kernels"))
+        if (!attention_rows(L, pos0, T, DQ, [&](size_t r, int pos, int Tr, const qmatvec_q8* q8) {
+                // the sliding layers' ring (one block of swa_ring positions, block stride 0: position p in slot p % R)
+                inference_kv_cache_t* kvc = L.kv_ring ? eng->kvc_swa : eng->kvc;
+                __half* K = kv_cache_k_row(kvc, L.kv_slot, 0);
+                __half* V = kv_cache_v_row(kvc, L.kv_slot, 0);
+                if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
+                attention_opts o = {};
+                o.head_dim = L.head_dim;
+                o.kv_stride = kv_cache_row_halves(kvc);
+                o.kv_q8 = kv_cache_type(kvc) == KV_CACHE_Q8_0;
+                o.rot_pairs = L.rot_pairs;
+                o.v_norm = 1;
+                o.window = L.window;
+                o.scale = 1.0f;
+                return check(attention_forward_opts(s.qfull + r * L.Wq.N, s.k + r * L.Wk.N,
+                                                    L.v_from_k ? s.k + r * L.Wk.N : s.v + r * L.Wv.N, L.q_norm,
+                                                    L.k_norm, K, V, kv_cache_block_shift(kvc),
+                                                    L.kv_ring ? 0 : kv_cache_block_stride(kvc), HQ, L.n_head_kv,
+                                                    L.n_rot, pos, Tr, L.rope_base, (float)eng->eps, s.q, s.part_ml,
+                                                    s.part_acc, s.attn + r * DQ, &o, q8, 0),
+                             "attention kernels");
+            }))
             return false;
-        mark(s.attn, DQ, T, q8);
         // GEMMA_DUMP_LAYER=<layer>: write Q (normed, rotated) and the attention output of that layer as raw floats
         // to $GEMMA_DUMP_DIR/{q,attn}.f32 (debugging against llama.cpp's Qcur_pos / kqv_out)
         static const char* dump = getenv("GEMMA_DUMP_LAYER");
@@ -1156,7 +1249,11 @@ struct QwenModel {
     int forward_gemma(const int* tokens, int T, int pos0, float* logits_out) {
         const int E = eng->n_embd, V = eng->vocab_size;
         const float eps = (float)eng->eps;
-        ring_hi = pos0 == 0 ? T : std::max(ring_hi, pos0 + T);
+        if (bat) {
+            for (int r = 0; r < T; ++r) use_seq(r), ring_hi = std::max(ring_hi, bat[r].pos + 1);
+        } else {
+            ring_hi = pos0 == 0 ? T : std::max(ring_hi, pos0 + T);
+        }
         prof.start();
         for (int t = 0; t < T; ++t) {
             if (tokens[t] < 0 || tokens[t] >= V) { qwen_set_error("token %d out of range", tokens[t]); return -1; }
@@ -1206,9 +1303,10 @@ struct QwenModel {
                 return -1;
             mark(s.xn, E, T, qe);
         }
-        if (lm_head(T, nullptr) != 0) return -1;
+        if (bat ? lm_head_seqs(T) != 0 : lm_head(T, nullptr) != 0) return -1;
         if (eng->logit_softcap > 0.0f &&
-            (!check(gpu_softcap(s.logits, V, eng->logit_softcap, 0), "softcap") || !sync()))
+            (!check(gpu_softcap(bat ? seqs_logits : s.logits, bat ? T * V : V, eng->logit_softcap, 0), "softcap") ||
+             !sync()))
             return -1;
         if (logits_out) memcpy(logits_out, s.logits, sizeof(float) * V);
         return 0;
@@ -1223,14 +1321,22 @@ struct QwenModel {
         const int DI = eng->ssm_d_inner, NG = eng->ssm_n_group, NH = eng->ssm_dt_rank;
         const int conv_dim = DI + 2 * NG * eng->ssm_d_state, ZX = DI + conv_dim + NH;
         const qmatvec_q8* qd = q8_for(DI, T);
-        if (!matvec(L.W_ssm_in, s.xn, s.zx, T, P_LIN) ||
-            !check(gpu_mamba_conv(s.zx, ZX, DI, rs.conv[l], L.ssm_conv1d, L.ssm_conv1d_b, s.conv, conv_dim,
-                                  eng->ssm_d_conv, T, 0),
-                   "mamba_conv") ||
-            !check(gpu_mamba_scan(rs.ssm[l], s.conv, s.zx, ZX, DI + conv_dim, L.ssm_dt, L.ssm_a, L.ssm_d, s.lin, NH, DI,
-                                  NG, T, 0),
-                   "mamba_scan") ||
-            !check(gpu_mamba_gnorm(s.lin, s.zx, ZX, L.ssm_norm, s.z, DI, NG, T, (float)eng->eps, qd, 0), "mamba_gnorm"))
+        if (!matvec(L.W_ssm_in, s.xn, s.zx, T, P_LIN)) return false;
+        // a batch of sequences (bat): the conv and scan row by row, each on its own sequence's state
+        for (int r = 0; r < (bat ? T : 1); ++r) {
+            if (bat) use_seq(r);
+            const int Tr = bat ? 1 : T;
+            const float* zx = s.zx + (size_t)r * ZX;
+            float* conv = s.conv + (size_t)r * conv_dim;
+            if (!check(gpu_mamba_conv(zx, ZX, DI, rs.conv[l], L.ssm_conv1d, L.ssm_conv1d_b, conv, conv_dim,
+                                      eng->ssm_d_conv, Tr, 0),
+                       "mamba_conv") ||
+                !check(gpu_mamba_scan(rs.ssm[l], conv, zx, ZX, DI + conv_dim, L.ssm_dt, L.ssm_a, L.ssm_d,
+                                      s.lin + (size_t)r * DI, NH, DI, NG, Tr, 0),
+                       "mamba_scan"))
+                return false;
+        }
+        if (!check(gpu_mamba_gnorm(s.lin, s.zx, ZX, L.ssm_norm, s.z, DI, NG, T, (float)eng->eps, qd, 0), "mamba_gnorm"))
             return false;
         mark(s.z, DI, T, qd);
         return matvec(L.W_ssm_out, s.z, s.proj, T, P_LIN);
@@ -1239,22 +1345,24 @@ struct QwenModel {
     bool nemotron_attention(const LayerWeights& L, int pos0, int T) {
         const int HQ = eng->n_head, HD = eng->head_dim, DQ = HQ * HD;
         if (!matvec_multi({{&L.Wq, s.qfull}, {&L.Wk, s.k}, {&L.Wv, s.v}}, s.xn, T, P_ATTN)) return false;
-        inference_kv_cache_t* kvc = eng->kvc;
-        __half* K = kv_cache_k_row(kvc, L.kv_slot, 0);
-        __half* V = kv_cache_v_row(kvc, L.kv_slot, 0);
-        if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
-        attention_opts o = {};
-        o.head_dim = HD;
-        o.kv_stride = kv_cache_row_halves(kvc);
-        o.kv_q8 = kv_cache_type(kvc) == KV_CACHE_Q8_0;
-        o.no_qk_norm = 1;  // and no RoPE (n_rot 0)
-        const qmatvec_q8* q8 = q8_for(DQ, T);
-        if (!check(attention_forward_opts(s.qfull, s.k, s.v, nullptr, nullptr, K, V, kv_cache_block_shift(kvc),
-                                          kv_cache_block_stride(kvc), HQ, L.n_head_kv, 0, pos0, T, eng->rope_freq_base,
-                                          (float)eng->eps, s.q, s.part_ml, s.part_acc, s.attn, &o, q8, 0),
-                   "attention kernels"))
+        if (!attention_rows(L, pos0, T, DQ, [&](size_t r, int pos, int Tr, const qmatvec_q8* q8) {
+                inference_kv_cache_t* kvc = eng->kvc;
+                __half* K = kv_cache_k_row(kvc, L.kv_slot, 0);
+                __half* V = kv_cache_v_row(kvc, L.kv_slot, 0);
+                if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
+                attention_opts o = {};
+                o.head_dim = HD;
+                o.kv_stride = kv_cache_row_halves(kvc);
+                o.kv_q8 = kv_cache_type(kvc) == KV_CACHE_Q8_0;
+                o.no_qk_norm = 1;  // and no RoPE (n_rot 0)
+                return check(attention_forward_opts(s.qfull + r * L.Wq.N, s.k + r * L.Wk.N, s.v + r * L.Wv.N, nullptr,
+                                                    nullptr, K, V, kv_cache_block_shift(kvc),
+                                                    kv_cache_block_stride(kvc), HQ, L.n_head_kv, 0, pos, Tr,
+                                                    eng->rope_freq_base, (float)eng->eps, s.q, s.part_ml, s.part_acc,
+                                                    s.attn + r * DQ, &o, q8, 0),
+                             "attention kernels");
+            }))
             return false;
-        mark(s.attn, DQ, T, q8);
         return matvec(L.Wo, s.attn, s.proj, T, P_ATTN);
     }
 
@@ -1351,7 +1459,7 @@ struct QwenModel {
             }
         }
         // a sequence starting at position 0 starts from zero recurrent state
-        if (pos0 == 0 && !check(rs.reset(), "recurrent state reset")) return -1;
+        if (pos0 == 0 && !bat && !check(rs.reset(), "recurrent state reset")) return -1;
         prof.lap(P_EMBED);
         const int l0 = dbg_res_in ? dbg_l0 : 0, l1 = dbg_res_in ? dbg_l1 : eng->n_layer;
         if (!check(gpu_add_rmsnorm(s.x, nullptr, s.x, eng->layers[l0].attn_norm, s.xn, E, T, eps, nullptr, 0),
@@ -1387,6 +1495,7 @@ struct QwenModel {
             }
         }
         if (dbg_res_in) return sync() ? 0 : -1;  // no LM head
+        if (bat) return lm_head_seqs(T);
         if (lm_head(T, nullptr) != 0) return -1;
         if (logits_out) memcpy(logits_out, s.logits, sizeof(float) * V);
         return 0;
@@ -1956,6 +2065,11 @@ int qwen_model_forward_batch(qwen_model_t* model, const int32_t* tokens, const i
     return INFERENCE_ERR_NOT_IMPLEMENTED;
 }
 
+}
+
+int qwen_model_forward_seqs(qwen_model_t* model, const int32_t* tokens, const qwen_seq_token* rows, int n) {
+    if (!model || !tokens || !rows) { qwen_set_error("NULL argument"); return -1; }
+    return model->forward_seqs(tokens, rows, n);
 }
 
 int qwen_model_seq_new(qwen_model_t* model) { return model ? model->seq_new() : -1; }

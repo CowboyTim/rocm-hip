@@ -238,6 +238,19 @@ int inference_stream_step(inference_stream_t* stream, int32_t* token, const char
 int inference_stream_tokens(const inference_stream_t* stream);  // tokens emitted so far
 int inference_stream_seq(const inference_stream_t* stream);     // its sequence
 void inference_stream_free(inference_stream_t* stream);
+// One step of each of n streams (of different sequences of one model) with one forward pass for all (batched
+// decoding: the matmuls read each weight once for all sequences), as inference_stream_step on each. results[i] is
+// streams[i]'s step: token, text, reason, and rc (as inference_stream_step returns: 1 going, 0 stopped, < 0 its
+// error). Returns 0, or < 0 when the batch failed. Without batched decoding (qwen4exp, a draft head)
+// the streams are decoded one by one, with the same results.
+typedef struct {
+    int32_t token;  // the token emitted (-1: none)
+    const char* text;  // the text ready with it (valid until the stream's next step)
+    int text_len;
+    inference_stop_reason reason;
+    int rc;
+} inference_step_result;
+int inference_stream_step_batch(inference_stream_t* const* streams, int n, inference_step_result* results);
 
 // How the last inference_generate_stream prompt was handled: tokens reused from the sequence, tokens prefilled.
 int inference_last_prompt_stats(const inference_model_t* model, int* reused, int* prefilled);

@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "inference.h"
+#include "kv_cache.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -128,6 +129,19 @@ int qwen_model_forward_batch(qwen_model_t* model,
 int qwen_model_seq_new(qwen_model_t* model);
 int qwen_model_seq_select(qwen_model_t* model, int seq);
 int qwen_model_seq_free(qwen_model_t* model, int seq);
+
+// Batched decoding: one token of each of n different sequences in one forward pass (the matmuls read each weight
+// once for all of them). Row r: tokens[r] of sequence rows[r].seq at position rows[r].pos (> 0), on that sequence's
+// KV caches (the engine's: kvc, kvc_swa). Each row's logits go to its sequence's (qwen_model_logits once selected);
+// the selected sequence stays selected. Returns 0; INFERENCE_ERR_NOT_IMPLEMENTED for the architectures without it
+// (qwen4exp, a draft head: decode one by one); -1 on error.
+typedef struct {
+    int seq;
+    int pos;
+    inference_kv_cache_t* kvc;
+    inference_kv_cache_t* kvc_swa;
+} qwen_seq_token;
+int qwen_model_forward_seqs(qwen_model_t* model, const int32_t* tokens, const qwen_seq_token* rows, int n);
 
 #ifdef __cplusplus
 }

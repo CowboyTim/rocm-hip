@@ -28,8 +28,11 @@ Revision history for ROCm-Inference
     - Sequences: seq_new / seq_select / seq_current / seq_free, several conversations on one model, each with
       its own KV cache and state. stream_begin (ROCm::Inference::Stream) and chat_start
       (ROCm::Inference::ChatStream) generate one token per step, so sequences can be interleaved.
-    - rocm-inference-server --parallel N: N conversations at once, each advanced one token per round of the
-      server's loop (needs Web::Route's pull responses); a client that leaves frees its sequence.
+    - step_streams / step_chats: one step of several streams / chats in one forward pass (batched decoding,
+      about 3.5 times the tokens per second at 8 sequences, the same tokens).
+    - rocm-inference-server --parallel N: N conversations at once, all advanced one token per round of the
+      server's loop in one forward pass (needs Web::Route's pull responses); a client that leaves frees its
+      sequence.
     - Chat templates are rendered with trim_blocks and lstrip_blocks, as transformers' apply_chat_template
       (Nemotron-3's template depends on them).
     - set_swa_ring / swa_ring: the sliding-window layers' KV cache as a ring (the default) or every layer's

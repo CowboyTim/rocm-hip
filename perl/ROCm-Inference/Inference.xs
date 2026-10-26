@@ -519,6 +519,45 @@ _stream_step(p)
     PUSHs(sv_2mortal(t));
     PUSHs(sv_2mortal(newSViv((IV)reason)));
 
+void
+_stream_step_batch(ptrs)
+    SV* ptrs
+  PPCODE:
+    /* one step of each stream, one forward pass: per stream [status, token, text, stop reason] */
+    if (!SvROK(ptrs) || SvTYPE(SvRV(ptrs)) != SVt_PVAV) croak("ROCm::Inference: expected an array reference of streams");
+    AV* av = (AV*)SvRV(ptrs);
+    const SSize_t n = av_len(av) + 1;
+    if (n <= 0) XSRETURN_EMPTY;
+    inference_stream_t** st;
+    inference_step_result* r;
+    Newx(st, n, inference_stream_t*);
+    Newx(r, n, inference_step_result);
+    for (SSize_t i = 0; i < n; ++i) {
+        SV** e = av_fetch(av, i, 0);
+        st[i] = INT2PTR(inference_stream_t*, e ? SvUV(*e) : 0);
+    }
+    int rc = inference_stream_step_batch(st, (int)n, r);
+    for (SSize_t i = 0; rc == 0 && i < n; ++i)
+        if (r[i].rc < 0) rc = r[i].rc;
+    if (rc < 0) {
+        Safefree(st);
+        Safefree(r);
+        croak_last(aTHX_ "step_streams", rc);
+    }
+    EXTEND(SP, n);
+    for (SSize_t i = 0; i < n; ++i) {
+        AV* o = newAV();
+        SV* t = newSVpvn(r[i].text, (STRLEN)r[i].text_len);
+        SvUTF8_on(t);
+        av_push(o, newSViv(r[i].rc));
+        av_push(o, newSViv(r[i].token));
+        av_push(o, t);
+        av_push(o, newSViv((IV)r[i].reason));
+        PUSHs(sv_2mortal(newRV_noinc((SV*)o)));
+    }
+    Safefree(st);
+    Safefree(r);
+
 int
 _stream_tokens(p)
     UV p

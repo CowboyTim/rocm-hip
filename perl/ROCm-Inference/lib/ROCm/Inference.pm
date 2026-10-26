@@ -18,7 +18,7 @@ BEGIN {  # at compile time: the constants below call into the XS
 our @EXPORT_OK = qw(
     load_model free_model kv_cache_init set_lm_head_q8 set_draft_model set_draft_tokens set_prefill_batch
     set_swa_ring swa_ring stage_info set_kv_type
-    seq_new seq_select seq_current seq_free stream_begin chat_start
+    seq_new seq_select seq_current seq_free stream_begin chat_start step_streams step_chats
     tokenize detokenize chat_template bos_id eos_id token_is_eog vocab_size
     n_ctx n_past reset prefill decode_token get_logits
     generate last_prompt_stats last_error
@@ -429,6 +429,26 @@ sub chat_start {
     return $c;
 }
 
+# step_streams(@streams): one step of each stream (of different sequences) in one forward pass for all of them
+# (batched decoding: each weight is read once for all); per stream [$token, $text, $going, $reason] as its step
+sub step_streams {
+    my @s = @_;
+    return () unless @s;
+    for (@s) { Carp::croak("ROCm::Inference::step_streams: a freed stream") unless $_->{p} }
+    return map { [ $_->[1], $_->[2], $_->[0] > 0, $_->[3] ] } _stream_step_batch([ map { $_->{p} } @s ]);
+}
+
+# step_chats(@chats): one step of each chat (chat_start, different sequences) in one forward pass; per chat
+# [\@deltas, $going] as its step
+sub step_chats {
+    my @c = @_;
+    my @live = grep { !$_->{done} } @c;
+    my %r;
+    my @r = step_streams(map { $_->{stream} } @live);
+    $r{ 0 + $live[$_] } = [ $live[$_]->_took(@{ $r[$_] }) ] for 0 .. $#live;
+    return map { $r{ 0 + $_ } // [ [], 0 ] } @c;
+}
+
 package ROCm::Inference::Stream;
 
 sub step {
@@ -454,8 +474,13 @@ package ROCm::Inference::ChatStream;
 sub step {
     my ($c) = @_;
     return ([], 0) if $c->{done};
+    return $c->_took($c->{stream}->step);
+}
+
+# What a step of the stream gave: the reply's deltas, and whether it goes on
+sub _took {
+    my ($c, $tok, $text, $going, $why) = @_;
     my $m = $c->{m};
-    my ($tok, $text, $going, $why) = $c->{stream}->step;
     $c->{reason} = $why;
     ++$c->{n} if $tok >= 0;
     $c->{split}{feed}->($text) if length $text;
@@ -646,6 +671,25 @@ C<vars> (template variables), C<on_delta> (C<< sub { my ($text, $kind) = @_; ret
 streamed by kind, C<reasoning>, C<content> or C<tool_call>, without the tags; reasoning and content trimmed as
 the templates trim them, so the deltas of a kind add up to the message's field) and C<max_thinking_tokens>
 (after that many reasoning tokens, close the reasoning as the model would and go on with the answer).
+
+=item seq_new($m), seq_select($m, $seq), seq_current($m), seq_free($m, $seq)
+
+Several conversations on one model, each with its own KV cache (of C<kv_cache_init>'s size), recurrent state and
+history. C<seq_new> returns a new sequence's number; the calls that generate work on the selected one
+(C<seq_select>, a swap of pointers, no copy). Sequence 0 is the model's own and cannot be freed.
+
+=item stream_begin($m, \@prompt, \%options), chat_start($m, \@messages, \%options)
+
+Generation one token per step on the selected sequence, so that several sequences can be interleaved; the options
+of C<generate> / C<chat> but the callbacks. C<< $stream->step >> returns C<($token, $text, $going, $reason)>,
+C<< $chat->step >> returns C<(\@deltas, $going)>, the reply's new pieces as C<[$text, $kind]>, and
+C<< $chat->result >> then C<($content, $reason, $message)> as C<chat> does. A step selects its sequence.
+
+=item step_streams(@streams), step_chats(@chats)
+
+One step of each of several streams / chats (on different sequences) in one forward pass: batched decoding, each
+weight read once for all of them (about 3.5 times the tokens per second of stepping 8 in turn), with the same
+tokens. Returns one C<[$token, $text, $going, $reason]> / C<[\@deltas, $going]> per stream / chat.
 
 =item chat_template($m [, $name]), bos_id, eos_id, token_is_eog, vocab_size, n_ctx, n_past, reset,
 prefill, decode_token, get_logits, last_prompt_stats, set_lm_head_q8, set_draft_model, set_draft_tokens,

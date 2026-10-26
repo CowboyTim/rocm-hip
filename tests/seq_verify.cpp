@@ -1,14 +1,17 @@
 // seq_verify -- sequences (inference_seq_*) and step-wise generation (inference_stream_*).
 //
-//   seq_verify <model.gguf> [n_ctx]        (run from build/co)
+//   seq_verify <model.gguf> [n_ctx] [n_batch]        (run from build/co)
 //
 // Two prompts are generated greedily, each alone on the default sequence, then on two new sequences stepped in
 // turn (a, b, a, b, ...): the interleaved tokens must be exactly the ones generated alone (each sequence keeps its
 // own KV cache, recurrent state and logits). Then a third turn continues sequence a with reuse_prefix (its history
-// must still be there after b ran), and freeing / reusing a sequence works.
+// must still be there after b ran), and freeing / reusing a sequence works. Then batched decoding
+// (inference_stream_step_batch): three sequences stepped together give the tokens each gives alone, and n_batch
+// (default 8) sequences' generation speed batched vs stepped in turn.
 
 #include "inference.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -138,6 +141,80 @@ int main(int argc, char** argv) {
     const int qc = inference_seq_new(m);
     check(qc == qb, "its number is reused");
     check(inference_seq_free(m, 0) != 0, "sequence 0 cannot be freed");
+    check(inference_seq_free(m, qa) == 0 && inference_seq_free(m, qc) == 0, "free both");
+
+    // batched: three new sequences stepped together (a third prompt alone first, on sequence 0)
+    const std::vector<int32_t> pc = tok(m, "def fibonacci(n):");
+    inference_seq_select(m, 0);
+    inference_reset(m);
+    s = inference_stream_begin(m, pc.data(), (int)pc.size(), &o);
+    const std::vector<int32_t> c0a = run(s);
+    inference_stream_free(s);
+    const std::vector<int32_t>* prompts[] = {&pa, &pb, &pc};
+    const std::vector<int32_t>* alone[] = {&a0, &b0, &c0a};
+    inference_stream_t* bs[3];
+    int bq[3];
+    for (int i = 0; i < 3; ++i) {
+        bq[i] = inference_seq_new(m);
+        inference_seq_select(m, bq[i]);
+        bs[i] = inference_stream_begin(m, prompts[i]->data(), (int)prompts[i]->size(), &o);
+    }
+    inference_seq_select(m, 0);
+    std::vector<int32_t> got[3];
+    for (bool going = true; going;) {
+        inference_step_result r[3];
+        if (inference_stream_step_batch(bs, 3, r) != 0) { check(false, inference_get_last_error()); break; }
+        going = false;
+        for (int i = 0; i < 3; ++i) {
+            if (r[i].token >= 0) got[i].push_back(r[i].token);
+            going |= r[i].rc > 0;
+        }
+    }
+    int same = 0;
+    for (int i = 0; i < 3; ++i) {
+        int k = 0;
+        while (k < (int)got[i].size() && k < (int)alone[i]->size() && got[i][k] == (*alone[i])[k]) ++k;
+        printf("  batched %d: %d of %d tokens as alone\n", i, k, (int)alone[i]->size());
+        same += got[i] == *alone[i];
+        inference_stream_free(bs[i]);
+        inference_seq_free(m, bq[i]);
+    }
+    check(inference_seq_current(m) == 0, "batched: the selected sequence stays");
+    // (the batch's matmuls may take other kernels than one token's (WMMA tiles): exact with QMATVEC_NO_WMMA=1)
+    check(same == 3 || !getenv("QMATVEC_NO_WMMA"), "batched: each sequence's tokens = alone");
+
+    // speed: n_batch sequences of G tokens, stepped in turn vs batched
+    const int NB = argc > 3 ? atoi(argv[3]) : 8, G = 64;
+    const inference_gen_options og = greedy(G);
+    std::vector<int> q(NB);
+    std::vector<inference_stream_t*> st(NB);
+    double secs[2];
+    for (int mode = 0; mode < 2; ++mode) {
+        for (int i = 0; i < NB; ++i) {
+            q[i] = inference_seq_new(m);
+            inference_seq_select(m, q[i]);
+            st[i] = inference_stream_begin(m, (i % 2 ? pb : pa).data(), (int)(i % 2 ? pb : pa).size(), &og);
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<inference_step_result> r(NB);
+        for (bool going = true; going;) {
+            going = false;
+            if (mode == 1) {
+                if (inference_stream_step_batch(st.data(), NB, r.data()) != 0) break;
+                for (int i = 0; i < NB; ++i) going |= r[i].rc > 0;
+            } else {
+                for (int i = 0; i < NB; ++i) going |= inference_stream_step(st[i], nullptr, nullptr, nullptr, nullptr) > 0;
+            }
+        }
+        secs[mode] = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        for (int i = 0; i < NB; ++i) {
+            inference_stream_free(st[i]);
+            inference_seq_free(m, q[i]);
+        }
+    }
+    printf("  %d sequences x %d tokens: in turn %.1f tok/s, batched %.1f tok/s (x%.2f)\n", NB, G, NB * G / secs[0],
+           NB * G / secs[1], secs[0] / secs[1]);
+    check(secs[1] < secs[0], "batched is faster");
     inference_free_model(m);
     printf("%s (%d failed)\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;

@@ -2032,6 +2032,69 @@ inference_stream_t* inference_stream_begin(inference_model_t* m, const int32_t* 
     return st;
 }
 
+// A step's first half: sample the stream's next token and its text (ready in st->out). Returns the token to decode
+// into the sequence, or -1 (none: the stream stops)
+static int stream_pick(inference_stream_t* st) {
+    inference_model_t* m = st->m;
+    st->out.clear();
+    if (st->done) return -1;
+    int next = -1;
+    if (st->emitted >= st->o.max_new_tokens) {
+        st->stop = INFERENCE_STOP_MAX_TOKENS;
+    } else {
+        next = sampler_sample(st->smp, qwen_model_logits(m->qwen), m->vocab_size);
+        if (!st->o.ignore_eog && tokenizer_is_eog(m->tokenizer, next)) {
+            st->stop = INFERENCE_STOP_EOG;
+            next = -1;
+        }
+    }
+    if (next < 0) return -1;
+    sampler_accept(st->smp, next);
+    ++st->emitted;
+    int len = tokenizer_detokenize(m->tokenizer, &next, 1, st->buf.data(), (int)st->buf.size());
+    if (len >= (int)st->buf.size()) {
+        st->buf.resize((size_t)len + 1);
+        len = tokenizer_detokenize(m->tokenizer, &next, 1, st->buf.data(), (int)st->buf.size());
+    }
+    st->pending.append(st->buf.data(), (size_t)std::max(len, 0));
+    // what can no longer become part of a stop string or of a split UTF-8 character
+    size_t ready, cut = std::string::npos;
+    for (const std::string& x : st->stops) cut = std::min(cut, st->pending.find(x));
+    if (cut != std::string::npos) {
+        ready = cut;
+        st->stop = INFERENCE_STOP_STRING;
+    } else {
+        ready = st->pending.size() - std::max(utf8_incomplete_tail(st->pending), stop_prefix_tail(st->pending, st->stops));
+    }
+    st->out.assign(st->pending, 0, ready);
+    st->pending.erase(0, st->stop == INFERENCE_STOP_STRING ? st->pending.size() : ready);
+    return next;
+}
+
+// The decode of the picked token returned rc: a full context stops the stream
+static int stream_decoded(inference_stream_t* st, int rc) {
+    if (rc == INFERENCE_ERR_CONTEXT_FULL) {
+        if (st->stop == INFERENCE_STOP_NONE) st->stop = INFERENCE_STOP_CONTEXT_FULL;
+        return 0;
+    }
+    return rc;
+}
+
+// A step's end: a stopped stream's rest of the text goes with its last step
+static int stream_finish(inference_stream_t* st, int32_t* token, int next, const char** text, int* text_len,
+                         inference_stop_reason* reason) {
+    if (!st->done && st->stop != INFERENCE_STOP_NONE) {
+        st->out += st->pending;
+        st->pending.clear();
+        st->done = true;
+    }
+    if (token) *token = next;
+    if (text) *text = st->out.c_str();
+    if (text_len) *text_len = (int)st->out.size();
+    if (reason) *reason = st->stop;
+    return st->done ? 0 : 1;
+}
+
 int inference_stream_step(inference_stream_t* st, int32_t* token, const char** text, int* text_len,
                           inference_stop_reason* reason) {
     clear_error();
@@ -2040,59 +2103,81 @@ int inference_stream_step(inference_stream_t* st, int32_t* token, const char** t
     if (text_len) *text_len = 0;
     if (!st) { set_error("NULL stream"); return INFERENCE_ERR_INVALID_ARG; }
     inference_model_t* m = st->m;
-    st->out.clear();
-    if (!st->done) {
-        if (m->cur_seq != st->seq && inference_seq_select(m, st->seq) != 0) return -1;
-        int next = -1;
-        if (st->emitted >= st->o.max_new_tokens) {
-            st->stop = INFERENCE_STOP_MAX_TOKENS;
-        } else {
-            next = sampler_sample(st->smp, qwen_model_logits(m->qwen), m->vocab_size);
-            if (!st->o.ignore_eog && tokenizer_is_eog(m->tokenizer, next)) {
-                st->stop = INFERENCE_STOP_EOG;
-                next = -1;
-            }
-        }
-        if (next >= 0) {
-            sampler_accept(st->smp, next);
-            ++st->emitted;
-            if (token) *token = next;
-            int len = tokenizer_detokenize(m->tokenizer, &next, 1, st->buf.data(), (int)st->buf.size());
-            if (len >= (int)st->buf.size()) {
-                st->buf.resize((size_t)len + 1);
-                len = tokenizer_detokenize(m->tokenizer, &next, 1, st->buf.data(), (int)st->buf.size());
-            }
-            st->pending.append(st->buf.data(), (size_t)std::max(len, 0));
-            // what can no longer become part of a stop string or of a split UTF-8 character
-            size_t ready, cut = std::string::npos;
-            for (const std::string& s : st->stops) cut = std::min(cut, st->pending.find(s));
-            if (cut != std::string::npos) {
-                ready = cut;
-                st->stop = INFERENCE_STOP_STRING;
-            } else {
-                ready = st->pending.size() -
-                        std::max(utf8_incomplete_tail(st->pending), stop_prefix_tail(st->pending, st->stops));
-            }
-            st->out.assign(st->pending, 0, ready);
-            st->pending.erase(0, st->stop == INFERENCE_STOP_STRING ? st->pending.size() : ready);
-            // every emitted token joins the sequence: a later call continues right after it
-            const int rc = forward_next(m, next);
-            if (rc == INFERENCE_ERR_CONTEXT_FULL) {
-                if (st->stop == INFERENCE_STOP_NONE) st->stop = INFERENCE_STOP_CONTEXT_FULL;
-            } else if (rc != 0) {
-                return rc;
-            }
-        }
-        if (st->stop != INFERENCE_STOP_NONE) {  // the rest of the text goes with the last step
-            st->out += st->pending;
-            st->pending.clear();
-            st->done = true;
+    if (!st->done && m->cur_seq != st->seq && inference_seq_select(m, st->seq) != 0) return -1;
+    const int next = stream_pick(st);
+    // every emitted token joins the sequence: a later call continues right after it
+    if (next >= 0) {
+        const int rc = stream_decoded(st, forward_next(m, next));
+        if (rc != 0) return rc;
+    }
+    return stream_finish(st, token, next, text, text_len, reason);
+}
+
+int inference_stream_step_batch(inference_stream_t* const* streams, int n, inference_step_result* results) {
+    clear_error();
+    if (n <= 0 || !streams || !results) { set_error("Invalid arguments"); return INFERENCE_ERR_INVALID_ARG; }
+    inference_model_t* m = streams[0] ? streams[0]->m : nullptr;
+    for (int i = 0; i < n; ++i) {
+        results[i] = inference_step_result{-1, "", 0, INFERENCE_STOP_NONE, 0};
+        bool dup = false;
+        for (int j = 0; j < i; ++j) dup |= streams[j] && streams[i] && streams[j]->seq == streams[i]->seq;
+        if (!streams[i] || streams[i]->m != m || dup) {
+            set_error("stream %d: NULL, of another model, or a second one of its sequence", i);
+            return INFERENCE_ERR_INVALID_ARG;
         }
     }
-    if (text) *text = st->out.c_str();
-    if (text_len) *text_len = (int)st->out.size();
-    if (reason) *reason = st->stop;
-    return st->done ? 0 : 1;
+    const int cur = m->cur_seq;
+    // pick every stream's token (its sequence's logits), and make the sequences' next positions writable
+    std::vector<int> next((size_t)n, -1), rc((size_t)n, 0);
+    std::vector<int32_t> toks;
+    std::vector<qwen_seq_token> rows;
+    std::vector<int> row_of;  // the streams in the batch
+    int err = 0;
+    for (int i = 0; i < n && !err; ++i) {
+        inference_stream_t* st = streams[i];
+        if (st->done) continue;
+        if (inference_seq_select(m, st->seq) != 0) { err = -1; break; }
+        next[i] = stream_pick(st);
+        if (next[i] < 0) continue;
+        if (m->n_past >= m->n_ctx) {
+            set_error("context full (%d tokens)", m->n_ctx);
+            rc[i] = INFERENCE_ERR_CONTEXT_FULL;
+        } else if (ensure_writable(m, m->n_past, 1) != 0) {
+            err = -1;
+        } else {
+            toks.push_back(next[i]);
+            rows.push_back(qwen_seq_token{st->seq, m->n_past, m->kvc, m->kvc_swa});
+            row_of.push_back(i);
+        }
+    }
+    if (!err && inference_seq_select(m, cur) != 0) err = -1;
+    // one forward pass for all (or one by one where batched decoding is not there, and for a single one)
+    int frc = rows.size() >= 2 && !err ? qwen_model_forward_seqs(m->qwen, toks.data(), rows.data(), (int)rows.size())
+                                      : INFERENCE_ERR_NOT_IMPLEMENTED;
+    if (frc != 0 && frc != INFERENCE_ERR_NOT_IMPLEMENTED) {
+        set_error("batched forward pass failed: %s", qwen_model_last_error());
+        err = -1;
+    }
+    for (size_t r = 0; r < rows.size() && !err; ++r) {
+        const int i = row_of[r];
+        if (inference_seq_select(m, streams[i]->seq) != 0) { err = -1; break; }
+        if (frc == 0) {
+            ++m->n_past;
+            m->seq.push_back(toks[r]);
+            rc[i] = store_after_forward(m);
+        } else {
+            rc[i] = forward_next(m, toks[r]);
+        }
+    }
+    if (!err && inference_seq_select(m, cur) != 0) err = -1;
+    if (err) return err;
+    for (int i = 0; i < n; ++i) {
+        inference_step_result& o = results[i];
+        o.rc = rc[i] ? stream_decoded(streams[i], rc[i]) : 0;
+        if (o.rc == 0) o.rc = stream_finish(streams[i], &o.token, next[i], &o.text, &o.text_len, &o.reason);
+        else o.text = "";
+    }
+    return 0;
 }
 
 int inference_stream_tokens(const inference_stream_t* st) { return st ? st->emitted : 0; }
