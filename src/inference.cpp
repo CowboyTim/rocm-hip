@@ -48,6 +48,7 @@ static void set_error(const char* fmt, ...) {
 static void clear_error() { g_last_error[0] = 0; }
 
 static void seq_reset(inference_model_t* m);
+static void free_seqs(inference_model_t* m);
 
 // All internal types (QuantWeight, LayerWeights, inference_model) are
 // defined in inference_internal.h which is included above.
@@ -913,6 +914,8 @@ void inference_free_model(inference_model_t* m) {
     unpin_model_memory(m);
     model_stage_unmap(m->stage);
     inference_store_close(m);
+    if (m->cur_seq != 0) inference_seq_select(m, 0);
+    free_seqs(m);
     if (m->kvc) { INFER_LOG("[CLEANUP] Freeing KV cache\n"); kv_cache_free(m->kvc); }
     if (m->kvc_swa) kv_cache_free(m->kvc_swa);
     if (m->qwen) { INFER_LOG("[CLEANUP] Freeing qwen model\n"); qwen_model_free(m->qwen); }
@@ -986,6 +989,7 @@ int inference_set_kv_type(inference_model_t* m, int kv_type) {
 int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
     clear_error();
     if (!m) { set_error("NULL model"); return -1; }
+    if (m->seqs.size() > 1) { set_error("free the sequences (inference_seq_free) before a new KV cache"); return -1; }
     if (m->kvc_swa) { kv_cache_free(m->kvc_swa); m->kvc_swa = nullptr; }
     int window = 0;
     const int R = swa_ring_size(m, n_ctx, &window);
@@ -1007,10 +1011,12 @@ int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
             const kv_cache_config_t rcfg{n_ring, R, m->n_embd, ring_hd, m->n_head, ring_kv, R, m->kv_type};
             m->kvc_swa = kv_cache_create("/dev/shm", &rcfg);
             if (!m->kvc_swa) { set_error("kv_cache_create (sliding-window ring) failed"); return -1; }
+            m->kv_cfg_swa = rcfg;
         }
     }
     m->kvc = kv_cache_create("/dev/shm", &cfg);
     if (!m->kvc) { set_error("kv_cache_create failed"); return -1; }
+    m->kv_cfg = cfg;
     if (m->kvc_swa)
         INFER_LOG("[KV_INIT] sliding-window ring: %d layers x %d positions (%.0f MB), %d global layers x %d (%.0f MB)\n",
                   kv_cache_n_layers(m->kvc_swa), R, kv_cache_total_bytes(m->kvc_swa) / 1048576.0,
@@ -1048,6 +1054,90 @@ int inference_set_lm_head_q8(inference_model_t* m, int enable) {
         m->lm_head_q8 = 0;
         return INFERENCE_ERR_OUT_OF_MEMORY;
     }
+    return 0;
+}
+
+// Free every sequence but the current one (their caches; QwenModel frees their states with itself)
+static void free_seqs(inference_model_t* m) {
+    for (inference_model::SeqCtx* c : m->seqs) {
+        if (!c) continue;
+        if (c->kvc) kv_cache_free(c->kvc);
+        if (c->kvc_swa) kv_cache_free(c->kvc_swa);
+        delete c;
+    }
+    m->seqs.clear();
+    m->cur_seq = 0;
+}
+
+// The model's sequence fields <-> c
+static void seq_swap(inference_model_t* m, inference_model::SeqCtx& c) {
+    std::swap(m->kvc, c.kvc);
+    std::swap(m->kvc_swa, c.kvc_swa);
+    std::swap(m->n_past, c.n_past);
+    std::swap(m->seq, c.seq);
+    std::swap(m->ckpts, c.ckpts);
+    std::swap(m->ckpt_clock, c.ckpt_clock);
+    std::swap(m->last_reused, c.last_reused);
+    std::swap(m->last_prefilled, c.last_prefilled);
+    std::swap(m->chain, c.chain);
+    std::swap(m->published, c.published);
+    std::swap(m->store_snapshot_at, c.store_snapshot_at);
+}
+
+int inference_seq_new(inference_model_t* m) {
+    clear_error();
+    if (!m || !m->qwen || !m->kvc) { set_error("sequences: call inference_kv_cache_init first"); return -1; }
+    if (m->mtp) { set_error("sequences: not with a draft model (speculative decoding is single-sequence)"); return -1; }
+    if (m->seqs.empty()) m->seqs.push_back(new inference_model::SeqCtx());  // slot 0: the default sequence
+    const int j = qwen_model_seq_new(m->qwen);
+    if (j < 0) { set_error("%s", qwen_model_last_error()); return -1; }
+    if ((int)m->seqs.size() <= j) m->seqs.resize((size_t)j + 1, nullptr);
+    if (!m->seqs[j]) m->seqs[j] = new inference_model::SeqCtx();
+    inference_model::SeqCtx& c = *m->seqs[j];
+    c = inference_model::SeqCtx();
+    c.kvc = kv_cache_create("/dev/shm", &m->kv_cfg);
+    c.kvc_swa = m->kv_cfg_swa.n_layers > 0 ? kv_cache_create("/dev/shm", &m->kv_cfg_swa) : nullptr;
+    if (!c.kvc || (m->kv_cfg_swa.n_layers > 0 && !c.kvc_swa)) {
+        if (c.kvc) kv_cache_free(c.kvc);
+        if (c.kvc_swa) kv_cache_free(c.kvc_swa);
+        c = inference_model::SeqCtx();
+        qwen_model_seq_free(m->qwen, j);
+        set_error("sequences: no memory for another KV cache");
+        return -1;
+    }
+    c.used = true;
+    return j;
+}
+
+int inference_seq_select(inference_model_t* m, int seq) {
+    clear_error();
+    if (!m || !m->qwen) { set_error("Invalid state"); return INFERENCE_ERR_INVALID_STATE; }
+    if (seq == m->cur_seq) return 0;
+    if (seq < 0 || seq >= (int)m->seqs.size() || !m->seqs[seq] || (seq > 0 && !m->seqs[seq]->used)) {
+        set_error("no sequence %d", seq);
+        return INFERENCE_ERR_INVALID_ARG;
+    }
+    if (qwen_model_seq_select(m->qwen, seq) != 0) { set_error("%s", qwen_model_last_error()); return -1; }
+    seq_swap(m, *m->seqs[m->cur_seq]);  // the current sequence back into its slot
+    seq_swap(m, *m->seqs[seq]);
+    m->cur_seq = seq;
+    return 0;
+}
+
+int inference_seq_current(const inference_model_t* m) { return m ? m->cur_seq : -1; }
+
+int inference_seq_free(inference_model_t* m, int seq) {
+    clear_error();
+    if (!m || seq <= 0 || seq >= (int)m->seqs.size() || !m->seqs[seq] || !m->seqs[seq]->used) {
+        set_error("no sequence %d", seq);
+        return INFERENCE_ERR_INVALID_ARG;
+    }
+    if (seq == m->cur_seq && inference_seq_select(m, 0) != 0) return -1;
+    if (qwen_model_seq_free(m->qwen, seq) != 0) { set_error("%s", qwen_model_last_error()); return -1; }
+    inference_model::SeqCtx& c = *m->seqs[seq];
+    if (c.kvc) kv_cache_free(c.kvc);
+    if (c.kvc_swa) kv_cache_free(c.kvc_swa);
+    c = inference_model::SeqCtx();
     return 0;
 }
 
@@ -1891,6 +1981,127 @@ int inference_generate_stream(inference_model_t* m, const int32_t* prompt_ids, i
     if (n_out) *n_out = emitted;
     if (reason) *reason = stop;
     return rc;
+}
+
+// ---- Step-wise generation (inference_stream_*): what inference_generate_stream does, one token per call, so that
+// a caller can interleave several sequences (no speculative decoding)
+struct inference_stream {
+    inference_model_t* m = nullptr;
+    int seq = 0;
+    inference_gen_options o{};
+    std::vector<std::string> stops;
+    sampler_t* smp = nullptr;
+    std::string pending, out;
+    std::vector<char> buf = std::vector<char>(256);
+    int emitted = 0;
+    inference_stop_reason stop = INFERENCE_STOP_NONE;
+    bool done = false;
+};
+
+inference_stream_t* inference_stream_begin(inference_model_t* m, const int32_t* prompt_ids, int n_prompt,
+                                           const inference_gen_options* options) {
+    clear_error();
+    if (!m || !m->qwen || !m->tokenizer || n_prompt < 0 || (n_prompt > 0 && !prompt_ids)) {
+        set_error("Invalid state or arguments");
+        return nullptr;
+    }
+    const inference_gen_options o = options ? *options : inference_gen_default_options();
+    m->store_snapshot_at = ((o.reuse_prefix ? 0 : m->n_past) + n_prompt) / kv_B(m);
+    int rc = 0;
+    if (o.reuse_prefix && n_prompt > 0) {
+        rc = sync_prompt(m, prompt_ids, n_prompt, o.checkpoint_tail);
+    } else if (n_prompt > 0) {
+        m->last_reused = m->n_past;
+        m->last_prefilled = n_prompt;
+        rc = prefill_with_checkpoint(m, prompt_ids, n_prompt, o.checkpoint_tail);
+    } else if (m->n_past == 0) {
+        set_error("nothing to continue: empty prompt and an empty sequence");
+        rc = INFERENCE_ERR_INVALID_ARG;
+    }
+    m->store_snapshot_at = -1;
+    if (rc != 0) return nullptr;
+    inference_stream_t* st = new inference_stream();
+    st->m = m;
+    st->seq = m->cur_seq;
+    st->o = o;
+    st->o.stop_strings = nullptr;  // copied below
+    for (int i = 0; i < o.n_stop_strings; ++i)
+        if (o.stop_strings && o.stop_strings[i] && o.stop_strings[i][0]) st->stops.emplace_back(o.stop_strings[i]);
+    st->smp = sampler_create(&o.sampler);
+    for (int i = 0; i < n_prompt; ++i) sampler_accept(st->smp, prompt_ids[i]);
+    return st;
+}
+
+int inference_stream_step(inference_stream_t* st, int32_t* token, const char** text, int* text_len,
+                          inference_stop_reason* reason) {
+    clear_error();
+    if (token) *token = -1;
+    if (text) *text = "";
+    if (text_len) *text_len = 0;
+    if (!st) { set_error("NULL stream"); return INFERENCE_ERR_INVALID_ARG; }
+    inference_model_t* m = st->m;
+    st->out.clear();
+    if (!st->done) {
+        if (m->cur_seq != st->seq && inference_seq_select(m, st->seq) != 0) return -1;
+        int next = -1;
+        if (st->emitted >= st->o.max_new_tokens) {
+            st->stop = INFERENCE_STOP_MAX_TOKENS;
+        } else {
+            next = sampler_sample(st->smp, qwen_model_logits(m->qwen), m->vocab_size);
+            if (!st->o.ignore_eog && tokenizer_is_eog(m->tokenizer, next)) {
+                st->stop = INFERENCE_STOP_EOG;
+                next = -1;
+            }
+        }
+        if (next >= 0) {
+            sampler_accept(st->smp, next);
+            ++st->emitted;
+            if (token) *token = next;
+            int len = tokenizer_detokenize(m->tokenizer, &next, 1, st->buf.data(), (int)st->buf.size());
+            if (len >= (int)st->buf.size()) {
+                st->buf.resize((size_t)len + 1);
+                len = tokenizer_detokenize(m->tokenizer, &next, 1, st->buf.data(), (int)st->buf.size());
+            }
+            st->pending.append(st->buf.data(), (size_t)std::max(len, 0));
+            // what can no longer become part of a stop string or of a split UTF-8 character
+            size_t ready, cut = std::string::npos;
+            for (const std::string& s : st->stops) cut = std::min(cut, st->pending.find(s));
+            if (cut != std::string::npos) {
+                ready = cut;
+                st->stop = INFERENCE_STOP_STRING;
+            } else {
+                ready = st->pending.size() -
+                        std::max(utf8_incomplete_tail(st->pending), stop_prefix_tail(st->pending, st->stops));
+            }
+            st->out.assign(st->pending, 0, ready);
+            st->pending.erase(0, st->stop == INFERENCE_STOP_STRING ? st->pending.size() : ready);
+            // every emitted token joins the sequence: a later call continues right after it
+            const int rc = forward_next(m, next);
+            if (rc == INFERENCE_ERR_CONTEXT_FULL) {
+                if (st->stop == INFERENCE_STOP_NONE) st->stop = INFERENCE_STOP_CONTEXT_FULL;
+            } else if (rc != 0) {
+                return rc;
+            }
+        }
+        if (st->stop != INFERENCE_STOP_NONE) {  // the rest of the text goes with the last step
+            st->out += st->pending;
+            st->pending.clear();
+            st->done = true;
+        }
+    }
+    if (text) *text = st->out.c_str();
+    if (text_len) *text_len = (int)st->out.size();
+    if (reason) *reason = st->stop;
+    return st->done ? 0 : 1;
+}
+
+int inference_stream_tokens(const inference_stream_t* st) { return st ? st->emitted : 0; }
+int inference_stream_seq(const inference_stream_t* st) { return st ? st->seq : -1; }
+
+void inference_stream_free(inference_stream_t* st) {
+    if (!st) return;
+    sampler_free(st->smp);
+    delete st;
 }
 
 int inference_generate(inference_model_t* model, const int32_t* prompt_ids, int prompt_len, int max_new_tokens,

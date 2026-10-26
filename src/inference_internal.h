@@ -255,6 +255,12 @@ struct inference_model {
     int swa_window = 0;                                 // the sliding window
     int swa_ring_opt = -1;                              // inference_set_swa_ring: -1 auto, 0 no ring, N >= N positions
     int kv_type = 0;                                    // inference_set_kv_type: KV_CACHE_F16 / KV_CACHE_Q8_0
+    // Sequences (inference_seq_*): the current one's context lives in the fields of this struct (kvc, kvc_swa,
+    // n_past, seq, ckpts, ...), the others in seqs[] (swapped on select). seqs[cur_seq] is then empty.
+    struct SeqCtx;
+    std::vector<SeqCtx*> seqs;
+    int cur_seq = 0;
+    kv_cache_config_t kv_cfg{}, kv_cfg_swa{};           // what inference_kv_cache_init created (a new sequence's)
     float embd_scale = 1.0f;                            // token embeddings * sqrt(n_embd)
     // Nemotron-H (nemotron_h_moe): ssm_* above describe its Mamba-2 layers (n_head = ssm_dt_rank)
     bool nemotron = false;
@@ -262,6 +268,21 @@ struct inference_model {
     bool expert_weights_norm = true;                    // MoE: the chosen sigmoid weights normalized to sum 1
     int moe_latent = 0;                                 // MoE: latent width of the experts (moe_latent_size; 0: n_embd)
     float logit_softcap = 0.0f;                         // final_logit_softcapping (0: none)
+};
+
+// A sequence's context while another is current (inference_seq_select swaps it with the model's fields)
+struct inference_model::SeqCtx {
+    inference_kv_cache_t* kvc = nullptr;
+    inference_kv_cache_t* kvc_swa = nullptr;
+    int n_past = 0;
+    std::vector<int32_t> seq;
+    std::vector<inference_model::Checkpoint> ckpts;
+    uint64_t ckpt_clock = 0;
+    int last_reused = 0, last_prefilled = 0;
+    std::vector<inference_model::Hash> chain;
+    size_t published = 0;
+    int store_snapshot_at = -1;
+    bool used = false;
 };
 
 // Tokens per prefill micro-batch: inference_set_prefill_batch's, else 2048 for MoE models (each expert's weights

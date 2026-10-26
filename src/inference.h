@@ -212,6 +212,33 @@ int inference_generate_stream(inference_model_t* model, const int32_t* prompt_id
                               const inference_gen_options* options, int32_t* out_ids, int max_out, int* n_out,
                               inference_stop_reason* reason);
 
+// ---- Sequences: several conversations on one model, each its own KV cache (as big as inference_kv_cache_init's),
+// recurrent state, history and prefix-reuse checkpoints. Everything above works on the current sequence (0, the
+// default, until another is selected); selecting is a swap of pointers, nothing is copied. inference_seq_new: a new
+// empty sequence (after inference_kv_cache_init; not with a draft model), its number, or -1 (not enough memory);
+// inference_seq_free: free one (not 0). 0 / negative on error.
+int inference_seq_new(inference_model_t* model);
+int inference_seq_select(inference_model_t* model, int seq);
+int inference_seq_current(const inference_model_t* model);
+int inference_seq_free(inference_model_t* model, int seq);
+
+// ---- Step-wise generation: inference_generate_stream one token per call, so that a caller can interleave
+// sequences. begin handles the prompt on the current sequence (as inference_generate_stream: options' reuse_prefix,
+// checkpoint_tail, ...; on_token is not used) and returns a stream bound to that sequence, NULL on error. step
+// selects the stream's sequence when another is current, samples a token, decodes it into the sequence and returns
+// 1 while generation goes on, 0 when it has stopped (*reason; the last step may still emit a token), negative on
+// error. *token: the emitted token (-1: none); text / text_len: the text ready to deliver with it (a stop string's
+// start or a split UTF-8 character is held back until it is resolved), valid until the next call. No speculative
+// decoding.
+typedef struct inference_stream inference_stream_t;
+inference_stream_t* inference_stream_begin(inference_model_t* model, const int32_t* prompt_ids, int n_prompt,
+                                           const inference_gen_options* options);
+int inference_stream_step(inference_stream_t* stream, int32_t* token, const char** text, int* text_len,
+                          inference_stop_reason* reason);
+int inference_stream_tokens(const inference_stream_t* stream);  // tokens emitted so far
+int inference_stream_seq(const inference_stream_t* stream);     // its sequence
+void inference_stream_free(inference_stream_t* stream);
+
 // How the last inference_generate_stream prompt was handled: tokens reused from the sequence, tokens prefilled.
 int inference_last_prompt_stats(const inference_model_t* model, int* reused, int* prefilled);
 

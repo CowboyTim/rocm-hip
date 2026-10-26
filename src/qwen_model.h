@@ -122,6 +122,13 @@ int qwen_model_forward_batch(qwen_model_t* model,
                              int seq_len,
                              float* logits_out);
 
+// Sequences: each its own recurrent state, ring mark and logits (0: the default). seq_new returns the new
+// sequence's number (-1 on error); seq_select makes a sequence the one forward passes work on (a swap, no copy);
+// seq_free frees one that is not selected. 0 / -1.
+int qwen_model_seq_new(qwen_model_t* model);
+int qwen_model_seq_select(qwen_model_t* model, int seq);
+int qwen_model_seq_free(qwen_model_t* model, int seq);
+
 #ifdef __cplusplus
 }
 #endif

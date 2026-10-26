@@ -392,12 +392,17 @@ struct QwenModel {
     }
 
     ~QwenModel() {
+        if (cur_seq != 0) seq_select(0);  // sequence 0's state and the scratch's own logits back into the model
         gemma_mem.free();
         mtp_free();
         hc_pad_mem.free();
         head_mem.free();
         rs.free();
         s.mem.free();
+        for (size_t j = 1; j < seqs.size(); ++j) {
+            seqs[j].rs.free();
+            seqs[j].logits_mem.free();
+        }
         // the kernel modules are the process's, shared by every model: unloaded with the last one (freeing one
         // model of two left the other without kernels)
         if (counted && --g_live_models == 0) {
@@ -410,6 +415,67 @@ struct QwenModel {
 
     static int g_live_models;  // QwenModels initialized and not yet freed (they share the kernel modules)
     bool counted = false;
+
+    // Sequences (inference_seq_*): each its own recurrent state, sliding-window ring mark and last logits; the
+    // current one's live in rs / ring_hi / s.logits, the others in their slots (swapped on select, no copy). Slot 0
+    // is the default sequence (its own data sits in the model until another one is selected).
+    struct SeqSlot {
+        RecurrentState rs;
+        int ring_hi = 0;
+        float* logits = nullptr;
+        ShmRegion logits_mem;
+        bool used = false;
+    };
+    std::vector<SeqSlot> seqs = std::vector<SeqSlot>(1);
+    int cur_seq = 0;
+
+    void seq_swap(SeqSlot& o) {
+        std::swap(rs, o.rs);
+        std::swap(ring_hi, o.ring_hi);
+        std::swap(s.logits, o.logits);
+    }
+
+    int seq_new() {
+        size_t j = 1;
+        while (j < seqs.size() && seqs[j].used) ++j;
+        if (j == seqs.size()) seqs.emplace_back();
+        SeqSlot& n = seqs[j];
+        const size_t V = (size_t)eng->vocab_size;
+        float** const pp[] = {&n.logits};
+        if (!n.rs.alloc(eng) || !n.logits_mem.alloc("/dev/shm/qwen_seq_logits.bin", &V, pp, 1)) {
+            n.rs.free();
+            n.logits_mem.free();
+            qwen_set_error("sequence: out of memory");
+            return -1;
+        }
+        n.ring_hi = 0;
+        n.used = true;
+        return (int)j;
+    }
+
+    bool seq_select(int j) {
+        if (j < 0 || j >= (int)seqs.size() || (j > 0 && !seqs[j].used)) {
+            qwen_set_error("no sequence %d", j);
+            return false;
+        }
+        if (j == cur_seq) return true;
+        seq_swap(seqs[cur_seq]);  // the current one back into its slot
+        seq_swap(seqs[j]);        // and j's into the model
+        cur_seq = j;
+        return true;
+    }
+
+    bool seq_free(int j) {
+        if (j <= 0 || j >= (int)seqs.size() || !seqs[j].used || j == cur_seq) {
+            qwen_set_error("cannot free sequence %d", j);
+            return false;
+        }
+        if (!sync()) return false;  // its state may be in use by queued work
+        seqs[j].rs.free();
+        seqs[j].logits_mem.free();
+        seqs[j] = SeqSlot();
+        return true;
+    }
 
     bool init(inference_model* model) {
         eng = model;
@@ -1891,3 +1957,7 @@ int qwen_model_forward_batch(qwen_model_t* model, const int32_t* tokens, const i
 }
 
 }
+
+int qwen_model_seq_new(qwen_model_t* model) { return model ? model->seq_new() : -1; }
+int qwen_model_seq_select(qwen_model_t* model, int seq) { return model && model->seq_select(seq) ? 0 : -1; }
+int qwen_model_seq_free(qwen_model_t* model, int seq) { return model && model->seq_free(seq) ? 0 : -1; }
