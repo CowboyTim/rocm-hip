@@ -2505,6 +2505,32 @@ GEMMA4_VERIFY_KV_Q8), logits 0.9988, same top tokens; prefill vs token by token 
 33.2 tok/s; the decode kernel's V loop dequantizes per element: a candidate). **Fixed on the way:** freeing one model
 unloaded the process's kernel modules under any other model still loaded (now counted: the last one unloads).
 
+### Several conversations at once — Stage 1 DONE ✅ (2026-10-26, user: "implement 5"); Stage 2 next
+
+**Stage 1, sequences and an interleaving server:**
+- Engine: `inference_seq_new` / `select` / `current` / `free`. Each sequence has its own KV cache (and Gemma-4
+  ring), recurrent state, logits, history and checkpoints. Selecting one swaps pointers (SeqCtx in inference.cpp,
+  SeqSlot in QwenModel); sequence 0 is the model's own. `inference_stream_begin` / `step` / `free` run
+  `inference_generate_stream` one token per call, bound to its sequence (step selects it), so callers interleave.
+  tests/seq_verify: interleaved sequences give each one's tokens alone, and a sequence keeps its history while
+  another runs (Qwen3.5-4B, Qwen3-0.6B, Gemma-4 with and without the ring, Nemotron).
+- Perl: `seq_*`, `stream_begin` (ROCm::Inference::Stream), `chat_start` (ROCm::Inference::ChatStream: step returns
+  the reply's deltas by kind; the thinking budget included); t/80-seq.t.
+- Web::Route: `pull(...)` responses, served together by run's loop with a `tick` hook per round, on_close when the
+  client leaves; t/30-pull.t.
+- rocm-inference-server `--parallel N`: N sequences (N KV caches of `--ctx`). A request becomes a job that waits
+  for a free sequence, choosing the one whose last prompt shares the most tokens with it. Each tick advances
+  every running job by one token, and its pull response drains the SSE events, or the JSON at the end. A client
+  that leaves cancels its job. Not with `--draft`. t/60-server.t runs all its tests on both modes, plus two chats
+  at once (one streamed) that answer as each alone, and a dropped client freeing its sequence (Qwen3.5-4B).
+- Limits: a new conversation's prompt is prefilled in one go, so the others pause meanwhile. Interleaving brings
+  no throughput: each token is still its own forward pass, and the weights are read once per sequence.
+
+**Stage 2 (next): batched decoding.** One forward pass carries a token from each running sequence: the matmuls
+batched (the weights read once for all, as in prefill), attention and the recurrent layers per sequence (each with
+its KV, state and position), and LM-head rows for all. Exposed as one step over several streams; the server's tick
+uses it. Also to consider: chunking a new prompt's prefill between decode rounds.
+
 ### BF16 dense prefill (ABC.gguf, a Qwen3.5 27B in BF16, 2026-10-25)
 
 Correct output; generation 4.1 tok/s (54 GB per token: the bandwidth); prefill **7.8 tok/s** (2,661 tokens in
@@ -2553,8 +2579,9 @@ replaces (and a GPU context does not survive the master's fork), a GPU fault wou
   `AMD_SERIALIZE_KERNEL=1` for llama-server; the runtime stage is `FROM base` (compilers, the ROCm tarball
   in a layer); no `proxy_buffering off` for llama-server's streams; llama.pm sets status after
   send_http_header and forces messages[0] to system.
-- Not here yet: the Docker image build itself (untested). Requests queue in the
-  socket backlog while one generates; serving several conversations at once needs multi-sequence KV.
+- Not here yet: the Docker image build itself (untested). By default requests queue in the socket backlog
+  while one generates; `--parallel N` (2026-10-26) serves N conversations at once (see "Several conversations
+  at once" above).
 
 Design (2026-10-21):
 

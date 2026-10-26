@@ -25,6 +25,11 @@ Revision history for ROCm-Inference
     - load_model($path, { stage => $dir }): the GPU tensors staged in a huge-page tmpfs and reused by later
       loads; stage_info; rocm-inference-server --stage. Nemotron-3 (nemotron_h_moe) models.
     - set_kv_type($m, 'q8_0'): a Q8_0 KV cache (half the memory); rocm-inference-server --kv-type.
+    - Sequences: seq_new / seq_select / seq_current / seq_free, several conversations on one model, each with
+      its own KV cache and state. stream_begin (ROCm::Inference::Stream) and chat_start
+      (ROCm::Inference::ChatStream) generate one token per step, so sequences can be interleaved.
+    - rocm-inference-server --parallel N: N conversations at once, each advanced one token per round of the
+      server's loop (needs Web::Route's pull responses); a client that leaves frees its sequence.
     - Chat templates are rendered with trim_blocks and lstrip_blocks, as transformers' apply_chat_template
       (Nemotron-3's template depends on them).
     - set_swa_ring / swa_ring: the sliding-window layers' KV cache as a ring (the default) or every layer's

@@ -8,7 +8,8 @@ use Socket qw(SOCK_STREAM);
 use JSON::PP ();
 use Time::HiRes qw(sleep);
 
-# bin/rocm-inference-server on a unix socket: models, a plain and a streamed chat, a tool call round trip
+# bin/rocm-inference-server on a unix socket: models, a plain and a streamed chat, a tool call round trip; all once
+# as is and once with --parallel 2 (conversations at once), where two chats at once answer as each alone
 my $path = $ENV{ROCM_INFERENCE_TEST_MODEL};
 plan skip_all => 'set ROCM_INFERENCE_TEST_MODEL to a GGUF model to run' unless $path && -f $path;
 plan skip_all => 'Web::Route is not installed' unless eval { require Web::Route; 1 };
@@ -18,24 +19,43 @@ plan skip_all => "Minijinja $ROCm::Inference::MINIJINJA_VERSION is not installed
 
 my $dir = tempdir(CLEANUP => 1);
 my $sock = "$dir/llm.sock";
-my $pid = open my $srv, '-|', $^X, (map { "-I$_" } @INC), 'bin/rocm-inference-server', '--model', $path,
-    '--listen', $sock, '--ctx', 4096, '--name', 'test-model', '--nolog';
-die "cannot start the server: $!" unless $pid;
-for (1 .. 600) { last if -S $sock; sleep 0.1 }
-ok(-S $sock, 'the server listens') or BAIL_OUT('no server');
-
 my $J = JSON::PP->new->utf8->canonical;
-sub http {
+
+# a request sent; its response read by http_read
+sub http_send {
     my ($method, $url, $data) = @_;
     my $c = IO::Socket::UNIX->new(Peer => $sock, Type => SOCK_STREAM) or die "connect: $!";
     my $body = defined $data ? $J->encode($data) : '';
     print $c "$method $url HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: "
              . length($body) . "\r\n\r\n$body";
+    return $c;
+}
+
+sub http_read {
+    my ($c) = @_;
     local $/;
     my ($head, $rest) = split /\r\n\r\n/, <$c>, 2;
     my ($status) = $head =~ m{^HTTP/1\.1 (\d+)};
     return ($status, $rest, $head);
 }
+
+sub http { http_read(http_send(@_)) }
+
+for my $parallel (1, 2) {
+    note("--parallel $parallel");
+    my $pid = open my $srv, '-|', $^X, (map { "-I$_" } @INC), 'bin/rocm-inference-server', '--model', $path,
+        '--listen', $sock, '--ctx', 4096, '--name', 'test-model', '--nolog', '--parallel', $parallel;
+    die "cannot start the server: $!" unless $pid;
+    for (1 .. 600) { last if -S $sock; sleep 0.1 }
+    ok(-S $sock, 'the server listens') or BAIL_OUT('no server');
+    server_tests($parallel);
+    kill TERM => $pid;
+    close $srv;
+    ok(!-e $sock, 'SIGTERM: the server stops and removes its socket');
+}
+
+sub server_tests {
+my ($parallel) = @_;
 
 my ($st, $body) = http(GET => '/v1/models');
 is($st, 200, 'GET /v1/models');
@@ -89,8 +109,26 @@ like($J->decode($body)->{choices}[0]{message}{content}, qr/14/, "the answer uses
 is($st, 400, 'a bad request: 400');
 like($J->decode($body)->{error}{message}, qr/messages/, 'with an OpenAI-style error');
 
-kill TERM => $pid;
-close $srv;
-ok(!-e $sock, 'SIGTERM: the server stops and removes its socket');
+return if $parallel < 2;
+# two chats at once (one streamed): each answers as alone
+my @q = map { { %q, max_tokens => 40, messages => [ { role => 'user', content => $_ } ] } }
+    'What is 7 times 8? Answer with the number.', 'Name a large animal that lives in the sea.';
+my @alone = map { $J->decode((http(POST => '/v1/chat/completions', $_))[1])->{choices}[0]{message}{content} } @q;
+my @c = (http_send(POST => '/v1/chat/completions', $q[0]),
+         http_send(POST => '/v1/chat/completions', { %{ $q[1] }, stream => JSON::PP::true }));
+my @r = map { [ http_read($_) ] } @c;
+is($J->decode($r[0][1])->{choices}[0]{message}{content}, $alone[0], "at once: chat 0 as alone: $alone[0]");
+my $streamed = join '', map { /^data: (\{.*)/ ? $J->decode($1)->{choices}[0]{delta}{content} // '' : '' }
+    split /\n\n/, $r[1][1];
+is($streamed, $alone[1], "at once: chat 1 (streamed) as alone: $alone[1]");
+
+# a client that leaves frees its sequence: two more conversations still run
+my $gone = http_send(POST => '/v1/chat/completions', { %{ $q[0] }, max_tokens => 4000, stream => JSON::PP::true });
+sleep 0.5;
+close $gone;
+@c = map { http_send(POST => '/v1/chat/completions', $_) } @q;
+is($J->decode((http_read($_))[1])->{choices}[0]{message}{content}, $alone[$_ == $c[0] ? 0 : 1], 'after a client left')
+    for @c;
+}
 
 done_testing;

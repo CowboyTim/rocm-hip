@@ -13,7 +13,7 @@ use Web::Route;
 
 my %o = (listen => './rocm-inference.sock', ctx => 8192, max_tokens => 4096);
 GetOptions(\%o, 'model=s', 'listen=s', 'mode=s', 'ctx=i', 'name=s', 'draft=s', 'store=s', 'max_tokens=i',
-           'swa-ring=i', 'stage=s', 'kv-type=s', 'thinking!', 'log!', 'help') or pod2usage(2);
+           'swa-ring=i', 'stage=s', 'kv-type=s', 'parallel=i', 'thinking!', 'log!', 'help') or pod2usage(2);
 pod2usage(-verbose => 2, -exitval => 0) if $o{help};
 pod2usage("--model is required\n") unless $o{model};
 ROCm::Inference::_require_minijinja()
@@ -31,6 +31,12 @@ kv_cache_init($m, $o{ctx});
 set_draft_model($m, $o{draft}) if $o{draft};
 die "--store needs every layer's KV history: --swa-ring 0 (the default with --store)\n" if $o{store} && swa_ring($m);
 store_open($m, $o{store}) if $o{store};
+my $parallel = $o{parallel} // 1;
+die "--parallel N: 1 or more\n" if $parallel < 1;
+die "--parallel: not with --draft (speculative decoding is single-sequence)\n" if $parallel > 1 && $o{draft};
+# --parallel N: N sequences (conversations at once), each a KV cache of --ctx; sequence 0 and N - 1 more
+my @pool = map { { seq => $_, job => undef, prompt => [] } } 0, map { seq_new($m) } 2 .. $parallel;
+my (@queue, @running);  # jobs waiting for a sequence, jobs generating
 my $created = time;
 my $J = JSON::PP->new->utf8->canonical;
 
@@ -132,6 +138,8 @@ route::post '/v1/chat/completions' => sub {
           total_tokens => $prompt_tokens + $completion_tokens };
     };
 
+    return start_job($id, $messages, $opts, $p) if $parallel > 1;
+
     unless ($p->{stream}) {
         my ($content, $why, $msg) = eval { chat($m, $messages, $opts) };
         error(400, $@ =~ s/ at \S+ line \d+\.?\n?\z//r) unless $msg;
@@ -177,8 +185,135 @@ route::post '/v1/chat/completions' => sub {
     });
 };
 
-print STDERR "serving $name on $o{listen}\n";
-run(listen => $o{listen}, log => $o{log} // 1, defined $o{mode} ? (mode => oct $o{mode}) : ());
+# ---- --parallel: conversations at once. A request becomes a job: it waits for a free sequence (the one whose last
+# prompt shares the most tokens with its prompt, for prefix reuse), then each round of the server's loop (tick)
+# advances every running job by one token; its response pulls what the job produced (SSE events, or the JSON at
+# the end). A client that leaves cancels its job.
+
+# A job for this request; the response pulls its output
+sub start_job {
+    my ($id, $messages, $opts, $p) = @_;
+    $opts = { %$opts };
+    delete $opts->{on_token};  # (a step gives the job its tokens)
+    my %vars = %{ $opts->{vars} // {} };
+    my $text = eval { chat_render($m, $messages, %vars) };  # template errors are this request's (400), now
+    error(400, $@ =~ s/ at \S+ line \d+\.?\n?\z//r) unless defined $text;
+    my $job = { id => $id, messages => $messages, opts => $opts, stream => $p->{stream} ? 1 : 0, out => [],
+                prompt => tokenize($m, $text), completion => 0,
+                usage_chunk => ref $p->{stream_options} eq 'HASH' && $p->{stream_options}{include_usage} };
+    push @queue, $job;
+    if ($job->{stream}) {
+        push @{ $job->{out} }, chunk($job, { role => 'assistant', content => '' }, undef);
+    }
+    my $type = $job->{stream} ? 'text/event-stream' : 'application/json';
+    return pull(200, [ 'Content-Type' => $type ], sub {
+        return join '', splice @{ $job->{out} } if @{ $job->{out} };
+        return $job->{done} ? undef : '';
+    }, on_close => sub { cancel($job) });
+}
+
+sub chunk {
+    my ($job, $delta, $finish) = @_;
+    return sse({ id => $job->{id}, object => 'chat.completion.chunk', created => time, model => $name,
+                 choices => [ { index => 0, delta => $delta, finish_reason => $finish } ] });
+}
+
+sub release {
+    my ($job) = @_;
+    my ($slot) = grep { ($_->{job} // 0) == $job } @pool;
+    $slot->{job} = undef if $slot;
+    @running = grep { $_ != $job } @running;
+    @queue = grep { $_ != $job } @queue;
+}
+
+sub cancel {
+    my ($job) = @_;
+    $job->{done} = 1;
+    $job->{chat} = undef;  # frees its stream
+    release($job);
+}
+
+sub common_prefix {
+    my ($a, $b) = @_;
+    my $n = 0;
+    ++$n while $n < @$a && $n < @$b && $a->[$n] == $b->[$n];
+    return $n;
+}
+
+# The job's reply so far as events, or (done) its response
+sub job_output {
+    my ($job, $deltas) = @_;
+    if ($job->{stream}) {
+        for my $d (@$deltas) {
+            my ($text, $kind) = @$d;
+            next if $kind eq 'tool_call';  # sent whole, once parsed
+            push @{ $job->{out} }, chunk($job, { ($kind eq 'reasoning' ? 'reasoning_content' : 'content') => $text }, undef);
+        }
+    }
+    return unless $job->{finished};
+    my ($content, $why, $msg) = @{ $job->{finished} };
+    my %usage = (prompt_tokens => $job->{prompt_tokens} // 0, completion_tokens => $job->{completion},
+                 total_tokens => ($job->{prompt_tokens} // 0) + $job->{completion});
+    if ($job->{stream}) {
+        if ($msg->{tool_calls}) {
+            my $i = 0;
+            push @{ $job->{out} }, chunk($job, { tool_calls => [ map { { index => $i++, %$_ } } @{ tool_calls($msg) } ] }, undef);
+        }
+        push @{ $job->{out} }, chunk($job, {}, finish_reason($why, $msg));
+        push @{ $job->{out} }, sse({ id => $job->{id}, object => 'chat.completion.chunk', created => time,
+                                     model => $name, choices => [], usage => \%usage }) if $job->{usage_chunk};
+        push @{ $job->{out} }, sse('[DONE]');
+    } else {
+        my %out = (role => 'assistant', content => $content);
+        $out{reasoning_content} = $msg->{reasoning_content} if defined $msg->{reasoning_content};
+        $out{tool_calls} = tool_calls($msg) if $msg->{tool_calls};
+        push @{ $job->{out} }, $J->encode({ id => $job->{id}, object => 'chat.completion', created => time,
+            model => $name, choices => [ { index => 0, message => \%out, finish_reason => finish_reason($why, $msg) } ],
+            usage => \%usage });
+    }
+    $job->{done} = 1;
+}
+
+sub job_error {
+    my ($job, $err) = @_;
+    $err =~ s/ at \S+ line \d+\.?\n?\z//;
+    push @{ $job->{out} }, $job->{stream} ? sse({ error => { message => $err, type => 'server_error' } })
+                                          : $J->encode({ error => { message => $err, type => 'server_error' } });
+    $job->{done} = 1;
+    release($job);
+}
+
+# One round: start what waits (free sequences), then one token for every running job
+sub tick {
+    while (@queue) {
+        my @free = grep { !$_->{job} } @pool or last;
+        my $job = shift @queue;
+        my ($slot) = sort { common_prefix($b->{prompt}, $job->{prompt}) <=> common_prefix($a->{prompt}, $job->{prompt}) } @free;
+        $slot->{job} = $job;
+        $slot->{prompt} = $job->{prompt};
+        seq_select($m, $slot->{seq});
+        $job->{chat} = eval { chat_start($m, $job->{messages}, $job->{opts}) };
+        if (!$job->{chat}) { job_error($job, $@); next }
+        $job->{prompt_tokens} = n_past($m);
+        push @running, $job;
+    }
+    for my $job (@{ [@running] }) {  # (a copy: a job that ends leaves @running)
+        my ($deltas, $going) = eval { $job->{chat}->step };
+        if (!$deltas) { job_error($job, $@); next }
+        $job->{completion} = $job->{chat}->tokens;
+        if (!$going) {
+            $job->{finished} = [ $job->{chat}->result ];
+            $job->{chat} = undef;
+            release($job);
+        }
+        job_output($job, $deltas);
+    }
+    return scalar @running;
+}
+
+print STDERR "serving $name on $o{listen}", ($parallel > 1 ? " ($parallel conversations at once)" : ''), "\n";
+run(listen => $o{listen}, log => $o{log} // 1, defined $o{mode} ? (mode => oct $o{mode}) : (),
+    $parallel > 1 ? (tick => \&tick) : ());
 
 __END__
 
@@ -221,6 +356,13 @@ Copy the model's GPU tensors to a stage file in F<dir> (a huge-page tmpfs such a
 =item --kv-type f16|q8_0
 
 The KV cache's element type (C<set_kv_type>): C<q8_0> takes about half the memory of C<f16>, the default.
+
+=item --parallel N
+
+Serve N conversations at once (default 1): N sequences, each its own KV cache of C<--ctx> positions (N times the
+memory). Every round of the server's loop advances each running conversation by one token; a request waits for a
+free sequence, preferably the one whose last prompt shares the most tokens with it (prefix reuse). A prompt is
+prefilled in one go when its conversation starts, pausing the others meanwhile. Not with C<--draft>.
 
 =item --swa-ring N
 
