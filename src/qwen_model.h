@@ -134,7 +134,7 @@ int qwen_model_seq_free(qwen_model_t* model, int seq);
 // once for all of them). Row r: tokens[r] of sequence rows[r].seq at position rows[r].pos (> 0), on that sequence's
 // KV caches (the engine's: kvc, kvc_swa). Each row's logits go to its sequence's (qwen_model_logits once selected);
 // the selected sequence stays selected. Returns 0; INFERENCE_ERR_NOT_IMPLEMENTED for the architectures without it
-// (qwen4exp, a draft head: decode one by one); -1 on error.
+// (a draft head: decode one by one); -1 on error.
 typedef struct {
     int seq;
     int pos;

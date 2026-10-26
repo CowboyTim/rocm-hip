@@ -244,7 +244,7 @@ void inference_stream_free(inference_stream_t* stream);
 // One step of each of n streams (of different sequences of one model) with one forward pass for all (batched
 // decoding: the matmuls read each weight once for all sequences), as inference_stream_step on each. results[i] is
 // streams[i]'s step: token, text, reason, and rc (as inference_stream_step returns: 1 going, 0 stopped, < 0 its
-// error). Returns 0, or < 0 when the batch failed. Without batched decoding (qwen4exp, a draft head)
+// error). Returns 0, or < 0 when the batch failed. Without batched decoding (a draft head)
 // the streams are decoded one by one, with the same results.
 typedef struct {
     int32_t token;  // the token emitted (-1: none)

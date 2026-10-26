@@ -953,7 +953,7 @@ struct QwenModel {
     }
 
     int forward_seqs(const int32_t* tokens, const qwen_seq_token* rows, int n) {
-        if (eng->n_hc > 0 || eng->mtp) {
+        if (eng->mtp) {
             qwen_set_error("batched decoding: not for this architecture yet");
             return INFERENCE_ERR_NOT_IMPLEMENTED;
         }
@@ -1548,6 +1548,18 @@ struct QwenModel {
     // token history in rs.ple_hist advanced. As llama.cpp's llm_graph_input_ple::set_input: positions before the
     // sequence start read as EOS, and an EOS among a token's predecessors hides the ones before it.
     bool ple_rows(const int* tokens, int T, int pos0) {
+        if (bat) {  // a batch of sequences: each row one token after its own sequence's history
+            for (int r = 0; r < T; ++r) {
+                use_seq(r);
+                if (!ple_rows(tokens + r, 1, bat[r].pos, r)) return false;
+            }
+            return true;
+        }
+        return ple_rows(tokens, T, pos0, 0);
+    }
+
+    // ple_rows for T tokens into rows row0 .. of s.ple_emb
+    bool ple_rows(const int* tokens, int T, int pos0, int row0) {
         const int NG = eng->ple_ngram, PER = eng->ple_per_ngram, PD = eng->ple_dim, E = eng->n_embd;
         const int64_t eos = eng->ple_eos;
         int32_t* hist = rs.ple_hist;  // NG - 1 tokens before this batch, most recent last
@@ -1568,7 +1580,8 @@ struct QwenModel {
                 for (int g = 0; g < PER; ++g) {
                     const int h = (n - 2) * PER + g;
                     const uint64_t row = mixed % eng->ple_vocab[h] + eng->ple_offset[h];
-                    if (qt_to_float(eng->ple_table.type, eng->ple_table.row((int)row), s.ple_emb + (size_t)t * E + h * PD,
+                    if (qt_to_float(eng->ple_table.type, eng->ple_table.row((int)row),
+                                    s.ple_emb + (size_t)(row0 + t) * E + h * PD,
                                     PD) != 0) {
                         qwen_set_error("cannot decode per_layer_token_embd type %d", eng->ple_table.type);
                         return false;
@@ -1590,14 +1603,22 @@ struct QwenModel {
     bool ple(int l, const LayerWeights& L, int T) {
         const int E = eng->n_embd, HC = eng->n_hc;
         const deltanet_mid_states mp = mids(&RecurrentState::ple, l, T);
-        return produced(s.ple_emb, E, T) &&
-               matvec_pair(L.ple_key, L.ple_value, s.ple_emb, s.ple_key, s.ple_val, T, P_LIN) &&
-               check(gpu_ple_gate(s.ple_key, s.ple_val, s.res, L.ple_norm_key, L.ple_norm_query, L.ple_norm_conv,
-                                  s.ple_gated, s.ple_normed, E, HC, T, (float)eng->eps, 0),
-                     "ple_gate") &&
-               check(gpu_ple_conv(s.ple_normed, s.ple_gated, s.res, rs.ple[l], L.ple_conv1d, HC * E, T, eng->ple_conv,
-                                  eng->ple_ngram, spec_mid ? &mp : nullptr, 0),
-                     "ple_conv");
+        if (!produced(s.ple_emb, E, T) ||
+            !matvec_pair(L.ple_key, L.ple_value, s.ple_emb, s.ple_key, s.ple_val, T, P_LIN) ||
+            !check(gpu_ple_gate(s.ple_key, s.ple_val, s.res, L.ple_norm_key, L.ple_norm_query, L.ple_norm_conv,
+                                s.ple_gated, s.ple_normed, E, HC, T, (float)eng->eps, 0),
+                   "ple_gate"))
+            return false;
+        // the conv on its input history: a batch of sequences (bat) row by row, each on its own sequence's
+        for (int r = 0; r < (bat ? T : 1); ++r) {
+            if (bat) use_seq(r);
+            const size_t o = (size_t)r * HC * E;
+            if (!check(gpu_ple_conv(s.ple_normed + o, s.ple_gated + o, s.res + o, rs.ple[l], L.ple_conv1d, HC * E,
+                                    bat ? 1 : T, eng->ple_conv, eng->ple_ngram, spec_mid ? &mp : nullptr, 0),
+                       "ple_conv"))
+                return false;
+        }
+        return true;
     }
 
     // forward() for hyper-connection models: the residual is n_hc streams; each block reads a mixer's output and
@@ -1610,9 +1631,9 @@ struct QwenModel {
     int forward_hc(const int* tokens, int T, int pos0, float* logits_out) {
         const int E = eng->n_embd, HC = eng->n_hc, HCD = HC * E;
         const int l0 = dbg_res_in ? dbg_l0 : 0, l1 = dbg_res_in ? dbg_l1 : eng->n_layer;
-        kvc_cur = eng->kvc;
+        kvc_cur = bat ? nullptr : eng->kvc;  // (a batch: each row's own sequence's, use_seq)
         prof.start();
-        if (eng->ple_table.data && pos0 > 0 && !sync()) return -1;  // a queued state restore may set ple_hist
+        if (eng->ple_table.data && (pos0 > 0 || bat) && !sync()) return -1;  // a queued state restore may set ple_hist
         for (int t = 0; t < T; ++t) {
             if (tokens[t] < 0 || tokens[t] >= eng->vocab_size) { qwen_set_error("token %d out of range", tokens[t]); return -1; }
             float* r = s.res + (size_t)t * HCD;  // every stream starts as the embedding
@@ -1624,7 +1645,8 @@ struct QwenModel {
         }
         if (dbg_res_in) memcpy(s.res, dbg_res_in, sizeof(float) * (size_t)T * HCD);
         // The reset (a GPU memset) also clears ple_hist, which the CPU writes next: wait for it
-        if (pos0 == 0 && (!check(rs.reset(), "recurrent state reset") || (eng->ple_table.data && !sync()))) return -1;
+        if (pos0 == 0 && !bat && (!check(rs.reset(), "recurrent state reset") || (eng->ple_table.data && !sync())))
+            return -1;
         if (eng->ple_table.data && !ple_rows(tokens, T, pos0)) return -1;
         prof.lap(P_EMBED);
 
@@ -1658,6 +1680,7 @@ struct QwenModel {
             }
         }
         if (dbg_res_in) return sync() ? 0 : -1;
+        if (bat) return hc_mix(eng->hc_head, T, P_HEAD) ? lm_head_seqs(T) : -1;
         const bool track = eng->mtp && mtp_track(pos0, T);
         if (!hc_mix(eng->hc_head, T, P_HEAD) || lm_head(T, logits_out) != 0) return -1;
         return track && !mtp_process(tokens, T, pos0) ? -1 : 0;

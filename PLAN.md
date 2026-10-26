@@ -2546,8 +2546,9 @@ sequence r at its own position. The matmuls, norms, MoE and LM head take all row
 weight read once for all sequences). Attention (`attention_rows`), DeltaNet and Mamba-2 conv / scan run row by row,
 each with its sequence selected (`use_seq`: its KV caches, ring, recurrent state), and are quantized for the next
 matmul afterwards. The LM head writes rows into `seqs_logits`, copied to each sequence's logits. Generic (Qwen3,
-Qwen3.5 / 3.6, the 35B MoE), Gemma-4 (ring per sequence, softcap on all rows) and Nemotron-H; qwen4exp and a draft
-head decode one by one (INFERENCE_ERR_NOT_IMPLEMENTED -> the fallback). `inference_stream_step_batch(streams, n,
+Qwen3.5 / 3.6, the 35B MoE), Gemma-4 (ring per sequence, softcap on all rows), Nemotron-H and qwen4exp (PLE: the
+n-gram hashing per row on its sequence's token history, the PLE conv per row on its state; attention on each row's
+own cache, not kvc_cur); a draft head decodes one by one (INFERENCE_ERR_NOT_IMPLEMENTED -> the fallback). `inference_stream_step_batch(streams, n,
 results)`: picks every stream's token, then one forward pass, then each sequence's bookkeeping (n_past, history,
 store). Perl `step_streams` / `step_chats`; the server's tick steps all running jobs with `step_chats`.
 - Exact: with QMATVEC_NO_WMMA=1, every batched sequence's tokens equal its tokens alone (seq_verify: Qwen3.5-4B,
@@ -2559,8 +2560,9 @@ store). Perl `step_streams` / `step_chats`; the server's tick steps all running 
 - Server, 8 requests at once (200 tokens each, `--parallel 8` vs 1): Qwen3.5-4B 61.5 -> 170.8 tok/s, Qwen3.6-35B
   63 -> 128 tok/s (the prompts' prefills pause the others; the batch thins as replies end). 16 at once on the 4B:
   216 tok/s.
-- Next candidates: chunk a new prompt's prefill between decode rounds (one batch with decode rows), and batched
-  rows for qwen4exp.
+- qwen4exp (2026-10-26), Qwen3.8-Flash-Next 94 GB: batched = alone exact (QMATVEC_NO_WMMA=1), also the chunked
+  prompt; 8 sequences 38.5 -> 107 tok/s (x2.8), 16: 134 tok/s (x3.5); qwen4exp_verify unchanged (559 of 564,
+  logits 0.9967).
 
 ### BF16 dense prefill (ABC.gguf, a Qwen3.5 27B in BF16, 2026-10-25)
 
