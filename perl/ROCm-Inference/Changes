@@ -32,7 +32,8 @@ Revision history for ROCm-Inference
       about 3.5 times the tokens per second at 8 sequences, the same tokens).
     - rocm-inference-server --parallel N: N conversations at once, all advanced one token per round of the
       server's loop in one forward pass (needs Web::Route's pull responses); a client that leaves frees its
-      sequence.
+      sequence. A new prompt is prefilled --prefill-chunk tokens (512) per round, so the others go on meanwhile.
+    - stream_begin / chat_start option prefill_chunk; ChatStream prompt_tokens.
     - Chat templates are rendered with trim_blocks and lstrip_blocks, as transformers' apply_chat_template
       (Nemotron-3's template depends on them).
     - set_swa_ring / swa_ring: the sliding-window layers' KV cache as a ring (the default) or every layer's

@@ -10,7 +10,9 @@
 // (default 8) sequences' generation speed batched vs stepped in turn.
 
 #include "inference.h"
+#include "qwen_model.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -180,6 +182,47 @@ int main(int argc, char** argv) {
         inference_seq_free(m, bq[i]);
     }
     check(inference_seq_current(m) == 0, "batched: the selected sequence stays");
+
+    // prefill_chunk: a's prompt 5 tokens per step, stepped in a batch with b (decoding from its first step); a
+    // emits nothing until its prompt is in, then its tokens alone
+    {
+        inference_gen_options oc = o;
+        oc.prefill_chunk = 5;
+        const int qx = inference_seq_new(m), qy = inference_seq_new(m);
+        inference_seq_select(m, qx);
+        inference_stream_t* sx[2];
+        sx[0] = inference_stream_begin(m, pa.data(), (int)pa.size(), &oc);
+        int reused_x = -1, pre_x = -1;
+        inference_last_prompt_stats(m, &reused_x, &pre_x);
+        inference_seq_select(m, qy);
+        sx[1] = inference_stream_begin(m, pb.data(), (int)pb.size(), &o);
+        std::vector<int32_t> gx[2];
+        int silent = 0;
+        for (bool going = true; going;) {
+            inference_step_result r[2];
+            if (inference_stream_step_batch(sx, 2, r) != 0) { check(false, inference_get_last_error()); break; }
+            going = false;
+            for (int i = 0; i < 2; ++i) {
+                if (r[i].token >= 0) gx[i].push_back(r[i].token);
+                going |= r[i].rc > 0;
+            }
+            silent += r[0].token < 0 && r[0].rc > 0;
+        }
+        // chunks of 5, cut at a recurrent model's checkpoint (checkpoint_tail 16, at most half the prompt, before its
+        // end); the step that prefills the last chunk emits a token
+        const int L = (int)pa.size();
+        const int ck = qwen_model_is_recurrent(inference_get_qwen_model(m)) ? L - std::min(16, L / 2) : L;
+        const int want = (ck + 4) / 5 + (L - ck + 4) / 5 - 1;
+        char w[200];
+        snprintf(w, sizeof w, "chunked prompt (%d tokens, all left to the steps: %s): %d steps without a token (%d), "
+                 "then a's tokens; b's tokens meanwhile", L, pre_x == L && reused_x == 0 ? "yes" : "NO", silent, want);
+        const bool tok_ok = (gx[0] == a0 && gx[1] == b0) || !getenv("QMATVEC_NO_WMMA");
+        check(silent == want && pre_x == L && tok_ok && (int)gx[0].size() == N && (int)gx[1].size() == N, w);
+        for (int i = 0; i < 2; ++i) inference_stream_free(sx[i]);
+        inference_seq_free(m, qx);
+        inference_seq_free(m, qy);
+        inference_seq_select(m, 0);
+    }
     // (the batch's matmuls may take other kernels than one token's (WMMA tiles): exact with QMATVEC_NO_WMMA=1)
     check(same == 3 || !getenv("QMATVEC_NO_WMMA"), "batched: each sequence's tokens = alone");
 

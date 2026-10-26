@@ -1562,6 +1562,7 @@ inference_gen_options inference_gen_default_options(void) {
     o.sampler = sampler_default_params();
     o.max_new_tokens = 256;
     o.checkpoint_tail = 16;
+    o.prefill_chunk = 0;
     return o;
 }
 
@@ -1703,7 +1704,7 @@ static int store_attach(inference_model_t* m, const int32_t* p, int start, const
 // extends it; else the latest point at or before the divergence (any position for attention-only models, an
 // in-memory checkpoint for recurrent ones); or the block store, when it reaches further; else a new sequence.
 // At least the prompt's last token is always decoded, so the logits are its.
-static int sync_prompt(inference_model_t* m, const int32_t* p, int n, int tail) {
+static int sync_prompt(inference_model_t* m, const int32_t* p, int n, int tail, int* defer_from = nullptr) {
     size_t L = 0;
     while (L < m->seq.size() && L < (size_t)n && m->seq[L] == p[L]) ++L;
     int start = 0, ck = -1;
@@ -1744,6 +1745,10 @@ static int sync_prompt(inference_model_t* m, const int32_t* p, int n, int tail) 
     }
     m->last_reused = start;
     m->last_prefilled = n - start;
+    if (defer_from) {  // the caller prefills p[start, n) itself (in chunks)
+        *defer_from = start;
+        return 0;
+    }
     return prefill_with_checkpoint(m, p + start, n - start, tail);
 }
 
@@ -2008,7 +2013,26 @@ struct inference_stream {
     int emitted = 0;
     inference_stop_reason stop = INFERENCE_STOP_NONE;
     bool done = false;
+    // prefill_chunk: the prompt's tokens still to prefill (pp[pp_at ..]), a step's chunk at a time; the recurrent
+    // checkpoint goes at pp_ck (as prefill_with_checkpoint), the store snapshot at block snap_at
+    std::vector<int32_t> pp;
+    size_t pp_at = 0, pp_ck = SIZE_MAX;
+    int snap_at = -1;
 };
+
+// The next chunk of a stream's prompt (its sequence selected); the checkpoint when it gets there
+static int stream_prefill_chunk(inference_stream_t* st) {
+    inference_model_t* m = st->m;
+    size_t n = std::min(st->pp.size() - st->pp_at, (size_t)std::max(st->o.prefill_chunk, 1));
+    if (st->pp_ck > st->pp_at) n = std::min(n, st->pp_ck - st->pp_at);
+    m->store_snapshot_at = st->snap_at;
+    int rc = inference_prefill(m, st->pp.data() + st->pp_at, (int)n);
+    st->pp_at += n;
+    if (rc == 0 && st->pp_at == st->pp_ck) rc = save_checkpoint(m);
+    m->store_snapshot_at = -1;
+    if (st->pp_at == st->pp.size()) st->pp.clear(), st->pp_at = 0;
+    return rc;
+}
 
 inference_stream_t* inference_stream_begin(inference_model_t* m, const int32_t* prompt_ids, int n_prompt,
                                            const inference_gen_options* options) {
@@ -2018,14 +2042,17 @@ inference_stream_t* inference_stream_begin(inference_model_t* m, const int32_t* 
         return nullptr;
     }
     const inference_gen_options o = options ? *options : inference_gen_default_options();
-    m->store_snapshot_at = ((o.reuse_prefix ? 0 : m->n_past) + n_prompt) / kv_B(m);
-    int rc = 0;
+    const int snap_at = ((o.reuse_prefix ? 0 : m->n_past) + n_prompt) / kv_B(m);
+    m->store_snapshot_at = snap_at;
+    int rc = 0, from = -1;  // from: prefill_chunk, the prompt's tokens from there on are prefilled by the steps
+    const bool chunked = o.prefill_chunk > 0;
     if (o.reuse_prefix && n_prompt > 0) {
-        rc = sync_prompt(m, prompt_ids, n_prompt, o.checkpoint_tail);
+        rc = sync_prompt(m, prompt_ids, n_prompt, o.checkpoint_tail, chunked ? &from : nullptr);
     } else if (n_prompt > 0) {
         m->last_reused = m->n_past;
         m->last_prefilled = n_prompt;
-        rc = prefill_with_checkpoint(m, prompt_ids, n_prompt, o.checkpoint_tail);
+        if (chunked) from = 0;
+        else rc = prefill_with_checkpoint(m, prompt_ids, n_prompt, o.checkpoint_tail);
     } else if (m->n_past == 0) {
         set_error("nothing to continue: empty prompt and an empty sequence");
         rc = INFERENCE_ERR_INVALID_ARG;
@@ -2033,6 +2060,12 @@ inference_stream_t* inference_stream_begin(inference_model_t* m, const int32_t* 
     m->store_snapshot_at = -1;
     if (rc != 0) return nullptr;
     inference_stream_t* st = new inference_stream();
+    if (from >= 0 && from < n_prompt) {
+        st->pp.assign(prompt_ids + from, prompt_ids + n_prompt);
+        const size_t L = st->pp.size(), tail = std::min((size_t)std::max(o.checkpoint_tail, 0), L / 2);
+        if (tail > 0 && qwen_model_is_recurrent(m->qwen)) st->pp_ck = L - tail;
+        st->snap_at = snap_at;
+    }
     st->m = m;
     st->seq = m->cur_seq;
     st->o = o;
@@ -2116,6 +2149,14 @@ int inference_stream_step(inference_stream_t* st, int32_t* token, const char** t
     if (!st) { set_error("NULL stream"); return INFERENCE_ERR_INVALID_ARG; }
     inference_model_t* m = st->m;
     if (!st->done && m->cur_seq != st->seq && inference_seq_select(m, st->seq) != 0) return -1;
+    if (!st->done && !st->pp.empty()) {  // a chunk of the prompt; the first token once it is all in
+        const int rc = stream_prefill_chunk(st);
+        if (rc != 0) return rc;
+        if (!st->pp.empty()) {
+            st->out.clear();
+            return stream_finish(st, token, -1, text, text_len, reason);
+        }
+    }
     const int next = stream_pick(st);
     // every emitted token joins the sequence: a later call continues right after it
     if (next >= 0) {
@@ -2149,6 +2190,13 @@ int inference_stream_step_batch(inference_stream_t* const* streams, int n, infer
         inference_stream_t* st = streams[i];
         if (st->done) continue;
         if (inference_seq_select(m, st->seq) != 0) { err = -1; break; }
+        if (!st->pp.empty()) {  // a chunk of its prompt; it joins the batch once the prompt is all in
+            if (stream_prefill_chunk(st) != 0) { err = -1; break; }
+            if (!st->pp.empty()) {
+                st->out.clear();
+                continue;
+            }
+        }
         next[i] = stream_pick(st);
         if (next[i] < 0) continue;
         if (m->n_past >= m->n_ctx) {

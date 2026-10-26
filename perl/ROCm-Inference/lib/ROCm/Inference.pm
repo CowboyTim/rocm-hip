@@ -425,7 +425,9 @@ sub chat_start {
                   'ROCm::Inference::ChatStream';
     $c->{split} = _reply_splitter(rindex($gen, $open) > rindex($gen, $close) ? 'reasoning' : 'content',
                                   sub { push @{ $c->{deltas} }, [@_]; 0 }, $tags);
-    $c->{stream} = stream_begin($m, tokenize($m, $text), { reuse_prefix => 1, %o });
+    my $ids = tokenize($m, $text);
+    $c->{prompt_n} = @$ids;
+    $c->{stream} = stream_begin($m, $ids, { reuse_prefix => 1, %o });
     return $c;
 }
 
@@ -506,6 +508,7 @@ sub _took {
 
 sub seq { $_[0]{seq} }
 sub tokens { $_[0]{n} }
+sub prompt_tokens { $_[0]{prompt_n} }
 
 sub result {
     my ($c) = @_;
@@ -681,9 +684,12 @@ history. C<seq_new> returns a new sequence's number; the calls that generate wor
 =item stream_begin($m, \@prompt, \%options), chat_start($m, \@messages, \%options)
 
 Generation one token per step on the selected sequence, so that several sequences can be interleaved; the options
-of C<generate> / C<chat> but the callbacks. C<< $stream->step >> returns C<($token, $text, $going, $reason)>,
-C<< $chat->step >> returns C<(\@deltas, $going)>, the reply's new pieces as C<[$text, $kind]>, and
-C<< $chat->result >> then C<($content, $reason, $message)> as C<chat> does. A step selects its sequence.
+of C<generate> / C<chat> but the callbacks, plus C<prefill_chunk>: prefill the prompt in steps of at most that many
+tokens instead of all at the start (a step that prefills returns no token: -1, no text), so that other sequences'
+steps go on in between. C<< $stream->step >> returns C<($token, $text, $going, $reason)>, C<< $chat->step >> returns
+C<(\@deltas, $going)>, the reply's new pieces as C<[$text, $kind]>, and C<< $chat->result >> then C<($content,
+$reason, $message)> as C<chat> does; C<< $chat->prompt_tokens >> is the prompt's length. A step selects its
+sequence.
 
 =item step_streams(@streams), step_chats(@chats)
 

@@ -13,7 +13,7 @@ use Web::Route;
 
 my %o = (listen => './rocm-inference.sock', ctx => 8192, max_tokens => 4096);
 GetOptions(\%o, 'model=s', 'listen=s', 'mode=s', 'ctx=i', 'name=s', 'draft=s', 'store=s', 'max_tokens=i',
-           'swa-ring=i', 'stage=s', 'kv-type=s', 'parallel=i', 'thinking!', 'log!', 'help') or pod2usage(2);
+           'swa-ring=i', 'stage=s', 'kv-type=s', 'parallel=i', 'prefill-chunk=i', 'thinking!', 'log!', 'help') or pod2usage(2);
 pod2usage(-verbose => 2, -exitval => 0) if $o{help};
 pod2usage("--model is required\n") unless $o{model};
 ROCm::Inference::_require_minijinja()
@@ -193,7 +193,7 @@ route::post '/v1/chat/completions' => sub {
 # A job for this request; the response pulls its output
 sub start_job {
     my ($id, $messages, $opts, $p) = @_;
-    $opts = { %$opts };
+    $opts = { %$opts, prefill_chunk => $o{'prefill-chunk'} // 512 };
     delete $opts->{on_token};  # (a step gives the job its tokens)
     my %vars = %{ $opts->{vars} // {} };
     my $text = eval { chat_render($m, $messages, %vars) };  # template errors are this request's (400), now
@@ -294,7 +294,7 @@ sub tick {
         seq_select($m, $slot->{seq});
         $job->{chat} = eval { chat_start($m, $job->{messages}, $job->{opts}) };
         if (!$job->{chat}) { job_error($job, $@); next }
-        $job->{prompt_tokens} = n_past($m);
+        $job->{prompt_tokens} = $job->{chat}->prompt_tokens;
         push @running, $job;
     }
     return 0 unless @running;
@@ -371,8 +371,14 @@ The KV cache's element type (C<set_kv_type>): C<q8_0> takes about half the memor
 Serve N conversations at once (default 1): N sequences, each its own KV cache of C<--ctx> positions (N times the
 memory). Every round of the server's loop advances each running conversation by one token, all in one forward pass
 (batched decoding: 8 conversations get about 3.5 times the tokens per second of one); a request waits for a
-free sequence, preferably the one whose last prompt shares the most tokens with it (prefix reuse). A prompt is
-prefilled in one go when its conversation starts, pausing the others meanwhile. Not with C<--draft>.
+free sequence, preferably the one whose last prompt shares the most tokens with it (prefix reuse; with C<--store>
+any sequence resumes from the store's blocks). A new prompt is prefilled C<--prefill-chunk> tokens per round, so the
+running conversations go on meanwhile. Not with C<--draft>.
+
+=item --prefill-chunk N
+
+With C<--parallel>: tokens of a new prompt prefilled per round of the server's loop (default 512). Smaller: the
+other conversations slow down less while a long prompt comes in; larger: the prompt is in sooner.
 
 =item --swa-ring N
 

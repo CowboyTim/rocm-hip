@@ -2523,7 +2523,16 @@ unloaded the process's kernel modules under any other model still loaded (now co
   every running job by one token, and its pull response drains the SSE events, or the JSON at the end. A client
   that leaves cancels its job. Not with `--draft`. t/60-server.t runs all its tests on both modes, plus two chats
   at once (one streamed) that answer as each alone, and a dropped client freeing its sequence (Qwen3.5-4B).
-- Limit: a new conversation's prompt is prefilled in one go, so the others pause meanwhile.
+- Chunked prefill (2026-10-26): `inference_gen_options.prefill_chunk` (stream_begin only): begin decides the reuse
+  (prefix, checkpoint, store blocks) at once and leaves the rest of the prompt to the steps, at most that many
+  tokens per step (a step that prefills emits no token; a recurrent model's checkpoint still cuts a chunk, the store
+  snapshot block too). In `inference_stream_step_batch` a stream with prompt left prefills one chunk per round and
+  joins the round's decode batch once its prompt is in. Server `--prefill-chunk N` (default 512) with `--parallel`.
+  seq_verify: a 5-token-chunked prompt stepped in a batch with a decoding sequence gives its tokens alone (exact,
+  QMATVEC_NO_WMMA=1: Qwen3.5-4B, Qwen3-0.6B, Nemotron, Gemma-4). Server, 4B, 3 chats generating when a ~17k-token
+  prompt comes: their longest pause 12.8 s (all at once) -> 0.76 s (512) / 0.50 s (256); the long prompt's first
+  token after 12.9 -> 14.2 / 16.1 s. Not done: a chunk in the same forward pass as the decode rows (one weight read
+  for both; the decode round is ~5% of a 512-token chunk's time).
 - With `--store` (2026-10-26 fix): every sequence's KV slots live on the store's filesystem (store_open moves the
   existing sequences', seq_new creates them there), so every sequence publishes its blocks by linking its slot files,
   and any sequence resumes a conversation from them by mapping the files (no copy but the page cache's to / from

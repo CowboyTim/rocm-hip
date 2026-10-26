@@ -193,10 +193,13 @@ typedef struct inference_gen_options {
                                       // usually diverges (default 16; 0: none)
     inference_token_cb on_token;      // optional
     void* user;                       // passed to on_token
+    int prefill_chunk;                // inference_stream_begin only: prefill the prompt in steps of at most this
+                                      // many tokens (0: all at begin), so that other sequences' steps go on
+                                      // between them; a step that prefills emits no token (-1, no text)
 } inference_gen_options;
 
 // Defaults: sampler_default_params(), max_new_tokens 256, no stop strings, stop at EOG, no callback, prompt
-// appended (reuse_prefix 0), checkpoint_tail 16.
+// appended (reuse_prefix 0), checkpoint_tail 16, prefill_chunk 0.
 inference_gen_options inference_gen_default_options(void);
 
 // Continues the current sequence (inference_reset starts a new one): appends the n_prompt prompt tokens

@@ -110,6 +110,7 @@ static const char** gen_options(pTHX_ HV* o, inference_gen_options* g, const cha
     if ((v = opt(aTHX_ o, "ignore_eog"))) g->ignore_eog = SvTRUE(v) ? 1 : 0;
     if ((v = opt(aTHX_ o, "reuse_prefix"))) g->reuse_prefix = SvTRUE(v) ? 1 : 0;
     if ((v = opt(aTHX_ o, "checkpoint_tail"))) g->checkpoint_tail = (int)SvIV(v);
+    if ((v = opt(aTHX_ o, "prefill_chunk"))) g->prefill_chunk = (int)SvIV(v);
     const char** stops = NULL;
     if ((v = opt(aTHX_ o, "stop"))) {
         if (!SvROK(v) || SvTYPE(SvRV(v)) != SVt_PVAV) croak("ROCm::Inference::%s: stop must be an array reference", who);
