@@ -93,6 +93,39 @@ static SV* opt(pTHX_ HV* h, const char* key) {
     return v && SvOK(*v) ? *v : NULL;
 }
 
+/* generate / stream_begin options (all optional): max_new_tokens, temperature, top_k, top_p, min_p,
+ * repeat_penalty, repeat_last_n, seed, stop => [strings], ignore_eog, reuse_prefix, checkpoint_tail. Returns the
+ * stop strings' array (Safefree it after the call that uses g), NULL when none. */
+static const char** gen_options(pTHX_ HV* o, inference_gen_options* g, const char* who) {
+    *g = inference_gen_default_options();
+    SV* v;
+    if ((v = opt(aTHX_ o, "max_new_tokens"))) g->max_new_tokens = (int)SvIV(v);
+    if ((v = opt(aTHX_ o, "temperature"))) g->sampler.temperature = (float)SvNV(v);
+    if ((v = opt(aTHX_ o, "top_k"))) g->sampler.top_k = (int)SvIV(v);
+    if ((v = opt(aTHX_ o, "top_p"))) g->sampler.top_p = (float)SvNV(v);
+    if ((v = opt(aTHX_ o, "min_p"))) g->sampler.min_p = (float)SvNV(v);
+    if ((v = opt(aTHX_ o, "repeat_penalty"))) g->sampler.repeat_penalty = (float)SvNV(v);
+    if ((v = opt(aTHX_ o, "repeat_last_n"))) g->sampler.repeat_last_n = (int)SvIV(v);
+    if ((v = opt(aTHX_ o, "seed"))) g->sampler.seed = (uint64_t)SvUV(v);
+    if ((v = opt(aTHX_ o, "ignore_eog"))) g->ignore_eog = SvTRUE(v) ? 1 : 0;
+    if ((v = opt(aTHX_ o, "reuse_prefix"))) g->reuse_prefix = SvTRUE(v) ? 1 : 0;
+    if ((v = opt(aTHX_ o, "checkpoint_tail"))) g->checkpoint_tail = (int)SvIV(v);
+    const char** stops = NULL;
+    if ((v = opt(aTHX_ o, "stop"))) {
+        if (!SvROK(v) || SvTYPE(SvRV(v)) != SVt_PVAV) croak("ROCm::Inference::%s: stop must be an array reference", who);
+        AV* av = (AV*)SvRV(v);
+        const SSize_t ns = av_len(av) + 1;
+        Newx(stops, ns > 0 ? ns : 1, const char*);
+        for (SSize_t i = 0; i < ns; ++i) {
+            SV** e = av_fetch(av, i, 0);
+            stops[i] = e && SvOK(*e) ? SvPVutf8_nolen(*e) : "";
+        }
+        g->stop_strings = stops;
+        g->n_stop_strings = (int)ns;
+    }
+    return stops;
+}
+
 MODULE = ROCm::Inference    PACKAGE = ROCm::Inference
 
 PROTOTYPES: DISABLE
@@ -368,32 +401,9 @@ generate(h, prompt_ref, opts_ref = NULL)
         if (!SvROK(opts_ref) || SvTYPE(SvRV(opts_ref)) != SVt_PVHV) croak("ROCm::Inference::generate: options must be a hash reference");
         o = (HV*)SvRV(opts_ref);
     }
-    inference_gen_options g = inference_gen_default_options();
+    inference_gen_options g;
+    const char** stops = gen_options(aTHX_ o, &g, "generate");
     SV* v;
-    if ((v = opt(aTHX_ o, "max_new_tokens"))) g.max_new_tokens = (int)SvIV(v);
-    if ((v = opt(aTHX_ o, "temperature"))) g.sampler.temperature = (float)SvNV(v);
-    if ((v = opt(aTHX_ o, "top_k"))) g.sampler.top_k = (int)SvIV(v);
-    if ((v = opt(aTHX_ o, "top_p"))) g.sampler.top_p = (float)SvNV(v);
-    if ((v = opt(aTHX_ o, "min_p"))) g.sampler.min_p = (float)SvNV(v);
-    if ((v = opt(aTHX_ o, "repeat_penalty"))) g.sampler.repeat_penalty = (float)SvNV(v);
-    if ((v = opt(aTHX_ o, "repeat_last_n"))) g.sampler.repeat_last_n = (int)SvIV(v);
-    if ((v = opt(aTHX_ o, "seed"))) g.sampler.seed = (uint64_t)SvUV(v);
-    if ((v = opt(aTHX_ o, "ignore_eog"))) g.ignore_eog = SvTRUE(v) ? 1 : 0;
-    if ((v = opt(aTHX_ o, "reuse_prefix"))) g.reuse_prefix = SvTRUE(v) ? 1 : 0;
-    if ((v = opt(aTHX_ o, "checkpoint_tail"))) g.checkpoint_tail = (int)SvIV(v);
-    const char** stops = NULL;
-    if ((v = opt(aTHX_ o, "stop"))) {
-        if (!SvROK(v) || SvTYPE(SvRV(v)) != SVt_PVAV) croak("ROCm::Inference::generate: stop must be an array reference");
-        AV* av = (AV*)SvRV(v);
-        const SSize_t ns = av_len(av) + 1;
-        Newx(stops, ns > 0 ? ns : 1, const char*);
-        for (SSize_t i = 0; i < ns; ++i) {
-            SV** e = av_fetch(av, i, 0);
-            stops[i] = e && SvOK(*e) ? SvPVutf8_nolen(*e) : "";
-        }
-        g.stop_strings = stops;
-        g.n_stop_strings = (int)ns;
-    }
     struct cb_ctx cb;
 #ifdef PERL_IMPLICIT_CONTEXT
     cb.perl = aTHX;
@@ -430,6 +440,106 @@ generate(h, prompt_ref, opts_ref = NULL)
     EXTEND(SP, 2);
     PUSHs(sv_2mortal(newRV_noinc((SV*)av)));
     PUSHs(sv_2mortal(newSViv((IV)reason)));
+
+int
+seq_new(h)
+    SV* h
+  CODE:
+    RETVAL = inference_seq_new(handle_ptr(aTHX_ h, 0));
+    if (RETVAL < 0) croak_last(aTHX_ "seq_new", INFERENCE_ERR_OUT_OF_MEMORY);
+  OUTPUT:
+    RETVAL
+
+void
+seq_select(h, seq)
+    SV* h
+    int seq
+  CODE:
+    const int rc = inference_seq_select(handle_ptr(aTHX_ h, 0), seq);
+    if (rc != 0) croak_last(aTHX_ "seq_select", rc);
+
+int
+seq_current(h)
+    SV* h
+  CODE:
+    RETVAL = inference_seq_current(handle_ptr(aTHX_ h, 0));
+  OUTPUT:
+    RETVAL
+
+void
+seq_free(h, seq)
+    SV* h
+    int seq
+  CODE:
+    const int rc = inference_seq_free(handle_ptr(aTHX_ h, 0), seq);
+    if (rc != 0) croak_last(aTHX_ "seq_free", rc);
+
+UV
+_stream_begin(h, prompt_ref, opts_ref = NULL)
+    SV* h
+    SV* prompt_ref
+    SV* opts_ref
+  CODE:
+    /* the C stream as a number; ROCm::Inference::Stream (Inference.pm) wraps it */
+    inference_model_t* m = handle_ptr(aTHX_ h, 0);
+    HV* o = NULL;
+    if (opts_ref && SvOK(opts_ref)) {
+        if (!SvROK(opts_ref) || SvTYPE(SvRV(opts_ref)) != SVt_PVHV) croak("ROCm::Inference::stream_begin: options must be a hash reference");
+        o = (HV*)SvRV(opts_ref);
+    }
+    if (opt(aTHX_ o, "on_token")) croak("ROCm::Inference::stream_begin: no on_token (step returns each token)");
+    inference_gen_options g;
+    const char** stops = gen_options(aTHX_ o, &g, "stream_begin");
+    int n = 0;
+    int32_t* prompt = ids_from_av(aTHX_ prompt_ref, &n);
+    inference_stream_t* st = inference_stream_begin(m, prompt, n, &g);
+    Safefree(prompt);
+    Safefree(stops);
+    if (!st) croak_last(aTHX_ "stream_begin", INFERENCE_ERR_INVALID_ARG);
+    RETVAL = PTR2UV(st);
+  OUTPUT:
+    RETVAL
+
+void
+_stream_step(p)
+    UV p
+  PPCODE:
+    /* (status 1 going / 0 done, token or -1, text, stop reason) */
+    int32_t tok = -1;
+    const char* text = "";
+    int len = 0;
+    inference_stop_reason reason = INFERENCE_STOP_NONE;
+    const int rc = inference_stream_step(INT2PTR(inference_stream_t*, p), &tok, &text, &len, &reason);
+    if (rc < 0) croak_last(aTHX_ "Stream::step", rc);
+    SV* t = newSVpvn(text, (STRLEN)len);
+    SvUTF8_on(t);  /* whole UTF-8 characters only (the stream holds a split one back) */
+    EXTEND(SP, 4);
+    PUSHs(sv_2mortal(newSViv(rc)));
+    PUSHs(sv_2mortal(newSViv(tok)));
+    PUSHs(sv_2mortal(t));
+    PUSHs(sv_2mortal(newSViv((IV)reason)));
+
+int
+_stream_tokens(p)
+    UV p
+  CODE:
+    RETVAL = inference_stream_tokens(INT2PTR(inference_stream_t*, p));
+  OUTPUT:
+    RETVAL
+
+int
+_stream_seq(p)
+    UV p
+  CODE:
+    RETVAL = inference_stream_seq(INT2PTR(inference_stream_t*, p));
+  OUTPUT:
+    RETVAL
+
+void
+_stream_free(p)
+    UV p
+  CODE:
+    inference_stream_free(INT2PTR(inference_stream_t*, p));
 
 void
 last_prompt_stats(h)

@@ -18,6 +18,7 @@ BEGIN {  # at compile time: the constants below call into the XS
 our @EXPORT_OK = qw(
     load_model free_model kv_cache_init set_lm_head_q8 set_draft_model set_draft_tokens set_prefill_batch
     set_swa_ring swa_ring stage_info set_kv_type
+    seq_new seq_select seq_current seq_free stream_begin chat_start
     tokenize detokenize chat_template bos_id eos_id token_is_eog vocab_size
     n_ctx n_past reset prefill decode_token get_logits
     generate last_prompt_stats last_error
@@ -378,7 +379,7 @@ sub chat {
         # Out of thinking budget: close the reasoning as the model would and continue with the answer, right
         # after the tokens generated so far
         $closing //= $close;
-        $prompt = tokenize($m, $closing);
+        $prompt = _text_ids($m, $closing);
         $split->{feed}->($closing);
         $budget = undef;
         $g{reuse_prefix} = 0;
@@ -386,6 +387,108 @@ sub chat {
     my $msg = $split->{finish}->();
     return wantarray ? ($msg->{content}, $reason, $msg) : $msg->{content};
 }
+
+# Text in the middle of a sequence as tokens: without the BOS tokenize adds for models that want one (Gemma)
+sub _text_ids {
+    my ($m, $text) = @_;
+    my $ids = tokenize($m, $text);
+    shift @$ids if @$ids && $ids->[0] == bos_id($m);
+    return $ids;
+}
+
+# stream_begin($m, \@prompt, \%options): generation one token per step on the current sequence (seq_select), so
+# that several sequences can be interleaved; generate's options but on_token. $stream->step returns ($token, $text,
+# $going, $reason): the token (-1: none), the text ready with it, false once it has stopped (why: STOP_*).
+sub stream_begin {
+    my ($m, $prompt, $opts) = @_;
+    my $p = _stream_begin($m, $prompt, $opts);
+    return bless { p => $p, m => $m }, 'ROCm::Inference::Stream';
+}
+
+# chat_start($m, \@messages, \%options): chat one token per step on the current sequence. Options as chat's but
+# on_delta / on_token. $c->step returns (\@deltas, $going): the reply's new pieces as [$text, $kind] (reasoning,
+# content, tool_call) and whether it goes on; $c->result then returns ($content, $reason, $message) as chat does.
+sub chat_start {
+    my ($m, $messages, $opts) = @_;
+    my %o = %{ $opts // {} };
+    my %vars = %{ delete $o{vars} // {} };
+    my $budget = delete $o{max_thinking_tokens};
+    croak "ROCm::Inference::chat_start: no on_delta / on_token (step returns the deltas)"
+        if exists $o{on_delta} || exists $o{on_token};
+    my $text = chat_render($m, $messages, %vars);
+    my $tags = reply_tags($m);
+    my ($open, $close, $closing) = @{ $tags->{reasoning} };
+    my $history = eval { chat_render($m, $messages, %vars, add_generation_prompt => 0) } // '';
+    my $gen = index($text, $history) == 0 ? substr($text, length $history) : $text;
+    my $c = bless { m => $m, seq => seq_current($m), max => $o{max_new_tokens} // 256, budget => $budget,
+                    closing => $closing // $close, thinking => 0, n => 0, deltas => [], opts => { %o } },
+                  'ROCm::Inference::ChatStream';
+    $c->{split} = _reply_splitter(rindex($gen, $open) > rindex($gen, $close) ? 'reasoning' : 'content',
+                                  sub { push @{ $c->{deltas} }, [@_]; 0 }, $tags);
+    $c->{stream} = stream_begin($m, tokenize($m, $text), { reuse_prefix => 1, %o });
+    return $c;
+}
+
+package ROCm::Inference::Stream;
+
+sub step {
+    my ($s) = @_;
+    Carp::croak("ROCm::Inference::Stream: step after free") unless $s->{p};
+    my ($rc, $tok, $text, $why) = ROCm::Inference::_stream_step($s->{p});
+    return ($tok, $text, $rc > 0, $why);
+}
+
+sub tokens { ROCm::Inference::_stream_tokens($_[0]{p}) }
+sub seq    { ROCm::Inference::_stream_seq($_[0]{p}) }
+
+sub free {
+    my ($s) = @_;
+    ROCm::Inference::_stream_free($s->{p}) if $s->{p};
+    $s->{p} = undef;
+}
+
+sub DESTROY { $_[0]->free }
+
+package ROCm::Inference::ChatStream;
+
+sub step {
+    my ($c) = @_;
+    return ([], 0) if $c->{done};
+    my $m = $c->{m};
+    my ($tok, $text, $going, $why) = $c->{stream}->step;
+    $c->{reason} = $why;
+    ++$c->{n} if $tok >= 0;
+    $c->{split}{feed}->($text) if length $text;
+    if ($going && defined $c->{budget} && $tok >= 0 && $c->{split}{kind}->() eq 'reasoning' &&
+        ++$c->{thinking} >= $c->{budget} && $c->{n} < $c->{max}) {
+        # out of thinking budget: close the reasoning as the model would, right after the tokens so far
+        $c->{stream}->free;
+        ROCm::Inference::seq_select($m, $c->{seq});
+        $c->{split}{feed}->($c->{closing});
+        $c->{stream} = ROCm::Inference::stream_begin($m, ROCm::Inference::_text_ids($m, $c->{closing}),
+                                                     { %{ $c->{opts} }, reuse_prefix => 0,
+                                                       max_new_tokens => $c->{max} - $c->{n} });
+        $c->{budget} = undef;
+    } elsif (!$going) {
+        $c->{done} = 1;
+        $c->{stream}->free;
+        $c->{msg} = $c->{split}{finish}->();
+    }
+    my @d = @{ $c->{deltas} };
+    @{ $c->{deltas} } = ();
+    return (\@d, !$c->{done});
+}
+
+sub seq { $_[0]{seq} }
+sub tokens { $_[0]{n} }
+
+sub result {
+    my ($c) = @_;
+    return unless $c->{done};
+    return ($c->{msg}{content}, $c->{reason}, $c->{msg});
+}
+
+package ROCm::Inference;
 
 1;
 
