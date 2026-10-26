@@ -1095,7 +1095,8 @@ int inference_seq_new(inference_model_t* m) {
     if (!m->seqs[j]) m->seqs[j] = new inference_model::SeqCtx();
     inference_model::SeqCtx& c = *m->seqs[j];
     c = inference_model::SeqCtx();
-    c.kvc = kv_cache_create("/dev/shm", &m->kv_cfg);
+    // with a block store open, the slots live on its filesystem (blocks are published by linking a slot's file)
+    c.kvc = kv_cache_create(m->store_dirfd >= 0 ? m->store_dir.c_str() : "/dev/shm", &m->kv_cfg);
     c.kvc_swa = m->kv_cfg_swa.n_layers > 0 ? kv_cache_create("/dev/shm", &m->kv_cfg_swa) : nullptr;
     if (!c.kvc || (m->kv_cfg_swa.n_layers > 0 && !c.kvc_swa)) {
         if (c.kvc) kv_cache_free(c.kvc);
@@ -1769,7 +1770,14 @@ int inference_store_open(inference_model_t* m, const char* dir, int snapshot_eve
         return INFERENCE_ERR_INVALID_ARG;
     }
     close(probe);
-    // Blocks are published by linking a slot's own file, so the slots must live on the store's filesystem
+    // Blocks are published by linking a slot's own file, so the slots must live on the store's filesystem: every
+    // sequence's
+    for (inference_model::SeqCtx* q : m->seqs)
+        if (q && q->kvc && kv_cache_set_dir(q->kvc, dir) != 0) {
+            set_error("store: cannot move the KV slots to %s", dir);
+            close(dfd);
+            return INFERENCE_ERR_KV_CACHE;
+        }
     if (kv_cache_set_dir(m->kvc, dir) != 0) {
         set_error("store: cannot move the KV slots to %s", dir);
         close(dfd);
@@ -1799,7 +1807,9 @@ int inference_store_open(inference_model_t* m, const char* dir, int snapshot_eve
     m->store_dirfd = dfd;
     m->store_snapshot_every = snapshot_every;
     m->chain.clear();
-    m->published = 0;  // the current sequence's full blocks are published by the next forward pass
+    m->published = 0;  // each sequence's full blocks are published by its next forward pass
+    for (inference_model::SeqCtx* q : m->seqs)
+        if (q) q->chain.clear(), q->published = 0;
     m->st_published = m->st_attached = m->st_snap_saved = m->st_snap_restored = m->st_tokens = 0;
     return 0;
 }
@@ -1830,6 +1840,8 @@ void inference_store_close(inference_model_t* m) {
     m->store_dir.clear();
     m->chain.clear();
     m->published = 0;
+    for (inference_model::SeqCtx* q : m->seqs)
+        if (q) q->chain.clear(), q->published = 0;
 }
 
 int inference_store_get_stats(const inference_model_t* m, inference_store_stats* st) {

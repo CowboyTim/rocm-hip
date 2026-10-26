@@ -13,3 +13,6 @@ rm -f "$DIR/$BLOCK1"
 echo "  (deleted block 1: $BLOCK1)"
 "$BIN" "$MODEL" "$DIR" 3
 rm -rf "$DIR" "$DIR.expected"
+mkdir -p "$DIR"
+"$BIN" "$MODEL" "$DIR" 4
+rm -rf "$DIR"

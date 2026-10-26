@@ -7,6 +7,8 @@
 //                                             same reply; a prompt sharing 3 blocks resumes at the 2-block
 //                                             snapshot; diverging inside a shared block leaves its file unchanged
 //   store_verify <model.gguf> <store_dir> 3   after block files were deleted (eviction): lookup stops at the gap
+//   store_verify <model.gguf> <store_dir> 4   fresh store, sequences (inference_seq_*): one made before the store was
+//                                             opened publishes the prompt; another one and sequence 0 start from it
 //
 // Snapshots every 2 blocks (and at each prompt's last block boundary). Replies are compared exactly with
 // QMATVEC_NO_WMMA=1, else by their first tokens (WMMA prefill sums in a different order when cut differently).
@@ -85,7 +87,7 @@ static std::vector<std::string> files(const std::string& dir, const char* ext) {
 
 int main(int argc, char** argv) {
     if (argc < 4) {
-        fprintf(stderr, "usage: %s <model.gguf> <store_dir> <phase 1|2|3>\n", argv[0]);
+        fprintf(stderr, "usage: %s <model.gguf> <store_dir> <phase 1|2|3|4>\n", argv[0]);
         return 2;
     }
     const std::string dir = argv[2];
@@ -94,8 +96,9 @@ int main(int argc, char** argv) {
     inference_model_t* m = inference_load_model(argv[1]);
     // STORE_VERIFY_DRAFT=<mtp head>: with speculative decoding (snapshots must never hold a draft)
     const char* draft = getenv("STORE_VERIFY_DRAFT");
+    int seq_before = -1;  // phase 4: a sequence made before the store is opened
     if (!m || (draft && inference_set_draft_model(m, draft) != 0) || inference_kv_cache_init(m, 4096) != 0 ||
-        inference_store_open(m, dir.c_str(), 2) != 0) {
+        (phase == 4 && (seq_before = inference_seq_new(m)) < 0) || inference_store_open(m, dir.c_str(), 2) != 0) {
         fprintf(stderr, "setup failed: %s\n", inference_get_last_error());
         return 1;
     }
@@ -123,6 +126,39 @@ int main(int argc, char** argv) {
         std::string all(names.data());
         const size_t a = all.find('\n') + 1;
         printf("BLOCK1 %s\n", all.substr(a, all.find('\n', a) - a).c_str());
+    } else if (phase == 4) {
+        // sequence a (made before the store was opened) publishes the prompt's blocks and snapshots
+        const int deepest = (int)((prompt.size() - 1) / B) * B;
+        inference_seq_select(m, seq_before);
+        const std::vector<int32_t> out = run(m, prompt, 24, &reused, &prefilled);
+        inference_store_get_stats(m, &st);
+        const long long blocks = (long long)(prompt.size() + out.size() - 1) / B;
+        snprintf(what, sizeof(what), "sequence %d (made before the store opened): %lld blocks published (expected %lld)",
+                 seq_before, st.blocks_published, blocks);
+        check((int)out.size() == 24 && st.blocks_published == blocks, what);
+        // a new sequence, and sequence 0, given the same prompt: from the store
+        const int seq_after = inference_seq_new(m);
+        for (const int q : {seq_after, 0}) {
+            inference_seq_select(m, q);
+            const long long att0 = st.blocks_attached;
+            const std::vector<int32_t> o2 = run(m, prompt, 24, &reused, &prefilled);
+            inference_store_get_stats(m, &st);
+            const bool same = exact ? o2 == out : !o2.empty() && !out.empty() && o2[0] == out[0];
+            snprintf(what, sizeof(what), "sequence %d: %d of %zu tokens from the store (%lld blocks mapped), reply %s", q,
+                     reused, prompt.size(), st.blocks_attached - att0, same ? "same" : "DIFFERS");
+            check(reused == deepest && same, what);
+        }
+        // and sequence 0's continuation is published too (its slots live in the store's filesystem as well)
+        const long long pub0 = st.blocks_published;
+        std::vector<int32_t> longer = prompt;
+        const std::vector<int32_t> more = tokens(m, std::string(" ") + text.substr(0, 1500));
+        longer.insert(longer.end(), more.begin(), more.end());
+        inference_seq_select(m, seq_after);
+        run(m, longer, 8, &reused, &prefilled);
+        inference_store_get_stats(m, &st);
+        snprintf(what, sizeof(what), "sequence %d extends the prompt: %lld more blocks published", seq_after,
+                 st.blocks_published - pub0);
+        check(st.blocks_published > pub0, what);
     } else if (phase == 1) {
         const std::vector<int32_t> out = run(m, prompt, 24, &reused, &prefilled);
         inference_store_get_stats(m, &st);

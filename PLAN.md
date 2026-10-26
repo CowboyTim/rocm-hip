@@ -2524,6 +2524,13 @@ unloaded the process's kernel modules under any other model still loaded (now co
   that leaves cancels its job. Not with `--draft`. t/60-server.t runs all its tests on both modes, plus two chats
   at once (one streamed) that answer as each alone, and a dropped client freeing its sequence (Qwen3.5-4B).
 - Limit: a new conversation's prompt is prefilled in one go, so the others pause meanwhile.
+- With `--store` (2026-10-26 fix): every sequence's KV slots live on the store's filesystem (store_open moves the
+  existing sequences', seq_new creates them there), so every sequence publishes its blocks by linking its slot files,
+  and any sequence resumes a conversation from them by mapping the files (no copy but the page cache's to / from
+  disk). Before, only the sequence current at store_open could publish when the store was not on /dev/shm.
+  store_verify phase 4 (store on /data): a sequence made before store_open publishes, another one and sequence 0
+  start from it (1,280 of 1,346 tokens). Server, `--parallel 2 --store`: two ~3k-token chats at once publish 24
+  blocks; their follow-ups at once, landing on either sequence, take 0.4 s (first turns 4.2 s).
 
 **Stage 2, batched decoding — DONE ✅.** `qwen_model_forward_seqs`: one forward pass whose row r is one token of
 sequence r at its own position. The matmuls, norms, MoE and LM head take all rows at once (prefill's kernels: each
