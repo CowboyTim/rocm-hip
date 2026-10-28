@@ -2602,6 +2602,22 @@ Q4_0 = one policy struct and one line per kernel family (the user asked that typ
   token by token. 2,427-token prompt: 0.6B prefill 1,916 (float path) -> 9,805 tok/s, 35B 793 (int8 without
   WMMA) -> 2,456 tok/s, generation 79 tok/s; float path, int8, int8 + WMMA give the same tokens on the 0.6B.
 
+### Quant types: Q4_1, Q5_0 int8 / WMMA; Q4_1 / Q5_1 offsets as ggml's (2026-10-28)
+
+The block-per-lane kernels (Q5_1's) became templates over a policy too (PBQ5_1 / PBQ4_1 / PBQ5_0: BYTES, DW,
+load(), decode() -> int8 values, d, m; MIN for an offset): mv_pb, mmb_pb, WStagePB. Q4_1 (20-byte blocks, q * d +
+m) and Q5_0 (22-byte, 2-aligned blocks: (q - 16) * d, int8 as signed) are one policy each.
+- Offsets: ggml's Q4_1 / Q5_1 dot takes m * s with s = F16(d * sum of the block's q), d = amax / 127 unrounded (Q8_1's
+  s). The quantizer now writes that (qmatvec_q8.s0 as float bits, q8_device.h) instead of the integer sum: int8
+  projections went from 5e-4 to 5e-7 of the reference (the F16 rounding of s alone; rounding d * sum from the
+  rounded d was not enough). forward_verify's float-kernel emulation cannot reproduce it: 2e-3 for those two types.
+- forward_verify against llama.cpp dumps (refdata/ref_qwen3_06b_{q4_1,q5_0,q5_1}, ref_qwen36_35b_{...}; models in
+  /data/q4_0): all pass; worst layer 0.6B >= 0.9994, 35B 0.9955 .. 0.9968 (routing flips).
+- 35B prefill on a 2,427-token prompt, int8 without WMMA -> WMMA: Q4_1 715 -> 2,273, Q5_0 427 -> 2,305, Q5_1 692 ->
+  2,140 tok/s; generation 67 .. 74 tok/s. 0.6B Q4_1: float, int8, WMMA the same 16 tokens; Q5_0: float and WMMA the
+  same, int8 without WMMA departs at token 9 (also with flash attention off: a near tie). No spills. Gemma-4
+  UD-Q8_K_XL (Q5_1 tensors): coherent, prefill 1,330 tok/s (a first run reads the model from disk: 530).
+
 ### BF16 dense prefill (ABC.gguf, a Qwen3.5 27B in BF16, 2026-10-25)
 
 Correct output; generation 4.1 tok/s (54 GB per token: the bandwidth); prefill **7.8 tok/s** (2,661 tokens in

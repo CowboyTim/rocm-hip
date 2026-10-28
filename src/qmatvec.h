@@ -52,7 +52,8 @@ typedef struct qmatvec_q8 {
     int8_t *qK;    // Q8_K values [K]
     float *dK;     // Q8_K scales [K / 256]
     int32_t *bsK;  // Q8_K sums of every 16 values [K / 16]
-    int32_t *s0;   // Q8_0 sums of every 32 values [K / 32] (Q5_1 weights' offsets)
+    int32_t *s0;   // per 32 values [K / 32]: ggml's Q8_1 s, F16(d * sum of the block's q), as float bits (the
+                   // offsets of Q5_1 / Q4_1 weights: m * s)
     int max_k;
 } qmatvec_q8;
 

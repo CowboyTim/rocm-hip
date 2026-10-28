@@ -1165,7 +1165,7 @@ __device__ __forceinline__ float mv_q8_0(const uint8_t *wr, const int8_t *q8, co
 // Q5_1 (24-byte blocks, 4-aligned: F16 d, F16 m, the 32 fifth bits qh, 16 bytes of nibbles) x Q8_0: values
 // j (0..15) are the low nibbles with bit j of qh as bit 4, values j + 16 the high nibbles with bit j + 16; each
 // q (0..31) * d + m. As ggml's vec_dot_q5_1_q8_1: (d_w * d_x) * (float)sumi + m_w * (d_x * sum of the block's
-// x q) per block, the sums from the quantizer (qmatvec_q8.s0; ggml keeps them as Q8_1's s).
+// x q) per block, that product as ggml's Q8_1 s from the quantizer (qmatvec_q8.s0: F16(d * sum), d unrounded).
 __device__ __forceinline__ uint32_t q5_1_hbits(uint32_t h) {  // 4 bits -> bit 4 of 4 bytes
     return ((h & 1u) << 4) | ((h & 2u) << 11) | ((h & 4u) << 18) | ((h & 8u) << 25);
 }
@@ -1181,34 +1181,102 @@ __device__ __forceinline__ void q5_1_decode(const uint32_t w[6], uint32_t q[8], 
     }
 }
 
-__device__ __forceinline__ void q5_1_block(const uint8_t *b, uint32_t q[8], float &d, float &m) {
-    uint32_t w[6];
+// The 32-value block types read a block per lane: Q5_1, Q4_1 (an offset m per block: MIN) and Q5_0. A policy gives
+// BYTES, load() (the block as DW dwords) and decode() (its 32 values as int8 bytes, d and m), so every kernel family
+// is written once for all three:
+//  Q4_1: 20 bytes (4-aligned): F16 d, F16 m, 16 bytes of nibbles; values q (0..15) * d + m (ggml: as Q5_1's).
+//  Q5_0: 22 bytes (2-aligned): F16 d, the fifth bits qh, 16 bytes of nibbles; values (q - 16) * d, q 0..31 as Q5_1's.
+//        As ggml's vec_dot_q5_0_q8_0: (d_w * d_x) * (float)sumi.
+struct PBQ5_1 {
+    static constexpr int BYTES = 24, DW = 6;
+    static constexpr bool MIN = true;
+    __device__ static void load(const uint8_t *b, uint32_t w[DW]) {
 #pragma unroll
-    for (int k = 0; k < 6; ++k) w[k] = ld32(b + 4 * k);
-    q5_1_decode(w, q, d, m);
-}
+        for (int k = 0; k < DW; ++k) w[k] = ld32(b + 4 * k);
+    }
+    __device__ static void decode(const uint32_t w[DW], uint32_t q[8], float &d, float &m) { q5_1_decode(w, q, d, m); }
+};
 
-__device__ __forceinline__ float q5_1_q8_block(const uint32_t q[8], float d, float m, const int8_t *q8, float dx,
-                                               int sx) {
+struct PBQ4_1 {
+    static constexpr int BYTES = 20, DW = 5;
+    static constexpr bool MIN = true;
+    __device__ static void load(const uint8_t *b, uint32_t w[DW]) {
+#pragma unroll
+        for (int k = 0; k < DW; ++k) w[k] = ld32(b + 4 * k);
+    }
+    __device__ static void decode(const uint32_t w[DW], uint32_t q[8], float &d, float &m) {
+        d = __half2float(__ushort_as_half((uint16_t)(w[0] & 0xFFFF)));
+        m = __half2float(__ushort_as_half((uint16_t)(w[0] >> 16)));
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            q[k] = w[1 + k] & 0x0F0F0F0Fu;
+            q[4 + k] = (w[1 + k] >> 4) & 0x0F0F0F0Fu;
+        }
+    }
+};
+
+struct PBQ5_0 {
+    static constexpr int BYTES = 22, DW = 6;
+    static constexpr bool MIN = false;
+    __device__ static void load(const uint8_t *b, uint32_t w[DW]) {  // w: d, qh, the 4 nibble dwords
+        w[0] = *(const uint16_t *)b;
+        w[1] = ld32_a2(b + 2);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) w[2 + k] = ld32_a2(b + 6 + 4 * k);
+    }
+    __device__ static void decode(const uint32_t w[DW], uint32_t q[8], float &d, float &m) {
+        uint32_t u[6] = {w[0], w[1], w[2], w[3], w[4], w[5]};
+        q5_1_decode(u, q, d, m);  // (its m: the high half of w[0], zero here)
+#pragma unroll
+        for (int k = 0; k < 8; ++k) q[k] = ((q[k] | 0x80808080u) - 0x10101010u) ^ 0x80808080u;  // q - 16 per byte
+        m = 0.0f;
+    }
+};
+
+// One block (its values, d, m) against its Q8_0 block (dx, sx: its scale and the sum of its q)
+template <class P>
+__device__ __forceinline__ float pb_q8_block(const uint32_t q[8], float d, float m, const int8_t *q8, float dx, int sx) {
     const int *x8 = (const int *)q8;
     int s = 0;
 #pragma unroll
     for (int k = 0; k < 8; ++k) s = dot4((int)q[k], x8[k], s);
-    return d * dx * (float)s + m * (dx * (float)sx);
+    if constexpr (P::MIN) return d * dx * (float)s + m * __int_as_float(sx);  // sx: Q8_1's s (qmatvec_q8.s0)
+    else return d * dx * (float)s;
+}
+
+template <class P>
+__device__ __forceinline__ void pb_block(const uint8_t *b, uint32_t q[8], float &d, float &m) {
+    uint32_t w[P::DW];
+    P::load(b, w);
+    P::decode(w, q, d, m);
 }
 
 // bs: the Q8_0 block sums (s0). L lanes per row, a block per lane and step, as mv_q8_0
-__device__ __forceinline__ float mv_q5_1(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
-                                         int lane, int L) {
+template <class P>
+__device__ __forceinline__ float mv_pb(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
+                                       int lane, int L) {
     const int nb = K / 32;
     float acc = 0.0f;
     for (int ib = lane; ib < nb; ib += L) {
         uint32_t q[8];
         float d, m;
-        q5_1_block(wr + (long long)ib * 24, q, d, m);
-        acc += q5_1_q8_block(q, d, m, q8 + ib * 32, d8[ib], bs[ib]);
+        pb_block<P>(wr + (long long)ib * P::BYTES, q, d, m);
+        acc += pb_q8_block<P>(q, d, m, q8 + ib * 32, d8[ib], bs[ib]);
     }
     return acc;
+}
+
+__device__ __forceinline__ float mv_q5_1(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
+                                         int lane, int L) {
+    return mv_pb<PBQ5_1>(wr, q8, d8, bs, K, lane, L);
+}
+__device__ __forceinline__ float mv_q4_1(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
+                                         int lane, int L) {
+    return mv_pb<PBQ4_1>(wr, q8, d8, bs, K, lane, L);
+}
+__device__ __forceinline__ float mv_q5_0(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
+                                         int lane, int L) {
+    return mv_pb<PBQ5_0>(wr, q8, d8, bs, K, lane, L);
 }
 
 // K-quant x Q8_K kernels: the wave works on 4 blocks at a time, 8 lanes per 256-value block, each lane on 16
@@ -1510,6 +1578,8 @@ MATVEC_Q8_KERNELS(q4_0, mv_q4_0, 0)
 MATVEC_Q8_KERNELS(q4_0_rocmfp4_fast, mv_rocmfp4_fast, 0)
 MATVEC_Q8_KERNELS(q8_0, mv_q8_0, 0)
 MATVEC_Q8_KERNELS(q5_1, mv_q5_1, 2)
+MATVEC_Q8_KERNELS(q4_1, mv_q4_1, 2)
+MATVEC_Q8_KERNELS(q5_0, mv_q5_0, 2)
 MATVEC_Q8_KERNELS(q4_K, mv_q4_K, 1)
 MATVEC_Q8_KERNELS(q5_K, mv_q5_K, 1)
 MATVEC_Q8_KERNELS(q6_K, mv_q6_K, 1)
@@ -1758,20 +1828,20 @@ __device__ __forceinline__ void mmb_q8_0(MM_BARGS, const RM &rm) {
     MM_STORE
 }
 
-// bs: the Q8_0 block sums (s0), [T][K / 32]
-template <class RM>
-__device__ __forceinline__ void mmb_q5_1(MM_BARGS, const RM &rm) {
+// Q5_1 / Q4_1 / Q5_0 (P: the block-per-lane policy). bs: the Q8_0 block sums (s0), [T][K / 32]
+template <class P, class RM>
+__device__ __forceinline__ void mmb_pb(MM_BARGS, const RM &rm) {
     MM_ROW_SETUP
     const int nb = K / 32;
     for (int ib = lane; ib < nb; ib += 32) {
         uint32_t q[8];
         float d, m;
-        q5_1_block(wr + (long long)ib * 24, q, d, m);
+        pb_block<P>(wr + (long long)ib * P::BYTES, q, d, m);
         // Not unrolled: see matmul_q8_q4_0_rocmfp4
         for (int j = 0; j < MM_TB; ++j) {
             if (j >= nt) break;
             const long long t = rm.in(j);
-            acc[j] += q5_1_q8_block(q, d, m, q8 + t * K + ib * 32, d8[t * nb + ib], bs[t * nb + ib]);
+            acc[j] += pb_q8_block<P>(q, d, m, q8 + t * K + ib * 32, d8[t * nb + ib], bs[t * nb + ib]);
         }
     }
     MM_STORE
@@ -1809,7 +1879,9 @@ MATMUL_Q8_KERNELS(q4_0_rocmfp4, (mmb_p4<P4ROCmFP4, RowsLinear>), (mmb_p4<P4ROCmF
 MATMUL_Q8_KERNELS(q4_0, (mmb_p4<P4Q4_0, RowsLinear>), (mmb_p4<P4Q4_0, RowsExpert>))
 MATMUL_Q8_KERNELS(q4_0_rocmfp4_fast, mmb_rocmfp4_fast<RowsLinear>, mmb_rocmfp4_fast<RowsExpert>)
 MATMUL_Q8_KERNELS(q8_0, mmb_q8_0<RowsLinear>, mmb_q8_0<RowsExpert>)
-MATMUL_Q8_KERNELS(q5_1, mmb_q5_1<RowsLinear>, mmb_q5_1<RowsExpert>)
+MATMUL_Q8_KERNELS(q5_1, (mmb_pb<PBQ5_1, RowsLinear>), (mmb_pb<PBQ5_1, RowsExpert>))
+MATMUL_Q8_KERNELS(q4_1, (mmb_pb<PBQ4_1, RowsLinear>), (mmb_pb<PBQ4_1, RowsExpert>))
+MATMUL_Q8_KERNELS(q5_0, (mmb_pb<PBQ5_0, RowsLinear>), (mmb_pb<PBQ5_0, RowsExpert>))
 MATMUL_Q8_KERNELS(q6_K, mmb_q6_K<RowsLinear>, mmb_q6_K<RowsExpert>)
 MATMUL_Q8_KERNELS(q4_K, mmb_q4_K_lin, mmb_q4_K_exp)
 MATMUL_Q8_KERNELS(q5_K, mmb_q5_K_lin, mmb_q5_K_exp)
@@ -1933,16 +2005,20 @@ struct WStageQ8_0 {  // Q8_0: 34-byte blocks, an F16 scale per 32 int8 values (n
     }
 };
 
-struct WStageQ5_1 {  // Q5_1: 24-byte blocks (4-aligned), an F16 scale d and offset m per 32 values (0..31 after
-                     // decoding, so int8 as they are). store_min writes the blocks' m.
-    static constexpr bool BLOCK_SCALE = true, MIN = true;
-    uint32_t w[2][6];
+template <class P>
+struct WStagePB {  // Q5_1 / Q4_1 / Q5_0: a scale d (and offset m: MIN) per 32 values, decoded to int8 as the
+                   // decode kernels do. store_min writes the blocks' m.
+    static constexpr bool BLOCK_SCALE = true, MIN = P::MIN;
+    uint32_t w[2][P::DW];
     __device__ void load(const uint8_t *W, long long rb, int row, bool ok, int b0, int wb) {
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
-            const uint8_t *b = W + (long long)row * rb + (long long)(b0 + wb + j) * 24;
+            if (ok) {
+                P::load(W + (long long)row * rb + (long long)(b0 + wb + j) * P::BYTES, w[j]);
+            } else {
 #pragma unroll
-            for (int k = 0; k < 6; ++k) w[j][k] = ok ? ld32(b + 4 * k) : 0;
+                for (int k = 0; k < P::DW; ++k) w[j][k] = 0;
+            }
         }
     }
     __device__ void store(int8_t *srow, float *erow, int wb) const {
@@ -1950,7 +2026,7 @@ struct WStageQ5_1 {  // Q5_1: 24-byte blocks (4-aligned), an F16 scale d and off
         for (int j = 0; j < 2; ++j) {
             uint32_t q[8];
             float d, m;
-            q5_1_decode(w[j], q, d, m);
+            P::decode(w[j], q, d, m);
             uint32_t *dst = (uint32_t *)(srow + (wb + j) * 32);
 #pragma unroll
             for (int k = 0; k < 8; ++k) dst[k] = q[k];
@@ -1960,7 +2036,12 @@ struct WStageQ5_1 {  // Q5_1: 24-byte blocks (4-aligned), an F16 scale d and off
     }
     __device__ void store_min(float *mrow, int wb) const {
 #pragma unroll
-        for (int j = 0; j < 2; ++j) mrow[wb + j] = __half2float(__ushort_as_half((uint16_t)(w[j][0] >> 16)));
+        for (int j = 0; j < 2; ++j) {
+            uint32_t q[8];
+            float d, m;
+            P::decode(w[j], q, d, m);
+            mrow[wb + j] = m;
+        }
     }
 };
 
@@ -2060,7 +2141,7 @@ __device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, 
             const bool ok = tt < T && b0 + c < nb;
             const float dx = ok ? d8[rm.in(tt) * nb + b0 + c] : 0.0f;
             sdx[c][at] = dx;
-            if constexpr (WS::MIN) sm.sxs[c][at] = ok ? dx * (float)bs[rm.in(tt) * nb + b0 + c] : 0.0f;
+            if constexpr (WS::MIN) sm.sxs[c][at] = ok ? __int_as_float(bs[rm.in(tt) * nb + b0 + c]) : 0.0f;
         }
     };
 
@@ -2192,7 +2273,9 @@ MATMUL_WMMA_Q80_KERNELS(q4_0_rocmfp4, WStageP4<P4ROCmFP4>)
 MATMUL_WMMA_Q80_KERNELS(q4_0, WStageP4<P4Q4_0>)
 MATMUL_WMMA_Q80_KERNELS(q4_0_rocmfp4_fast, WStageFast)
 MATMUL_WMMA_Q80_KERNELS(q8_0, WStageQ8_0)
-MATMUL_WMMA_Q80_KERNELS(q5_1, WStageQ5_1)
+MATMUL_WMMA_Q80_KERNELS(q5_1, WStagePB<PBQ5_1>)
+MATMUL_WMMA_Q80_KERNELS(q4_1, WStagePB<PBQ4_1>)
+MATMUL_WMMA_Q80_KERNELS(q5_0, WStagePB<PBQ5_0>)
 
 // ---------------------------------------------------------------- WMMA for K-quants x Q8_K (Phase 20 W3)
 //

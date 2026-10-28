@@ -22,7 +22,7 @@ struct Q8Out {
     int8_t* qK;
     float* dK;
     int* bsK;
-    int* s0;  // sums of each Q8_0 block's 32 q values
+    int* s0;  // per Q8_0 block, ggml's Q8_1 s: F16(d * sum of its 32 q), d = amax / 127 unrounded; float bits
 };
 
 // Shared scratch for one 256-thread group
@@ -49,7 +49,7 @@ __device__ __forceinline__ void q8_block_value(float v, bool active, int b, int 
         o.q0[i] = (int8_t)q0;
         if (lane == 0) {
             o.d0[b * 8 + w] = __half2float(__float2half(am / 127.0f));
-            o.s0[b * 8 + w] = s0;
+            o.s0[b * 8 + w] = __float_as_int(__half2float(__float2half(am / 127.0f * (float)s0)));
         }
     }
 

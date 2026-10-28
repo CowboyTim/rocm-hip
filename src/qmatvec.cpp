@@ -42,13 +42,15 @@ static int g_wmma_min_t = 32;  // smaller batches, and N < 64 (a 64-row tile mos
 // weights the Q8_0 form
 static bool reads_q8k(int type) { return type == QT_Q4_K || type == QT_Q5_K || type == QT_Q6_K; }
 
-// The kernels' bs argument: the Q8_K group sums for K-quants, the Q8_0 block sums for Q5_1 (its offsets)
-static const int32_t *q8_sums(int type, const qmatvec_q8 *q) { return type == QT_Q5_1 ? q->s0 : q->bsK; }
+// The kernels' bs argument: the Q8_K group sums for K-quants, the Q8_0 block sums for the block-per-lane types (Q5_1,
+// Q4_1: their offsets)
+static bool block_per_lane(int type) { return type == QT_Q5_1 || type == QT_Q4_1 || type == QT_Q5_0; }
+static const int32_t *q8_sums(int type, const qmatvec_q8 *q) { return block_per_lane(type) ? q->s0 : q->bsK; }
 
 // The WMMA kernels of the Q8_0-activation types with 2 blocks per staging thread take K % 64 (a last half chunk);
 // ROCmFP4_FAST (block quads) and the K-quants K % 128
 static int wmma_k_multiple(int type) {
-    return type == QT_Q4_0_ROCMFP4 || type == QT_Q4_0 || type == QT_Q8_0 || type == QT_Q5_1 ? 64 : 128;
+    return type == QT_Q4_0_ROCMFP4 || type == QT_Q4_0 || type == QT_Q8_0 || block_per_lane(type) ? 64 : 128;
 }
 
 int qmatvec_init(const char *co_path) {
@@ -232,7 +234,7 @@ int qmatvec_q8_supported(int type, int K) {
     if (type < 0 || type >= QMV_MAX_TYPE || !g_fn_q8[type] || !g_quant) return 0;
     if (type == QT_Q4_0_ROCMFP4 || type == QT_Q4_0 || type == QT_Q8_0) return K % 64 == 0;  // block pairs (36 / 68 bytes)
     if (type == QT_Q4_0_ROCMFP4_FAST) return K % 128 == 0;  // lanes take 68-byte block quads
-    if (type == QT_Q5_1) return K % 32 == 0;                 // a block per lane
+    if (block_per_lane(type)) return K % 32 == 0;            // a block per lane (Q5_1, Q4_1, Q5_0)
     return K % 256 == 0;
 }
 
@@ -251,7 +253,7 @@ static int q8_lanes_per_row(int type, int K, long long rows) {
     const bool kq = reads_q8k(type);
     const int tasks = type == QT_Q4_0_ROCMFP4 || type == QT_Q4_0 || type == QT_Q8_0 ? K / 64
                       : type == QT_Q4_0_ROCMFP4_FAST          ? K / 128
-                      : type == QT_Q5_1                       ? K / 32
+                      : block_per_lane(type)                  ? K / 32
                                                               : K / 256 * 8;
     int L = 32;
     while (L > (kq ? 8 : 4) && L / 2 >= tasks) L /= 2;

@@ -189,14 +189,16 @@ static void report(const char* what, const Stat& s, double tol = 1e-4) {
 
 // Projection: FP32 input (informational), reference-quantized input on the float kernel, and the engine's
 // int8 kernel on the raw input (qmatvec_quantize + qmatvec_launch_q8, which quantizes like the reference).
-// The last two must match the reference to 1e-4.
+// The last two must match the reference to 1e-4. (Q4_1 / Q5_1: ggml's dot takes the offset term from Q8_1's
+// F16-rounded block sums, which the int8 kernels use too but the float kernel on the dequantized input cannot:
+// that one only to 2e-3.)
 struct ProjStat {
     Stat f32, emu, q8;
-    bool has_q8 = false;
+    bool has_q8 = false, q8_1 = false;
 };
 
 static void report(const char* what, const ProjStat& s) {
-    const bool ok = s.emu.max_rel <= 1e-4 && (!s.has_q8 || s.q8.max_rel <= 1e-4);
+    const bool ok = s.emu.max_rel <= (s.q8_1 ? 2e-3 : 1e-4) && (!s.has_q8 || s.q8.max_rel <= 1e-4);
     if (!ok) ++g_fail;
     printf("  [%s] %-36s cos %.7f  max|d|/max|ref| %.2e", ok ? "PASS" : "FAIL", what, s.emu.min_cos, s.emu.max_rel);
     if (s.has_q8) printf("   int8: %.2e", s.q8.max_rel);
@@ -216,6 +218,7 @@ static bool launch(const QuantWeight& W) {
 
 // y = W x both ways, compared with the reference output ref (W.N values); leaves the FP32 result in g_y
 static bool proj(const QuantWeight& W, const float* x, const float* ref_out, ProjStat& st) {
+    st.q8_1 = W.type == QT_Q4_1 || W.type == QT_Q5_1;
     ref_act_roundtrip(W.type, x, g_x, W.K);
     if (!launch(W)) return false;
     st.emu.add(g_y, ref_out, W.N);
