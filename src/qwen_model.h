@@ -143,6 +143,10 @@ typedef struct {
 } qwen_seq_token;
 int qwen_model_forward_seqs(qwen_model_t* model, const int32_t* tokens, const qwen_seq_token* rows, int n);
 
+// Embedding models: the pooled, output-normed hidden state of n tokens (one input, one batch from position 0, at
+// most the KV cache's length and 2048) into out[n_embd]. 0, or < 0 (INFERENCE_ERR_CONTEXT_FULL: too long).
+int qwen_model_embed(qwen_model_t* model, const int32_t* tokens, int n, float* out);
+
 #ifdef __cplusplus
 }
 #endif

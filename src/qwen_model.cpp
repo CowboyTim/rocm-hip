@@ -938,6 +938,37 @@ struct QwenModel {
         return bat ? lm_head_seqs(T) : lm_head(T, logits_out);
     }
 
+    // ---- Embedding models (qwen_model_embed): one input as one batch from position 0; its output-normed rows (s.xn)
+    // pooled into embed_out
+    float* embed_out = nullptr;
+
+    bool embed_pool(int T) {
+        if (!sync()) return false;
+        const int E = eng->n_embd;
+        if (eng->embed_pooling == 1) {  // mean (in double: up to the context's rows)
+            std::vector<double> acc((size_t)E, 0.0);
+            for (int t = 0; t < T; ++t)
+                for (int i = 0; i < E; ++i) acc[i] += s.xn[(size_t)t * E + i];
+            for (int i = 0; i < E; ++i) embed_out[i] = (float)(acc[i] / T);
+        } else {  // first (CLS) or last token
+            memcpy(embed_out, s.xn + (size_t)(eng->embed_pooling == 2 ? 0 : T - 1) * E, sizeof(float) * E);
+        }
+        prof.tokens += T;
+        return true;
+    }
+
+    int embed(const int32_t* tokens, int n, float* out) {
+        if (eng->embed_pooling < 0) { qwen_set_error("not an embedding model"); return -1; }
+        if (n <= 0 || n > s.B || n > kv_cache_n_ctx(eng->kvc) || n > 2048) {
+            qwen_set_error("embedding input of %d tokens (at most %d)", n, std::min({s.B, kv_cache_n_ctx(eng->kvc), 2048}));
+            return INFERENCE_ERR_CONTEXT_FULL;
+        }
+        embed_out = out;
+        const int rc = forward(tokens, n, 0, nullptr);
+        embed_out = nullptr;
+        return rc;
+    }
+
     // ---- Batched decoding (qwen_model_forward_seqs): row r of a forward pass is one token of sequence bat[r].seq
     // at bat[r].pos, on its KV caches. The matmuls take all rows at once (each weight read once for all
     // sequences); attention and the recurrent layers run row by row, each with its sequence selected (use_seq).
@@ -1120,9 +1151,11 @@ struct QwenModel {
                 o.kv_stride = kv_cache_row_halves(kvc);
                 o.kv_q8 = kv_cache_type(kvc) == KV_CACHE_Q8_0;
                 o.rot_pairs = L.rot_pairs;
-                o.v_norm = 1;
+                const bool emb = eng->embed_pooling >= 0;  // EmbeddingGemma: no V norm, 1 / sqrt(D), bidirectional
+                o.v_norm = emb ? 0 : 1;
                 o.window = L.window;
-                o.scale = 1.0f;
+                o.scale = emb ? 0.0f : 1.0f;
+                o.bidir = emb ? 1 : 0;
                 return check(attention_forward_opts(s.qfull + r * L.Wq.N, s.k + r * L.Wk.N,
                                                     L.v_from_k ? s.k + r * L.Wk.N : s.v + r * L.Wv.N, L.q_norm,
                                                     L.k_norm, K, V, kv_cache_block_shift(kvc),
@@ -1303,6 +1336,7 @@ struct QwenModel {
                 return -1;
             mark(s.xn, E, T, qe);
         }
+        if (eng->embed_pooling >= 0) return embed_pool(T) ? 0 : -1;
         if (bat ? lm_head_seqs(T) != 0 : lm_head(T, nullptr) != 0) return -1;
         if (eng->logit_softcap > 0.0f &&
             (!check(gpu_softcap(bat ? seqs_logits : s.logits, bat ? T * V : V, eng->logit_softcap, 0), "softcap") ||
@@ -2088,6 +2122,11 @@ int qwen_model_forward_batch(qwen_model_t* model, const int32_t* tokens, const i
     return INFERENCE_ERR_NOT_IMPLEMENTED;
 }
 
+}
+
+int qwen_model_embed(qwen_model_t* model, const int32_t* tokens, int n, float* out) {
+    if (!model || !tokens || !out) { qwen_set_error("NULL argument"); return -1; }
+    return model->embed(tokens, n, out);
 }
 
 int qwen_model_forward_seqs(qwen_model_t* model, const int32_t* tokens, const qwen_seq_token* rows, int n) {

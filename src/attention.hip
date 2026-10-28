@@ -470,6 +470,71 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
     }
 }
 
+// attn_bidir  grid (n_q, n), block D: bidirectional attention (embedding models, attention_opts.bidir): token z of a
+//             batch at positions 0 .. n - 1 attends to every position p of it, or to |p - z| <= half_window when
+//             that is > 0 (llama.cpp's symmetric sliding window, half of n_swa). One workgroup per (head, token):
+//             its threads score the positions (kept in LDS, n <= ATTN_BIDIR_MAX), softmax, then thread d sums
+//             p's weight times V[p][d] over the positions. F16 cache rows.
+#define ATTN_BIDIR_MAX 2048
+template <int D>
+__device__ __forceinline__ float bidir_reduce(float v, float* red, bool is_max) {
+    for (int o = 16; o > 0; o >>= 1) {
+        const float w = __shfl_xor(v, o, 32);
+        v = is_max ? fmaxf(v, w) : v + w;
+    }
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    __syncthreads();  // red may still be read by a previous reduction
+    if (lane == 0) red[wave] = v;
+    __syncthreads();
+    v = red[0];
+    for (int i = 1; i < D / 32; ++i) v = is_max ? fmaxf(v, red[i]) : v + red[i];
+    return v;
+}
+
+template <int D>
+__device__ void attn_bidir_body(const float* q, const __half* K, const __half* V, int kv_stride, int kv_shift,
+                                long long kv_bstride, int n, int n_q, int n_kv, float scale, int half_window,
+                                float* out) {
+    __shared__ float qs[D];
+    __shared__ float sc[ATTN_BIDIR_MAX];
+    __shared__ float red[D / 32];
+    const int h = blockIdx.x, z = blockIdx.y, t = threadIdx.x;
+    const int hk = h / (n_q / n_kv);
+    qs[t] = q[((size_t)z * n_q + h) * D + t];
+    __syncthreads();
+    const int lo = half_window > 0 ? max(0, z - half_window) : 0;
+    const int hi = half_window > 0 ? min(n - 1, z + half_window) : n - 1;
+    float mx = -INFINITY;
+    for (int p = lo + t; p <= hi; p += D) {
+        const __half* kr = K + kv_row(p, kv_stride, kv_shift, kv_bstride) + (size_t)hk * D;
+        float s = 0.0f;
+        for (int i = 0; i < D; i += 8) {
+            const uint4 u = *(const uint4*)(kr + i);
+            const __half2* k2 = (const __half2*)&u;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 kk = __half22float2(k2[j]);
+                s += qs[i + 2 * j] * kk.x + qs[i + 2 * j + 1] * kk.y;
+            }
+        }
+        s *= scale;
+        sc[p - lo] = s;
+        mx = fmaxf(mx, s);
+    }
+    mx = bidir_reduce<D>(mx, red, true);
+    float sum = 0.0f;
+    for (int p = lo + t; p <= hi; p += D) {
+        const float e = __expf(sc[p - lo] - mx);
+        sc[p - lo] = e;
+        sum += e;
+    }
+    sum = bidir_reduce<D>(sum, red, false);  // (its first barrier also makes the weights visible)
+    float acc = 0.0f;
+    for (int p = lo; p <= hi; ++p)
+        acc += sc[p - lo] * __half2float(V[kv_row(p, kv_stride, kv_shift, kv_bstride) + (size_t)hk * D + t]);
+    out[((size_t)z * n_q + h) * D + t] = acc / sum;
+}
+
 // The kernels for each head size: attn_<kernel>_128 (Qwen3), attn_<kernel>_256 (Qwen3.5 and later, Gemma-4's
 // sliding layers), attn_<kernel>_512 (Gemma-4's global layers; its flash kernel is attn_flash_512_h2s2)
 #define ATTN_DECODE_KERNELS(D)                                                                                \
@@ -500,8 +565,15 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
                          float* out, Q8Out o, int gated) {                                                   \
         attn_combine_body<D>(part_ml, part_acc, n_chunks, n_q, qfull, out, o, gated);                         \
     }
+#define ATTN_BIDIR_KERNEL(D)                                                                                  \
+    extern "C" __global__ void __launch_bounds__(D)                                                          \
+        attn_bidir_##D(const float* q, const __half* K, const __half* V, int kv_stride, int kv_shift,         \
+                       long long kv_bstride, int n, int n_q, int n_kv, float scale, int half_window, float* out) { \
+        attn_bidir_body<D>(q, K, V, kv_stride, kv_shift, kv_bstride, n, n_q, n_kv, scale, half_window, out);   \
+    }
 #define ATTN_KERNELS(D)                                                                                       \
     ATTN_DECODE_KERNELS(D)                                                                                    \
+    ATTN_BIDIR_KERNEL(D)                                                                                      \
     ATTN_FLASH_KERNEL_NAMED(attn_flash_##D, D, 1, 4, 1, 1)
 
 // attn_flash_<D> (ratio n_q / n_kv a multiple of 4: 4 heads x 16 tokens), attn_flash_<D>_g2 (ratio 2: 4 heads of
@@ -523,6 +595,7 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
 ATTN_KERNELS(128)
 ATTN_KERNELS(256)
 ATTN_DECODE_KERNELS(512)
+ATTN_BIDIR_KERNEL(512)
 // Two KV heads per workgroup (Qwen3: ratio 2): head_dim 128 only (256 would need over 64 KB of LDS)
 ATTN_FLASH_KERNEL_NAMED(attn_flash_128_g2, 128, 2, 4, 1, 1)
 // Gemma-4: sliding layers (D 256, ratio 2), global layers (D 512, ratio 8; 59 KB of LDS)

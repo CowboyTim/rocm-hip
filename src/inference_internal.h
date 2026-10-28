@@ -268,6 +268,10 @@ struct inference_model {
     bool expert_weights_norm = true;                    // MoE: the chosen sigmoid weights normalized to sum 1
     int moe_latent = 0;                                 // MoE: latent width of the experts (moe_latent_size; 0: n_embd)
     float logit_softcap = 0.0f;                         // final_logit_softcapping (0: none)
+    // Embedding models (gemma-embedding: EmbeddingGemma; gemma4 above set too): bidirectional attention, and the
+    // output-normed rows pooled into the embedding instead of an LM head. pooling_type: 1 mean, 2 first (CLS),
+    // 3 last; -1: not an embedding model
+    int embed_pooling = -1;
 };
 
 // A sequence's context while another is current (inference_seq_select swaps it with the model's fields)
@@ -288,6 +292,8 @@ struct inference_model::SeqCtx {
 // Tokens per prefill micro-batch: inference_set_prefill_batch's, else 2048 for MoE models (each expert's weights
 // are read once per batch: Gemma-4 26B-A4B +4%, Qwen3.6-35B-A3B +4% over 1024) and 1024 for dense ones
 static inline int prefill_batch_tokens(const inference_model* m) {
+    // (an embedding model's input is one batch: its whole context)
+    if (m->embed_pooling >= 0) return m->prefill_batch > 0 ? m->prefill_batch : std::min(m->n_ctx, 8192);
     return m->prefill_batch > 0 ? m->prefill_batch : m->n_expert > 0 ? 2048 : 1024;
 }
 

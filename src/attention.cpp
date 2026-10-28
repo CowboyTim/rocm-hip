@@ -13,7 +13,8 @@
 static hipModule_t g_mod = nullptr;
 // [0]: head_dim 128 (attn_*_128), [1]: 256, [2]: 512 (no attn_flash_512)
 static hipFunction_t g_prep[3], g_partial[3], g_combine[3], g_flash[3];
-static hipFunction_t g_partial_q8[3], g_flash_q8[3];  // the same reading a Q8_0 KV cache (attention_opts.kv_q8)
+static hipFunction_t g_partial_q8[3], g_flash_q8[3];
+static hipFunction_t g_bidir[3];  // attn_bidir_<D> (attention_opts.bidir)  // the same reading a Q8_0 KV cache (attention_opts.kv_q8)
 // attn_flash_128_g2: 2 KV heads per workgroup, for a query / KV head ratio of 2 (Qwen3); attn_flash_256_h2t2
 // (ratio 2: Gemma-4's sliding layers) and attn_flash_512_h2s2 (Gemma-4's global layers, D split in 2)
 static hipFunction_t g_flash128_g2 = nullptr, g_flash256_h2t2 = nullptr, g_flash512_h2s2 = nullptr;
@@ -53,6 +54,11 @@ int attention_init(const char* co_path) {
             return -1;
         }
     }
+    for (int i = 0; i < 3; ++i) {
+        char n[32];
+        snprintf(n, sizeof(n), "attn_bidir_%d", 128 << i);
+        if (hipModuleGetFunction(&g_bidir[i], g_mod, n) != hipSuccess) g_bidir[i] = nullptr;
+    }
     if (hipModuleGetFunction(&g_flash128_g2, g_mod, "attn_flash_128_g2") != hipSuccess) g_flash128_g2 = nullptr;
     if (hipModuleGetFunction(&g_flash256_h2t2, g_mod, "attn_flash_256_h2t2") != hipSuccess) g_flash256_h2t2 = nullptr;
     if (hipModuleGetFunction(&g_flash512_h2s2, g_mod, "attn_flash_512_h2s2") != hipSuccess) g_flash512_h2s2 = nullptr;
@@ -68,7 +74,8 @@ int attention_init(const char* co_path) {
 void attention_free(void) {
     if (g_mod) (void)hipModuleUnload(g_mod);
     g_mod = nullptr;
-    for (int i = 0; i < 3; ++i) g_prep[i] = g_partial[i] = g_combine[i] = g_flash[i] = g_partial_q8[i] = g_flash_q8[i] = nullptr;
+    for (int i = 0; i < 3; ++i)
+        g_prep[i] = g_partial[i] = g_combine[i] = g_flash[i] = g_partial_q8[i] = g_flash_q8[i] = g_bidir[i] = nullptr;
     g_flash128_g2 = g_flash256_h2t2 = g_flash512_h2s2 = nullptr;
     g_flash128_g2_q8 = g_flash256_h2t2_q8 = g_flash512_h2s2_q8 = nullptr;
 }
@@ -115,6 +122,17 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
                                          stream,
                                          a_prep, nullptr);
     if (e != hipSuccess) return e;
+
+    if (opts->bidir) {  // embedding models: every token of the batch sees the whole batch (or its window)
+        if (pos0 != 0 || T > 2048 || kv_q8 || gated || !g_bidir[hi]) return hipErrorInvalidValue;
+        const float sc = opts->scale != 0.0f ? opts->scale : 1.0f / sqrtf((float)D);
+        int half = window / 2;
+        void* a_bidir[] = {&q, &K, &V, &kv_stride, &kv_shift, &kv_bstride, &T, &n_q, &n_kv, (void*)&sc, &half, &out};
+        e = hipModuleLaunchKernel(g_bidir[hi], (unsigned)n_q, (unsigned)T, 1, (unsigned)D, 1, 1, 0, stream, a_bidir,
+                                  nullptr);
+        if (e != hipSuccess || !q8) return e;
+        return qmatvec_quantize(out, T * n_q * D, q8, stream);
+    }
 
     // Partial-result slots the caller's buffers hold (attention_part_slots with n_ctx >= n_last)
     const int nc = (n_last + ATTN_CHUNK - 1) / ATTN_CHUNK;

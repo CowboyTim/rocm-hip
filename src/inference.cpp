@@ -499,6 +499,45 @@ static bool load_gemma4(inference_model* m, Gemma4Shape& g) {
     return true;
 }
 
+// EmbeddingGemma (gemma-embedding; llama.cpp gemma-embedding.cpp): Gemma-3 blocks as Gemma-4's dense ones (q / k
+// norms, post norms, GeGLU) with one head size, sliding layers by period (every 6th layer global, the rest with a
+// symmetric window of sliding_window, RoPE base 10000), bidirectional attention (no V norm, scale 1 / sqrt(head_dim)),
+// and the output-normed rows pooled (pooling_type) into the embedding
+static bool load_gemma_embedding(inference_model* m, Gemma4Shape& g) {
+    const int period = (int)gguf_arch_int(m->gguf, "attention.sliding_window_pattern", 6);
+    g.hd = g.hd_swa = (int)gguf_arch_int(m->gguf, "attention.key_length", m->head_dim);
+    g.rot = g.rot_swa = (int)gguf_arch_int(m->gguf, "rope.dimension_count", g.hd);
+    g.rot_pairs = g.rot / 2;
+    g.window = (int)gguf_arch_int(m->gguf, "attention.sliding_window", 0);
+    g.base = gguf_arch_float(m->gguf, "rope.freq_base", 10000.0f);
+    g.base_swa = gguf_arch_float(m->gguf, "rope.freq_base_swa", 10000.0f);
+    if (gguf_arch_int(m->gguf, "attention.value_length", g.hd) != g.hd || g.hd <= 0 || period <= 0 ||
+        m->n_head_kv <= 0) {
+        set_error("gemma-embedding: needs key_length == value_length (%d), a sliding window pattern", g.hd);
+        return false;
+    }
+    if (find_tensor_index(m->gguf, "dense_2.weight") >= 0 || find_tensor_index(m->gguf, "dense_3.weight") >= 0) {
+        set_error("gemma-embedding: the sentence-transformers dense layers are not supported");
+        return false;
+    }
+    g.swa.resize(m->n_layer);
+    g.n_kv.assign(m->n_layer, m->n_head_kv);
+    for (int i = 0; i < m->n_layer; ++i) g.swa[i] = i % period < period - 1 && g.window > 0;
+    m->gemma4 = true;
+    m->embed_pooling = (int)gguf_arch_int(m->gguf, "pooling_type", 1);
+    if (m->embed_pooling < 1 || m->embed_pooling > 3) {
+        set_error("gemma-embedding: pooling_type %d (supported: 1 mean, 2 first, 3 last)", m->embed_pooling);
+        return false;
+    }
+    m->embd_scale = sqrtf((float)m->n_embd);
+    m->head_dim = m->kv_head_dim = g.hd;
+    m->attn_gated = false;
+    m->n_rot = g.rot;
+    m->rope_freq_base = g.base;
+    m->swa_ring_opt = 0;  // one batch from position 0: the whole history in the cache
+    return true;
+}
+
 // Gemma-4 block i: attention (sliding or global) with q / k norms, post-attention norm, then the dense GeGLU MLP and
 // (if ffn_gate_inp is there) the experts, each with its own norms, their sum normed, and the layer output scale
 static bool load_layer_gemma4(inference_model* m, int i, LayerWeights& L, const Gemma4Shape& g) {
@@ -655,6 +694,7 @@ static bool load_model_weights(inference_model* m, const std::vector<int>& ple_l
     Gemma4Shape g4;
     NemotronShape gn;
     if (m->model_name == "gemma4" && !load_gemma4(m, g4)) return false;
+    if (m->model_name == "gemma-embedding" && !load_gemma_embedding(m, g4)) return false;
     if (m->model_name == "nemotron_h_moe" && !load_nemotron(m, gn)) return false;
     for (int i = 0; i < m->n_layer; ++i)
         if (!(m->gemma4     ? load_layer_gemma4(m, i, m->layers[i], g4)
@@ -2236,6 +2276,24 @@ int inference_stream_step_batch(inference_stream_t* const* streams, int n, infer
         o.rc = rc[i] ? stream_decoded(streams[i], rc[i]) : 0;
         if (o.rc == 0) o.rc = stream_finish(streams[i], &o.token, next[i], &o.text, &o.text_len, &o.reason);
         else o.text = "";
+    }
+    return 0;
+}
+
+int inference_embedding_dim(const inference_model_t* m) { return m && m->embed_pooling >= 0 ? m->n_embd : 0; }
+
+int inference_embed(inference_model_t* m, const int32_t* tokens, int n, float* out, int normalize) {
+    clear_error();
+    if (!m || !tokens || !out || n <= 0) { set_error("Invalid arguments"); return INFERENCE_ERR_INVALID_ARG; }
+    if (m->embed_pooling < 0) { set_error("not an embedding model"); return INFERENCE_ERR_INVALID_ARG; }
+    if (!m->qwen) { set_error("call inference_kv_cache_init first"); return INFERENCE_ERR_INVALID_STATE; }
+    const int rc = qwen_model_embed(m->qwen, tokens, n, out);
+    if (rc != 0) { set_error("embedding: %s", qwen_model_last_error()); return rc; }
+    if (normalize) {
+        double ss = 0.0;
+        for (int i = 0; i < m->n_embd; ++i) ss += (double)out[i] * out[i];
+        const float k = ss > 0.0 ? (float)(1.0 / sqrt(ss)) : 0.0f;
+        for (int i = 0; i < m->n_embd; ++i) out[i] *= k;
     }
     return 0;
 }

@@ -255,6 +255,15 @@ typedef struct {
 } inference_step_result;
 int inference_stream_step_batch(inference_stream_t* const* streams, int n, inference_step_result* results);
 
+// Embedding models (EmbeddingGemma, GGUF architecture gemma-embedding). inference_embedding_dim: the embedding's
+// length (0: not an embedding model). inference_embed: the embedding of one input, n tokens as inference_tokenize
+// gives them (with BOS / EOS), after inference_kv_cache_init (n <= its length, at most 2048): the model's pooling
+// (mean for EmbeddingGemma) of its last hidden states into out[inference_embedding_dim]; normalize 1: scaled to
+// length 1 (as llama-server's /v1/embeddings). Leaves the model's sequences alone. 0, or < 0
+// (INFERENCE_ERR_CONTEXT_FULL: the input is too long).
+int inference_embedding_dim(const inference_model_t* model);
+int inference_embed(inference_model_t* model, const int32_t* tokens, int n, float* out, int normalize);
+
 // How the last inference_generate_stream prompt was handled: tokens reused from the sequence, tokens prefilled.
 int inference_last_prompt_stats(const inference_model_t* model, int* reused, int* prefilled);
 

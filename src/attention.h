@@ -73,6 +73,9 @@ typedef struct {
     float scale;     // the scores' scale; 0: 1 / sqrt(head_dim) (Gemma-4: 1, its q / k norms replace it)
     int no_qk_norm;  // Q and K as they come (no RMSNorm; Nemotron-H), q_norm / k_norm unused
     int kv_q8;       // the KV cache rows are Q8_0 (kv_cache_config_t.kv_type): int8 values, then an fp16 scale per 32
+    int bidir;       // embedding models: a batch at positions 0 .. T - 1 (pos0 0, T <= 2048, F16 cache) where every
+                     // token attends to all of its positions, or to |p - z| <= window / 2 with a window
+                     // (llama.cpp's symmetric sliding window)
                      // values; kv_stride is then the row stride in halves (kv_cache_row_halves), 0: n_kv * D * 17 / 32
 } attention_opts;
 
