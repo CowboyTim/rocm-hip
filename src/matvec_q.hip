@@ -941,17 +941,66 @@ __device__ __forceinline__ int rocmfp4_dec4(uint32_t n) {
     return (int)((pos & ~m) | (neg & m));
 }
 
-// One ROCmFP4 block (qs as 4 dwords, two UE4M3 half scales) against its Q8_0 block
-__device__ __forceinline__ float rocmfp4_q8_block(const uint32_t qs[4], uint32_t e0, uint32_t e1, const int8_t *q8,
-                                                  float dx) {
+// The 18-byte 4-bit block types, read as 4-aligned pairs of blocks (36 bytes, 9 dwords; K % 64 == 0): values j
+// (0..15) in the low nibbles of the 16 value bytes, j + 16 in the high ones. A policy P gives pair() (the two
+// blocks' value dwords and scales from the 9 dwords), dec4() (four nibbles -> four int8 values) and block() (a
+// block's float sum from its two half-block int dots), so every kernel family is written once for both:
+//  ROCmFP4: 16 value bytes, then two UE4M3 scales (one per 16 values); FP4 codebook values.
+//  Q4_0: an F16 scale, then 16 value bytes; values nibble - 8. As ggml's vec_dot_q4_0_q8_0: (d_w d_x) * sumi.
+struct P4ROCmFP4 {
+    static constexpr bool BLOCK_SCALE = false;  // (WMMA: a scale per half-block)
+    __device__ static void pair(const uint32_t w[9], uint32_t qs[2][4], float e[2][2]) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            qs[0][k] = w[k];
+            qs[1][k] = (w[4 + k] >> 16) | (w[5 + k] << 16);
+        }
+        e[0][0] = ue4m3_half((uint8_t)(w[4] & 0xFF));
+        e[0][1] = ue4m3_half((uint8_t)((w[4] >> 8) & 0xFF));
+        e[1][0] = ue4m3_half((uint8_t)((w[8] >> 16) & 0xFF));
+        e[1][1] = ue4m3_half((uint8_t)(w[8] >> 24));
+    }
+    __device__ static int dec4(uint32_t n) { return rocmfp4_dec4(n); }
+    __device__ static float block(int s0, int s1, const float e[2], float dx) {
+        return e[0] * dx * (float)s0 + e[1] * dx * (float)s1;
+    }
+};
+
+struct P4Q4_0 {
+    static constexpr bool BLOCK_SCALE = true;
+    __device__ static void pair(const uint32_t w[9], uint32_t qs[2][4], float e[2][2]) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            qs[0][k] = __builtin_amdgcn_alignbyte(w[k + 1], w[k], 2);  // block 0's values: bytes 2..17
+            qs[1][k] = w[5 + k];                                       // block 1's: bytes 20..35
+        }
+        e[0][0] = e[0][1] = __half2float(__ushort_as_half((uint16_t)(w[0] & 0xFFFF)));
+        e[1][0] = e[1][1] = __half2float(__ushort_as_half((uint16_t)(w[4] >> 16)));
+    }
+    // nibbles 0..15 -> -8..7 per byte (no borrow between bytes: each is >= 0x80 before the subtraction)
+    __device__ static int dec4(uint32_t n) { return (int)(((n | 0x80808080u) - 0x08080808u) ^ 0x80808080u); }
+    __device__ static float block(int s0, int s1, const float e[2], float dx) { return e[0] * dx * (float)(s0 + s1); }
+};
+
+template <class P>
+__device__ __forceinline__ void p4_pair(const uint8_t *b, uint32_t qs[2][4], float e[2][2]) {
+    uint32_t w[9];
+#pragma unroll
+    for (int k = 0; k < 9; ++k) w[k] = ld32(b + 4 * k);
+    P::pair(w, qs, e);
+}
+
+// One block (its value dwords and scales) against its Q8_0 block
+template <class P>
+__device__ __forceinline__ float p4_q8_block(const uint32_t qs[4], const float e[2], const int8_t *q8, float dx) {
     const int *x8 = (const int *)q8;
     int s0 = 0, s1 = 0;
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
-        s0 = dot4(rocmfp4_dec4(qs[k] & 0x0F0F0F0Fu), x8[k], s0);
-        s1 = dot4(rocmfp4_dec4((qs[k] >> 4) & 0x0F0F0F0Fu), x8[4 + k], s1);
+        s0 = dot4(P::dec4(qs[k] & 0x0F0F0F0Fu), x8[k], s0);
+        s1 = dot4(P::dec4((qs[k] >> 4) & 0x0F0F0F0Fu), x8[4 + k], s1);
     }
-    return ue4m3_half((uint8_t)e0) * dx * (float)s0 + ue4m3_half((uint8_t)e1) * dx * (float)s1;
+    return P::block(s0, s1, e, dx);
 }
 
 // Lanes per row: a row whose K gives fewer lane-tasks than 32 (e.g. the MoE experts' K = 512 down projection:
@@ -981,24 +1030,30 @@ __device__ __forceinline__ float rocmfp4_q8_block(const uint32_t qs[4], uint32_t
         long long row_bytes, const int8_t *q8, const float *d8, const int *bs, float *y, float *y2, float *y3, \
         float *y4, int N, int K, int L
 
-// ROCmFP4 x Q8_0: a lane takes a pair of 18-byte blocks (36 bytes, 4-aligned; the host requires K % 64 == 0)
-__device__ __forceinline__ float mv_rocmfp4(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K, int lane, int L) {
-    (void)bs;
+// ROCmFP4 / Q4_0 x Q8_0: a lane takes a pair of 18-byte blocks (36 bytes, 4-aligned; the host requires K % 64 == 0)
+template <class P>
+__device__ __forceinline__ float mv_p4(const uint8_t *wr, const int8_t *q8, const float *d8, int K, int lane, int L) {
     const int npairs = K / 64;
     float acc = 0.0f;
     for (int p = lane; p < npairs; p += L) {
-        const uint8_t *b = wr + (long long)p * 36;
-        uint32_t w[9];
-#pragma unroll
-        for (int k = 0; k < 9; ++k) w[k] = ld32(b + 4 * k);
-        const uint32_t qa[4] = {w[0], w[1], w[2], w[3]};
-        const uint32_t qb[4] = {(w[4] >> 16) | (w[5] << 16), (w[5] >> 16) | (w[6] << 16), (w[6] >> 16) | (w[7] << 16),
-                                (w[7] >> 16) | (w[8] << 16)};
+        uint32_t qs[2][4];
+        float e[2][2];
+        p4_pair<P>(wr + (long long)p * 36, qs, e);
         const int ib = 2 * p;
-        acc += rocmfp4_q8_block(qa, w[4] & 0xFF, (w[4] >> 8) & 0xFF, q8 + ib * 32, d8[ib]);
-        acc += rocmfp4_q8_block(qb, (w[8] >> 16) & 0xFF, w[8] >> 24, q8 + (ib + 1) * 32, d8[ib + 1]);
+        acc += p4_q8_block<P>(qs[0], e[0], q8 + ib * 32, d8[ib]);
+        acc += p4_q8_block<P>(qs[1], e[1], q8 + (ib + 1) * 32, d8[ib + 1]);
     }
     return acc;
+}
+
+__device__ __forceinline__ float mv_rocmfp4(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
+                                            int lane, int L) {
+    return mv_p4<P4ROCmFP4>(wr, q8, d8, K, lane, L);
+}
+
+__device__ __forceinline__ float mv_q4_0(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
+                                         int lane, int L) {
+    return mv_p4<P4Q4_0>(wr, q8, d8, K, lane, L);
 }
 
 // ROCmFP4_FAST (17-byte blocks: 16 nibble bytes + one UE4M3 scale per 32 values) x Q8_0: a lane takes four
@@ -1451,6 +1506,7 @@ matvec_q8_lr_q4_0_rocmfp4_fast(const uint8_t *W, long long row_bytes, const floa
 }
 
 MATVEC_Q8_KERNELS(q4_0_rocmfp4, mv_rocmfp4, 0)
+MATVEC_Q8_KERNELS(q4_0, mv_q4_0, 0)
 MATVEC_Q8_KERNELS(q4_0_rocmfp4_fast, mv_rocmfp4_fast, 0)
 MATVEC_Q8_KERNELS(q8_0, mv_q8_0, 0)
 MATVEC_Q8_KERNELS(q5_1, mv_q5_1, 2)
@@ -1512,28 +1568,23 @@ struct RowsExpert {  // MoE prefill: one expert's tile of (token, slot) entries,
         if (lane == 0 && j < nt) y[rm.out(j) * ldy + row] = a;                      \
     }
 
-template <class RM>
-__device__ __forceinline__ void mmb_rocmfp4(MM_BARGS, const RM &rm) {
+// ROCmFP4 / Q4_0 (P: the 18-byte block policy)
+template <class P, class RM>
+__device__ __forceinline__ void mmb_p4(MM_BARGS, const RM &rm) {
     (void)bs;
     MM_ROW_SETUP
     const int npairs = K / 64, nb = K / 32;
     for (int p = lane; p < npairs; p += 32) {
-        const uint8_t *b = wr + (long long)p * 36;
-        uint32_t w[9];
-#pragma unroll
-        for (int k = 0; k < 9; ++k) w[k] = ld32(b + 4 * k);
-        const uint32_t qs[2][4] = {{w[0], w[1], w[2], w[3]},
-                                   {(w[4] >> 16) | (w[5] << 16), (w[5] >> 16) | (w[6] << 16),
-                                    (w[6] >> 16) | (w[7] << 16), (w[7] >> 16) | (w[8] << 16)}};
-        const float e[2][2] = {{ue4m3_half((uint8_t)(w[4] & 0xFF)), ue4m3_half((uint8_t)((w[4] >> 8) & 0xFF))},
-                               {ue4m3_half((uint8_t)((w[8] >> 16) & 0xFF)), ue4m3_half((uint8_t)(w[8] >> 24))}};
+        uint32_t qs[2][4];
+        float e[2][2];
+        p4_pair<P>(wr + (long long)p * 36, qs, e);
         int lo[2][4], hi[2][4];
 #pragma unroll
         for (int h = 0; h < 2; ++h)
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
-                lo[h][k] = rocmfp4_dec4(qs[h][k] & 0x0F0F0F0Fu);
-                hi[h][k] = rocmfp4_dec4((qs[h][k] >> 4) & 0x0F0F0F0Fu);
+                lo[h][k] = P::dec4(qs[h][k] & 0x0F0F0F0Fu);
+                hi[h][k] = P::dec4((qs[h][k] >> 4) & 0x0F0F0F0Fu);
             }
         // Not unrolled: 16 copies of the body cost more in registers than the loop does (600 vs 466 tokens/s)
         for (int j = 0; j < MM_TB; ++j) {
@@ -1549,8 +1600,7 @@ __device__ __forceinline__ void mmb_rocmfp4(MM_BARGS, const RM &rm) {
                     s0 = dot4(lo[h][k], x8[k], s0);
                     s1 = dot4(hi[h][k], x8[4 + k], s1);
                 }
-                const float dx = d8[t * nb + ib];
-                acc[j] += e[h][0] * dx * (float)s0 + e[h][1] * dx * (float)s1;
+                acc[j] += P::block(s0, s1, e[h], d8[t * nb + ib]);
             }
         }
     }
@@ -1755,7 +1805,8 @@ __device__ __forceinline__ void mmb_q5_K_exp(MM_BARGS, const RowsExpert &rm) { m
         BODY_EXP(W, row_bytes, q8, d8, bs, y, N, N, K, rm);                                               \
     }
 
-MATMUL_Q8_KERNELS(q4_0_rocmfp4, mmb_rocmfp4<RowsLinear>, mmb_rocmfp4<RowsExpert>)
+MATMUL_Q8_KERNELS(q4_0_rocmfp4, (mmb_p4<P4ROCmFP4, RowsLinear>), (mmb_p4<P4ROCmFP4, RowsExpert>))
+MATMUL_Q8_KERNELS(q4_0, (mmb_p4<P4Q4_0, RowsLinear>), (mmb_p4<P4Q4_0, RowsExpert>))
 MATMUL_Q8_KERNELS(q4_0_rocmfp4_fast, mmb_rocmfp4_fast<RowsLinear>, mmb_rocmfp4_fast<RowsExpert>)
 MATMUL_Q8_KERNELS(q8_0, mmb_q8_0<RowsLinear>, mmb_q8_0<RowsExpert>)
 MATMUL_Q8_KERNELS(q5_1, mmb_q5_1<RowsLinear>, mmb_q5_1<RowsExpert>)
@@ -1792,34 +1843,30 @@ typedef int v8i_t __attribute__((ext_vector_type(8)));
 // wb = 2 * (tid & 1) and wb + 1 of the chunk's 4 blocks: load() reads them from global memory into registers
 // (so the next chunk's loads overlap this chunk's WMMAs), store() decodes them to int8 in LDS and writes the two
 // half-block scales of each block.
-struct WStageFP4 {  // Q4_0_ROCMFP4: 18-byte blocks (2-aligned), a UE4M3 scale per 16 values
-    static constexpr bool BLOCK_SCALE = false, MIN = false;
-    uint32_t q[2][5];
+template <class P>
+struct WStageP4 {  // ROCmFP4 / Q4_0: a thread's two 18-byte blocks (wb = 0 or 2) are the 36-byte, 4-aligned pair at
+                   // byte 18 wb of the chunk's 4 blocks; a scale per half-block (ROCmFP4) or per block (Q4_0)
+    static constexpr bool BLOCK_SCALE = P::BLOCK_SCALE, MIN = false;
+    uint32_t w[9];
     __device__ void load(const uint8_t *W, long long rb, int row, bool ok, int b0, int wb) {
+        const uint8_t *b = W + (long long)row * rb + (long long)(b0 + wb) * 18;  // b0 % 4 == 0
 #pragma unroll
-        for (int j = 0; j < 2; ++j) {
-            if (ok) {
-                const uint8_t *b = W + (long long)row * rb + (long long)(b0 + wb + j) * 18;
-#pragma unroll
-                for (int k = 0; k < 4; ++k) q[j][k] = ld32_a2(b + 4 * k);
-                q[j][4] = *(const uint16_t *)(b + 16);
-            } else {
-#pragma unroll
-                for (int k = 0; k < 5; ++k) q[j][k] = 0;
-            }
-        }
+        for (int k = 0; k < 9; ++k) w[k] = ok ? ld32(b + 4 * k) : 0;
     }
     __device__ void store(int8_t *srow, float *erow, int wb) const {
+        uint32_t qs[2][4];
+        float e[2][2];
+        P::pair(w, qs, e);
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
             uint32_t *dst = (uint32_t *)(srow + (wb + j) * 32);
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
-                dst[k] = (uint32_t)rocmfp4_dec4(q[j][k] & 0x0F0F0F0Fu);
-                dst[4 + k] = (uint32_t)rocmfp4_dec4((q[j][k] >> 4) & 0x0F0F0F0Fu);
+                dst[k] = (uint32_t)P::dec4(qs[j][k] & 0x0F0F0F0Fu);
+                dst[4 + k] = (uint32_t)P::dec4((qs[j][k] >> 4) & 0x0F0F0F0Fu);
             }
-            erow[(wb + j) * 2] = ue4m3_half((uint8_t)(q[j][4] & 0xFF));
-            erow[(wb + j) * 2 + 1] = ue4m3_half((uint8_t)(q[j][4] >> 8));
+            erow[(wb + j) * 2] = e[j][0];
+            erow[(wb + j) * 2 + 1] = e[j][1];
         }
     }
 };
@@ -2141,7 +2188,8 @@ __device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, 
             wmma_q80<WS, 4>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                                   \
     }
 
-MATMUL_WMMA_Q80_KERNELS(q4_0_rocmfp4, WStageFP4)
+MATMUL_WMMA_Q80_KERNELS(q4_0_rocmfp4, WStageP4<P4ROCmFP4>)
+MATMUL_WMMA_Q80_KERNELS(q4_0, WStageP4<P4Q4_0>)
 MATMUL_WMMA_Q80_KERNELS(q4_0_rocmfp4_fast, WStageFast)
 MATMUL_WMMA_Q80_KERNELS(q8_0, WStageQ8_0)
 MATMUL_WMMA_Q80_KERNELS(q5_1, WStageQ5_1)

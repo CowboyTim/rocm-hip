@@ -38,8 +38,8 @@ static int g_wmma_min_t = 32;  // smaller batches, and N < 64 (a 64-row tile mos
 #define QMV_WM_THREADS 256    // its block size
 #define QMV_WMMA_ID_TB 64  // entries per expert tile of matmul_wmma_id_<type> (4 sub-tiles of 16)
 
-// The int8 kernels of the K-quants read the activations' Q8_K form; ROCmFP4, ROCmFP4_FAST and Q8_0 weights the
-// Q8_0 form
+// The int8 kernels of the K-quants read the activations' Q8_K form; ROCmFP4, ROCmFP4_FAST, Q4_0, Q5_1 and Q8_0
+// weights the Q8_0 form
 static bool reads_q8k(int type) { return type == QT_Q4_K || type == QT_Q5_K || type == QT_Q6_K; }
 
 // The kernels' bs argument: the Q8_K group sums for K-quants, the Q8_0 block sums for Q5_1 (its offsets)
@@ -48,7 +48,7 @@ static const int32_t *q8_sums(int type, const qmatvec_q8 *q) { return type == QT
 // The WMMA kernels of the Q8_0-activation types with 2 blocks per staging thread take K % 64 (a last half chunk);
 // ROCmFP4_FAST (block quads) and the K-quants K % 128
 static int wmma_k_multiple(int type) {
-    return type == QT_Q4_0_ROCMFP4 || type == QT_Q8_0 || type == QT_Q5_1 ? 64 : 128;
+    return type == QT_Q4_0_ROCMFP4 || type == QT_Q4_0 || type == QT_Q8_0 || type == QT_Q5_1 ? 64 : 128;
 }
 
 int qmatvec_init(const char *co_path) {
@@ -230,7 +230,7 @@ void qmatvec_q8_bind(qmatvec_q8 *q, void *mem, int max_k) {
 // whole 256-value Q8_K blocks: e.g. the qwen4exp experts' K = 640. K-quants read Q8_K and need K % 256 == 0.
 int qmatvec_q8_supported(int type, int K) {
     if (type < 0 || type >= QMV_MAX_TYPE || !g_fn_q8[type] || !g_quant) return 0;
-    if (type == QT_Q4_0_ROCMFP4 || type == QT_Q8_0) return K % 64 == 0;  // lanes take block pairs (36 / 68 bytes)
+    if (type == QT_Q4_0_ROCMFP4 || type == QT_Q4_0 || type == QT_Q8_0) return K % 64 == 0;  // block pairs (36 / 68 bytes)
     if (type == QT_Q4_0_ROCMFP4_FAST) return K % 128 == 0;  // lanes take 68-byte block quads
     if (type == QT_Q5_1) return K % 32 == 0;                 // a block per lane
     return K % 256 == 0;
@@ -249,7 +249,7 @@ hipError_t qmatvec_quantize(const float *x, int K, const qmatvec_q8 *q, hipStrea
 // leave most of the wave idle. See Q8_ROW_INDEX in matvec_q.hip.
 static int q8_lanes_per_row(int type, int K, long long rows) {
     const bool kq = reads_q8k(type);
-    const int tasks = type == QT_Q4_0_ROCMFP4 || type == QT_Q8_0 ? K / 64
+    const int tasks = type == QT_Q4_0_ROCMFP4 || type == QT_Q4_0 || type == QT_Q8_0 ? K / 64
                       : type == QT_Q4_0_ROCMFP4_FAST          ? K / 128
                       : type == QT_Q5_1                       ? K / 32
                                                               : K / 256 * 8;

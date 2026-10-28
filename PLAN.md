@@ -2585,6 +2585,23 @@ store). Perl `step_streams` / `step_chats`; the server's tick steps all running 
   sentence-transformers dense layers (dense_2 / dense_3, refused at load); other embedding architectures (BERT,
   Qwen3-Embedding: causal, last-token pooling).
 
+### Quant types: Q4_0 int8 / WMMA (2026-10-28, user: "start with 1: Int8 WMMA for Q4_0")
+
+Q4_0 shares ROCmFP4's 18-byte block (16 nibble bytes, low nibbles values 0..15, high 16..31); only the scale (one
+F16 before the values vs two UE4M3 after) and the values (nibble - 8 vs the FP4 codebook) differ. So the ROCmFP4
+kernels became templates over a block policy (P4ROCmFP4 / P4Q4_0: pair() from a 36-byte pair's 9 dwords, dec4(),
+block()): mv_p4 (decode), mmb_p4 (batched, dense and expert tiles), WStageP4 (WMMA staging, BLOCK_SCALE per policy);
+Q4_0 = one policy struct and one line per kernel family (the user asked that types not bloat the code).
+(nibble - 8 per byte: ((n | 0x80808080) - 0x08080808) ^ 0x80808080.) ggml's vec_dot_q4_0_q8_0: (d_w d_x) * sumi.
+- ROCmFP4 unchanged: forward_verify 4B / 35B the same cosines (0.999096 / 0.997234), gemma4_verify passes;
+  prefill 4B 2,008 tok/s, 35B 2,257 (WMMA staging now loads 36-byte pairs as 9 dwords). No spills.
+- Q4_0 test models made with llama.cpp's llama-quantize --allow-requantize into /data/q4_0 (Qwen3-0.6B from Q8_0,
+  Qwen3.6-35B-A3B from ROCMFP4: 20.2 GB, all experts Q4_0); references refdata/ref_qwen3_06b_q4_0,
+  ref_qwen36_35b_q4_0. forward_verify: 0.6B every layer >= 0.9996, 35B experts exact (grouped path cos 1, max
+  |d| 0), worst layer 0.9946 (a routing flip at layer 5, flat after), next tokens = llama.cpp, prefill =
+  token by token. 2,427-token prompt: 0.6B prefill 1,916 (float path) -> 9,805 tok/s, 35B 793 (int8 without
+  WMMA) -> 2,456 tok/s, generation 79 tok/s; float path, int8, int8 + WMMA give the same tokens on the 0.6B.
+
 ### BF16 dense prefill (ABC.gguf, a Qwen3.5 27B in BF16, 2026-10-25)
 
 Correct output; generation 4.1 tok/s (54 GB per token: the bandwidth); prefill **7.8 tok/s** (2,661 tokens in
