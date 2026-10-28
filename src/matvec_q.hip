@@ -1363,6 +1363,92 @@ __device__ __forceinline__ float mv_q4_K(const uint8_t *wr, const int8_t *q8, co
     return mv_kquant<false>(wr, q8, d8, bs, K, lane, L);
 }
 
+// Q3_K's 6-bit scale of 16-value group g (0..15) from its 12 scale bytes, as ggml's aux[] shuffle, minus 32
+__device__ __forceinline__ int q3k_scale(const uint8_t *raw, int g) {
+    const int lo = g < 8 ? (raw[g] & 0xF) : (raw[g - 8] >> 4);
+    const int hi = (raw[8 + (g & 3)] >> (2 * (g >> 2))) & 3;
+    return (lo | (hi << 4)) - 32;
+}
+
+// Q2_K (84 bytes, 4-aligned: 16 scale bytes (scale | min << 4 per 16 values), 64 bytes of 2-bit values, F16 d,
+// dmin) and Q3_K (110 bytes, 2-aligned: 32 bytes hmask, 64 bytes of 2-bit values, 12 bytes of 6-bit scales, F16 d)
+// x Q8_K. Byte l (0..31) of half h holds values 128h + 32j + l at bits 2j (Q3_K: plus hmask byte l's bit 4h + j
+// as bit 2, the value q - 4, int8 as decoded). Lane s (0..7) of its block takes bytes 8 (s & 3) .. + 7 of half
+// s / 4: for each j, 8 values of group 8h + 2j + (s & 3) / 2; and (Q2_K) the mins of groups 2s, 2s + 1 through the
+// Q8_K group sums. As ggml's vec_dot_q2_K_q8_K / q3_K: d_w d_x * sum(scale * dot) - dmin_w d_x * sum(min * bsum).
+template <bool Q3>
+struct K2Lane {
+    static constexpr int BYTES = Q3 ? 110 : 84;
+    int v[4][2];  // the lane's values, 2 dwords per j
+    int sc[4];    // their groups' scales
+    int m0 = 0, m1 = 0;
+    float dw, dmin = 0.0f;
+    __device__ void load(const uint8_t *b, int s) {
+        const int h = s >> 2, l0 = 8 * (s & 3);
+        uint32_t q[2], hm[2] = {0, 0};
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            q[k] = Q3 ? ld32_a2(b + 32 + 32 * h + l0 + 4 * k) : ld32(b + 16 + 32 * h + l0 + 4 * k);
+            if (Q3) hm[k] = ld32_a2(b + l0 + 4 * k);
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                uint32_t x = (q[k] >> (2 * j)) & 0x03030303u;
+                if (Q3) x = (((x | (((hm[k] >> (4 * h + j)) & 0x01010101u) << 2)) | 0x80808080u) - 0x04040404u) ^ 0x80808080u;
+                v[j][k] = (int)x;
+            }
+            const int g = 8 * h + 2 * j + (l0 >> 4);
+            sc[j] = Q3 ? q3k_scale(b + 96, g) : (b[g] & 0xF);
+        }
+        if (Q3) {
+            dw = fp16(b + 108);
+        } else {
+            m0 = b[2 * s] >> 4;
+            m1 = b[2 * s + 1] >> 4;
+            dw = fp16(b + 80);
+            dmin = fp16(b + 82);
+        }
+    }
+    // The lane's share of a block's sum against token block xb (256 q) and its 16 group sums bst
+    __device__ float dot(const int8_t *xb, const int *bst, float dx, int s) const {
+        const int h = s >> 2, l0 = 8 * (s & 3);
+        int isum = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int *x = (const int *)(xb + 128 * h + 32 * j + l0);
+            isum += sc[j] * dot4(v[j][1], x[1], dot4(v[j][0], x[0], 0));
+        }
+        if (Q3) return dw * dx * (float)isum;
+        return dw * dx * (float)isum - dmin * dx * (float)(m0 * bst[2 * s] + m1 * bst[2 * s + 1]);
+    }
+};
+
+template <bool Q3>
+__device__ __forceinline__ float mv_k2(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
+                                       int lane, int L) {
+    const int sub = lane >> 3, s = lane & 7;
+    const int nb = K / 256;
+    float acc = 0.0f;
+    for (int ib = sub; ib < nb; ib += L / 8) {
+        K2Lane<Q3> kl;
+        kl.load(wr + (long long)ib * K2Lane<Q3>::BYTES, s);
+        acc += kl.dot(q8 + (long long)ib * 256, bs + ib * 16, d8[ib], s);
+    }
+    return acc;
+}
+
+__device__ __forceinline__ float mv_q2_K(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
+                                         int lane, int L) {
+    return mv_k2<false>(wr, q8, d8, bs, K, lane, L);
+}
+
+__device__ __forceinline__ float mv_q3_K(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
+                                         int lane, int L) {
+    return mv_k2<true>(wr, q8, d8, bs, K, lane, L);
+}
+
 __device__ __forceinline__ float mv_q5_K(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
                                          int lane, int L) {
     return mv_kquant<true>(wr, q8, d8, bs, K, lane, L);
@@ -1583,6 +1669,8 @@ MATVEC_Q8_KERNELS(q5_0, mv_q5_0, 2)
 MATVEC_Q8_KERNELS(q4_K, mv_q4_K, 1)
 MATVEC_Q8_KERNELS(q5_K, mv_q5_K, 1)
 MATVEC_Q8_KERNELS(q6_K, mv_q6_K, 1)
+MATVEC_Q8_KERNELS(q2_K, mv_q2_K, 1)
+MATVEC_Q8_KERNELS(q3_K, mv_q3_K, 1)
 
 // ================================================================ batched int8 matmul (prefill)
 //
@@ -1847,6 +1935,25 @@ __device__ __forceinline__ void mmb_pb(MM_BARGS, const RM &rm) {
     MM_STORE
 }
 
+// Q2_K / Q3_K: each lane's block share decoded once (K2Lane), then summed for every token as mv_k2 does
+template <bool Q3, class RM>
+__device__ __forceinline__ void mmb_k2(MM_BARGS, const RM &rm) {
+    MM_ROW_SETUP
+    const int sub = lane >> 3, s = lane & 7;
+    const int nb = K / 256;
+    for (int ib = sub; ib < nb; ib += KQ_BLOCKS_PER_ITER) {
+        K2Lane<Q3> kl;
+        kl.load(wr + (long long)ib * K2Lane<Q3>::BYTES, s);
+        // Not unrolled: see matmul_q8_q4_0_rocmfp4
+        for (int j = 0; j < MM_TB; ++j) {
+            if (j >= nt) break;
+            const long long t = rm.in(j);
+            acc[j] += kl.dot(q8 + t * K + (long long)ib * 256, bs + t * (K / 16) + ib * 16, d8[t * nb + ib], s);
+        }
+    }
+    MM_STORE
+}
+
 __device__ __forceinline__ void mmb_q4_K_lin(MM_BARGS, const RowsLinear &rm) { mmb_kquant<false>(W, row_bytes, q8, d8, bs, y, ldy, N, K, rm); }
 __device__ __forceinline__ void mmb_q5_K_lin(MM_BARGS, const RowsLinear &rm) { mmb_kquant<true>(W, row_bytes, q8, d8, bs, y, ldy, N, K, rm); }
 __device__ __forceinline__ void mmb_q4_K_exp(MM_BARGS, const RowsExpert &rm) { mmb_kquant<false>(W, row_bytes, q8, d8, bs, y, ldy, N, K, rm); }
@@ -1885,6 +1992,8 @@ MATMUL_Q8_KERNELS(q5_0, (mmb_pb<PBQ5_0, RowsLinear>), (mmb_pb<PBQ5_0, RowsExpert
 MATMUL_Q8_KERNELS(q6_K, mmb_q6_K<RowsLinear>, mmb_q6_K<RowsExpert>)
 MATMUL_Q8_KERNELS(q4_K, mmb_q4_K_lin, mmb_q4_K_exp)
 MATMUL_Q8_KERNELS(q5_K, mmb_q5_K_lin, mmb_q5_K_exp)
+MATMUL_Q8_KERNELS(q2_K, (mmb_k2<false, RowsLinear>), (mmb_k2<false, RowsExpert>))
+MATMUL_Q8_KERNELS(q3_K, (mmb_k2<true, RowsLinear>), (mmb_k2<true, RowsExpert>))
 
 // ================================================================ WMMA tiled matmul (prefill, Phase 20 W2)
 //
@@ -2294,13 +2403,16 @@ __device__ __forceinline__ uint32_t sub32_bytes(uint32_t b) {
     return r | (m << 1) | (m << 2);
 }
 
-template <int KT>  // 4: Q4_K, 5: Q5_K, 6: Q6_K
+template <int KT>  // 2: Q2_K, 3: Q3_K, 4: Q4_K, 5: Q5_K, 6: Q6_K
 struct WStageK {
-    static constexpr int BYTES = KT == 6 ? 210 : KT == 5 ? 176 : 144;
-    uint32_t q[16];   // Q4/5: 8 dwords of qs for this part's 64-value sub-chunk; Q6: 16 dwords of ql (both parts)
-    uint32_t qh[8];   // Q5 / Q6 high bits (32 bytes at the chunk's qh offset)
-    uint32_t sc[3];   // Q4/5: the 12 scale bytes; Q6: 8 group scales (2 dwords)
-    uint32_t dd;      // fp16 d (and dmin for Q4/5)
+    static constexpr int BYTES = KT == 6 ? 210 : KT == 5 ? 176 : KT == 4 ? 144 : KT == 3 ? 110 : 84;
+    static constexpr int MINS = KT == 2 ? 8 : KT == 4 || KT == 5 ? 4 : 0;  // min groups per 128-value chunk
+    static constexpr int GW = KT == 4 || KT == 5 ? 2 : 1;                   // 16-value WMMAs per scale group
+    uint32_t q[16];   // Q4/5: 8 dwords of qs for this part's 64-value sub-chunk; Q6: 16 dwords of ql (both parts);
+                      // Q2/3: the half's 8 dwords of 2-bit values (both parts)
+    uint32_t qh[8];   // Q5 / Q6 high bits (32 bytes at the chunk's qh offset); Q3: the hmask
+    uint32_t sc[3];   // Q4/5, Q3: the 12 scale bytes; Q6: 8 group scales (2 dwords); Q2: the half's 8 scale bytes
+    uint32_t dd;      // fp16 d (and dmin for Q4/5, Q2)
     __device__ void load(const uint8_t *W, long long rb, int row, bool ok, int k0, int part) {
         const int hh = (k0 / 128) & 1;  // which half of the super-block
         const uint8_t *b = W + (long long)row * rb + (long long)(k0 / 256) * BYTES;
@@ -2313,7 +2425,25 @@ struct WStageK {
             dd = 0;
             return;
         }
-        if (KT == 6) {  // 2-aligned blocks
+        if (KT == 2 || KT == 3) {  // Q2_K 4-aligned, Q3_K 2-aligned
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                q[k] = KT == 3 ? ld32_a2(b + 32 + 32 * hh + 4 * k) : ld32(b + 16 + 32 * hh + 4 * k);
+                qh[k] = KT == 3 ? ld32_a2(b + 4 * k) : 0;
+            }
+#pragma unroll
+            for (int k = 8; k < 16; ++k) q[k] = 0;
+            if (KT == 3) {
+#pragma unroll
+                for (int k = 0; k < 3; ++k) sc[k] = ld32_a2(b + 96 + 4 * k);
+                dd = *(const uint16_t *)(b + 108);
+            } else {
+                sc[0] = ld32(b + 8 * hh);
+                sc[1] = ld32(b + 8 * hh + 4);
+                sc[2] = 0;
+                dd = ld32(b + 80);
+            }
+        } else if (KT == 6) {  // 2-aligned blocks
 #pragma unroll
             for (int k = 0; k < 16; ++k) q[k] = ld32_a2(b + 64 * hh + 4 * k);
 #pragma unroll
@@ -2339,7 +2469,33 @@ struct WStageK {
     __device__ void store(int8_t *srow, int *gsc, float *dw, float *dmin, int *mins, int k0, int part) const {
         const int hh = (k0 / 128) & 1;
         uint32_t *dst = (uint32_t *)(srow + 64 * part);
-        if (KT == 6) {
+        if (KT == 2 || KT == 3) {
+            // local values 32 j + l (l 0..31), j = 2 part + j': bits 2j of byte l (Q3: hmask bit 4 hh + j, q - 4)
+#pragma unroll
+            for (int jj = 0; jj < 2; ++jj) {
+                const int j = 2 * part + jj;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    uint32_t x = (q[k] >> (2 * j)) & 0x03030303u;
+                    if (KT == 3)
+                        x = (((x | (((qh[k] >> (4 * hh + j)) & 0x01010101u) << 2)) | 0x80808080u) - 0x04040404u) ^
+                            0x80808080u;
+                    dst[8 * jj + k] = x;
+                }
+            }
+            if (part == 0) {  // local group g = global group 8 hh + g
+                uint8_t sb[12];
+#pragma unroll
+                for (int k = 0; k < 12; ++k) sb[k] = (uint8_t)(sc[k / 4] >> (8 * (k % 4)));
+#pragma unroll
+                for (int g = 0; g < 8; ++g) {
+                    gsc[g] = KT == 3 ? q3k_scale(sb, 8 * hh + g) : (sb[g] & 0xF);
+                    if (KT == 2) mins[g] = sb[g] >> 4;
+                }
+                *dw = __half2float(__ushort_as_half((uint16_t)(dd & 0xFFFF)));
+                *dmin = KT == 2 ? __half2float(__ushort_as_half((uint16_t)(dd >> 16))) : 0.0f;
+            }
+        } else if (KT == 6) {
             // local values 64 part + 32 j + l: quarter qd = 2 part + j, ql byte l + 32 (qd & 1), nibble qd >> 1
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
@@ -2393,10 +2549,11 @@ struct WmmaKSmem {
     int8_t sw[WM_TILE][WM_KC + 16];
     int8_t sx[WM_TILE][WM_KC + 16];
     int sgsc[WM_TILE][8];   // integer scale of each local 16-value group
-    int smin[WM_TILE][4];   // Q4/5: mins of the chunk's 4 sub-blocks
+    int smin[WM_TILE][8];   // Q4/5: mins of the chunk's 4 sub-blocks; Q2: of its 8 groups
     float sdw[WM_TILE], sdm[WM_TILE];
     float sdx[WM_TILE];     // token Q8_K scale of this super-block
-    int sbs[WM_TILE][4];    // Q4/5: token group sums per sub-block (bs[2 sub] + bs[2 sub + 1])
+    int sbs[WM_TILE][8];    // token group sums per min group: Q4/5 per sub-block (bs[2 sub] + bs[2 sub + 1]), Q2
+                            // per group
 };
 
 // RM: the tile's tokens (WRowsLinear, or WRowsExpert: one expert's entries, MoE prefill), as in wmma_q80. NT: the
@@ -2443,7 +2600,7 @@ __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, 
         const int bk = k0 / 256, hh = (k0 / 128) & 1;
         if (tid < 64) {
             sdx[tid] = tid < T ? d8[rm.in(tid) * nbk + bk] : 0.0f;
-        } else if (KT != 6) {
+        } else if (WStageK<KT>::MINS == 4) {
             const int tt = tid - 64;
             const long long t = tt < T ? rm.in(tt) : 0;
 #pragma unroll
@@ -2452,6 +2609,11 @@ __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, 
                 sbs[tt][s2] = tt < T ? bs[t * (K / 16) + bk * 16 + 2 * sub] + bs[t * (K / 16) + bk * 16 + 2 * sub + 1]
                                      : 0;
             }
+        } else if (WStageK<KT>::MINS == 8) {
+            const int tt = tid - 64;
+            const long long t = tt < T ? rm.in(tt) : 0;
+#pragma unroll
+            for (int g = 0; g < 8; ++g) sbs[tt][g] = tt < T ? bs[t * (K / 16) + bk * 16 + 8 * hh + g] : 0;
         }
     };
 
@@ -2468,8 +2630,8 @@ __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, 
 #pragma unroll
             for (int r = 0; r < 8; ++r) isum[n][r] = 0;
         // Q4_K / Q5_K: one scale per 32-value sub-block, so its two 16-value WMMAs chain in the int32 accumulator
-        // and are scaled once (the same integer sums); Q6_K: a scale per 16 values
-        constexpr int GW = KT == 6 ? 1 : 2;  // WMMAs per scale group
+        // and are scaled once (the same integer sums); Q2_K, Q3_K, Q6_K: a scale per 16 values
+        constexpr int GW = WStageK<KT>::GW, NM = WStageK<KT>::MINS;
 #pragma unroll 1
         for (int g = 0; g < WM_KC / 16; g += GW) {
             v8i_t c[NT];
@@ -2494,28 +2656,27 @@ __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, 
         }
         // float step for this chunk
         float dwr[8], dmr[8];
-        int mr[8][4];
+        int mr[8][NM > 0 ? NM : 1];
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             const int rr = 16 * w + 2 * r + hi;
             dwr[r] = sdw[rr];
             dmr[r] = sdm[rr];
 #pragma unroll
-            for (int s2 = 0; s2 < 4; ++s2) mr[r][s2] = KT == 6 ? 0 : smin[rr][s2];
+            for (int s2 = 0; s2 < NM; ++s2) mr[r][s2] = smin[rr][s2];
         }
 #pragma unroll
         for (int n = 0; n < NT; ++n) {
             const int tt = 16 * n + i;
             const float dx = sdx[tt];
-            int bsp[4];
+            int bsp[NM > 0 ? NM : 1];
 #pragma unroll
-            for (int s2 = 0; s2 < 4; ++s2) bsp[s2] = KT == 6 ? 0 : sbs[tt][s2];
+            for (int s2 = 0; s2 < NM; ++s2) bsp[s2] = sbs[tt][s2];
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 int msum = 0;
-                if (KT != 6)
 #pragma unroll
-                    for (int s2 = 0; s2 < 4; ++s2) msum += mr[r][s2] * bsp[s2];
+                for (int s2 = 0; s2 < NM; ++s2) msum += mr[r][s2] * bsp[s2];
                 acc[n][r] += dx * (dwr[r] * (float)isum[n][r] - dmr[r] * (float)msum);
             }
         }
@@ -2535,68 +2696,33 @@ __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, 
     }
 }
 
-extern "C" __global__ void __launch_bounds__(128)
-matmul_wmma_q4_K(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, const int *bs, float *y,
-                 long long ldy, int N, int K, int T) {
-    __shared__ __attribute__((aligned(16))) WmmaKSmem sm;
-    const int t0 = blockIdx.y * WM_TILE;
-    wmma_q8k<4, 4>(W, row_bytes, q8, d8, bs, y, ldy, N, K, WRowsLinear{t0, min(WM_TILE, T - t0)}, sm);
-}
+// matmul_wmma_<type> (dense: 4 sub-tiles of 16 tokens) and matmul_wmma_id_<type> (MoE prefill: grid (ceil(N / 64),
+// max_tiles) over moe_group's expert tiles of up to 64 entries (QMV_WMMA_ID_TB), block 128; the arguments of
+// matmul_q8_id_<type>; the fewest sub-tiles that cover the tile's entries)
+#define MATMUL_WMMA_Q8K_KERNELS(name, KT)                                                                    \
+    extern "C" __global__ void __launch_bounds__(128)                                                        \
+        matmul_wmma_##name(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8,          \
+                           const int *bs, float *y, long long ldy, int N, int K, int T) {                    \
+        __shared__ __attribute__((aligned(16))) WmmaKSmem sm;                                                \
+        const int t0 = blockIdx.y * WM_TILE;                                                                 \
+        wmma_q8k<KT, 4>(W, row_bytes, q8, d8, bs, y, ldy, N, K, WRowsLinear{t0, min(WM_TILE, T - t0)}, sm);   \
+    }                                                                                                        \
+    extern "C" __global__ void __launch_bounds__(128) matmul_wmma_id_##name(MMID_ARGS) {                      \
+        const int k = blockIdx.y;                                                                            \
+        if (k >= *n_tiles) return;                                                                           \
+        __shared__ __attribute__((aligned(16))) WmmaKSmem sm;                                                \
+        const WRowsExpert rm{tile_e[k], tile_n[k], in_rows + tile_start[k], out_rows + tile_start[k]};       \
+        if (rm.nt <= 16) wmma_q8k<KT, 1>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                       \
+        else if (rm.nt <= 32) wmma_q8k<KT, 2>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                  \
+        else if (rm.nt <= 48) wmma_q8k<KT, 3>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                  \
+        else wmma_q8k<KT, 4>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                                   \
+    }
 
-// MoE prefill: grid (ceil(N / 64), max_tiles) over moe_group's expert tiles of up to 64 entries (QMV_WMMA_ID_TB),
-// block 128; same arguments as matmul_q8_id_<type>
-extern "C" __global__ void __launch_bounds__(128) matmul_wmma_id_q4_K(MMID_ARGS) {
-    const int k = blockIdx.y;
-    if (k >= *n_tiles) return;
-    __shared__ __attribute__((aligned(16))) WmmaKSmem sm;
-    const WRowsExpert rm{tile_e[k], tile_n[k], in_rows + tile_start[k], out_rows + tile_start[k]};
-    if (rm.nt <= 16) wmma_q8k<4, 1>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);
-    else if (rm.nt <= 32) wmma_q8k<4, 2>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);
-    else if (rm.nt <= 48) wmma_q8k<4, 3>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);
-    else wmma_q8k<4, 4>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);
-}
-
-extern "C" __global__ void __launch_bounds__(128)
-matmul_wmma_q5_K(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, const int *bs, float *y,
-                 long long ldy, int N, int K, int T) {
-    __shared__ __attribute__((aligned(16))) WmmaKSmem sm;
-    const int t0 = blockIdx.y * WM_TILE;
-    wmma_q8k<5, 4>(W, row_bytes, q8, d8, bs, y, ldy, N, K, WRowsLinear{t0, min(WM_TILE, T - t0)}, sm);
-}
-
-// MoE prefill: grid (ceil(N / 64), max_tiles) over moe_group's expert tiles of up to 64 entries (QMV_WMMA_ID_TB),
-// block 128; same arguments as matmul_q8_id_<type>
-extern "C" __global__ void __launch_bounds__(128) matmul_wmma_id_q5_K(MMID_ARGS) {
-    const int k = blockIdx.y;
-    if (k >= *n_tiles) return;
-    __shared__ __attribute__((aligned(16))) WmmaKSmem sm;
-    const WRowsExpert rm{tile_e[k], tile_n[k], in_rows + tile_start[k], out_rows + tile_start[k]};
-    if (rm.nt <= 16) wmma_q8k<5, 1>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);
-    else if (rm.nt <= 32) wmma_q8k<5, 2>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);
-    else if (rm.nt <= 48) wmma_q8k<5, 3>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);
-    else wmma_q8k<5, 4>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);
-}
-
-extern "C" __global__ void __launch_bounds__(128)
-matmul_wmma_q6_K(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8, const int *bs, float *y,
-                 long long ldy, int N, int K, int T) {
-    __shared__ __attribute__((aligned(16))) WmmaKSmem sm;
-    const int t0 = blockIdx.y * WM_TILE;
-    wmma_q8k<6, 4>(W, row_bytes, q8, d8, bs, y, ldy, N, K, WRowsLinear{t0, min(WM_TILE, T - t0)}, sm);
-}
-
-// MoE prefill: grid (ceil(N / 64), max_tiles) over moe_group's expert tiles of up to 64 entries (QMV_WMMA_ID_TB),
-// block 128; same arguments as matmul_q8_id_<type>
-extern "C" __global__ void __launch_bounds__(128) matmul_wmma_id_q6_K(MMID_ARGS) {
-    const int k = blockIdx.y;
-    if (k >= *n_tiles) return;
-    __shared__ __attribute__((aligned(16))) WmmaKSmem sm;
-    const WRowsExpert rm{tile_e[k], tile_n[k], in_rows + tile_start[k], out_rows + tile_start[k]};
-    if (rm.nt <= 16) wmma_q8k<6, 1>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);
-    else if (rm.nt <= 32) wmma_q8k<6, 2>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);
-    else if (rm.nt <= 48) wmma_q8k<6, 3>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);
-    else wmma_q8k<6, 4>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);
-}
+MATMUL_WMMA_Q8K_KERNELS(q2_K, 2)
+MATMUL_WMMA_Q8K_KERNELS(q3_K, 3)
+MATMUL_WMMA_Q8K_KERNELS(q4_K, 4)
+MATMUL_WMMA_Q8K_KERNELS(q5_K, 5)
+MATMUL_WMMA_Q8K_KERNELS(q6_K, 6)
 
 // ================================================================ int8 copy of a float LM head (opt-in)
 //

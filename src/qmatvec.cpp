@@ -40,7 +40,9 @@ static int g_wmma_min_t = 32;  // smaller batches, and N < 64 (a 64-row tile mos
 
 // The int8 kernels of the K-quants read the activations' Q8_K form; ROCmFP4, ROCmFP4_FAST, Q4_0, Q5_1 and Q8_0
 // weights the Q8_0 form
-static bool reads_q8k(int type) { return type == QT_Q4_K || type == QT_Q5_K || type == QT_Q6_K; }
+static bool reads_q8k(int type) {
+    return type == QT_Q2_K || type == QT_Q3_K || type == QT_Q4_K || type == QT_Q5_K || type == QT_Q6_K;
+}
 
 // The kernels' bs argument: the Q8_K group sums for K-quants, the Q8_0 block sums for the block-per-lane types (Q5_1,
 // Q4_1: their offsets)

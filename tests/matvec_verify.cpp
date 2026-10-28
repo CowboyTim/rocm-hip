@@ -54,7 +54,7 @@ struct ShmBuf {
 // x quantized and decoded back as ggml's CPU reference does for this weight type's vec_dot_type:
 // Q8_0 (x86 SIMD quantize_row_q8_0) for ROCmFP4 and Q8_0, Q8_K (quantize_row_q8_K_ref) for K-quants
 static void q8_roundtrip(int wtype, const float *x, float *out, int K) {
-    if (wtype == QT_Q4_K || wtype == QT_Q5_K || wtype == QT_Q6_K) {
+    if (wtype >= QT_Q2_K && wtype <= QT_Q6_K) {
         for (int b = 0; b < K; b += 256) {
             float amax = 0.0f, mx = 0.0f;
             for (int j = 0; j < 256; ++j)
@@ -156,6 +156,9 @@ static bool run_one(gguf_model_t *g, int64_t idx, ShmBuf &xb, ShmBuf &yb) {
     q8_roundtrip(type, x, xq.data(), K);
     double worst8 = 0.0;
     int bad8 = 0, worst8_n = 0;
+    // Q4_1 / Q5_1: the offsets use ggml's F16-rounded Q8_1 block sums (qmatvec_q8.s0), which this exact reference
+    // does not round
+    const double tol8 = type == QT_Q4_1 || type == QT_Q5_1 ? 5e-4 : 1e-5;
     for (int n = 0; n < N; ++n) {
         qt_to_float(type, W + (size_t)n * rb, row.data(), K);
         double ref = 0.0, mag = 0.0;
@@ -168,7 +171,7 @@ static bool run_one(gguf_model_t *g, int64_t idx, ShmBuf &xb, ShmBuf &yb) {
             worst8 = rel;
             worst8_n = n;
         }
-        if (rel > 1e-5) ++bad8;
+        if (rel > tol8) ++bad8;
     }
     printf("  [%s] %-32s %-18s int8 path (q8 x)   worst rel err %.2e (row %d)%s\n", bad8 ? "FAIL" : "PASS", name,
            tr->name, worst8, worst8_n, bad8 ? " <-- rows over 1e-5" : "");

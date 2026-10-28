@@ -2618,6 +2618,23 @@ m) and Q5_0 (22-byte, 2-aligned blocks: (q - 16) * d, int8 as signed) are one po
   same, int8 without WMMA departs at token 9 (also with flash attention off: a near tie). No spills. Gemma-4
   UD-Q8_K_XL (Q5_1 tensors): coherent, prefill 1,330 tok/s (a first run reads the model from disk: 530).
 
+### Quant types: Q2_K, Q3_K int8 / WMMA (2026-10-28)
+
+The two 2-bit K-quants (Q2_K: 4-bit scale | min per 16 values, d, dmin; Q3_K: hmask high bit -> q - 4 as int8, 6-bit
+signed scales per 16) share K2Lane<Q3> (a lane's 8 value bytes of a half: 4 groups x 8 values, their scales, Q2_K's
+mins of groups 2s, 2s + 1) for the decode (mv_k2) and batched (mmb_k2) kernels, and WStageK<2 / 3> for WMMA. The
+K-quant WMMA kernel now takes MINS min groups per chunk (Q2_K 8 of 16 values, Q4/5_K 4 sub-blocks, Q3/6_K none);
+its five kernel pairs come from one macro (MATMUL_WMMA_Q8K_KERNELS).
+- forward_verify (llama-quantize Q2_K / Q3_K_S mixes in /data/q4_0, refdata/ref_*_q2_k, _q3_k_s): 35B per-matrix
+  and expert checks at 1.8e-7, next token = llama.cpp, prefill = token by token. The 0.6B at 2-3 bits is fragile
+  (worst layer 0.92 / 0.99, the float kernels the same). matvec_verify: dense WMMA 70-token batches of every Q3_K
+  shape 1.2e-8 .. 2e-8 of the single-token sums (its int8 reference quantized Q2_K / Q3_K inputs as Q8_0: fixed;
+  Q4_1 / Q5_1 int8 rows 5e-4 there: the F16 offset sums). No spills.
+- 35B, 2,427-token prompt: int8 without WMMA -> WMMA prefill Q2_K 658 -> 1,798, Q3_K_S 649 -> 1,943 tok/s;
+  generation 84 / 76 tok/s. Greedy output = llama-completion's on the same prompt (16 / 12 tokens). (With the
+  prompt file's trailing newline, which llama-completion drops, the 3-bit model's first token is a near tie: our
+  WMMA + flash run ends at once.)
+
 ### BF16 dense prefill (ABC.gguf, a Qwen3.5 27B in BF16, 2026-10-25)
 
 Correct output; generation 4.1 tok/s (54 GB per token: the bandwidth); prefill **7.8 tok/s** (2,661 tokens in
