@@ -26,7 +26,7 @@ rocm-hip checkout it is the perl-minijinja-xs submodule:
     cd perl-minijinja-xs && bash scripts/setup-minijinja.sh && perl Makefile.PL && make && make install
 
 bin/rocm-inference-server is an OpenAI-compatible chat server (streamed, with reasoning and tool calls) for
-one model on a unix socket behind nginx; it needs Web::Route (perl/Web-Route in rocm-hip). See its POD:
+one model, and /v1/embeddings for an embedding model (EmbeddingGemma), on a unix socket behind nginx; it needs Web::Route (perl/Web-Route in rocm-hip). See its POD:
 
     rocm-inference-server --model /models/Qwen3.5-4B-ROCMFP4.gguf --listen /run/llm/llm.sock --mode 0660
 
@@ -35,6 +35,7 @@ Tests beyond t/00-load.t need the GPU and models, given by environment variables
     ROCM_INFERENCE_TEST_MODEL=/path/Qwen3.5-4B-ROCMFP4.gguf
     ROCM_INFERENCE_TEST_QWEN38=/path/Qwen3.8-Flash-Next-...-00001-of-00003.gguf
     ROCM_INFERENCE_TEST_DRAFT=/path/mtp-Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST.gguf
+    ROCM_INFERENCE_TEST_EMBED_MODEL=/path/embeddinggemma-300M-Q8_0.gguf
 
 LICENSE
 

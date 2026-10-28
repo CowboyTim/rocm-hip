@@ -19,6 +19,7 @@ our @EXPORT_OK = qw(
     load_model free_model kv_cache_init set_lm_head_q8 set_draft_model set_draft_tokens set_prefill_batch
     set_swa_ring swa_ring stage_info set_kv_type
     seq_new seq_select seq_current seq_free stream_begin chat_start step_streams step_chats
+    embedding_dim embed
     tokenize detokenize chat_template bos_id eos_id token_is_eog vocab_size
     n_ctx n_past reset prefill decode_token get_logits
     generate last_prompt_stats last_error
@@ -696,6 +697,13 @@ sequence.
 One step of each of several streams / chats (on different sequences) in one forward pass: batched decoding, each
 weight read once for all of them (about 3.5 times the tokens per second of stepping 8 in turn), with the same
 tokens. Returns one C<[$token, $text, $going, $reason]> / C<[\@deltas, $going]> per stream / chat.
+
+=item embedding_dim($m), embed($m, \@ids [, $normalize = 1])
+
+Embedding models (EmbeddingGemma: GGUF architecture C<gemma-embedding>; after C<kv_cache_init>, whose length is the
+longest input, at most 2048 tokens): C<embedding_dim> is the embedding's length (0 for other models), C<embed>
+returns the embedding of one input's token ids (C<tokenize>'s, with BOS and EOS) as an array reference, scaled to
+length 1 unless C<$normalize> is 0. Dies when the input is longer than the KV cache.
 
 =item chat_template($m [, $name]), bos_id, eos_id, token_is_eog, vocab_size, n_ctx, n_past, reset,
 prefill, decode_token, get_logits, last_prompt_stats, set_lm_head_q8, set_draft_model, set_draft_tokens,

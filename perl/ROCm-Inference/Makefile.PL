@@ -60,6 +60,7 @@ Tests: t/00-load.t runs anywhere; the others need the GPU and a model, given by 
                                             chat (with Minijinja), the KV block store
   ROCM_INFERENCE_TEST_QWEN38=<first shard>  Qwen3.8-Flash-Next (qwen4exp), with
   ROCM_INFERENCE_TEST_DRAFT=<mtp head.gguf> its MTP head: speculative decoding
+  ROCM_INFERENCE_TEST_EMBED_MODEL=<gguf>    an embedding model (EmbeddingGemma): embed, /v1/embeddings
 EOT
 
 WriteMakefile(

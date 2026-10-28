@@ -2564,6 +2564,27 @@ store). Perl `step_streams` / `step_chats`; the server's tick steps all running 
   prompt; 8 sequences 38.5 -> 107 tok/s (x2.8), 16: 134 tok/s (x3.5); qwen4exp_verify unchanged (559 of 564,
   logits 0.9967).
 
+### Embedding models: EmbeddingGemma — DONE ✅ (2026-10-28, user: a code indexer that uses embeddings)
+
+`/models/embeddinggemma-300M-Q8_0.gguf` (GGUF arch `gemma-embedding`, llama.cpp gemma-embedding.cpp):
+- Tokenizer: SentencePiece (`tokenizer.ggml.model` llama, llm_tokenizer_spm: score-ordered bigram merges, byte
+  fallback), add_eos_token; GGUF BOOL values are now read (the tokenizer flags were always their defaults).
+  tokenizer_gguf_verify: 27 prompts = llama.cpp.
+- Model: Gemma-4's dense blocks (load_layer_gemma4) with one head size; sliding layers by period 6 (every 6th
+  global, RoPE 1e6; the others RoPE 10000 with llama.cpp's symmetric window |p - z| <= 256); no ring.
+  Bidirectional attention: `attention_opts.bidir` -> `attn_bidir_<D>` after the prep kernel (one workgroup per
+  token and head, scores in LDS, up to 2048 positions), no V norm, scale 1 / sqrt(256). The output-normed rows
+  are pooled (pooling_type: mean) instead of an LM head. One input = one batch (prefill batch = the context).
+- API: `inference_embedding_dim`, `inference_embed` (L2-normalized optionally). Perl `embedding_dim`, `embed`.
+  Server: `/v1/embeddings` (string / strings / token arrays, float / base64, `dimensions` = Matryoshka truncation
+  renormalized, 400 past the context) with the embedding model as `--model` (embeddings only) or next to a chat
+  model (`--embedding-model`, `--embedding-name`). t/90-embed.t.
+- tests/embed_verify vs llama.cpp's llama-embedding (tools/gen_embed_ref.py -> refdata/, git-ignored): 8 texts of
+  3 .. 1,882 tokens, cosine >= 0.99982. ~11,400 tokens/s in one-input batches.
+- Not done: several inputs in one batch (block-diagonal attention: faster for many short chunks); the
+  sentence-transformers dense layers (dense_2 / dense_3, refused at load); other embedding architectures (BERT,
+  Qwen3-Embedding: causal, last-token pooling).
+
 ### BF16 dense prefill (ABC.gguf, a Qwen3.5 27B in BF16, 2026-10-25)
 
 Correct output; generation 4.1 tok/s (54 GB per token: the bandwidth); prefill **7.8 tok/s** (2,661 tokens in

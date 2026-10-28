@@ -327,6 +327,39 @@ vocab_size(h)
     RETVAL
 
 int
+embedding_dim(h)
+    SV* h
+  CODE:
+    RETVAL = inference_embedding_dim(handle_ptr(aTHX_ h, 0));
+  OUTPUT:
+    RETVAL
+
+SV*
+embed(h, ids_ref, normalize = 1)
+    SV* h
+    SV* ids_ref
+    int normalize
+  CODE:
+    /* the embedding of one input's token ids, as an array ref of floats */
+    inference_model_t* m = handle_ptr(aTHX_ h, 0);
+    const int d = inference_embedding_dim(m);
+    if (d <= 0) croak("ROCm::Inference::embed: not an embedding model");
+    int n = 0;
+    int32_t* ids = ids_from_av(aTHX_ ids_ref, &n);
+    float* out;
+    Newx(out, d, float);
+    const int rc = inference_embed(m, ids, n, out, normalize);
+    Safefree(ids);
+    if (rc != 0) { Safefree(out); croak_last(aTHX_ "embed", rc); }
+    AV* av = newAV();
+    av_extend(av, d - 1);
+    for (int i = 0; i < d; ++i) av_push(av, newSVnv(out[i]));
+    Safefree(out);
+    RETVAL = newRV_noinc((SV*)av);
+  OUTPUT:
+    RETVAL
+
+int
 n_ctx(h)
     SV* h
   CODE:

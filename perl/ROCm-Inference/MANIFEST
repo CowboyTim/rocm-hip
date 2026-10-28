@@ -19,5 +19,6 @@ t/50-draft.t
 t/60-server.t
 t/70-stage.t
 t/80-seq.t
+t/90-embed.t
 xt/pod-coverage.t
 xt/pod.t

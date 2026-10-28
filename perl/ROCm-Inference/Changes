@@ -34,6 +34,9 @@ Revision history for ROCm-Inference
       server's loop in one forward pass (needs Web::Route's pull responses); a client that leaves frees its
       sequence. A new prompt is prefilled --prefill-chunk tokens (512) per round, so the others go on meanwhile.
     - stream_begin / chat_start option prefill_chunk; ChatStream prompt_tokens.
+    - Embedding models (EmbeddingGemma, gemma-embedding): embedding_dim, embed; rocm-inference-server
+      /v1/embeddings (input strings or token arrays, encoding_format float / base64, dimensions), for an
+      embedding model as --model or next to a chat model (--embedding-model).
     - rocm-inference-server defaults for agents (opencode): --ctx is the model's trained context (at most
       131072) instead of 8192; --max_tokens 0 (no limit of its own) instead of a silent cap at 4096: a
       request's max_tokens is honoured, without one a reply runs to its end or the context's.

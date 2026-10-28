@@ -1,19 +1,23 @@
 #!/usr/bin/perl
 # rocm-inference-server: an OpenAI-compatible chat server (/v1/chat/completions, streamed as server-sent events)
-# for one model, on a unix socket behind nginx. See the POD at the end, or --help.
+# for one model, and /v1/embeddings for an embedding model, on a unix socket behind nginx. See the POD at the end,
+# or --help.
 use strict;
 use warnings;
 
 use Getopt::Long qw(GetOptions);
 use File::Basename qw(basename);
+use B ();
 use JSON::PP ();
+use MIME::Base64 qw(encode_base64);
 use Pod::Usage qw(pod2usage);
 use ROCm::Inference qw(:all);
 use Web::Route;
 
 my %o = (listen => './rocm-inference.sock', max_tokens => 0);
 GetOptions(\%o, 'model=s', 'listen=s', 'mode=s', 'ctx=i', 'name=s', 'draft=s', 'store=s', 'max_tokens=i',
-           'swa-ring=i', 'stage=s', 'kv-type=s', 'parallel=i', 'prefill-chunk=i', 'thinking!', 'log!', 'help') or pod2usage(2);
+           'swa-ring=i', 'stage=s', 'kv-type=s', 'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s',
+           'thinking!', 'log!', 'help') or pod2usage(2);
 pod2usage(-verbose => 2, -exitval => 0) if $o{help};
 pod2usage("--model is required\n") unless $o{model};
 ROCm::Inference::_require_minijinja()
@@ -27,10 +31,26 @@ print STDERR "stage: ", stage_info($m), "\n" if $o{stage};
 my $ring = $o{'swa-ring'} // ($o{store} ? 0 : -1);
 set_swa_ring($m, $ring);
 set_kv_type($m, $o{'kv-type'}) if $o{'kv-type'};
-# the model's trained context unless asked (n_ctx before kv_cache_init), at most 131072 by default
+# the model's trained context unless asked (n_ctx before kv_cache_init), at most 131072 by default (an embedding
+# model's input is one batch: at most 2048)
 my $trained = n_ctx($m);
-$o{ctx} //= $trained < 131072 ? $trained : 131072;
+my $emb_only = embedding_dim($m) > 0;  # --model is an embedding model: /v1/embeddings only
+my $cap = $emb_only ? 2048 : 131072;
+$o{ctx} //= $trained < $cap ? $trained : $cap;
+die "--store, --draft, --parallel: not for an embedding model\n"
+    if $emb_only && ($o{store} || $o{draft} || ($o{parallel} // 1) > 1);
 kv_cache_init($m, $o{ctx});
+# the embedding model: --model itself, or --embedding-model next to a chat model
+my ($E, $ename) = $emb_only ? ($m, $name) : ();
+if ($o{'embedding-model'}) {
+    die "--embedding-model: --model is an embedding model already\n" if $emb_only;
+    $ename = $o{'embedding-name'} // basename($o{'embedding-model'}) =~ s/(?:-\d{5}-of-\d{5})?\.gguf\z//r;
+    print STDERR "loading $o{'embedding-model'} ...\n";
+    $E = load_model($o{'embedding-model'}) // die "cannot load $o{'embedding-model'}: " . last_error() . "\n";
+    die "$o{'embedding-model'} is not an embedding model\n" unless embedding_dim($E);
+    my $n = n_ctx($E);
+    kv_cache_init($E, $n < 2048 ? $n : 2048);
+}
 set_draft_model($m, $o{draft}) if $o{draft};
 die "--store needs every layer's KV history: --swa-ring 0 (the default with --store)\n" if $o{store} && swa_ring($m);
 store_open($m, $o{store}) if $o{store};
@@ -120,19 +140,64 @@ sub finish_reason {
 
 route::get '/health' => sub { { status => 'ok' } };
 
+my @models = ($name, $E && $E != $m ? $ename : ());
 route::get '/v1/models' => sub {
-    { object => 'list', data => [ { id => $name, object => 'model', created => $created, owned_by => 'rocm-inference' } ] };
+    { object => 'list', data => [ map { { id => $_, object => 'model', created => $created, owned_by => 'rocm-inference' } }
+                                  @models ] };
 };
 route::get '/v1/models/*id' => sub {
     my ($req) = @_;
-    $req->{params}{id} eq $name or error(404, "no model '$req->{params}{id}'", 'not_found_error');
-    { id => $name, object => 'model', created => $created, owned_by => 'rocm-inference' };
+    grep { $_ eq $req->{params}{id} } @models or error(404, "no model '$req->{params}{id}'", 'not_found_error');
+    { id => $req->{params}{id}, object => 'model', created => $created, owned_by => 'rocm-inference' };
+};
+
+# OpenAI's /v1/embeddings: input a string, an array of strings, an array of token ids or an array of those;
+# encoding_format float (default) or base64 (little-endian float32); dimensions: the first N values, renormalized
+# (EmbeddingGemma is trained for 768, 512, 256 and 128). Each input is one batch: at most the context's tokens.
+sub is_number { my $f = B::svref_2object(\$_[0])->FLAGS; !ref $_[0] && ($f & (B::SVp_IOK | B::SVp_NOK)) && !($f & B::SVp_POK) }
+route::post '/v1/embeddings' => sub {
+    my ($req) = @_;
+    my $p = $req->{json};
+    ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');
+    $E or error(400, "$name is not an embedding model (start the server with --embedding-model)");
+    my $in = $p->{input};
+    my @inputs = !ref $in                                        ? ($in)
+               : ref $in eq 'ARRAY' && @$in && is_number($in->[0]) ? ($in)
+               : ref $in eq 'ARRAY'                              ? @$in
+               :                                                   ();
+    @inputs && !grep { !defined || (ref && ref ne 'ARRAY') } @inputs
+        or error(400, "'input' must be a string, an array of strings or of token arrays");
+    my $fmt = $p->{encoding_format} // 'float';
+    $fmt =~ /^(?:float|base64)\z/ or error(400, "encoding_format: float or base64");
+    my $dim = embedding_dim($E);
+    my $want = $p->{dimensions} // $dim;
+    $want =~ /^\d+\z/ && $want >= 1 && $want <= $dim or error(400, "dimensions: 1 .. $dim");
+    my $ctx = n_ctx($E);
+    my ($i, $tokens, @data) = (0, 0);
+    for my $x (@inputs) {
+        my $ids = ref $x ? [ map { int } @$x ] : tokenize($E, $x);
+        @$ids <= $ctx or error(400, "input $i is " . @$ids . " tokens, more than the context ($ctx)");
+        @$ids or error(400, "input $i is empty");
+        my $e = eval { embed($E, $ids, 1) } or error(500, $@ =~ s/ at \S+ line \d+\.?\n?\z//r, 'server_error');
+        if ($want < $dim) {  # Matryoshka: the leading values, back to length 1
+            $e = [ @$e[ 0 .. $want - 1 ] ];
+            my $n = 0;
+            $n += $_ * $_ for @$e;
+            $n = sqrt $n || 1;
+            $_ /= $n for @$e;
+        }
+        push @data, { object => 'embedding', index => $i++,
+                      embedding => $fmt eq 'base64' ? encode_base64(pack('f<*', @$e), '') : $e };
+        $tokens += @$ids;
+    }
+    { object => 'list', data => \@data, model => $ename, usage => { prompt_tokens => $tokens, total_tokens => $tokens } };
 };
 
 route::post '/v1/chat/completions' => sub {
     my ($req) = @_;
     my $p = $req->{json};
     ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');
+    error(400, "$name is an embedding model: use /v1/embeddings") if $emb_only;
     my ($messages, $opts) = (messages($p->{messages}), options($p));
     my $id = sprintf 'chatcmpl-%x%06x', time, int rand 2**24;
     my ($prompt_tokens, $completion_tokens) = (undef, 0);
@@ -350,7 +415,13 @@ rocm-inference-server - an OpenAI-compatible chat server for one model, behind n
 
 =item --model F<file.gguf>
 
-The model (the first shard of a split one). Required.
+The model (the first shard of a split one). Required. An embedding model (EmbeddingGemma) serves
+C</v1/embeddings> only.
+
+=item --embedding-model F<file.gguf>, --embedding-name NAME
+
+An embedding model next to the chat model, for C</v1/embeddings> (its name in C</v1/models>: the file's, unless
+given).
 
 =item --listen F<path> | host:port
 
@@ -433,6 +504,11 @@ streamed C<delta>s), its tool calls as C<tool_calls> (with arguments as a JSON s
 C<tool_calls>. Beyond OpenAI's: C<top_k>, C<min_p>, C<repeat_penalty>, C<chat_template_kwargs> (template
 variables, e.g. C<{"enable_thinking": false}>), C<reasoning_effort> (C<none> / C<minimal> turn thinking off),
 C<max_thinking_tokens> (or C<thinking_budget_tokens>): close the reasoning after that many tokens.
+
+C<POST /v1/embeddings> (with an embedding model), as OpenAI's: C<input> (a string, an array of strings, an array
+of token ids or an array of those), C<encoding_format> (C<float> or C<base64>), C<dimensions> (the leading values,
+renormalized: Matryoshka), C<usage.prompt_tokens>. Embeddings are normalized to length 1, as llama-server's; an
+input longer than the embedding model's context (2048 tokens at most) is an error (400).
 
 Requests are served one at a time; the model keeps the last conversation, so its next turn only prefills
 what is new (C<--store> extends that to every conversation). A client that disconnects stops its reply.
