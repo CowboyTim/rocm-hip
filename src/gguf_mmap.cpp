@@ -503,6 +503,7 @@ int32_t gguf_kv_get_u8(const gguf_model_t *m, int64_t idx, uint8_t *out) {
     switch (kv->scalar.type) {
         case GGUF_TYPE_UINT8:  *out=kv->scalar.v_u8; break;
         case GGUF_TYPE_INT8:   *out=(uint8_t)kv->scalar.v_i8; break;
+        case GGUF_TYPE_BOOL:   *out=kv->scalar.v_bool ? 1 : 0; break;
         default: return -1;
     }
     return 0;

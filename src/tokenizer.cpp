@@ -15,6 +15,11 @@
 // stage 2 splits only into runs of newlines and runs of other text, after every space became U+2581; stage 3
 // is skipped (the vocab and merges are raw UTF-8); a newline run that is a token is taken whole; a symbol not
 // in the vocab falls back to <0xXX> byte tokens; BOS is always added. Decoding turns U+2581 back into spaces.
+//
+// tokenizer.ggml.model = "llama" is SentencePiece (llama.cpp's llm_tokenizer_spm; EmbeddingGemma): spaces become
+// U+2581 (a space prefix first if add_space_prefix), the text is split into UTF-8 characters and the bigram that is
+// the highest-scoring token (tokenizer.ggml.scores; leftmost on ties) is merged until none is left; a final piece
+// that is no token is split back along its merges, down to <0xXX> byte tokens. add_eos_token appends EOS.
 
 #include "inference_log.h"
 #include "tokenizer.h"
@@ -24,6 +29,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <queue>
 #include <string>
 #include <unordered_map>
@@ -129,7 +135,7 @@ uint32_t ascii_lower(uint32_t c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
 
 // ---------------------------------------------------------------- pre-tokenizers
 
-enum PreType { PRE_QWEN2, PRE_QWEN35, PRE_GEMMA4, PRE_LLAMA3 };
+enum PreType { PRE_QWEN2, PRE_QWEN35, PRE_GEMMA4, PRE_LLAMA3, PRE_SPM };
 
 // Word lengths (in codepoints) for llama.cpp's qwen2 / qwen35 regex:
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N} | ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
@@ -227,7 +233,8 @@ struct tokenizer {
     std::vector<int> specials;                         // CONTROL/USER_DEFINED/UNKNOWN ids, longest text first
     PreType pre = PRE_QWEN2;
     int bos_id = -1, eos_id = -1, pad_id = -1, unk_id = -1;
-    bool add_bos = false;
+    bool add_bos = false, add_eos = false, add_space_prefix = false;
+    std::vector<float> score;  // id -> SentencePiece score (PRE_SPM)
     std::vector<int> eog;  // end-of-generation ids, sorted (build_eog)
 
     int lookup(const std::string& s) const {
@@ -351,9 +358,80 @@ struct tokenizer {
         }
     }
 
+    // SentencePiece (llama.cpp llm_tokenizer_spm_session::tokenize) over one span, spaces already U+2581
+    void spm(const std::string& text, std::vector<int>& out) const {
+        struct Sym { int prev, next; size_t off, n; };
+        std::vector<Sym> sym;
+        static const uint8_t kLen[16] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 3, 4};  // by the lead byte's top 4 bits
+        for (size_t off = 0; off < text.size();) {
+            const size_t len = std::min(text.size() - off, (size_t)kLen[(unsigned char)text[off] >> 4]);
+            sym.push_back({(int)sym.size() - 1, (int)sym.size() + 1, off, len});
+            off += len;
+        }
+        if (!sym.empty()) sym.back().next = -1;
+        struct Bigram { float score; int left, right; size_t size; };
+        auto lower = [](const Bigram& a, const Bigram& b) {
+            return a.score < b.score || (a.score == b.score && a.left > b.left);
+        };
+        std::priority_queue<Bigram, std::vector<Bigram>, decltype(lower)> q(lower);
+        std::unordered_map<std::string, std::pair<int, int>> rev_merge;
+        auto add_bigram = [&](int l, int r) {
+            if (l < 0 || r < 0) return;
+            const std::string t = text.substr(sym[l].off, sym[l].n + sym[r].n);
+            const int id = lookup(t);
+            if (id < 0) return;
+            q.push({id < (int)score.size() ? score[id] : 0.0f, l, r, t.size()});
+            rev_merge[t] = {l, r};
+        };
+        for (size_t i = 1; i < sym.size(); ++i) add_bigram((int)i - 1, (int)i);
+        while (!q.empty()) {
+            const Bigram bg = q.top();
+            q.pop();
+            Sym& L = sym[bg.left];
+            Sym& R = sym[bg.right];
+            if (L.n == 0 || R.n == 0 || L.n + R.n != bg.size) continue;  // stale
+            L.n += R.n;
+            R.n = 0;
+            L.next = R.next;
+            if (R.next >= 0) sym[R.next].prev = bg.left;
+            add_bigram(L.prev, bg.left);
+            add_bigram(bg.left, L.next);
+        }
+        // a piece that is no token: back along its merges, then bytes
+        std::function<void(const std::string&)> reseg = [&](const std::string& t) {
+            const int id = lookup(t);
+            if (id >= 0) { out.push_back(id); return; }
+            auto it = rev_merge.find(t);
+            if (it != rev_merge.end()) {
+                const Sym &a = sym[it->second.first], &b = sym[it->second.second];
+                // (the halves' texts as they were when merged: the same offsets, their lengths at that time)
+                const size_t la = b.off - a.off;
+                reseg(t.substr(0, la));
+                reseg(t.substr(la));
+                return;
+            }
+            for (char ch : t) {
+                int b = lookup(hex_byte_token((unsigned char)ch));
+                if (b < 0) b = lookup(std::string(1, ch));
+                if (b >= 0) out.push_back(b);
+            }
+        };
+        for (int i = sym.empty() ? -1 : 0; i >= 0; i = sym[i].next)
+            if (sym[i].n) reseg(text.substr(sym[i].off, sym[i].n));
+    }
+
     // Pre-tokenize + byte-encode + BPE one span of plain text
     void encode_text(const std::string& text, std::vector<int>& out) const {
         if (pre == PRE_GEMMA4) { encode_text_gemma4(text, out); return; }
+        if (pre == PRE_SPM) {
+            std::string esc;
+            for (char c : text) {
+                if (c == ' ') esc += "\xe2\x96\x81";
+                else esc += c;
+            }
+            spm(esc, out);
+            return;
+        }
         const std::vector<uint32_t> cpts = utf8_to_cpts(text);
         const std::vector<size_t> words = split_qwen(cpts, pre == PRE_QWEN35, pre == PRE_LLAMA3 ? 3 : 1);
         const ByteMap& bm = byte_map();
@@ -394,10 +472,18 @@ struct tokenizer {
             frags.swap(next);
         }
         if (add_bos && bos_id >= 0) out.push_back(bos_id);
+        bool prev_special = true;  // SentencePiece's space prefix: before text that follows no text
         for (const Frag& f : frags) {
-            if (f.id >= 0) out.push_back(f.id);
-            else encode_text(text.substr(f.off, f.len), out);
+            if (f.id >= 0) {
+                out.push_back(f.id);
+                prev_special = true;
+                continue;
+            }
+            const std::string t = text.substr(f.off, f.len);
+            encode_text(pre == PRE_SPM && add_space_prefix && prev_special ? " " + t : t, out);
+            prev_special = false;
         }
+        if (add_eos && eos_id >= 0) out.push_back(eos_id);
     }
 
     // One token's text: byte-decoded for normal tokens, verbatim for control/user-defined ones
@@ -405,7 +491,7 @@ struct tokenizer {
         if (id < 0 || id >= (int)vocab.size()) return;
         const std::string& t = vocab[id];
         if (type[id] == TT_CONTROL || type[id] == TT_USER_DEFINED || type[id] == TT_UNKNOWN) { out += t; return; }
-        if (pre == PRE_GEMMA4) {
+        if (pre == PRE_GEMMA4 || pre == PRE_SPM) {
             if (type[id] == TT_BYTE && t.size() == 6 && t.compare(0, 3, "<0x") == 0) {
                 out += (char)std::stoi(t.substr(3, 2), nullptr, 16);
                 return;
@@ -514,14 +600,15 @@ tokenizer_t* tokenizer_load_from_gguf(void* gguf_model) {
     if (!m) return nullptr;
 
     const char* model = gguf_tokenizer_type(m);
-    const bool gemma4 = model && strcmp(model, "gemma4") == 0;
-    if (!model || (strcmp(model, "gpt2") != 0 && !gemma4)) {
-        INFER_LOG("[tokenizer] unsupported tokenizer.ggml.model '%s' (gpt2 BPE, gemma4)\n", model ? model : "");
+    const bool gemma4 = model && strcmp(model, "gemma4") == 0, spm = model && strcmp(model, "llama") == 0;
+    if (!model || (strcmp(model, "gpt2") != 0 && !gemma4 && !spm)) {
+        INFER_LOG("[tokenizer] unsupported tokenizer.ggml.model '%s' (gpt2 BPE, gemma4, llama SPM)\n", model ? model : "");
         return nullptr;
     }
     const char* pre = gguf_pre_type(m);
     PreType pt;
     if (gemma4) pt = PRE_GEMMA4;
+    else if (spm) pt = PRE_SPM;
     else if (pre && strcmp(pre, "qwen35") == 0) pt = PRE_QWEN35;
     else if (pre && strcmp(pre, "qwen2") == 0) pt = PRE_QWEN2;
     else if (pre && (!strcmp(pre, "llama3") || !strcmp(pre, "llama-v3") || !strcmp(pre, "llama-bpe") ||
@@ -560,7 +647,18 @@ tokenizer_t* tokenizer_load_from_gguf(void* gguf_model) {
     t->pad_id = (int)kv_int(m, "tokenizer.ggml.padding_token_id", -1);
     t->unk_id = (int)kv_int(m, "tokenizer.ggml.unknown_token_id", -1);
     // llama.cpp forces BOS for gemma4; llama3 / pixtral default to it unless the GGUF says otherwise
-    t->add_bos = kv_bool(m, "tokenizer.ggml.add_bos_token", pt == PRE_LLAMA3) || pt == PRE_GEMMA4;
+    t->add_bos = kv_bool(m, "tokenizer.ggml.add_bos_token", pt == PRE_LLAMA3 || pt == PRE_SPM) || pt == PRE_GEMMA4;
+    t->add_eos = kv_bool(m, "tokenizer.ggml.add_eos_token", false);
+    t->add_space_prefix = kv_bool(m, "tokenizer.ggml.add_space_prefix", pt == PRE_SPM);
+    if (pt == PRE_SPM) {
+        int32_t st = -1;
+        const void* sc = nullptr;
+        size_t n_sc = 0;
+        if (gguf_kv_get_array(m, "tokenizer.ggml.scores", &st, &sc, &n_sc) == 0 && n_sc == n_vocab && st == 6 /* F32 */) {
+            t->score.resize(n_vocab);
+            memcpy(t->score.data(), sc, n_vocab * sizeof(float));
+        }
+    }
     std::vector<int> eog_ids = {t->eos_id};
     for (const char* key : {"tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id", "tokenizer.ggml.fim_pad_token_id",
                             "tokenizer.ggml.fim_rep_token_id", "tokenizer.ggml.fim_sep_token_id"})
