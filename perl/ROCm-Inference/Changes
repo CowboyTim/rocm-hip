@@ -34,6 +34,9 @@ Revision history for ROCm-Inference
       server's loop in one forward pass (needs Web::Route's pull responses); a client that leaves frees its
       sequence. A new prompt is prefilled --prefill-chunk tokens (512) per round, so the others go on meanwhile.
     - stream_begin / chat_start option prefill_chunk; ChatStream prompt_tokens.
+    - rocm-inference-server defaults for agents (opencode): --ctx is the model's trained context (at most
+      131072) instead of 8192; --max_tokens 0 (no limit of its own) instead of a silent cap at 4096: a
+      request's max_tokens is honoured, without one a reply runs to its end or the context's.
     - Chat templates are rendered with trim_blocks and lstrip_blocks, as transformers' apply_chat_template
       (Nemotron-3's template depends on them).
     - set_swa_ring / swa_ring: the sliding-window layers' KV cache as a ring (the default) or every layer's

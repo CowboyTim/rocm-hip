@@ -2612,6 +2612,8 @@ replaces (and a GPU context does not survive the master's fork), a GPU fault wou
   `AMD_SERIALIZE_KERNEL=1` for llama-server; the runtime stage is `FROM base` (compilers, the ROCm tarball
   in a layer); no `proxy_buffering off` for llama-server's streams; llama.pm sets status after
   send_http_header and forces messages[0] to system.
+- Defaults (2026-10-28, for opencode): `--ctx` the model's trained context (at most 131072; was 8192),
+  `--max_tokens` 0 = no cap of its own (was a silent cap at 4096: long file writes ended with `length`).
 - Not here yet: the Docker image build itself (untested). By default requests queue in the socket backlog
   while one generates; `--parallel N` (2026-10-26) serves N conversations at once (see "Several conversations
   at once" above).

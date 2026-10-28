@@ -11,7 +11,7 @@ use Pod::Usage qw(pod2usage);
 use ROCm::Inference qw(:all);
 use Web::Route;
 
-my %o = (listen => './rocm-inference.sock', ctx => 8192, max_tokens => 4096);
+my %o = (listen => './rocm-inference.sock', max_tokens => 0);
 GetOptions(\%o, 'model=s', 'listen=s', 'mode=s', 'ctx=i', 'name=s', 'draft=s', 'store=s', 'max_tokens=i',
            'swa-ring=i', 'stage=s', 'kv-type=s', 'parallel=i', 'prefill-chunk=i', 'thinking!', 'log!', 'help') or pod2usage(2);
 pod2usage(-verbose => 2, -exitval => 0) if $o{help};
@@ -27,6 +27,9 @@ print STDERR "stage: ", stage_info($m), "\n" if $o{stage};
 my $ring = $o{'swa-ring'} // ($o{store} ? 0 : -1);
 set_swa_ring($m, $ring);
 set_kv_type($m, $o{'kv-type'}) if $o{'kv-type'};
+# the model's trained context unless asked (n_ctx before kv_cache_init), at most 131072 by default
+my $trained = n_ctx($m);
+$o{ctx} //= $trained < 131072 ? $trained : 131072;
 kv_cache_init($m, $o{ctx});
 set_draft_model($m, $o{draft}) if $o{draft};
 die "--store needs every layer's KV history: --swa-ring 0 (the default with --store)\n" if $o{store} && swa_ring($m);
@@ -87,8 +90,11 @@ sub options {
         $vars{enable_thinking} = defined $effort ? ($effort =~ /^(?:none|minimal)\z/ ? 0 : 1) : $o{thinking}
             if defined $effort || defined $o{thinking};
     }
-    my %c = (vars => \%vars, max_new_tokens => $p->{max_completion_tokens} // $p->{max_tokens} // $o{max_tokens});
-    $c{max_new_tokens} = $o{max_tokens} if $c{max_new_tokens} > $o{max_tokens} || $c{max_new_tokens} < 1;
+    # the request's max_tokens, else up to the context's end (finish_reason length); --max_tokens N caps both
+    my $want = $p->{max_completion_tokens} // $p->{max_tokens};
+    $want = $o{ctx} if !defined $want || $want < 1;
+    $want = $o{max_tokens} if $o{max_tokens} > 0 && $want > $o{max_tokens};
+    my %c = (vars => \%vars, max_new_tokens => $want);
     for (qw(temperature top_p top_k min_p seed repeat_penalty)) { $c{$_} = $p->{$_} if defined $p->{$_} }
     $c{stop} = ref $p->{stop} ? $p->{stop} : [ $p->{stop} ] if defined $p->{stop};
     my $budget = $p->{max_thinking_tokens} // $p->{thinking_budget_tokens};
@@ -320,7 +326,8 @@ sub tick {
     return scalar @running;
 }
 
-print STDERR "serving $name on $o{listen}", ($parallel > 1 ? " ($parallel conversations at once)" : ''), "\n";
+print STDERR "serving $name on $o{listen}: context $o{ctx} tokens (trained $trained)",
+    ($parallel > 1 ? ", $parallel conversations at once" : ''), "\n";
 run(listen => $o{listen}, log => $o{log} // 1, defined $o{mode} ? (mode => oct $o{mode}) : (),
     $parallel > 1 ? (tick => \&tick) : ());
 
@@ -355,7 +362,8 @@ The socket file's permissions (nginx's user must be able to write to it).
 
 =item --ctx N
 
-Context length (8192).
+Context length per conversation: the model's trained context, at most 131072, unless given. (Each
+conversation's KV cache is this long: C<--parallel> N takes N times the memory.)
 
 =item --stage F<dir>
 
@@ -401,7 +409,9 @@ A KV block store (e.g. under F</dev/shm>): prompt prefixes are reused across con
 
 =item --max_tokens N
 
-The most tokens a reply may have, and the default (4096).
+The most tokens a reply may have (0, the default: no limit of its own). A request's C<max_tokens> /
+C<max_completion_tokens> is honoured up to it; without one a reply goes on until it ends or the context is full
+(C<finish_reason> C<length>).
 
 =item --[no]thinking
 
