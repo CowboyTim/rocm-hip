@@ -149,6 +149,17 @@ static bool bind_weight(gguf_model_t* gguf, const char* name, QuantWeight& w, bo
     const int64_t* ne = gguf_tensor_ne(gguf, idx);
     const int nd = gguf_tensor_dims(gguf, idx);
     if (!qt_get_traits(type)) { set_error("%s: unsupported tensor type %d", name, type); return false; }
+    // NVFP4 converted from ModelOpt / compressed-tensors checkpoints carries a per-tensor (per-expert) global scale
+    // <name>.scale that multiplies the matmul's output (llama.cpp's build_lora_mm w_s); not applied yet
+    if (type == QT_NVFP4) {
+        std::string s(name);
+        if (s.size() > 7 && s.compare(s.size() - 7, 7, ".weight") == 0 &&
+            find_tensor_index(gguf, (s.substr(0, s.size() - 7) + ".scale").c_str()) >= 0) {
+            set_error("%s: NVFP4 with a per-tensor scale (%s.scale) is not supported yet", name,
+                      s.substr(0, s.size() - 7).c_str());
+            return false;
+        }
+    }
     // A 3-D tensor (MoE experts, ne = {K, rows per expert, n_expert}) is bound as one matrix of all experts'
     // rows: expert e is the row range [e * ne[1], (e + 1) * ne[1])
     if (!ne || nd < 1 || nd > 3) { set_error("%s: expected a 2-D or 3-D tensor (n_dims=%d)", name, nd); return false; }

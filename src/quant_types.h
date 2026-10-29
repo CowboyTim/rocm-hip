@@ -30,6 +30,8 @@ enum qt_type {
     QT_Q5_K = 13,
     QT_Q6_K = 14,
     QT_BF16 = 30,
+    QT_MXFP4 = 39,
+    QT_NVFP4 = 40,
     QT_Q4_0_ROCMFP4      = 100,
     QT_Q4_0_ROCMFP4_FAST = 101,
 };

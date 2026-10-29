@@ -2635,6 +2635,30 @@ its five kernel pairs come from one macro (MATMUL_WMMA_Q8K_KERNELS).
   prompt file's trailing newline, which llama-completion drops, the 3-bit model's first token is a near tie: our
   WMMA + flash run ends at once.)
 
+### Quant types: MXFP4, NVFP4 (2026-10-29, user: "ok, implement those")
+
+Both reuse existing kernel families through a policy struct, no new kernel bodies:
+- MXFP4 (type 39, 17 bytes / 32 values: E8M0 scale, then ROCmFP4_FAST's nibble layout; E2M1 codebook with 12 as the
+  top level): the ROCmFP4_FAST quad kernels (mv, mmb, WMMA dense / expert) now take PF (scale / value byte offsets,
+  scale(), dec4()). fp4_dec4<TOP> is rocmfp4_dec4 with the top level a template parameter. WStageFast reads a
+  dword at a run-time 0 / 2 byte shift with dword_sh (MXFP4's values start at byte 1). The ROCmFP4_FAST and ROCmFP4
+  int8 / WMMA kernels compile to the same instructions as before (disassembly compared).
+- NVFP4 (type 40, 36 bytes / 64 values: four UE4M3 scales per 16, sub-block nibbles j / j + 8): one block is a P4
+  pair; P4NVFP4::pair() regroups the nibbles into ROCmFP4's j / j + 16 layout (2 ANDs, shifts, ORs per dword), half-
+  block scales as ROCmFP4. ggml's UE4M3 decode ignores the sign bit: masked to match.
+- Float kernels (BlkMXFP4, BlkNVFP4) and CPU decoders; dequant_verify bit-exact on 0.6B tensors of both.
+- Test models (llama-quantize, /data/q4_0): Qwen3-0.6B-MXFP4 (`--tensor-type <proj>=mxfp4`, rest Q8_0), -NVFP4;
+  Qwen3.6-35B-A3B-MXFP4 (MXFP4_MOE: experts MXFP4, rest Q8_0), -NVFP4. References in /data/q4_0/refs.
+- forward_verify (35B): every per-matrix and expert check passes (int8 2e-7 .. 7e-7, grouped prefill bit-equal);
+  next token = llama.cpp. On this 20-token prompt the engine's per-layer drift is lower than Q4_0's (worst 0.988
+  MXFP4, 0.976 NVFP4 at the last layer only, Q4_0 0.984 with 14 layers below 0.99). The 0.6B NVFP4 drifts to 0.93
+  around layer 13 (float kernels 0.98): its fragility, as Q2_K's. Greedy MXFP4 text = llama-completion's; NVFP4
+  differs at a near tie (' the' 21.42 vs ' molecules' 21.11 in llama.cpp's own logits).
+- 35B, 553-token prompt: WMMA prefill MXFP4 2,112, NVFP4 1,859 tok/s (Q4_0 2,026; int8 without WMMA 681 / 816);
+  generation NVFP4 79 tok/s, MXFP4_MOE 60 (its Q8_0 attention).
+- Not done: NVFP4's per-tensor global scale (`<weight>.scale`, ModelOpt's weight_scale_2, and per expert) that real
+  NVFP4 GGUFs carry; the loader refuses them. gpt-oss (MXFP4's own models) is a new architecture.
+
 ### BF16 dense prefill (ABC.gguf, a Qwen3.5 27B in BF16, 2026-10-25)
 
 Correct output; generation 4.1 tok/s (54 GB per token: the bandwidth); prefill **7.8 tok/s** (2,661 tokens in

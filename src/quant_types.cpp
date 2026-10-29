@@ -345,6 +345,47 @@ static void deq_rocmfp4_fast(const void *src, float *y, int64_t n) {
     }
 }
 
+// ---------------------------------------------------------------- MXFP4 / NVFP4
+
+// E2M1 at half scale (ggml's kvalues_mxfp4)
+static const int8_t mxfp4_codebook[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+// E8M0 scale byte -> half-scale float 2^(e - 128), as ggml's GGML_E8M0_TO_FP32_HALF
+static inline float e8m0_half(uint8_t e) {
+    const uint32_t bits = e < 2 ? 0x00200000u << e : (uint32_t)(e - 1) << 23;
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
+// MXFP4: e, qs[16] = 17 B; values 0..15 = low nibbles, 16..31 = high nibbles
+static void deq_mxfp4(const void *src, float *y, int64_t n) {
+    const uint8_t *b = (const uint8_t *)src;
+    for (int64_t i = 0; i < n / 32; ++i, b += 17, y += 32) {
+        const float d = e8m0_half(b[0]);
+        for (int j = 0; j < 16; ++j) {
+            y[j]      = (float)mxfp4_codebook[b[1 + j] & 0x0f] * d;
+            y[j + 16] = (float)mxfp4_codebook[b[1 + j] >> 4] * d;
+        }
+    }
+}
+
+// NVFP4: d[4] (UE4M3, the sign bit ignored as ggml's ggml_ue4m3_to_fp32), qs[32] = 36 B per 64 values; sub-block s
+// (16 values) has scale d[s] and bytes 8s .. 8s + 7: value j in the low nibble of byte j, j + 8 in the high one
+static void deq_nvfp4(const void *src, float *y, int64_t n) {
+    const uint8_t *b = (const uint8_t *)src;
+    for (int64_t i = 0; i < n / 64; ++i, b += 36) {
+        for (int s = 0; s < 4; ++s, y += 16) {
+            const float d = ue4m3_half(b[s] & 0x7f);
+            const uint8_t *qs = b + 4 + 8 * s;
+            for (int j = 0; j < 8; ++j) {
+                y[j]     = (float)mxfp4_codebook[qs[j] & 0x0f] * d;
+                y[j + 8] = (float)mxfp4_codebook[qs[j] >> 4] * d;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- table
 
 // verified: 1 = bit-exact vs `ref_dump dequant` on a real GGUF tensor (tests/dequant_verify)
@@ -362,6 +403,8 @@ static const qt_traits k_traits[] = {
     {QT_Q5_K,              "q5_K",              256, 176, deq_q5_K,         1},
     {QT_Q6_K,              "q6_K",              256, 210, deq_q6_K,         1},
     {QT_BF16,              "bf16",              1,   2,   deq_bf16,         1},
+    {QT_MXFP4,             "mxfp4",             32,  17,  deq_mxfp4,        1},
+    {QT_NVFP4,             "nvfp4",             64,  36,  deq_nvfp4,        1},
     {QT_Q4_0_ROCMFP4,      "q4_0_rocmfp4",      32,  18,  deq_rocmfp4,      1},
     {QT_Q4_0_ROCMFP4_FAST, "q4_0_rocmfp4_fast", 32,  17,  deq_rocmfp4_fast, 1},
 };

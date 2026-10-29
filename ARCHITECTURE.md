@@ -82,9 +82,11 @@ Weights stay in their GGUF blocks; each type has a CPU decoder (tests) and GPU k
 - **LM head**: on the last row only (two rows in a verify pass); opt-in int8 copy of a float head
   (`inference_set_lm_head_q8`).
 
-Supported weight types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K–Q6_K, ROCmFP4 and ROCmFP4_FAST; int8
-kernels (single token, batched, WMMA where noted) for ROCmFP4, ROCmFP4_FAST and Q8_0 (WMMA, also for experts), Q4_K,
-Q5_K, Q6_K (WMMA dense and expert); F32, F16 and BF16 have dedicated 16-byte-load float kernels (F16 / BF16
+Supported weight types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K–Q6_K, MXFP4, NVFP4, ROCmFP4 and
+ROCmFP4_FAST; int8 kernels (single token, batched, WMMA dense and expert) for all but the float types. Types that
+share a layout share the kernels through a small policy struct: the 36-byte pair family (ROCmFP4, Q4_0, NVFP4), the
+17-byte quad family (ROCmFP4_FAST, MXFP4), a block per lane (Q4_1, Q5_0, Q5_1) and the K-quants. NVFP4 from
+ModelOpt / compressed-tensors checkpoints (a per-tensor `.scale` on the output) is refused at load. F32, F16 and BF16 have dedicated 16-byte-load float kernels (F16 / BF16
 round the activations to their type first, as ggml). The CPU decoders are bit-exact against the reference's on real
 tensors (`tests/dequant_verify`).
 

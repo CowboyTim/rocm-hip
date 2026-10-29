@@ -38,8 +38,8 @@ static int g_wmma_min_t = 32;  // smaller batches, and N < 64 (a 64-row tile mos
 #define QMV_WM_THREADS 256    // its block size
 #define QMV_WMMA_ID_TB 64  // entries per expert tile of matmul_wmma_id_<type> (4 sub-tiles of 16)
 
-// The int8 kernels of the K-quants read the activations' Q8_K form; ROCmFP4, ROCmFP4_FAST, Q4_0, Q5_1 and Q8_0
-// weights the Q8_0 form
+// The int8 kernels of the K-quants read the activations' Q8_K form; the other types' (ROCmFP4, MXFP4, NVFP4, Q4_0, Q5_1,
+// Q8_0, ...) the Q8_0 form
 static bool reads_q8k(int type) {
     return type == QT_Q2_K || type == QT_Q3_K || type == QT_Q4_K || type == QT_Q5_K || type == QT_Q6_K;
 }
@@ -49,10 +49,17 @@ static bool reads_q8k(int type) {
 static bool block_per_lane(int type) { return type == QT_Q5_1 || type == QT_Q4_1 || type == QT_Q5_0; }
 static const int32_t *q8_sums(int type, const qmatvec_q8 *q) { return block_per_lane(type) ? q->s0 : q->bsK; }
 
+// The Q8_0-activation types whose int8 kernels give a lane a pair of 32-value blocks (36 / 68 bytes: ROCmFP4, Q4_0,
+// Q8_0; NVFP4's one 64-value block), and those that give it a quad of 17-byte blocks (ROCmFP4_FAST, MXFP4)
+static bool pair_type(int type) {
+    return type == QT_Q4_0_ROCMFP4 || type == QT_Q4_0 || type == QT_Q8_0 || type == QT_NVFP4;
+}
+static bool quad_type(int type) { return type == QT_Q4_0_ROCMFP4_FAST || type == QT_MXFP4; }
+
 // The WMMA kernels of the Q8_0-activation types with 2 blocks per staging thread take K % 64 (a last half chunk);
 // ROCmFP4_FAST (block quads) and the K-quants K % 128
 static int wmma_k_multiple(int type) {
-    return type == QT_Q4_0_ROCMFP4 || type == QT_Q4_0 || type == QT_Q8_0 || block_per_lane(type) ? 64 : 128;
+    return pair_type(type) || block_per_lane(type) ? 64 : 128;
 }
 
 int qmatvec_init(const char *co_path) {
@@ -234,8 +241,8 @@ void qmatvec_q8_bind(qmatvec_q8 *q, void *mem, int max_k) {
 // whole 256-value Q8_K blocks: e.g. the qwen4exp experts' K = 640. K-quants read Q8_K and need K % 256 == 0.
 int qmatvec_q8_supported(int type, int K) {
     if (type < 0 || type >= QMV_MAX_TYPE || !g_fn_q8[type] || !g_quant) return 0;
-    if (type == QT_Q4_0_ROCMFP4 || type == QT_Q4_0 || type == QT_Q8_0) return K % 64 == 0;  // block pairs (36 / 68 bytes)
-    if (type == QT_Q4_0_ROCMFP4_FAST) return K % 128 == 0;  // lanes take 68-byte block quads
+    if (pair_type(type)) return K % 64 == 0;   // block pairs (36 / 68 bytes)
+    if (quad_type(type)) return K % 128 == 0;  // lanes take 68-byte block quads
     if (block_per_lane(type)) return K % 32 == 0;            // a block per lane (Q5_1, Q4_1, Q5_0)
     return K % 256 == 0;
 }
@@ -253,10 +260,10 @@ hipError_t qmatvec_quantize(const float *x, int K, const qmatvec_q8 *q, hipStrea
 // leave most of the wave idle. See Q8_ROW_INDEX in matvec_q.hip.
 static int q8_lanes_per_row(int type, int K, long long rows) {
     const bool kq = reads_q8k(type);
-    const int tasks = type == QT_Q4_0_ROCMFP4 || type == QT_Q4_0 || type == QT_Q8_0 ? K / 64
-                      : type == QT_Q4_0_ROCMFP4_FAST          ? K / 128
-                      : block_per_lane(type)                  ? K / 32
-                                                              : K / 256 * 8;
+    const int tasks = pair_type(type)         ? K / 64
+                      : quad_type(type)       ? K / 128
+                      : block_per_lane(type)  ? K / 32
+                                              : K / 256 * 8;
     int L = 32;
     while (L > (kq ? 8 : 4) && L / 2 >= tasks) L /= 2;
     // ROCmFP4_FAST: at most 8 lanes per row, i.e. several 68-byte quads per lane. Measured on the 35B: z
@@ -264,7 +271,7 @@ static int q8_lanes_per_row(int type, int K, long long rows) {
     // of few rows (all rows of the launch) need more lanes to keep enough loads in flight: the qwen4exp mixers'
     // down + inject (324 x 10240) ran at 118 GB/s with 8.
     const int cap = rows >= 4096 ? 8 : rows >= 1024 ? 16 : 32;
-    if (type == QT_Q4_0_ROCMFP4_FAST && L > cap) L = cap;
+    if (quad_type(type) && L > cap) L = cap;
     return L;
 }
 

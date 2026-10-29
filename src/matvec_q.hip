@@ -349,6 +349,40 @@ struct BlkROCmFP4 {
     }
 };
 
+// E8M0 scale byte -> half-scale float 2^(e - 128), as ggml's GGML_E8M0_TO_FP32_HALF
+__device__ __forceinline__ float e8m0_half(uint8_t e) {
+    return __uint_as_float(e < 2 ? 0x00200000u << e : (uint32_t)(e - 1) << 23);
+}
+
+__constant__ int8_t k_mxfp4_codebook[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+struct BlkMXFP4 {  // an E8M0 scale, then 16 value bytes (j: low nibble, j + 16: high) = 17 B per 32 values
+    static constexpr int QK = 32, BYTES = 17;
+    __device__ static float dot(const uint8_t *b, const float *x) {
+        float s = 0.0f;
+        for (int j = 0; j < 16; ++j) {
+            s += k_mxfp4_codebook[b[1 + j] & 0x0f] * x[j];
+            s += k_mxfp4_codebook[b[1 + j] >> 4] * x[j + 16];
+        }
+        return s * e8m0_half(b[0]);
+    }
+};
+
+struct BlkNVFP4 {  // four UE4M3 scales, then four 8-byte sub-blocks of 16 values (j: low nibble, j + 8: high)
+    static constexpr int QK = 64, BYTES = 36;
+    __device__ static float dot(const uint8_t *b, const float *x) {
+        float s = 0.0f;
+        for (int sb = 0; sb < 4; ++sb) {
+            const uint8_t *q = b + 4 + 8 * sb;
+            float t = 0.0f;
+            for (int j = 0; j < 8; ++j)
+                t += k_mxfp4_codebook[q[j] & 0x0f] * x[16 * sb + j] + k_mxfp4_codebook[q[j] >> 4] * x[16 * sb + j + 8];
+            s += t * ue4m3_half(b[sb] & 0x7F);
+        }
+        return s;
+    }
+};
+
 struct BlkROCmFP4Fast {
     static constexpr int QK = 32, BYTES = 17;
     __device__ static float dot(const uint8_t *b, const float *x) {
@@ -772,6 +806,8 @@ MATVEC_COOP_KERNEL(q5_K, BlkQ5_KCoop)
 MATVEC_COOP_KERNEL(q6_K, BlkQ6_KCoop)
 MATVEC_KERNEL(q4_0_rocmfp4, BlkROCmFP4)
 MATVEC_KERNEL(q4_0_rocmfp4_fast, BlkROCmFP4Fast)
+MATVEC_KERNEL(mxfp4, BlkMXFP4)
+MATVEC_KERNEL(nvfp4, BlkNVFP4)
 
 // Float expert-indexed (MoE) kernels, for types without an int8 kernel (and QWEN_MATVEC_FP32): same grid and
 // ids / x_per_slot convention as matvec_q8_id_<type> below, on the FP32 input rows.
@@ -816,6 +852,8 @@ MATVEC_ID_KERNEL(q5_K, BlkQ5_KCoop, true)
 MATVEC_ID_KERNEL(q6_K, BlkQ6_KCoop, true)
 MATVEC_ID_KERNEL(q4_0_rocmfp4, BlkROCmFP4, false)
 MATVEC_ID_KERNEL(q4_0_rocmfp4_fast, BlkROCmFP4Fast, false)
+MATVEC_ID_KERNEL(mxfp4, BlkMXFP4, false)
+MATVEC_ID_KERNEL(nvfp4, BlkNVFP4, false)
 
 // BF16 experts: as matvec_bf16 (bf16_lane_dot), so that the expert-tiled batch below gives decoding's bits
 extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
@@ -881,6 +919,8 @@ MATMUL_F_ID_KERNEL(q2_K, BlkQ2_K)
 MATMUL_F_ID_KERNEL(q3_K, BlkQ3_K)
 MATMUL_F_ID_KERNEL(q4_0_rocmfp4, BlkROCmFP4)
 MATMUL_F_ID_KERNEL(q4_0_rocmfp4_fast, BlkROCmFP4Fast)
+MATMUL_F_ID_KERNEL(mxfp4, BlkMXFP4)
+MATMUL_F_ID_KERNEL(nvfp4, BlkNVFP4)
 
 extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matmul_f_id_bf16(MMF_ID_ARGS) {
     const int lane = threadIdx.x & 31;
@@ -931,15 +971,18 @@ quantize_q8(const float *x, int n, Q8Out o) {
     q8_block_value(i < n ? x[i] : 0.0f, i < n, b, t, sh, o);
 }
 
-// Four ROCmFP4 nibbles (one per byte, 0..15) -> four int8 codebook values {0,1,2,3,4,6,8,10} with sign bit 3,
-// by v_perm_b32 byte lookups into a positive and a negative 8-entry table
-__device__ __forceinline__ int rocmfp4_dec4(uint32_t n) {
+// Four FP4 nibbles (one per byte, 0..15) -> four int8 codebook values {0,1,2,3,4,6,8,TOP} with sign bit 3, by
+// v_perm_b32 byte lookups into a positive and a negative 8-entry table. ROCmFP4: TOP 10; MXFP4 / NVFP4 (E2M1 at
+// half scale, ggml's kvalues_mxfp4): 12.
+template <int TOP>
+__device__ __forceinline__ int fp4_dec4(uint32_t n) {
     const uint32_t sel = n & 0x07070707u;
-    const uint32_t pos = __builtin_amdgcn_perm(0x0A080604u, 0x03020100u, sel);
-    const uint32_t neg = __builtin_amdgcn_perm(0xF6F8FAFCu, 0xFDFEFF00u, sel);
+    const uint32_t pos = __builtin_amdgcn_perm(0x00080604u | (uint32_t)TOP << 24, 0x03020100u, sel);
+    const uint32_t neg = __builtin_amdgcn_perm(0x00F8FAFCu | (uint32_t)(256 - TOP) << 24, 0xFDFEFF00u, sel);
     const uint32_t m = ((n >> 3) & 0x01010101u) * 0xFFu;
     return (int)((pos & ~m) | (neg & m));
 }
+__device__ __forceinline__ int rocmfp4_dec4(uint32_t n) { return fp4_dec4<10>(n); }
 
 // The 18-byte 4-bit block types, read as 4-aligned pairs of blocks (36 bytes, 9 dwords; K % 64 == 0): values j
 // (0..15) in the low nibbles of the 16 value bytes, j + 16 in the high ones. A policy P gives pair() (the two
@@ -947,6 +990,9 @@ __device__ __forceinline__ int rocmfp4_dec4(uint32_t n) {
 // block's float sum from its two half-block int dots), so every kernel family is written once for both:
 //  ROCmFP4: 16 value bytes, then two UE4M3 scales (one per 16 values); FP4 codebook values.
 //  Q4_0: an F16 scale, then 16 value bytes; values nibble - 8. As ggml's vec_dot_q4_0_q8_0: (d_w d_x) * sumi.
+//  NVFP4: one 36-byte block per pair (64 values): four UE4M3 scales (one per 16 values), then four 8-byte
+//         sub-blocks, value j of sub-block s in the low nibble of its byte j, j + 8 in the high one; pair()
+//         regroups the nibbles into the layout above. As ggml's vec_dot_nvfp4_q8_0: per 16 values dy d sumi.
 struct P4ROCmFP4 {
     static constexpr bool BLOCK_SCALE = false;  // (WMMA: a scale per half-block)
     __device__ static void pair(const uint32_t w[9], uint32_t qs[2][4], float e[2][2]) {
@@ -980,6 +1026,27 @@ struct P4Q4_0 {
     // nibbles 0..15 -> -8..7 per byte (no borrow between bytes: each is >= 0x80 before the subtraction)
     __device__ static int dec4(uint32_t n) { return (int)(((n | 0x80808080u) - 0x08080808u) ^ 0x80808080u); }
     __device__ static float block(int s0, int s1, const float e[2], float dx) { return e[0] * dx * (float)(s0 + s1); }
+};
+
+struct P4NVFP4 {
+    static constexpr bool BLOCK_SCALE = false;
+    __device__ static void pair(const uint32_t w[9], uint32_t qs[2][4], float e[2][2]) {
+#pragma unroll
+        for (int b = 0; b < 2; ++b) {
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const uint32_t lo = w[1 + 4 * b + k], hi = w[3 + 4 * b + k];  // sub-blocks 2b and 2b + 1
+                qs[b][k] = (lo & 0x0F0F0F0Fu) | ((hi & 0x0F0F0F0Fu) << 4);
+                qs[b][2 + k] = ((lo >> 4) & 0x0F0F0F0Fu) | (hi & 0xF0F0F0F0u);
+            }
+            e[b][0] = ue4m3_half((uint8_t)(w[0] >> (16 * b)) & 0x7F);  // (ggml ignores the sign bit)
+            e[b][1] = ue4m3_half((uint8_t)(w[0] >> (16 * b + 8)) & 0x7F);
+        }
+    }
+    __device__ static int dec4(uint32_t n) { return fp4_dec4<12>(n); }
+    __device__ static float block(int s0, int s1, const float e[2], float dx) {
+        return dx * e[0] * (float)s0 + dx * e[1] * (float)s1;
+    }
 };
 
 template <class P>
@@ -1056,13 +1123,29 @@ __device__ __forceinline__ float mv_q4_0(const uint8_t *wr, const int8_t *q8, co
     return mv_p4<P4Q4_0>(wr, q8, d8, K, lane, L);
 }
 
-// ROCmFP4_FAST (17-byte blocks: 16 nibble bytes + one UE4M3 scale per 32 values) x Q8_0: a lane takes four
-// blocks (68 bytes, 4-aligned; the host requires K % 128 == 0) and extracts each block's 16 bytes from the
-// loaded dwords with v_alignbyte_b32. Same as ggml's rocmfp4_vec_dot_q4_0_fast_q8_0: d * (sumi0 + sumi1).
+// The 17-byte FP4 block types (16 nibble bytes, values j in the low nibbles and j + 16 in the high ones, and one
+// scale per 32 values) x Q8_0: a lane takes four blocks (68 bytes, 4-aligned; the host requires K % 128 == 0) and
+// extracts each block's 16 bytes from the loaded dwords with v_alignbyte_b32. A policy PF gives the byte offsets
+// of a block's scale (SOFF) and values (VOFF), scale() and dec4():
+//  ROCmFP4_FAST: the values, then a UE4M3 scale. As ggml's rocmfp4_vec_dot_q4_0_fast_q8_0: d * (sumi0 + sumi1).
+//  MXFP4: an E8M0 scale, then the values; E2M1 codebook. As ggml's vec_dot_mxfp4_q8_0: (d_x e) * (sumi1 + sumi2).
+struct PFROCmFP4 {
+    static constexpr int SOFF = 16, VOFF = 0;
+    __device__ static float scale(uint8_t e) { return ue4m3_half(e); }
+    __device__ static int dec4(uint32_t n) { return rocmfp4_dec4(n); }
+};
+
+struct PFMXFP4 {
+    static constexpr int SOFF = 0, VOFF = 1;
+    __device__ static float scale(uint8_t e) { return e8m0_half(e); }
+    __device__ static int dec4(uint32_t n) { return fp4_dec4<12>(n); }
+};
+
 __device__ __forceinline__ uint32_t dword_at(const uint32_t *w, int off) {  // off: compile-time after unrolling
     return off % 4 == 0 ? w[off / 4] : __builtin_amdgcn_alignbyte(w[off / 4 + 1], w[off / 4], off % 4);
 }
 
+template <class PF = PFROCmFP4>
 __device__ __forceinline__ void rocmfp4_fast_quad(const uint8_t *b, uint32_t qs[4][4], float e[4]) {
     uint32_t w[18];
 #pragma unroll
@@ -1071,25 +1154,26 @@ __device__ __forceinline__ void rocmfp4_fast_quad(const uint8_t *b, uint32_t qs[
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
 #pragma unroll
-        for (int k = 0; k < 4; ++k) qs[j][k] = dword_at(w, 17 * j + 4 * k);
-        e[j] = ue4m3_half((uint8_t)(dword_at(w, 17 * j + 16) & 0xFF));
+        for (int k = 0; k < 4; ++k) qs[j][k] = dword_at(w, 17 * j + PF::VOFF + 4 * k);
+        e[j] = PF::scale((uint8_t)(dword_at(w, 17 * j + PF::SOFF) & 0xFF));
     }
 }
 
+template <class PF = PFROCmFP4>
 __device__ __forceinline__ float rocmfp4_fast_q8_block(const uint32_t qs[4], float e, const int8_t *q8, float dx) {
     const int *x8 = (const int *)q8;
     int s0 = 0, s1 = 0;
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
-        s0 = dot4(rocmfp4_dec4(qs[k] & 0x0F0F0F0Fu), x8[k], s0);
-        s1 = dot4(rocmfp4_dec4((qs[k] >> 4) & 0x0F0F0F0Fu), x8[4 + k], s1);
+        s0 = dot4(PF::dec4(qs[k] & 0x0F0F0F0Fu), x8[k], s0);
+        s1 = dot4(PF::dec4((qs[k] >> 4) & 0x0F0F0F0Fu), x8[4 + k], s1);
     }
     return e * dx * (float)(s0 + s1);
 }
 
-__device__ __forceinline__ float mv_rocmfp4_fast(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K, int lane, int L) {
-    (void)bs;
-    // The batched kernel (mmb_rocmfp4_fast) gives each row 32 lanes: lane l sums quads l, l + 32, ... and the
+template <class PF>
+__device__ __forceinline__ float mv_fast(const uint8_t *wr, const int8_t *q8, const float *d8, int K, int lane, int L) {
+    // The batched kernel (mmb_fast) gives each row 32 lanes: lane l sums quads l, l + 32, ... and the
     // lanes are added by an xor tree. With L < 32 lanes per row, this lane stands in for the 32 / L virtual lanes
     // lane + k L, keeps their sums apart and adds them in that tree's order (offsets 16 .. L, then Q8_REDUCE
     // does L / 2 .. 1), so a token gives the same bits here as in a prefill batch.
@@ -1102,11 +1186,11 @@ __device__ __forceinline__ float mv_rocmfp4_fast(const uint8_t *wr, const int8_t
         for (int p = lane + k * L; p < nquad; p += 32) {
             uint32_t qs[4][4];
             float e[4];
-            rocmfp4_fast_quad(wr + (long long)p * 68, qs, e);
+            rocmfp4_fast_quad<PF>(wr + (long long)p * 68, qs, e);
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int ib = 4 * p + j;
-                a[k] += rocmfp4_fast_q8_block(qs[j], e[j], q8 + ib * 32, d8[ib]);
+                a[k] += rocmfp4_fast_q8_block<PF>(qs[j], e[j], q8 + ib * 32, d8[ib]);
             }
         }
     }
@@ -1117,6 +1201,19 @@ __device__ __forceinline__ float mv_rocmfp4_fast(const uint8_t *wr, const int8_t
             for (int k = 0; k < 4; ++k)
                 if (k < d) a[k] += a[k + d];
     return a[0];
+}
+
+__device__ __forceinline__ float mv_rocmfp4_fast(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs,
+                                                 int K, int lane, int L) {
+    return mv_fast<PFROCmFP4>(wr, q8, d8, K, lane, L);
+}
+__device__ __forceinline__ float mv_mxfp4(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
+                                          int lane, int L) {
+    return mv_fast<PFMXFP4>(wr, q8, d8, K, lane, L);
+}
+__device__ __forceinline__ float mv_nvfp4(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
+                                          int lane, int L) {
+    return mv_p4<P4NVFP4>(wr, q8, d8, K, lane, L);
 }
 
 // Q8_0 (34-byte blocks: an F16 scale, then 32 int8 values) x Q8_0: a lane takes a pair of blocks (68 bytes,
@@ -1662,6 +1759,8 @@ matvec_q8_lr_q4_0_rocmfp4_fast(const uint8_t *W, long long row_bytes, const floa
 MATVEC_Q8_KERNELS(q4_0_rocmfp4, mv_rocmfp4, 0)
 MATVEC_Q8_KERNELS(q4_0, mv_q4_0, 0)
 MATVEC_Q8_KERNELS(q4_0_rocmfp4_fast, mv_rocmfp4_fast, 0)
+MATVEC_Q8_KERNELS(mxfp4, mv_mxfp4, 0)
+MATVEC_Q8_KERNELS(nvfp4, mv_nvfp4, 0)
 MATVEC_Q8_KERNELS(q8_0, mv_q8_0, 0)
 MATVEC_Q8_KERNELS(q5_1, mv_q5_1, 2)
 MATVEC_Q8_KERNELS(q4_1, mv_q4_1, 2)
@@ -1855,22 +1954,22 @@ __device__ __forceinline__ void mmb_kquant(MM_BARGS, const RM &rm) {
     MM_STORE
 }
 
-template <class RM>
-__device__ __forceinline__ void mmb_rocmfp4_fast(MM_BARGS, const RM &rm) {
+template <class PF, class RM>
+__device__ __forceinline__ void mmb_fast(MM_BARGS, const RM &rm) {
     (void)bs;
     MM_ROW_SETUP
     const int nquad = K / 128, nb = K / 32;
     for (int p = lane; p < nquad; p += 32) {
         uint32_t qs[4][4];
         float e[4];
-        rocmfp4_fast_quad(wr + (long long)p * 68, qs, e);
+        rocmfp4_fast_quad<PF>(wr + (long long)p * 68, qs, e);
         int lo[4][4], hi[4][4];
 #pragma unroll
         for (int j = 0; j < 4; ++j)
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
-                lo[j][k] = rocmfp4_dec4(qs[j][k] & 0x0F0F0F0Fu);
-                hi[j][k] = rocmfp4_dec4((qs[j][k] >> 4) & 0x0F0F0F0Fu);
+                lo[j][k] = PF::dec4(qs[j][k] & 0x0F0F0F0Fu);
+                hi[j][k] = PF::dec4((qs[j][k] >> 4) & 0x0F0F0F0Fu);
             }
         // Not unrolled: see matmul_q8_q4_0_rocmfp4
         for (int jt = 0; jt < MM_TB; ++jt) {
@@ -1984,7 +2083,9 @@ __device__ __forceinline__ void mmb_q5_K_exp(MM_BARGS, const RowsExpert &rm) { m
 
 MATMUL_Q8_KERNELS(q4_0_rocmfp4, (mmb_p4<P4ROCmFP4, RowsLinear>), (mmb_p4<P4ROCmFP4, RowsExpert>))
 MATMUL_Q8_KERNELS(q4_0, (mmb_p4<P4Q4_0, RowsLinear>), (mmb_p4<P4Q4_0, RowsExpert>))
-MATMUL_Q8_KERNELS(q4_0_rocmfp4_fast, mmb_rocmfp4_fast<RowsLinear>, mmb_rocmfp4_fast<RowsExpert>)
+MATMUL_Q8_KERNELS(q4_0_rocmfp4_fast, (mmb_fast<PFROCmFP4, RowsLinear>), (mmb_fast<PFROCmFP4, RowsExpert>))
+MATMUL_Q8_KERNELS(mxfp4, (mmb_fast<PFMXFP4, RowsLinear>), (mmb_fast<PFMXFP4, RowsExpert>))
+MATMUL_Q8_KERNELS(nvfp4, (mmb_p4<P4NVFP4, RowsLinear>), (mmb_p4<P4NVFP4, RowsExpert>))
 MATMUL_Q8_KERNELS(q8_0, mmb_q8_0<RowsLinear>, mmb_q8_0<RowsExpert>)
 MATMUL_Q8_KERNELS(q5_1, (mmb_pb<PBQ5_1, RowsLinear>), (mmb_pb<PBQ5_1, RowsExpert>))
 MATMUL_Q8_KERNELS(q4_1, (mmb_pb<PBQ4_1, RowsLinear>), (mmb_pb<PBQ4_1, RowsExpert>))
@@ -2052,8 +2153,16 @@ struct WStageP4 {  // ROCmFP4 / Q4_0: a thread's two 18-byte blocks (wb = 0 or 2
     }
 };
 
-struct WStageFast {  // Q4_0_ROCMFP4_FAST: 17-byte blocks, one UE4M3 scale per 32 values. The chunk's 4 blocks
-                     // of a row are a 68-byte, 4-aligned quad; a thread's two blocks (wb = 0 or 2) are its bytes
+// The dword at byte c + sh of w: c compile-time after unrolling, sh (0 or 2) at run time
+__device__ __forceinline__ uint32_t dword_sh(const uint32_t *w, int c, int sh) {
+    const int i = c >> 2, r = c & 3;
+    if (r < 2) return __builtin_amdgcn_alignbyte(w[i + 1], w[i], r + sh);
+    return sh ? __builtin_amdgcn_alignbyte(w[i + 2], w[i + 1], r + sh - 4) : __builtin_amdgcn_alignbyte(w[i + 1], w[i], r);
+}
+
+template <class PF = PFROCmFP4>
+struct WStageFast {  // ROCmFP4_FAST / MXFP4: 17-byte blocks, one scale per 32 values. The chunk's 4 blocks of a
+                     // row are a 68-byte, 4-aligned quad; a thread's two blocks (wb = 0 or 2) are its bytes
                      // 17 wb .. 17 wb + 33: load the 9 dwords from byte 16 wb on, extract with v_alignbyte.
     static constexpr bool BLOCK_SCALE = true, MIN = false;  // both half-blocks share it: one int32 dot per block
     uint32_t w[10];
@@ -2067,17 +2176,15 @@ struct WStageFast {  // Q4_0_ROCMFP4_FAST: 17-byte blocks, one UE4M3 scale per 3
     }
     __device__ void store(int8_t *srow, float *erow, int wb) const {
 #pragma unroll
-        for (int j = 0; j < 2; ++j) {
-            // bytes off .. of w, off = 17 j + sh: the dword index is the same for both sh, only the shift differs
-            const int s = (17 * j + sh) & 3, d = (17 * j) >> 2;
+        for (int j = 0; j < 2; ++j) {  // block j's bytes are at 17 j + sh of w
             uint32_t *dst = (uint32_t *)(srow + (wb + j) * 32);
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
-                const uint32_t qd = __builtin_amdgcn_alignbyte(w[d + k + 1], w[d + k], s);
-                dst[k] = (uint32_t)rocmfp4_dec4(qd & 0x0F0F0F0Fu);
-                dst[4 + k] = (uint32_t)rocmfp4_dec4((qd >> 4) & 0x0F0F0F0Fu);
+                const uint32_t qd = dword_sh(w, 17 * j + PF::VOFF + 4 * k, sh);
+                dst[k] = (uint32_t)PF::dec4(qd & 0x0F0F0F0Fu);
+                dst[4 + k] = (uint32_t)PF::dec4((qd >> 4) & 0x0F0F0F0Fu);
             }
-            const float e = ue4m3_half((uint8_t)(__builtin_amdgcn_alignbyte(w[d + 5], w[d + 4], s) & 0xFF));
+            const float e = PF::scale((uint8_t)(dword_sh(w, 17 * j + PF::SOFF, sh) & 0xFF));
             erow[(wb + j) * 2] = e;
             erow[(wb + j) * 2 + 1] = e;
         }
@@ -2380,7 +2487,9 @@ __device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, 
 
 MATMUL_WMMA_Q80_KERNELS(q4_0_rocmfp4, WStageP4<P4ROCmFP4>)
 MATMUL_WMMA_Q80_KERNELS(q4_0, WStageP4<P4Q4_0>)
-MATMUL_WMMA_Q80_KERNELS(q4_0_rocmfp4_fast, WStageFast)
+MATMUL_WMMA_Q80_KERNELS(q4_0_rocmfp4_fast, WStageFast<>)
+MATMUL_WMMA_Q80_KERNELS(mxfp4, WStageFast<PFMXFP4>)
+MATMUL_WMMA_Q80_KERNELS(nvfp4, WStageP4<P4NVFP4>)
 MATMUL_WMMA_Q80_KERNELS(q8_0, WStageQ8_0)
 MATMUL_WMMA_Q80_KERNELS(q5_1, WStagePB<PBQ5_1>)
 MATMUL_WMMA_Q80_KERNELS(q4_1, WStagePB<PBQ4_1>)
