@@ -2688,6 +2688,12 @@ allows it on a tied head).
   token. Greedy text = llama-completion's (is_prime prompt, 64 tokens); on the sky prompt a near tie after <think>
   ('\n' 22.409 vs '\n\n' 22.394 in llama.cpp's logits). 553-token prompt: prefill 1,860 tok/s, generation 62 tok/s
   (the ROCmFP4 35B: 1,608 / 57).
+- Stock llama.cpp next to the fork (2026-10-30, user: keep ./llama.cpp for ROCmFP4, a second dir for stock):
+  `llama.cpp-stock/` is a git worktree of ggml-org master (branch stock-master, remote `upstream` in llama.cpp/; the
+  fork has no shared history with upstream: a 2026-06-19 snapshot + 272 ROCmFPX commits), builds `build-cpu`
+  (reference: `make ref_dump_stock` -> build/ref_dump_stock, shared libs) and `build-hip` (gfx1151, the speed
+  baseline). Real NVFP4-Fast model: stock CPU and stock ROCm greedy text = ours. Stock ROCm llama-bench (fa 1):
+  pp512 1,231 tok/s, tg128 51.6 tok/s; the engine: 553-token prefill 1,865 tok/s, generation 62 tok/s.
 - Note: llama.cpp/build-cpu/bin/llama-completion was stale (built 2026-10-14, before the libraries' NVFP4 scale
   support) and degenerated on any file with .scale tensors; ref_dump links the current libraries. Rebuilt
   (`cmake --build llama.cpp/build-cpu --target llama-completion`). ref_dump: REF_DUMP_NO_CB=1 runs without the eval

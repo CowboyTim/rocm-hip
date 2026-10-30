@@ -6,6 +6,7 @@
 
 # llama.cpp submodule (full repo)
 llama.cpp/
+llama.cpp-stock/
 
 # Session logs
 session-*.md

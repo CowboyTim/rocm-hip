@@ -338,6 +338,20 @@ $(REF_DUMP): tools/ref_oracle/ref_dump.cpp
 		$(REF_LLAMA_B)/ggml/src/libggml-cpu.a $(REF_LLAMA_B)/ggml/src/libggml-base.a \
 		-fopenmp -lpthread -ldl -o $@
 
+# The same oracle on stock upstream llama.cpp (a worktree of ggml-org master at llama.cpp-stock, CPU build in
+# build-cpu): formats the fork predates or handles differently (NVFP4 / MXFP4). Its libraries are shared ones.
+REF_STOCK    ?= llama.cpp-stock
+REF_STOCK_B  ?= $(REF_STOCK)/build-cpu
+REF_DUMP_STOCK = $(BINDIR)/ref_dump_stock
+
+ref_dump_stock: $(REF_DUMP_STOCK)
+
+$(REF_DUMP_STOCK): tools/ref_oracle/ref_dump.cpp
+	@mkdir -p $(BINDIR)
+	c++ -O2 -std=c++17 -I$(REF_STOCK)/include -I$(REF_STOCK)/ggml/include $< -L$(REF_STOCK_B)/bin \
+		-Wl,-rpath,$(abspath $(REF_STOCK_B)/bin) -lllama -lggml -lggml-base -lggml-cpu -fopenmp -lpthread -ldl \
+		-o $@
+
 clean:
 	rm -rf $(BUILDDIR) *.co
 
@@ -345,7 +359,7 @@ clean:
 copy_co_files:
 	cp -f $(CODIR)/*.co . 2>/dev/null || true
 
-.PHONY: all clean both ref_dump tokenizer_verify copy_co_files
+.PHONY: all clean both ref_dump ref_dump_stock tokenizer_verify copy_co_files
 
 tokenizer_verify: $(TOKENIZER_VERIFY) copy_co_files
 
