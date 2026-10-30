@@ -86,7 +86,10 @@ Supported weight types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K–Q6_
 ROCmFP4_FAST; int8 kernels (single token, batched, WMMA dense and expert) for all but the float types. Types that
 share a layout share the kernels through a small policy struct: the 36-byte pair family (ROCmFP4, Q4_0, NVFP4), the
 17-byte quad family (ROCmFP4_FAST, MXFP4), a block per lane (Q4_1, Q5_0, Q5_1) and the K-quants. NVFP4 from
-ModelOpt / compressed-tensors checkpoints (a per-tensor `.scale` on the output) is refused at load. F32, F16 and BF16 have dedicated 16-byte-load float kernels (F16 / BF16
+ModelOpt / compressed-tensors checkpoints carries a global scale per tensor (per expert), `<weight>.scale`: the
+loader registers it with qmatvec (`qmatvec_set_out_scale`), and every qmatvec launch on that matrix multiplies its
+outputs by it afterwards (`scale_out*` kernels: dense rows, expert slots by id, expert-grouped tiles), as llama.cpp's
+`ggml_mul` after the matmul. F32, F16 and BF16 have dedicated 16-byte-load float kernels (F16 / BF16
 round the activations to their type first, as ggml). The CPU decoders are bit-exact against the reference's on real
 tensors (`tests/dequant_verify`).
 

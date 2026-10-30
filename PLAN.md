@@ -2656,8 +2656,30 @@ Both reuse existing kernel families through a policy struct, no new kernel bodie
   differs at a near tie (' the' 21.42 vs ' molecules' 21.11 in llama.cpp's own logits).
 - 35B, 553-token prompt: WMMA prefill MXFP4 2,112, NVFP4 1,859 tok/s (Q4_0 2,026; int8 without WMMA 681 / 816);
   generation NVFP4 79 tok/s, MXFP4_MOE 60 (its Q8_0 attention).
-- Not done: NVFP4's per-tensor global scale (`<weight>.scale`, ModelOpt's weight_scale_2, and per expert) that real
-  NVFP4 GGUFs carry; the loader refuses them. gpt-oss (MXFP4's own models) is a new architecture.
+- gpt-oss (MXFP4's own models) is a new architecture: not started.
+
+### NVFP4 global scales (2026-10-30, user: "ok, implement the scale NVFP4")
+
+Real NVFP4 GGUFs (convert_hf_to_gguf from ModelOpt / compressed-tensors) carry `<weight>.scale`, F32 [1] or
+[n_expert] (weight_scale_2), which llama.cpp multiplies into the matmul's output (build_lora_mm[_id]'s ggml_mul; the
+`.input_scale` tensors are loaded but unused). bind_weight registers an NVFP4 weight's scale with qmatvec
+(qmatvec_set_out_scale(owner = the GGUF handle, the weight's bytes, s, n); dropped when the GGUF closes); each
+qmatvec launch function then scales the outputs of a registered matrix right after its matmul: scale_out (dense,
+up to 4 outputs of a multi launch), scale_out_id (expert slots by ids, the shared expert's slot -1 with its own
+scale), scale_out_tiles (expert-grouped prefill). No engine call site changed: attention, DeltaNet, MoE, grouped
+prefill, LM head and MTP all go through qmatvec. token_embd never gets one (llama.cpp neither applies one nor
+allows it on a tied head).
+- Test files: tools/gguf_nvfp4_scales.py gives every NVFP4 projection (llama.cpp's set) .scale = 2^-k and its UE4M3
+  block scales x 2^k, exact in UE4M3 (k >= 3 turns subnormals normal; the largest exponent stays <= 14) and in the
+  float products, so the scaled file computes the same bits as the unscaled one: llama.cpp's logits are identical
+  for both (0.6B, 35B), which checks the transform; the engine's results must then match its unscaled run bit for
+  bit, and any missing or doubled scale would be off by 8..64x. /data/q4_0/*-NVFP4-scaled.gguf.
+- forward_verify (reads <name>_s / <name>_scaled / the MUL of the same name, the reference's post-scale tensors):
+  35B scaled = unscaled to the digit (67 checks; experts by id, shared expert, grouped prefill, attention, DeltaNet,
+  LM head). Greedy tokens identical scaled vs unscaled on WMMA, int8 without WMMA, and the float path (decode;
+  QWEN_MATVEC_FP32 prefill of more than one token fails for every type, Q4_0 / ROCmFP4 too: not this change).
+- Cost (35B, 553-token prompt): prefill 1,910 -> 1,780 tok/s (-7%), generation 79 -> 76 tok/s (-4%): the scale
+  kernels read and write the outputs once more. Fusing the scale into the matmul kernels' stores would remove it.
 
 ### BF16 dense prefill (ABC.gguf, a Qwen3.5 27B in BF16, 2026-10-25)
 

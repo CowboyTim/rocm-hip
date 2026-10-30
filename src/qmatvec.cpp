@@ -10,6 +10,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <atomic>
+#include <mutex>
+#include <vector>
+
 #define QMV_ROWS_PER_BLOCK 4  // must match ROWS_PER_BLOCK in matvec_q.hip
 #define QMV_F32_PARTS 4       // must match F32_PARTS in matvec_q.hip
 #define QMV_MAX_TYPE 128
@@ -31,6 +35,7 @@ static hipFunction_t g_fn_mmf[QMV_MAX_TYPE];     // batched float kernels, matmu
 static hipFunction_t g_fn_mmf_id[QMV_MAX_TYPE];  // expert-tiled batched float kernels, matmul_f_id_<type>
 static hipFunction_t g_lr_fast = nullptr;         // matvec_q8_lr_q4_0_rocmfp4_fast
 static hipFunction_t g_fn_q8t[QMV_MAX_TYPE];     // int8 kernels for 2..4 tokens, matvec_q8t_<type>
+static hipFunction_t g_scale_out = nullptr, g_scale_out_id = nullptr, g_scale_out_tiles = nullptr;
 static bool g_use_wmma = true;
 static int g_wmma_min_t = 32;  // smaller batches, and N < 64 (a 64-row tile mostly padding), stay on matmul_q8_<type>
 #define QMV_MM_TB 16      // tokens per tile, must match MM_TB in matvec_q.hip
@@ -113,6 +118,9 @@ int qmatvec_init(const char *co_path) {
     if (hipModuleGetFunction(&g_lr_fast, g_mod, "matvec_q8_lr_q4_0_rocmfp4_fast") != hipSuccess) g_lr_fast = nullptr;
     if (hipModuleGetFunction(&g_quant_rows_q8_0, g_mod, "quantize_rows_q8_0") != hipSuccess) g_quant_rows_q8_0 = nullptr;
     if (hipModuleGetFunction(&g_mv_q8_0s, g_mod, "matvec_q8_0s") != hipSuccess) g_mv_q8_0s = nullptr;
+    if (hipModuleGetFunction(&g_scale_out, g_mod, "scale_out") != hipSuccess) g_scale_out = nullptr;
+    if (hipModuleGetFunction(&g_scale_out_id, g_mod, "scale_out_id") != hipSuccess) g_scale_out_id = nullptr;
+    if (hipModuleGetFunction(&g_scale_out_tiles, g_mod, "scale_out_tiles") != hipSuccess) g_scale_out_tiles = nullptr;
     g_use_wmma = getenv("QMATVEC_NO_WMMA") == nullptr && getenv("QMATVEC_NO_WMMA_MM") == nullptr;  // A/B: all / matmuls only
     if (const char *v = getenv("QMATVEC_WMMA_MIN_T")) g_wmma_min_t = atoi(v);  // tests: route small batches to WMMA
     return 0;
@@ -134,6 +142,115 @@ void qmatvec_free(void) {
     memset(g_fn_q8t, 0, sizeof(g_fn_q8t));
     g_quant = nullptr;
     g_mm_f32 = g_mm_f32_tile = g_quant_rows_q8_0 = g_mv_q8_0s = g_lr_fast = nullptr;
+    g_scale_out = g_scale_out_id = g_scale_out_tiles = nullptr;
+}
+
+// ---------------------------------------------------------------- output scales (NVFP4's global scale)
+
+struct OutScale {
+    const void *owner;
+    const char *lo, *hi;  // the matrix's bytes
+    const float *s;       // n values: the matrix's (n = 1) or each of n stacked experts'
+    int n;
+};
+static std::vector<OutScale> g_scales;
+static std::mutex g_scales_mu;
+static std::atomic<int> g_n_scales{0};
+
+int qmatvec_set_out_scale(const void *owner, const void *W, size_t bytes, const float *s, int n) {
+    if (!W || !s || n < 1 || bytes % (size_t)n != 0) return -1;
+    std::lock_guard<std::mutex> lk(g_scales_mu);
+    g_scales.push_back({owner, (const char *)W, (const char *)W + bytes, s, n});
+    g_n_scales.store((int)g_scales.size());
+    return 0;
+}
+
+void qmatvec_drop_out_scales(const void *owner) {
+    std::lock_guard<std::mutex> lk(g_scales_mu);
+    for (size_t i = g_scales.size(); i-- > 0;)
+        if (g_scales[i].owner == owner) g_scales.erase(g_scales.begin() + (long)i);
+    g_n_scales.store((int)g_scales.size());
+}
+
+// The registered scale of the matrix at W (a pointer inside its bytes); false when there is none
+static bool find_scale(const void *W, OutScale &o) {
+    if (!W || g_n_scales.load(std::memory_order_relaxed) == 0) return false;
+    std::lock_guard<std::mutex> lk(g_scales_mu);
+    for (const OutScale &x : g_scales)
+        if ((const char *)W >= x.lo && (const char *)W < x.hi) {
+            o = x;
+            return true;
+        }
+    return false;
+}
+
+// The factor of a launch on rows from W: one expert's when W lies in stacked experts
+static float dense_scale(const OutScale &o, const void *W) {
+    if (o.n == 1) return o.s[0];
+    return o.s[((const char *)W - o.lo) / ((o.hi - o.lo) / o.n)];
+}
+
+struct ScaleOutArgs {  // ScaleOut in matvec_q.hip
+    float *y[4];
+    long long ld[4];
+    int N[4];
+    float s[4];
+};
+
+// After a launch (e) of n matrices Ws[i] -> T rows of ys[i] (lds[i] apart, Ns[i] values): scale the outputs of the
+// registered ones
+static hipError_t post_scale(hipError_t e, int n, const void *const *Ws, float *const *ys, const int *Ns,
+                             const long long *lds, int T, hipStream_t stream) {
+    if (e != hipSuccess || g_n_scales.load(std::memory_order_relaxed) == 0) return e;
+    ScaleOutArgs a;
+    memset(&a, 0, sizeof a);
+    int m = 0, maxn = 0;
+    for (int i = 0; i < n; ++i) {
+        OutScale o;
+        if (Ns[i] <= 0 || !find_scale(Ws[i], o)) continue;
+        a.y[m] = ys[i], a.ld[m] = lds[i], a.N[m] = Ns[i], a.s[m] = dense_scale(o, Ws[i]);
+        if (Ns[i] > maxn) maxn = Ns[i];
+        ++m;
+    }
+    if (m == 0) return e;
+    if (!g_scale_out) return hipErrorInvalidDeviceFunction;
+    void *args[] = {&a, &T};
+    return hipModuleLaunchKernel(g_scale_out, (unsigned)(((long long)maxn * T + 255) / 256), (unsigned)m, 1, 256, 1, 1,
+                                 0, stream, args, nullptr);
+}
+
+static hipError_t post_scale1(hipError_t e, const void *W, float *y, int N, long long ld, int T, hipStream_t stream) {
+    return post_scale(e, 1, &W, &y, &N, &ld, T, stream);
+}
+
+// Expert launches: R rows of y, row r from expert ids[r] of W (Wx for an id of -1)
+static hipError_t post_scale_id(hipError_t e, const void *W, const void *Wx, float *y, int N, int R,
+                                const int32_t *ids, hipStream_t stream) {
+    if (e != hipSuccess || !y || g_n_scales.load(std::memory_order_relaxed) == 0) return e;
+    OutScale ow, ox;
+    const bool hw = find_scale(W, ow), hx = find_scale(Wx, ox);
+    if (!hw && !hx) return e;
+    if (!g_scale_out_id) return hipErrorInvalidDeviceFunction;
+    const float *es = hw && ow.n > 1 ? ow.s : nullptr;
+    float sw = hw && ow.n == 1 ? ow.s[0] : 1.0f, sx = hx ? dense_scale(ox, Wx) : 1.0f;
+    void *args[] = {&y, &N, (void *)&ids, (void *)&es, &sw, &sx};
+    return hipModuleLaunchKernel(g_scale_out_id, (unsigned)((N + 255) / 256), (unsigned)R, 1, 256, 1, 1, 0, stream,
+                                 args, nullptr);
+}
+
+// Expert-grouped launches (gpu_moe_group tiles)
+static hipError_t post_scale_tiles(hipError_t e, const void *W, float *y, int N, int max_tiles, const int32_t *n_tiles,
+                                   const int32_t *tile_e, const int32_t *tile_start, const int32_t *tile_n,
+                                   const int32_t *out_rows, hipStream_t stream) {
+    OutScale o;
+    if (e != hipSuccess || !find_scale(W, o)) return e;
+    if (!g_scale_out_tiles) return hipErrorInvalidDeviceFunction;
+    const float *es = o.n > 1 ? o.s : nullptr;
+    float sw = o.n == 1 ? o.s[0] : 1.0f;
+    void *args[] = {&y, &N, (void *)&n_tiles, (void *)&tile_e, (void *)&tile_start, (void *)&tile_n,
+                    (void *)&out_rows, (void *)&es, &sw};
+    return hipModuleLaunchKernel(g_scale_out_tiles, (unsigned)((N + 255) / 256), (unsigned)max_tiles, 1, 256, 1, 1, 0,
+                                 stream, args, nullptr);
 }
 
 int qmatvec_supported(int type) {
@@ -147,10 +264,13 @@ hipError_t qmatvec_launch(int type, const void *W, size_t row_bytes, const float
     if (K % tr->blck_size != 0 || row_bytes != qt_row_size(type, K)) return hipErrorInvalidValue;
     long long rb = (long long)row_bytes;
     void *args[] = {(void *)&W, &rb, (void *)&x, (void *)&y, &N, &K};
+    hipError_t e;
     if (type == QT_F32)  // one row per workgroup (matvec_f32)
-        return hipModuleLaunchKernel(g_fn[type], (unsigned)N, 1, 1, 32 * QMV_F32_PARTS, 1, 1, 0, stream, args, nullptr);
-    const unsigned grid = (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);
-    return hipModuleLaunchKernel(g_fn[type], grid, 1, 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream, args, nullptr);
+        e = hipModuleLaunchKernel(g_fn[type], (unsigned)N, 1, 1, 32 * QMV_F32_PARTS, 1, 1, 0, stream, args, nullptr);
+    else
+        e = hipModuleLaunchKernel(g_fn[type], (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK), 1, 1,
+                                  32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream, args, nullptr);
+    return post_scale1(e, W, y, N, N, 1, stream);
 }
 
 #define QMV_MF32_TT 8     // must match MF32_TT in matvec_q.hip
@@ -165,21 +285,26 @@ hipError_t qmatvec_launch_batch(int type, const void *W, size_t row_bytes, const
         void *args[] = {(void *)&W, &rb, (void *)&x, (void *)&y, &N, &K, &T};
         // Prefill batches in the WMMA mode: the tiled kernel (another summation order, like the WMMA kernels;
         // decoding, verify passes and QMATVEC_NO_WMMA keep matvec_f32's order)
+        hipError_t e;
         if (g_use_wmma && g_mm_f32_tile && T >= g_wmma_min_t && K % 32 == 0)
-            return hipModuleLaunchKernel(g_mm_f32_tile, (unsigned)((N + 63) / 64), (unsigned)((T + 63) / 64), 1, 256,
-                                         1, 1, 0, stream, args, nullptr);
-        return hipModuleLaunchKernel(g_mm_f32, (unsigned)((N + QMV_MF32_ROWS - 1) / QMV_MF32_ROWS),
-                                     (unsigned)((T + QMV_MF32_TT - 1) / QMV_MF32_TT), 1,
-                                     32 * QMV_F32_PARTS, 1, 1, 0, stream, args, nullptr);
+            e = hipModuleLaunchKernel(g_mm_f32_tile, (unsigned)((N + 63) / 64), (unsigned)((T + 63) / 64), 1, 256, 1,
+                                      1, 0, stream, args, nullptr);
+        else
+            e = hipModuleLaunchKernel(g_mm_f32, (unsigned)((N + QMV_MF32_ROWS - 1) / QMV_MF32_ROWS),
+                                      (unsigned)((T + QMV_MF32_TT - 1) / QMV_MF32_TT), 1, 32 * QMV_F32_PARTS, 1, 1, 0,
+                                      stream, args, nullptr);
+        return post_scale1(e, W, y, N, N, T, stream);
     }
     if (T > 1 && type >= 0 && type < QMV_MAX_TYPE && g_fn_mmf[type]) {  // same sums as T launches of matvec_<type>
         const qt_traits *tr = qt_get_traits(type);
         if (K % tr->blck_size != 0 || row_bytes != qt_row_size(type, K)) return hipErrorInvalidValue;
         long long rb = (long long)row_bytes;
         void *args[] = {(void *)&W, &rb, (void *)&x, (void *)&y, &N, &K, &T};
-        return hipModuleLaunchKernel(g_fn_mmf[type], (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK),
-                                     (unsigned)((T + QMV_MMF_TT - 1) / QMV_MMF_TT), 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0,
-                                     stream, args, nullptr);
+        return post_scale1(hipModuleLaunchKernel(g_fn_mmf[type],
+                                                 (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK),
+                                                 (unsigned)((T + QMV_MMF_TT - 1) / QMV_MMF_TT), 1,
+                                                 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream, args, nullptr),
+                           W, y, N, N, T, stream);
     }
     hipError_t e = hipSuccess;
     for (int t = 0; t < T && e == hipSuccess; ++t)
@@ -296,8 +421,9 @@ hipError_t qmatvec_launch_q8_lr(int type, const void *W, size_t row_bytes, const
     int L = q8_lanes_per_row(type, K, N);
     void *args[] = {(void *)&W, &rb, (void *)&lo, &n, &K, &scale, &y, &N, &L};
     const int rows = QMV_ROWS_PER_BLOCK * 32 / L;
-    return hipModuleLaunchKernel(g_lr_fast, (unsigned)((N + rows - 1) / rows), 1, 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0,
-                                 stream, args, nullptr);
+    return post_scale1(hipModuleLaunchKernel(g_lr_fast, (unsigned)((N + rows - 1) / rows), 1, 1,
+                                             32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream, args, nullptr),
+                       W, y, N, N, 1, stream);
 }
 
 hipError_t qmatvec_launch_q8_multi(int type, int n, const void *const *Ws, const int *Ns, float *const *ys,
@@ -338,8 +464,11 @@ hipError_t qmatvec_launch_q8_multi_t(int type, int n, const void *const *Ws, con
                     &Nt, &K, &L, &T};
     const int rows = QMV_ROWS_PER_BLOCK * 32 / L;
     const unsigned grid = (unsigned)((Nt + rows - 1) / rows);
-    return hipModuleLaunchKernel(T == 1 ? g_fn_q8[type] : g_fn_q8t[type], grid, 1, 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0,
-                                 stream, args, nullptr);
+    const hipError_t e = hipModuleLaunchKernel(T == 1 ? g_fn_q8[type] : g_fn_q8t[type], grid, 1, 1,
+                                               32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream, args, nullptr);
+    long long lds[4];
+    for (int i = 0; i < n; ++i) lds[i] = Ns[i];
+    return post_scale(e, n, Ws, ys, Ns, lds, T, stream);
 }
 
 hipError_t qmatvec_launch_q8(int type, const void *W, size_t row_bytes, const qmatvec_q8 *q, float *y, int N, int K,
@@ -369,13 +498,17 @@ hipError_t qmatvec_launch_q8_batch(int type, const void *W, size_t row_bytes, co
         // bs: the K-quants' group sums (for the mins), Q5_1's block sums (offsets)
         void *wargs[] = {(void *)&W, &rb, (void *)&q8, (void *)&d8, (void *)&bs, (void *)&y, &ldy, &N, &K, &T};
         const int rows = kq ? 64 : QMV_WM_ROWS, threads = kq ? 128 : QMV_WM_THREADS;
-        return hipModuleLaunchKernel(g_fn_wmma[type], (unsigned)((N + rows - 1) / rows), (unsigned)((T + 63) / 64), 1,
-                                     (unsigned)threads, 1, 1, 0, stream, wargs, nullptr);
+        return post_scale1(hipModuleLaunchKernel(g_fn_wmma[type], (unsigned)((N + rows - 1) / rows),
+                                                 (unsigned)((T + 63) / 64), 1, (unsigned)threads, 1, 1, 0, stream,
+                                                 wargs, nullptr),
+                           W, y, N, ldy, T, stream);
     }
     void *args[] = {(void *)&W, &rb, (void *)&q8, (void *)&d8, (void *)&bs, (void *)&y, &ldy, &N, &K, &T};
     const unsigned gx = (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);
     const unsigned gy = (unsigned)((T + QMV_MM_TB - 1) / QMV_MM_TB);
-    return hipModuleLaunchKernel(g_fn_mm[type], gx, gy, 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream, args, nullptr);
+    return post_scale1(
+        hipModuleLaunchKernel(g_fn_mm[type], gx, gy, 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream, args, nullptr), W, y,
+        N, ldy, T, stream);
 }
 
 hipError_t qmatvec_launch_q8_id(int type, const void *W, size_t row_bytes, const int32_t *ids, int n_used,
@@ -410,8 +543,10 @@ hipError_t qmatvec_launch_q8_id_x(int type, const void *W, const void *W2, const
                     (void *)&bs, (void *)&y, (void *)&y2, &N, &K, &L, (void *)&Wx, (void *)&W2x};
     const int rows = QMV_ROWS_PER_BLOCK * 32 / L;
     const unsigned gx = (unsigned)((N + rows - 1) / rows);
-    return hipModuleLaunchKernel(g_fn_q8_id[type], gx, (unsigned)(n_used * (W2 ? 2 : 1)), (unsigned)T,
-                                 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream, args, nullptr);
+    hipError_t e = hipModuleLaunchKernel(g_fn_q8_id[type], gx, (unsigned)(n_used * (W2 ? 2 : 1)), (unsigned)T,
+                                         32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream, args, nullptr);
+    e = post_scale_id(e, W, Wx, y, N, T * n_used, ids, stream);
+    return W2 ? post_scale_id(e, W2, W2x, y2, N, T * n_used, ids, stream) : e;
 }
 
 hipError_t qmatvec_launch_id(int type, const void *W, size_t row_bytes, const int32_t *ids, int n_used, int x_per_slot,
@@ -422,8 +557,9 @@ hipError_t qmatvec_launch_id(int type, const void *W, size_t row_bytes, const in
     long long rb = (long long)row_bytes;
     void *args[] = {(void *)&W, &rb, (void *)&ids, &n_used, &x_per_slot, (void *)&x, (void *)&y, &N, &K};
     const unsigned gx = (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);
-    return hipModuleLaunchKernel(g_fn_id[type], gx, (unsigned)n_used, (unsigned)T, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0,
-                                 stream, args, nullptr);
+    return post_scale_id(hipModuleLaunchKernel(g_fn_id[type], gx, (unsigned)n_used, (unsigned)T,
+                                               32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream, args, nullptr),
+                         W, nullptr, y, N, T * n_used, ids, stream);
 }
 
 static bool wmma_id_ok(int type, int N, int K) {
@@ -456,12 +592,15 @@ hipError_t qmatvec_launch_q8_id_batch(int type, const void *W, size_t row_bytes,
                     (void *)&tile_e, (void *)&tile_start, (void *)&tile_n, (void *)&in_rows, (void *)&out_rows};
     if (wmma_id_ok(type, N, K)) {  // up to 64 entries x 128 expert rows (ROCmFP4 / Q8_0) or 64 (K-quants)
         const int rows = kq ? 64 : QMV_WM_ROWS, threads = kq ? 128 : QMV_WM_THREADS;
-        return hipModuleLaunchKernel(g_fn_wmma_id[type], (unsigned)((N + rows - 1) / rows), (unsigned)max_tiles, 1,
-                                     (unsigned)threads, 1, 1, 0, stream, args, nullptr);
+        return post_scale_tiles(hipModuleLaunchKernel(g_fn_wmma_id[type], (unsigned)((N + rows - 1) / rows),
+                                                      (unsigned)max_tiles, 1, (unsigned)threads, 1, 1, 0, stream, args,
+                                                      nullptr),
+                                W, y, N, max_tiles, n_tiles, tile_e, tile_start, tile_n, out_rows, stream);
     }
     const unsigned gx = (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);
-    return hipModuleLaunchKernel(g_fn_mm_id[type], gx, (unsigned)max_tiles, 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream,
-                                 args, nullptr);
+    return post_scale_tiles(hipModuleLaunchKernel(g_fn_mm_id[type], gx, (unsigned)max_tiles, 1,
+                                                  32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream, args, nullptr),
+                            W, y, N, max_tiles, n_tiles, tile_e, tile_start, tile_n, out_rows, stream);
 }
 
 int qmatvec_id_batch_f_supported(int type) { return type >= 0 && type < QMV_MAX_TYPE && g_fn_mmf_id[type] != nullptr; }
@@ -478,6 +617,7 @@ hipError_t qmatvec_launch_id_batch_f(int type, const void *W, size_t row_bytes, 
     void *args[] = {(void *)&W, &rb, (void *)&x, (void *)&y, &N, &K, (void *)&n_tiles, (void *)&tile_e,
                     (void *)&tile_start, (void *)&tile_n, (void *)&in_rows, (void *)&out_rows};
     const unsigned gx = (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);
-    return hipModuleLaunchKernel(g_fn_mmf_id[type], gx, (unsigned)max_tiles, 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0,
-                                 stream, args, nullptr);
+    return post_scale_tiles(hipModuleLaunchKernel(g_fn_mmf_id[type], gx, (unsigned)max_tiles, 1,
+                                                  32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream, args, nullptr),
+                            W, y, N, max_tiles, n_tiles, tile_e, tile_start, tile_n, out_rows, stream);
 }

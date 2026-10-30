@@ -77,19 +77,36 @@ static bool load_index() {
     return !g_index.empty();
 }
 
-// First tensor with this name (and op and ne[0], if given), read as rows of ne[0] floats
+static const RefTensor* find_ref(const std::string& name, const char* op, int64_t ne0) {
+    for (const RefTensor& t : g_index)
+        if (t.name == name && (!op || t.op == op) && (!ne0 || t.ne[0] == ne0)) return &t;
+    return nullptr;
+}
+
+// First tensor with this name (and op and ne[0], if given), read as rows of ne[0] floats. A matmul of an NVFP4
+// weight with an output scale (<weight>.scale) is followed by the reference's ggml_mul by it, named <name>_s-N
+// (dense FFN), <name>_scaled-N (experts) or <name>-N again (op MUL): the engine's projections give that product.
 static bool ref(const char* name, const char* op, std::vector<float>& out, int64_t* row_len = nullptr,
                 int64_t ne0 = 0) {
-    for (const RefTensor& t : g_index) {
-        if (t.name != name || (op && t.op != op) || (ne0 && t.ne[0] != ne0)) continue;
-        const int64_t n = t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3];
-        out.resize((size_t)n);
-        FILE* f = fopen((g_dir + "/" + t.file).c_str(), "rb");
+    const std::string n(name);
+    const size_t dash = n.rfind('-');
+    const RefTensor* t = nullptr;
+    if (dash != std::string::npos && (!op || !strncmp(op, "MUL_MAT", 7))) {
+        const std::string base = n.substr(0, dash), num = n.substr(dash);
+        if (!(t = find_ref(base + "_s" + num, "MUL", ne0)) && !(t = find_ref(base + "_scaled" + num, "MUL", ne0)) &&
+            op && !find_ref(n, op, ne0))
+            t = find_ref(n, "MUL", ne0);
+    }
+    if (!t) t = find_ref(n, op, ne0);
+    if (t) {
+        const int64_t cnt = t->ne[0] * t->ne[1] * t->ne[2] * t->ne[3];
+        out.resize((size_t)cnt);
+        FILE* f = fopen((g_dir + "/" + t->file).c_str(), "rb");
         if (!f) return false;
-        const size_t got = fread(out.data(), sizeof(float), (size_t)n, f);
+        const size_t got = fread(out.data(), sizeof(float), (size_t)cnt, f);
         fclose(f);
-        if (row_len) *row_len = t.ne[0];
-        return got == (size_t)n;
+        if (row_len) *row_len = t->ne[0];
+        return got == (size_t)cnt;
     }
     fprintf(stderr, "reference tensor %s%s%s not found\n", name, op ? " op " : "", op ? op : "");
     return false;

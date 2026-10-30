@@ -18,6 +18,13 @@ extern "C" {
 int qmatvec_init(const char *co_path);
 void qmatvec_free(void);
 
+// NVFP4's global scale (llama.cpp's <weight>.scale, ModelOpt's weight_scale_2): every launch on the matrix at W
+// (bytes long) multiplies its outputs by s[0] (n = 1) or, for n stacked experts of bytes / n each, expert e's by
+// s[e], after the matmul as the reference does. s must stay readable by the CPU and the GPU while registered.
+// owner groups registrations for qmatvec_drop_out_scales (e.g. the model's GGUF handle).
+int qmatvec_set_out_scale(const void *owner, const void *W, size_t bytes, const float *s, int n);
+void qmatvec_drop_out_scales(const void *owner);
+
 // 1 if a matvec kernel exists for this ggml type id.
 int qmatvec_supported(int type);
 

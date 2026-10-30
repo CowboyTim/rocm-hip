@@ -6,6 +6,7 @@
 #include "inference_internal.h"
 #include "gguf_mmap.h"
 #include "quant_types.h"
+#include "qmatvec.h"
 #include "kv_cache.h"
 #include "tokenizer.h"
 #include "sampler.h"
@@ -138,6 +139,36 @@ static int find_tensor_index(gguf_model_t* gguf, const char* name) {
 // Weights are not copied or repacked. Each QuantWeight points at its tensor inside the GGUF mapping,
 // which is pinned once (read-only) so qmatvec kernels read the native ggml blocks in place.
 
+// Close a GGUF and forget the output scales registered for its weights
+static void close_gguf(gguf_model_t* g) {
+    qmatvec_drop_out_scales(g);
+    gguf_mmap_close(g);
+}
+
+// NVFP4 converted from ModelOpt / compressed-tensors checkpoints carries a global scale per tensor (per expert of a
+// 3-D one), <name minus .weight>.scale (F32 [1] or [n_expert]), that multiplies the matmul's output (llama.cpp's
+// build_lora_mm / build_lora_mm_id w_s): registered with qmatvec, which applies it after every launch on w. (Its
+// .input_scale is not used: the reference does not apply it either.)
+static bool bind_out_scale(gguf_model_t* gguf, const char* name, const QuantWeight& w, int64_t n_expert) {
+    const std::string n(name);
+    // (the token embeddings never have one: llama.cpp neither applies one nor allows it on a tied LM head)
+    if (n.size() <= 7 || n.compare(n.size() - 7, 7, ".weight") != 0 || n == "token_embd.weight") return true;
+    const std::string sn = n.substr(0, n.size() - 7) + ".scale";
+    const int idx = find_tensor_index(gguf, sn.c_str());
+    if (idx < 0) return true;
+    const int64_t* ne = gguf_tensor_ne(gguf, idx);
+    size_t bytes = 0;
+    const float* s = (const float*)gguf_get_tensor_ptr(gguf, sn.c_str(), &bytes);
+    const int64_t cnt = ne ? ne[0] : 0;
+    if (gguf_tensor_type(gguf, idx) != QT_F32 || !s || (cnt != 1 && cnt != n_expert) || bytes != (size_t)cnt * 4 ||
+        qmatvec_set_out_scale(gguf, w.data, w.row_bytes * (size_t)w.N, s, (int)cnt) != 0) {
+        set_error("%s: expected F32[1] or F32[%lld] (type %d, %zu bytes)", sn.c_str(), (long long)n_expert,
+                  gguf_tensor_type(gguf, idx), bytes);
+        return false;
+    }
+    return true;
+}
+
 // Bind a 2-D weight tensor. Missing tensors fail only when required.
 static bool bind_weight(gguf_model_t* gguf, const char* name, QuantWeight& w, bool required) {
     const int idx = find_tensor_index(gguf, name);
@@ -149,17 +180,6 @@ static bool bind_weight(gguf_model_t* gguf, const char* name, QuantWeight& w, bo
     const int64_t* ne = gguf_tensor_ne(gguf, idx);
     const int nd = gguf_tensor_dims(gguf, idx);
     if (!qt_get_traits(type)) { set_error("%s: unsupported tensor type %d", name, type); return false; }
-    // NVFP4 converted from ModelOpt / compressed-tensors checkpoints carries a per-tensor (per-expert) global scale
-    // <name>.scale that multiplies the matmul's output (llama.cpp's build_lora_mm w_s); not applied yet
-    if (type == QT_NVFP4) {
-        std::string s(name);
-        if (s.size() > 7 && s.compare(s.size() - 7, 7, ".weight") == 0 &&
-            find_tensor_index(gguf, (s.substr(0, s.size() - 7) + ".scale").c_str()) >= 0) {
-            set_error("%s: NVFP4 with a per-tensor scale (%s.scale) is not supported yet", name,
-                      s.substr(0, s.size() - 7).c_str());
-            return false;
-        }
-    }
     // A 3-D tensor (MoE experts, ne = {K, rows per expert, n_expert}) is bound as one matrix of all experts'
     // rows: expert e is the row range [e * ne[1], (e + 1) * ne[1])
     if (!ne || nd < 1 || nd > 3) { set_error("%s: expected a 2-D or 3-D tensor (n_dims=%d)", name, nd); return false; }
@@ -176,7 +196,7 @@ static bool bind_weight(gguf_model_t* gguf, const char* name, QuantWeight& w, bo
     w.K = (int)K;
     w.row_bytes = rb;
     w.data = p;
-    return true;
+    return type != QT_NVFP4 || bind_out_scale(gguf, name, w, nd == 3 ? ne[2] : 1);
 }
 
 // Bind an F32 norm vector of n values. Missing tensors fail only when required.
@@ -822,24 +842,24 @@ inference_model_t* inference_load_model_ex(const char* gguf_path, const inferenc
         if (m->token_embd.data)
             set_error("token_embd: shape %dx%d, expected %dx%d", m->token_embd.N, m->token_embd.K,
                       m->vocab_size, m->n_embd);
-        gguf_mmap_close(m->gguf); delete m; return nullptr;
+        close_gguf(m->gguf); delete m; return nullptr;
     }
 
     // Per-layer weights and norms (qwen4exp: hyper-connection mixers and the PLE layers instead of the norms)
     std::vector<int> ple_layers;
     if (!load_qwen4exp(m, ple_layers) || !load_model_weights(m, ple_layers)) {
-        gguf_mmap_close(m->gguf); delete m; return nullptr;
+        close_gguf(m->gguf); delete m; return nullptr;
     }
 
     // LM head: output.weight when present, else tied to token_embd
     if (!bind_weight(m->gguf, "output.weight", m->output, false) ||
         !bind_norm(m->gguf, "output_norm.weight", m->n_embd, m->output_norm, m->n_hc == 0)) {
-        gguf_mmap_close(m->gguf); delete m; return nullptr;
+        close_gguf(m->gguf); delete m; return nullptr;
     }
     if (!m->output.data) m->output = m->token_embd;
     if (m->output.K != m->n_embd || m->output.N != m->vocab_size) {
         set_error("output: shape %dx%d, expected %dx%d", m->output.N, m->output.K, m->vocab_size, m->n_embd);
-        gguf_mmap_close(m->gguf); delete m; return nullptr;
+        close_gguf(m->gguf); delete m; return nullptr;
     }
     INFER_LOG("[LOAD] token_embd type %d, LM head type %d%s\n", m->token_embd.type, m->output.type,
             m->output.data == m->token_embd.data ? " (tied)" : "");
@@ -865,7 +885,7 @@ static void free_mtp(inference_model* m) {
     if (!m->mtp) return;
     unpin(m->mtp->pinned);
     if (m->mtp->kvc) kv_cache_free(m->mtp->kvc);
-    if (m->mtp->gguf) gguf_mmap_close(m->mtp->gguf);
+    if (m->mtp->gguf) close_gguf(m->mtp->gguf);
     delete m->mtp;
     m->mtp = nullptr;
 }
@@ -970,7 +990,7 @@ void inference_free_model(inference_model_t* m) {
     if (m->kvc) { INFER_LOG("[CLEANUP] Freeing KV cache\n"); kv_cache_free(m->kvc); }
     if (m->kvc_swa) kv_cache_free(m->kvc_swa);
     if (m->qwen) { INFER_LOG("[CLEANUP] Freeing qwen model\n"); qwen_model_free(m->qwen); }
-    if (m->gguf) { INFER_LOG("[CLEANUP] Closing GGUF\n"); gguf_mmap_close(m->gguf); }
+    if (m->gguf) { INFER_LOG("[CLEANUP] Closing GGUF\n"); close_gguf(m->gguf); }
     INFER_LOG("[CLEANUP] Deleting model struct\n");
     delete m;
     INFER_LOG("[CLEANUP] Model free complete\n");

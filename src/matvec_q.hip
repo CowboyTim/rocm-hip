@@ -2887,3 +2887,43 @@ matvec_q8_0s(const int8_t *qs, const __half *d, const int8_t *q8, const float *d
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
     if (lane == 0) y[row] = acc;
 }
+
+// ================================================================ output scales
+//
+// NVFP4's global scale per matrix (or per expert), llama.cpp's <weight>.scale (ModelOpt's weight_scale_2): the
+// matmul's outputs are multiplied by it after the matmul, as the reference's ggml_mul does (qmatvec.cpp launches
+// these after the matmul kernels of a registered matrix; see qmatvec_set_out_scale).
+
+// Up to 4 outputs (blockIdx.y): T rows ld[m] apart of N[m] values each, times s[m]
+struct ScaleOut {
+    float *y[4];
+    long long ld[4];
+    int N[4];
+    float s[4];
+};
+
+extern "C" __global__ void __launch_bounds__(256) scale_out(ScaleOut o, int T) {
+    const int m = blockIdx.y;
+    const long long i = (long long)blockIdx.x * 256 + threadIdx.x, n = o.N[m];
+    if (i >= n * T) return;
+    o.y[m][(i / n) * o.ld[m] + i % n] *= o.s[m];
+}
+
+// Expert outputs: row r < R of y (N values) times es[ids[r]] (sw when es is NULL), sx for an id of -1 (the extra
+// matrix). Grid (ceil(N / 256), R).
+extern "C" __global__ void __launch_bounds__(256)
+scale_out_id(float *y, int N, const int *ids, const float *es, float sw, float sx) {
+    const int i = blockIdx.x * 256 + threadIdx.x, r = blockIdx.y, e = ids[r];
+    if (i < N) y[(long long)r * N + i] *= e < 0 ? sx : es ? es[e] : sw;
+}
+
+// Expert-grouped outputs (gpu_moe_group tiles): tile k's rows out_rows[tile_start[k] ..] of y times es[tile_e[k]]
+// (sw when es is NULL). Grid (ceil(N / 256), max_tiles).
+extern "C" __global__ void __launch_bounds__(256)
+scale_out_tiles(float *y, int N, const int *n_tiles, const int *tile_e, const int *tile_start, const int *tile_n,
+                const int *out_rows, const float *es, float sw) {
+    const int i = blockIdx.x * 256 + threadIdx.x, k = blockIdx.y;
+    if (i >= N || k >= *n_tiles) return;
+    const float s = es ? es[tile_e[k]] : sw;
+    for (int j = 0; j < tile_n[k]; ++j) y[(long long)out_rows[tile_start[k] + j] * N + i] *= s;
+}
