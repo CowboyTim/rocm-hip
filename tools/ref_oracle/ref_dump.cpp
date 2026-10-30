@@ -143,8 +143,12 @@ static int cmd_acts(const char * model_path, const char * prompt, const std::str
     cp.n_batch = 512;
     cp.n_threads = nthr;
     cp.n_threads_batch = nthr;
-    cp.cb_eval = dump_cb;
-    cp.cb_eval_user_data = &st;
+    // REF_DUMP_NO_CB=1: no eval callback (nothing dumped), so llama.cpp runs its graph as llama-completion does
+    // (the callback makes the scheduler compute and keep every tensor); only the top-1 next token
+    if (!getenv("REF_DUMP_NO_CB")) {
+        cp.cb_eval = dump_cb;
+        cp.cb_eval_user_data = &st;
+    }
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) {
         fprintf(stderr, "failed to create context\n");

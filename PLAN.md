@@ -2680,6 +2680,18 @@ allows it on a tied head).
   QWEN_MATVEC_FP32 prefill of more than one token fails for every type, Q4_0 / ROCmFP4 too: not this change).
 - Cost (35B, 553-token prompt): prefill 1,910 -> 1,780 tok/s (-7%), generation 79 -> 76 tok/s (-4%): the scale
   kernels read and write the outputs once more. Fusing the scale into the matmul kernels' stores would remove it.
+- Real model: unsloth/Qwen3.6-35B-A3B-NVFP4-Fast (compressed-tensors: NVFP4 experts and shared experts with
+  weight_global_scale; FP8 per-channel attention / DeltaNet / LM head), converted by the user with
+  `convert_hf_to_gguf.py --outtype q8_0` (/data/q4_0/Qwen3.6-35B-A3B-NVFP4-Fast.gguf, 21.6 GB: experts NVFP4 + .scale
+  per expert, shared expert NVFP4 + .scale, the rest Q8_0). forward_verify: all 70 checks pass, including the
+  engine's per-layer drift (worst 0.9946, none below 0.99: closer than any requantized model) and prefill = token by
+  token. Greedy text = llama-completion's (is_prime prompt, 64 tokens); on the sky prompt a near tie after <think>
+  ('\n' 22.409 vs '\n\n' 22.394 in llama.cpp's logits). 553-token prompt: prefill 1,860 tok/s, generation 62 tok/s
+  (the ROCmFP4 35B: 1,608 / 57).
+- Note: llama.cpp/build-cpu/bin/llama-completion was stale (built 2026-10-14, before the libraries' NVFP4 scale
+  support) and degenerated on any file with .scale tensors; ref_dump links the current libraries. Rebuilt
+  (`cmake --build llama.cpp/build-cpu --target llama-completion`). ref_dump: REF_DUMP_NO_CB=1 runs without the eval
+  callback (llama.cpp's normal graph execution; only the next token).
 
 ### BF16 dense prefill (ABC.gguf, a Qwen3.5 27B in BF16, 2026-10-25)
 
