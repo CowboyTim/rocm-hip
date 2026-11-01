@@ -70,8 +70,8 @@ hipError_t gpu_add_rmsnorm(const float* x_in, const float* add, float* x_out, co
         return hipErrorInvalidValue;
     qmatvec_q8_out o = qmatvec_q8_outputs(q8);
     void* args[] = {(void*)&x_in, (void*)&add, &x_out, (void*)&w, &y, &n, &eps, &o};
-    // One token: spread the row over the GPU. Several: one workgroup per row (16 = NORM_MAXV in gpu_ops.hip).
-    if (T > 1 && n % 256 == 0 && n <= 256 * 16)
+    // One token: spread the row over the GPU. Several: one workgroup per row (32 = ROWS_MAXV in gpu_ops.hip).
+    if (T > 1 && n % 256 == 0 && n <= 256 * 32)
         return hipModuleLaunchKernel(g_norm_rows, (unsigned)T, 1, 1, 256, 1, 1, 0, stream, args, nullptr);
     return hipModuleLaunchKernel(g_norm, (unsigned)((n + 255) / 256), (unsigned)T, 1, 256, 1, 1, 0, stream, args,
                                  nullptr);

@@ -2838,17 +2838,18 @@ MATMUL_WMMA_Q8K_KERNELS(q6_K, 6)
 //
 // Y[t][n] = sum_k W[n][k] X[t][k] with v_wmma_f32_16x16x16_f16 / _bf16: the activations rounded to the weight
 // type (F16 / BF16 is its own vec_dot_type in ggml, as matvec_bf16), the products exact, summed in FP32 by the
-// WMMA. 8 waves, WF_ROWS (128) weight rows x WF_TOK (128) tokens: wave w rows 16 w .. + 15 and all the tokens,
-// tokens operand A and weights B (a lane's results are one weight row's, 16 tokens' outputs 16 consecutive
-// floats). Per WF_KC-value chunk the workgroup copies the rows' 16-bit weights into LDS as they are and the
-// tokens' activations; the next chunk's loads are in flight during the WMMAs.
+// WMMA. WF_WAVES (16) waves, WF_ROWS (256) weight rows x WF_TOK (128) tokens: wave w rows 16 w .. + 15 and all
+// the tokens, tokens operand A and weights B (a lane's results are one weight row's, 16 tokens' outputs 16
+// consecutive floats). Per WF_KC-value chunk the workgroup copies the rows' 16-bit weights into LDS as they are and
+// the tokens' activations; the next chunk's loads are in flight during the WMMAs.
 // The kernels are bound by the bytes they read from L2 / MALL (~600 GB/s however they are split between weights
 // and activations), so: matmul_wmma_h_<type> reads activations already rounded to 16 bits (round_half_<type>,
-// one pass per matmul: 23 -> 37 TFLOPS on the 27B's 17408 x 5120 FFN gate, 2,048 tokens); matmul_wmma_f_<type>
-// rounds float activations itself (for callers without a scratch buffer). Workgroups go in groups of WF_GROUP
-// row blocks x every token tile, row blocks first, so that the ones in flight together share their token
-// tiles (4 beat 2, 8 and 16 on all of the 27B's shapes). K % 8 == 0 (16-byte rows).
-// grid ceil(N / WF_ROWS) * ceil(T / WF_TOK), block WM_THREADS.
+// one pass per matmul, rows of ldx = K + 8 values: rows a multiple of 4 KB apart alias in the memory channels;
+// 23 -> 37 TFLOPS on the 27B's 17408 x 5120 FFN gate, 2,048 tokens); matmul_wmma_f_<type> rounds float
+// activations itself (for callers without a scratch buffer). 256 rows (16 waves) rather than 128 cut the bytes per
+// FLOP by a quarter (FFN down 24 -> 36 TFLOPS). Workgroups go in groups of WF_GROUP row blocks x every token tile,
+// row blocks first, so that the ones in flight together share their token tiles. K % 8 == 0 (16-byte rows).
+// grid ceil(N / WF_ROWS) * ceil(T / WF_TOK), block WF_THREADS.
 typedef float v8f_t __attribute__((ext_vector_type(8)));
 typedef short v16s_t __attribute__((ext_vector_type(16)));
 typedef _Float16 v16h_t __attribute__((ext_vector_type(16)));
@@ -2870,14 +2871,16 @@ struct WFBF16 {
 };
 
 #define WF_KC 64
-#define WF_GROUP 4
-#define WF_ROWS 128  // weight rows per workgroup: 8 waves x 16 (QMV_WF_ROWS in qmatvec.cpp)
+#define WF_GROUP 2
+#define WF_WAVES 16
+#define WF_THREADS (32 * WF_WAVES)  // QMV_WF_THREADS
+#define WF_ROWS (16 * WF_WAVES)  // weight rows per workgroup, 16 per wave (QMV_WF_ROWS in qmatvec.cpp)
 #define WF_NT 8      // 16-token sub-tiles per workgroup
 #define WF_TOK (16 * WF_NT)  // QMV_WF_TOK
 // XH: x holds 16-bit values (already rounded), else floats
 template <class P, bool XH>
-__device__ __forceinline__ void wmma_f(const uint8_t *W, long long row_bytes, const void *xv, float *y, int N, int K,
-                                       int T) {
+__device__ __forceinline__ void wmma_f(const uint8_t *W, long long row_bytes, const void *xv, long long ldx, float *y,
+                                       int N, int K, int T) {
     __shared__ __attribute__((aligned(16))) uint16_t sw[WF_ROWS][WF_KC + 8];  // (+16 bytes: see WmmaSmem)
     __shared__ __attribute__((aligned(16))) uint16_t sx[WF_TOK][WF_KC + 8];
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, i = lane & 15, hi = lane >> 4;
@@ -2888,26 +2891,26 @@ __device__ __forceinline__ void wmma_f(const uint8_t *W, long long row_bytes, co
 
     // One chunk in registers: WF_ROWS rows x 8 uint4 of weights; WF_TOK tokens x 8 uint4 (XH) or 16 float4 of
     // activations
-    constexpr int CW = WF_ROWS * WF_KC / 8 / WM_THREADS, CX = WF_TOK * WF_KC / (XH ? 8 : 4) / WM_THREADS;
+    constexpr int CW = WF_ROWS * WF_KC / 8 / WF_THREADS, CX = WF_TOK * WF_KC / (XH ? 8 : 4) / WF_THREADS;
     uint4 gw[CW];
     typedef typename std::conditional<XH, uint4, float4>::type xchunk_t;
     xchunk_t gx[CX];
     auto load_chunk = [&](int k0) {
 #pragma unroll
         for (int c = 0; c < CW; ++c) {
-            const int task = tid + WM_THREADS * c, row = r0 + (task >> 3), kw = k0 + 8 * (task & 7);
+            const int task = tid + WF_THREADS * c, row = r0 + (task >> 3), kw = k0 + 8 * (task & 7);
             gw[c] = row < N && kw < K ? *(const uint4 *)(W + (long long)row * row_bytes + 2 * kw) : uint4{0, 0, 0, 0};
         }
 #pragma unroll
         for (int c = 0; c < CX; ++c) {
-            const int task = tid + WM_THREADS * c;
+            const int task = tid + WF_THREADS * c;
             if constexpr (XH) {
                 const int tt = t0 + (task >> 3), kx = k0 + 8 * (task & 7);
-                gx[c] = tt < T && kx < K ? *(const uint4 *)((const uint16_t *)xv + (long long)tt * K + kx)
+                gx[c] = tt < T && kx < K ? *(const uint4 *)((const uint16_t *)xv + tt * ldx + kx)
                                          : uint4{0, 0, 0, 0};
             } else {
                 const int tt = t0 + (task >> 4), kx = k0 + 4 * (task & 15);
-                gx[c] = tt < T && kx < K ? *(const float4 *)((const float *)xv + (long long)tt * K + kx)
+                gx[c] = tt < T && kx < K ? *(const float4 *)((const float *)xv + tt * ldx + kx)
                                          : float4{0, 0, 0, 0};
             }
         }
@@ -2915,12 +2918,12 @@ __device__ __forceinline__ void wmma_f(const uint8_t *W, long long row_bytes, co
     auto store_chunk = [&]() {
 #pragma unroll
         for (int c = 0; c < CW; ++c) {
-            const int task = tid + WM_THREADS * c;
+            const int task = tid + WF_THREADS * c;
             *(uint4 *)&sw[task >> 3][8 * (task & 7)] = gw[c];
         }
 #pragma unroll
         for (int c = 0; c < CX; ++c) {
-            const int task = tid + WM_THREADS * c;
+            const int task = tid + WF_THREADS * c;
             if constexpr (XH)
                 *(uint4 *)&sx[task >> 3][8 * (task & 7)] = gx[c];
             else
@@ -2957,22 +2960,24 @@ __device__ __forceinline__ void wmma_f(const uint8_t *W, long long row_bytes, co
         }
 }
 
-// matmul_wmma_f_<type>: same arguments as matmul_f_<type>; matmul_wmma_h_<type>: x from round_half_<type>
-// (n8 groups of 8 floats -> 8 16-bit values; grid ceil(n8 / 256), block 256)
+// matmul_wmma_f_<type>: same arguments as matmul_f_<type>; matmul_wmma_h_<type>: x from round_half_<type>, rows
+// of ldx values (n8 groups of 8 floats, rows of k8 groups -> 8 16-bit values, rows of ldx8 groups; grid
+// ceil(n8 / 256), block 256)
 #define MATMUL_WMMA_F_KERNELS(name, P)                                                                         \
-    extern "C" __global__ void __launch_bounds__(WM_THREADS)                                                   \
+    extern "C" __global__ void __launch_bounds__(WF_THREADS)                                                   \
         matmul_wmma_f_##name(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K, int T) { \
-        wmma_f<P, false>(W, row_bytes, x, y, N, K, T);                                                         \
+        wmma_f<P, false>(W, row_bytes, x, K, y, N, K, T);                                                      \
     }                                                                                                          \
-    extern "C" __global__ void __launch_bounds__(WM_THREADS) matmul_wmma_h_##name(                             \
-        const uint8_t *W, long long row_bytes, const uint16_t *x, float *y, int N, int K, int T) {             \
-        wmma_f<P, true>(W, row_bytes, x, y, N, K, T);                                                          \
+    extern "C" __global__ void __launch_bounds__(WF_THREADS) matmul_wmma_h_##name(                             \
+        const uint8_t *W, long long row_bytes, const uint16_t *x, long long ldx, float *y, int N, int K, int T) { \
+        wmma_f<P, true>(W, row_bytes, x, ldx, y, N, K, T);                                                     \
     }                                                                                                          \
-    extern "C" __global__ void __launch_bounds__(256) round_half_##name(const float4 *x, uint4 *xh, long long n8) { \
+    extern "C" __global__ void __launch_bounds__(256)                                                         \
+        round_half_##name(const float4 *x, uint4 *xh, int k8, int ldx8, long long n8) {                       \
         const long long j = (long long)blockIdx.x * 256 + threadIdx.x;                                         \
         if (j >= n8) return;                                                                                   \
         const float4 a = x[2 * j], b = x[2 * j + 1];                                                           \
-        xh[j] = uint4{P::pack(a.x, a.y), P::pack(a.z, a.w), P::pack(b.x, b.y), P::pack(b.z, b.w)};             \
+        xh[j / k8 * ldx8 + j % k8] = uint4{P::pack(a.x, a.y), P::pack(a.z, a.w), P::pack(b.x, b.y), P::pack(b.z, b.w)}; \
     }
 
 MATMUL_WMMA_F_KERNELS(f16, WFF16)

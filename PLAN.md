@@ -2729,6 +2729,26 @@ K % 8 == 0; `QMATVEC_NO_WMMA[_MM]` turns it off.
   matrices) 2,976 -> 8,980 tok/s.** Left: MoE experts in F16 / BF16 (no model here has them) still run
   matmul_f_id; FFN down (K 17408) is the slowest shape (23 TFLOPS).
 
+**F16 / BF16 WMMA, round 2 (2026-11-01, user: "continue with WMMA BF16"): 27B BF16 409 -> 467 tok/s.**
+- 16 waves, 256 rows x 128 tokens per workgroup (55 KB LDS, one per CU), groups of 2 row blocks: FFN down at 2,048
+  tokens 24 -> 36 TFLOPS, gate 37 -> 40 (bytes per FLOP -25%).
+- Row-stride aliasing (synthetic BF16 matrices in hipMalloc memory, 1,024 tokens): rows a multiple of 4 KB apart put a
+  tile's loads into the same memory channels. 5120 x 6144 (12 KB rows, the 27B's ssm_out) 21 TFLOPS, x 6208 41;
+  x 17408 (34 KB, FFN down) 30, x 17472 42; a 16-byte pad is enough, 2 KB pads still half alias. Padding the
+  activation rows (scratch rows of K + 8, ours) gives 21 -> 28 and 27.5 -> 37; the weights' rows stay as the GGUF
+  has them. Tried and dropped: a K rotation per workgroup (helps aliasing a bit, costs L2 sharing), weights straight
+  from global memory into the WMMA registers (16 rows per load instruction coalesce badly: 41 -> 34 on clean
+  shapes), two K phases per workgroup (needs 32-value chunks or 64-token tiles, which cost more than the aliasing).
+- Small batches stay slow (128 tokens ~10 TFLOPS: the weights are read once at ~80-100 GB/s from 4 KB page-cache
+  pages; 8-wave tiles no better). A 1,024-token batch, the default: gate / up 36, qkv 38, down 24, ssm_out 26.
+- Not the matmuls: add_rmsnorm_rows took n <= 4096 (NORM_MAXV 16), so the 27B's 5,120-value rows ran add_rmsnorm
+  (every workgroup re-reads the row: 1.07 ms per 1,024 rows); now ROWS_MAXV 32 (0.66 ms). And a model whose
+  matrices are all F16 / BF16 / F32 no longer quantizes producer outputs for int8 kernels it never runs (use_q8
+  off when no tensor has int8 kernels): +3%.
+- Checks: matvec_verify (both kernels), forward_verify 0.8B F16 (WMMA forced, unchanged results), 0.8B tokens
+  unchanged (9,050 tok/s), 27B greedy text = stock llama.cpp ROCm llama-completion's on the long prompt.
+- Profile now (2,426 tokens, 5.2 s GPU): matmuls 77%, add_rmsnorm_rows 5%, DeltaNet 7%, swiglu 3.5%, round_half 3.4%.
+
 ### Web service: nginx -> Perl, SSE — DONE ✅ (2026-10-22)
 
 Built as designed below (user, 2026-10-22: a unix socket, nginx does the hard work; the route helpers a

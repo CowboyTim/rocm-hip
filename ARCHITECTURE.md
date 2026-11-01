@@ -64,9 +64,10 @@ Weights stay in their GGUF blocks; each type has a CPU decoder (tests) and GPU k
 - **Float path** (`matvec_<type>`, `matmul_f_<type>`): decode and FMA; any type, any K; used where no int8
   kernel applies (e.g. Q8_0, F16).
 - **F16 / BF16 WMMA** (`matmul_wmma_h_<type>`, prefill from 32 tokens): `v_wmma_f32_16x16x16_f16 / _bf16` on
-  128-row x 128-token tiles; the activations are rounded to the weight type first (`round_half_<type>` into the
-  engine's scratch, `qmatvec_launch_batch_h`), so the kernel reads 2 bytes per activation; it is bound by L2 /
-  MALL bytes, not by the WMMAs (~40 TFLOPS from LDS alone, 23-37 in practice). `matmul_wmma_f_<type>` rounds
+  256-row x 128-token tiles (16 waves); the activations are rounded to the weight type first (`round_half_<type>`
+  into the engine's scratch, rows padded by 8 values, `qmatvec_launch_batch_h`), so the kernel reads 2 bytes per
+  activation; it is bound by L2 / MALL bytes, not by the WMMAs (~40 TFLOPS from LDS alone, 24-40 in practice;
+  weight rows a multiple of 4 KB apart alias in the memory channels and are the slow shapes). `matmul_wmma_f_<type>` rounds
   float activations itself, for callers without a scratch.
 - **Int8 path** (`matvec_q8_<type>`): the activation is quantized once (by the producing kernel, `q8_device.h`)
   to ggml's activation format for the weight type (Q8_0 for ROCmFP4, Q8_K for K-quants); weights are decoded
@@ -226,11 +227,11 @@ tokens after a short prompt. Runs vary by about ±5%.
 | Model | Quantization (size) | Generation | Prefill |
 |---|---|---|---|
 | Qwen3-0.6B | Q8_0 (0.6 GB) | 184 tok/s | 7,200 tok/s |
-| Qwen3.5-0.8B | UD-Q8_K_XL (1.2 GB): Q8_0 / F16 matrices | 120 tok/s | 8,980 tok/s (2026-11-01, F16 WMMA) |
+| Qwen3.5-0.8B | UD-Q8_K_XL (1.2 GB): Q8_0 / F16 matrices | 120 tok/s | 9,050 tok/s (2026-11-01, F16 WMMA) |
 | Qwen3.5-4B | ROCmFP4 (2.9 GB) | 59 tok/s | 1,850 tok/s |
 | Qwen3.6-35B-A3B | ROCmFP4 (20 GB), BF16 head | 62 tok/s (more with the int8 head option) | 2,075 tok/s |
 | Qwen3.8-27B (dense) | Q4_0_ROCMFP4_FAST (14.6 GB) | 13.8 tok/s (~200 GB/s of weights) | 296 tok/s |
-| Qwen3.5-27B (dense) | BF16 (54 GB) | 4.1 tok/s (the bandwidth) | 409 tok/s (2026-11-01; stock llama.cpp ROCm pp2048 329) |
+| Qwen3.5-27B (dense) | BF16 (54 GB) | 4.1 tok/s (the bandwidth) | 467 tok/s (2026-11-01; stock llama.cpp ROCm pp2048 329) |
 | Qwen3.5-122B-A10B | UD-Q4_K_XL (77 GB): Q4_K / Q5_K experts, Q8_0 dense | 22.6 tok/s | 620 tok/s |
 | Qwen3.8-Flash-Next (177B) | Q4_0_ROCmFP4_FAST (94 GB) | 34–38 tok/s; 48–55 with the MTP head | 826 tok/s |
 

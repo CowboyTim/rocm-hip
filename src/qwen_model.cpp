@@ -166,9 +166,10 @@ struct Scratch {
     float* q8mem = nullptr;
     qmatvec_q8 q8;
     int q8_max_k = 0;
-    // The current matmul input rounded to 16 bits for the F16 / BF16 WMMA kernels (qmatvec_launch_batch_h),
-    // q8_max_k values
+    // The current matmul input rounded to 16 bits for the F16 / BF16 WMMA kernels (qmatvec_launch_batch_h):
+    // q8_max_k values, rows padded by 8
     uint16_t* xh = nullptr;
+    size_t xh_bytes = 0;
 
     ShmRegion mem;
 
@@ -196,7 +197,7 @@ struct Scratch {
                                 b * HCD, b * HCD, b * HCD, b * R, b * RP, b * HCD, b * NHC,
                                 b * PE, b * PHCD, b * PE, b * PHCD, b * PHCD, b * NU * GU, b * ZX,
                                 b * LT, b * LT, b * LU, (qmatvec_q8_bytes(q8_max_k) + 3) / 4,
-                                (size_t)q8_max_k / 2};
+                                ((size_t)q8_max_k + 8 * b) / 2};
         float *xh_f = nullptr, *ids_f = nullptr, *gt = nullptr, *gp = nullptr, *gn = nullptr, *ge = nullptr, *gs = nullptr, *gc = nullptr;
         float** const ptrs[] = {&x, &x_alt, &xn, &qfull, &q, &k, &v, &attn, &proj, &ffg, &ffu, &act, &logits,
                                 &qkv, &conv, &z, &alpha, &beta, &lin,
@@ -219,6 +220,7 @@ struct Scratch {
         g_tile_n = (int*)gc;
         qmatvec_q8_bind(&q8, q8mem, q8_max_k);
         xh = (uint16_t*)xh_f;
+        xh_bytes = ((size_t)q8_max_k + 8 * b) * 2;
         return true;
     }
 };
@@ -345,7 +347,8 @@ struct QwenModel {
     qwen_layer_cb layer_cb = nullptr;
     void* layer_cb_user = nullptr;
     // int8 matvec path: s.q8 holds the quantized form of q8_src[q8_k]; matvec() uses it when its input matches.
-    // QWEN_MATVEC_FP32=1 keeps every matvec on the float kernels (A/B and debugging).
+    // QWEN_MATVEC_FP32=1 keeps every matvec on the float kernels (A/B and debugging). Off as well when no matrix
+    // of the model has int8 kernels (F16 / BF16 / F32 only): the producers then do not quantize for nothing.
     bool use_q8 = getenv("QWEN_MATVEC_FP32") == nullptr;
     const float* q8_src = nullptr;
     int q8_k = 0, q8_t = 0;
@@ -491,6 +494,17 @@ struct QwenModel {
             qwen_set_error("cannot load matvec_q.co / gpu_ops.co (run from build/co)");
             return false;
         }
+        if (use_q8) {  // any 2-D / 3-D tensor of a type with int8 kernels (the per-layer embedding table is read on
+                       // the CPU)
+            bool any = false;
+            for (int64_t i = 0; i < gguf_n_tensors(eng->gguf) && !any; ++i) {
+                const int64_t* ne = gguf_tensor_ne(eng->gguf, i);
+                any = gguf_tensor_dims(eng->gguf, i) >= 2 &&
+                      strcmp(gguf_tensor_name(eng->gguf, i), "per_layer_token_embd.weight") != 0 &&
+                      qmatvec_q8_supported(gguf_tensor_type(eng->gguf, i), (int)ne[0]);
+            }
+            use_q8 = any;
+        }
         bool has_linear = false;
         for (const LayerWeights& L : eng->layers) has_linear |= L.kind == LAYER_LINEAR_ATTN;
         if (has_linear) {
@@ -575,7 +589,7 @@ struct QwenModel {
         hipError_t e = hipSuccess;
         if (q8 && T == 1) e = qmatvec_launch_q8(W.type, W.data, W.row_bytes, &s.q8, y, W.N, W.K, 0);
         else if (q8) e = qmatvec_launch_q8_batch(W.type, W.data, W.row_bytes, &s.q8, y, W.N, W.N, W.K, T, 0);
-        else e = qmatvec_launch_batch_h(W.type, W.data, W.row_bytes, x, s.xh, (size_t)s.q8_max_k * 2, y, W.N, W.K, T, 0);
+        else e = qmatvec_launch_batch_h(W.type, W.data, W.row_bytes, x, s.xh, s.xh_bytes, y, W.N, W.K, T, 0);
         if (e != hipSuccess) {
             qwen_set_error("qmatvec type %d %dx%d (T %d): %s", W.type, W.N, W.K, T, hipGetErrorString(e));
             return false;

@@ -44,8 +44,9 @@ static int g_wmma_min_t = 32;  // smaller batches, and N < 64 (a 64-row tile mos
 #define QMV_MM_TB 16      // tokens per tile, must match MM_TB in matvec_q.hip
 #define QMV_WM_ROWS 128       // weight rows per workgroup of matmul_wmma[_id]_<rocmfp4 type>, WM_ROWS in matvec_q.hip
 #define QMV_WM_THREADS 256    // its block size
-#define QMV_WF_ROWS 128      // weight rows per workgroup of matmul_wmma_[fh]_<type>, WF_ROWS in matvec_q.hip
-#define QMV_WF_TOK 128       // tokens per workgroup, WF_TOK
+#define QMV_WF_ROWS 256      // weight rows per workgroup of matmul_wmma_[fh]_<type>, WF_ROWS in matvec_q.hip
+#define QMV_WF_TOK 128      // tokens per workgroup, WF_TOK
+#define QMV_WF_THREADS 512   // its block size, WF_THREADS
 #define QMV_WMMA_ID_TB 64  // entries per expert tile of matmul_wmma_id_<type> (4 sub-tiles of 16)
 
 // The int8 kernels of the K-quants read the activations' Q8_K form; the other types' (ROCmFP4, MXFP4, NVFP4, Q4_0, Q5_1,
@@ -320,21 +321,28 @@ hipError_t qmatvec_launch_batch_h(int type, const void *W, size_t row_bytes, con
     // F16 / BF16 prefill batches in the WMMA mode: matmul_wmma_h_<type> on x rounded to 16 bits into xh, or
     // matmul_wmma_f_<type> rounding x itself (FP32 sums in another order than matvec_<type>'s)
     if (type >= 0 && type < QMV_MAX_TYPE && g_fn_wmmaf[type] && g_use_wmma && T >= g_wmma_min_t && N >= 64 &&
-        K % 8 == 0 && row_bytes == (size_t)K * 2 && (((uintptr_t)W | (uintptr_t)x | (uintptr_t)xh) & 15) == 0) {
+        K % 8 == 0 && row_bytes >= (size_t)K * 2 && row_bytes % 16 == 0 &&
+        (((uintptr_t)W | (uintptr_t)x | (uintptr_t)xh) & 15) == 0) {
         long long rb = (long long)row_bytes;
-        const unsigned grid = (unsigned)((N + QMV_WF_ROWS - 1) / QMV_WF_ROWS) * (unsigned)((T + QMV_WF_TOK - 1) / QMV_WF_TOK);
+        const unsigned grid =
+            (unsigned)((N + QMV_WF_ROWS - 1) / QMV_WF_ROWS) * (unsigned)((T + QMV_WF_TOK - 1) / QMV_WF_TOK);
         hipError_t e;
-        if (xh && xh_bytes >= (size_t)T * K * 2 && g_fn_wmmah[type] && g_round_half[type]) {
-            long long n8 = (long long)T * K / 8;
-            void *ra[] = {(void *)&x, (void *)&xh, &n8};
+        // xh rows padded by 8 values: rows a multiple of 4 KB apart (K = 6144: 12 KB) put a tile's loads in the
+        // same memory channels, 21 vs 28 TFLOPS on 5120 x 6144 (the weights' own rows have the same effect, 26 vs
+        // 41, but stay as the GGUF has them)
+        const int ldx = K + 8;
+        if (xh && xh_bytes >= (size_t)T * ldx * 2 && g_fn_wmmah[type] && g_round_half[type]) {
+            long long n8 = (long long)T * K / 8, ldx_ll = ldx;
+            int k8 = K / 8, ldx8 = ldx / 8;
+            void *ra[] = {(void *)&x, (void *)&xh, &k8, &ldx8, &n8};
             e = hipModuleLaunchKernel(g_round_half[type], (unsigned)((n8 + 255) / 256), 1, 1, 256, 1, 1, 0, stream, ra,
                                       nullptr);
-            void *args[] = {(void *)&W, &rb, (void *)&xh, (void *)&y, &N, &K, &T};
+            void *args[] = {(void *)&W, &rb, (void *)&xh, &ldx_ll, (void *)&y, &N, &K, &T};
             if (e == hipSuccess)
-                e = hipModuleLaunchKernel(g_fn_wmmah[type], grid, 1, 1, QMV_WM_THREADS, 1, 1, 0, stream, args, nullptr);
+                e = hipModuleLaunchKernel(g_fn_wmmah[type], grid, 1, 1, QMV_WF_THREADS, 1, 1, 0, stream, args, nullptr);
         } else {
             void *args[] = {(void *)&W, &rb, (void *)&x, (void *)&y, &N, &K, &T};
-            e = hipModuleLaunchKernel(g_fn_wmmaf[type], grid, 1, 1, QMV_WM_THREADS, 1, 1, 0, stream, args, nullptr);
+            e = hipModuleLaunchKernel(g_fn_wmmaf[type], grid, 1, 1, QMV_WF_THREADS, 1, 1, 0, stream, args, nullptr);
         }
         return post_scale1(e, W, y, N, N, T, stream);
     }

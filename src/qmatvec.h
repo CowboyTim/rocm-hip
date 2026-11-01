@@ -40,7 +40,8 @@ hipError_t qmatvec_launch_batch(int type, const void *W, size_t row_bytes, const
                                 int T, hipStream_t stream);
 
 // The same with a scratch buffer xh of xh_bytes (16-byte aligned; NULL: none): F16 / BF16 prefill batches round x
-// to the weight type into it first (T * K * 2 bytes), and the WMMA kernel then reads half the activation bytes.
+// to the weight type into it first (T rows of K + 8 values, 2 bytes each), and the WMMA kernel then reads half the
+// activation bytes.
 hipError_t qmatvec_launch_batch_h(int type, const void *W, size_t row_bytes, const float *x, uint16_t *xh,
                                   size_t xh_bytes, float *y, int N, int K, int T, hipStream_t stream);
 

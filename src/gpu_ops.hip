@@ -57,9 +57,10 @@ add_rmsnorm(const float* x_in, const float* add, float* x_out, const float* w, f
 
 // add_rmsnorm_rows: the same for many rows (prefill): grid T, block 256, one workgroup per row, which it reads
 // once (add_rmsnorm's workgroups each re-read the whole row for the sum of squares). n % 256 == 0 and
-// n <= 256 * NORM_MAXV. Thread t holds values t + 256 j and sums them in add_rmsnorm's order, so the
-// results are bit-identical.
+// n <= 256 * ROWS_MAXV (32: the 27B's 5,120 values took the add_rmsnorm path at 16, 1 ms per 1,024 rows). Thread
+// t holds values t + 256 j and sums them in add_rmsnorm's order, so the results are bit-identical.
 #define NORM_MAXV 16
+#define ROWS_MAXV 32
 extern "C" __global__ void __launch_bounds__(256)
 add_rmsnorm_rows(const float* x_in, const float* add, float* x_out, const float* w, float* y, int n, float eps,
                  Q8Out o) {
@@ -71,10 +72,10 @@ add_rmsnorm_rows(const float* x_in, const float* add, float* x_out, const float*
     y += row;
     if (add) add += row;
     const int t = threadIdx.x, nb = n / 256;
-    float x[NORM_MAXV];
+    float x[ROWS_MAXV];
     float ss = 0.0f;
 #pragma unroll
-    for (int j = 0; j < NORM_MAXV; ++j)
+    for (int j = 0; j < ROWS_MAXV; ++j)
         if (j < nb) {
             const int k = t + 256 * j;
             x[j] = add ? x_in[k] + add[k] : x_in[k];
@@ -89,7 +90,7 @@ add_rmsnorm_rows(const float* x_in, const float* add, float* x_out, const float*
     const float inv = rsqrtf(tot / n + eps);
 
 #pragma unroll
-    for (int j = 0; j < NORM_MAXV; ++j)
+    for (int j = 0; j < ROWS_MAXV; ++j)
         if (j < nb) {  // uniform
             const int k = t + 256 * j;
             if (add) x_out[k] = x[j];
