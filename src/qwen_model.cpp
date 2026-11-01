@@ -166,6 +166,9 @@ struct Scratch {
     float* q8mem = nullptr;
     qmatvec_q8 q8;
     int q8_max_k = 0;
+    // The current matmul input rounded to 16 bits for the F16 / BF16 WMMA kernels (qmatvec_launch_batch_h),
+    // q8_max_k values
+    uint16_t* xh = nullptr;
 
     ShmRegion mem;
 
@@ -192,8 +195,9 @@ struct Scratch {
                                 attention_part_ml_floats(HQ, n_ctx, rows), attention_part_acc_floats_d(HQ, n_ctx, rows, HD),
                                 b * HCD, b * HCD, b * HCD, b * R, b * RP, b * HCD, b * NHC,
                                 b * PE, b * PHCD, b * PE, b * PHCD, b * PHCD, b * NU * GU, b * ZX,
-                                b * LT, b * LT, b * LU, (qmatvec_q8_bytes(q8_max_k) + 3) / 4};
-        float *ids_f = nullptr, *gt = nullptr, *gp = nullptr, *gn = nullptr, *ge = nullptr, *gs = nullptr, *gc = nullptr;
+                                b * LT, b * LT, b * LU, (qmatvec_q8_bytes(q8_max_k) + 3) / 4,
+                                (size_t)q8_max_k / 2};
+        float *xh_f = nullptr, *ids_f = nullptr, *gt = nullptr, *gp = nullptr, *gn = nullptr, *ge = nullptr, *gs = nullptr, *gc = nullptr;
         float** const ptrs[] = {&x, &x_alt, &xn, &qfull, &q, &k, &v, &attn, &proj, &ffg, &ffu, &act, &logits,
                                 &qkv, &conv, &z, &alpha, &beta, &lin,
                                 &r_logits, &ids_f, &wts, &sg, &moe_g, &moe_u, &moe_act, &moe_down, &sh_out,
@@ -201,7 +205,7 @@ struct Scratch {
                                 &part_ml, &part_acc,
                                 &res, &res_alt, &hxn, &hlo, &hlo_pad, &hgate, &inj,
                                 &ple_emb, &ple_key, &ple_val, &ple_gated, &ple_normed, &moe_gu, &zx,
-                                &lat, &lat2, &latup, &q8mem};
+                                &lat, &lat2, &latup, &q8mem, &xh_f};
         static_assert(sizeof(sizes) / sizeof(sizes[0]) == sizeof(ptrs) / sizeof(ptrs[0]), "scratch table");
         if (!mem.alloc("/dev/shm/qwen_scratch.bin", sizes, ptrs, sizeof(sizes) / sizeof(sizes[0]),
                        hipExtHostRegisterCoarseGrained))
@@ -214,6 +218,7 @@ struct Scratch {
         g_tile_start = (int*)gs;
         g_tile_n = (int*)gc;
         qmatvec_q8_bind(&q8, q8mem, q8_max_k);
+        xh = (uint16_t*)xh_f;
         return true;
     }
 };
@@ -563,14 +568,14 @@ struct QwenModel {
 
     // Y[t] = W X[t] for T rows on the GPU (X, Y in pinned memory, rows of W.K / W.N values). c: profile
     // section. Uses the int8 kernels when there is one for the type and s.q8 holds these rows; otherwise the
-    // float kernels (one batched launch for F32, else one launch per row).
+    // float kernels (batched; F16 / BF16 prefill rounds x into s.xh for the WMMA kernels).
     bool matvec(const QuantWeight& W, const float* x, float* y, int T, ProfCat c) {
         prof.bytes[c] += (double)W.row_bytes * W.N;
         const bool q8 = q8_src == x && q8_k == W.K && q8_t == T && qmatvec_q8_supported(W.type, W.K);
         hipError_t e = hipSuccess;
         if (q8 && T == 1) e = qmatvec_launch_q8(W.type, W.data, W.row_bytes, &s.q8, y, W.N, W.K, 0);
         else if (q8) e = qmatvec_launch_q8_batch(W.type, W.data, W.row_bytes, &s.q8, y, W.N, W.N, W.K, T, 0);
-        else e = qmatvec_launch_batch(W.type, W.data, W.row_bytes, x, y, W.N, W.K, T, 0);
+        else e = qmatvec_launch_batch_h(W.type, W.data, W.row_bytes, x, s.xh, (size_t)s.q8_max_k * 2, y, W.N, W.K, T, 0);
         if (e != hipSuccess) {
             qwen_set_error("qmatvec type %d %dx%d (T %d): %s", W.type, W.N, W.K, T, hipGetErrorString(e));
             return false;

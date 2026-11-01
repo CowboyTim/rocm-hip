@@ -12,6 +12,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
+#include <type_traits>
 
 #include "q8_device.h"
 
@@ -2832,6 +2833,150 @@ MATMUL_WMMA_Q8K_KERNELS(q3_K, 3)
 MATMUL_WMMA_Q8K_KERNELS(q4_K, 4)
 MATMUL_WMMA_Q8K_KERNELS(q5_K, 5)
 MATMUL_WMMA_Q8K_KERNELS(q6_K, 6)
+
+// ---------------------------------------------------------------- WMMA for F16 / BF16 weights (dense prefill)
+//
+// Y[t][n] = sum_k W[n][k] X[t][k] with v_wmma_f32_16x16x16_f16 / _bf16: the activations rounded to the weight
+// type (F16 / BF16 is its own vec_dot_type in ggml, as matvec_bf16), the products exact, summed in FP32 by the
+// WMMA. 8 waves, WF_ROWS (128) weight rows x WF_TOK (128) tokens: wave w rows 16 w .. + 15 and all the tokens,
+// tokens operand A and weights B (a lane's results are one weight row's, 16 tokens' outputs 16 consecutive
+// floats). Per WF_KC-value chunk the workgroup copies the rows' 16-bit weights into LDS as they are and the
+// tokens' activations; the next chunk's loads are in flight during the WMMAs.
+// The kernels are bound by the bytes they read from L2 / MALL (~600 GB/s however they are split between weights
+// and activations), so: matmul_wmma_h_<type> reads activations already rounded to 16 bits (round_half_<type>,
+// one pass per matmul: 23 -> 37 TFLOPS on the 27B's 17408 x 5120 FFN gate, 2,048 tokens); matmul_wmma_f_<type>
+// rounds float activations itself (for callers without a scratch buffer). Workgroups go in groups of WF_GROUP
+// row blocks x every token tile, row blocks first, so that the ones in flight together share their token
+// tiles (4 beat 2, 8 and 16 on all of the 27B's shapes). K % 8 == 0 (16-byte rows).
+// grid ceil(N / WF_ROWS) * ceil(T / WF_TOK), block WM_THREADS.
+typedef float v8f_t __attribute__((ext_vector_type(8)));
+typedef short v16s_t __attribute__((ext_vector_type(16)));
+typedef _Float16 v16h_t __attribute__((ext_vector_type(16)));
+
+struct WFF16 {
+    __device__ static uint32_t pack(float a, float b) {
+        return (uint32_t)__half_as_ushort(__float2half(a)) | ((uint32_t)__half_as_ushort(__float2half(b)) << 16);
+    }
+    __device__ static v8f_t mma(v16s_t a, v16s_t b, v8f_t c) {
+        return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(v16h_t, a), __builtin_bit_cast(v16h_t, b),
+                                                          c);
+    }
+};
+struct WFBF16 {
+    __device__ static uint32_t pack(float a, float b) {
+        return (__float_as_uint(bf16_round(a)) >> 16) | (__float_as_uint(bf16_round(b)) & 0xffff0000u);
+    }
+    __device__ static v8f_t mma(v16s_t a, v16s_t b, v8f_t c) { return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c); }
+};
+
+#define WF_KC 64
+#define WF_GROUP 4
+#define WF_ROWS 128  // weight rows per workgroup: 8 waves x 16 (QMV_WF_ROWS in qmatvec.cpp)
+#define WF_NT 8      // 16-token sub-tiles per workgroup
+#define WF_TOK (16 * WF_NT)  // QMV_WF_TOK
+// XH: x holds 16-bit values (already rounded), else floats
+template <class P, bool XH>
+__device__ __forceinline__ void wmma_f(const uint8_t *W, long long row_bytes, const void *xv, float *y, int N, int K,
+                                       int T) {
+    __shared__ __attribute__((aligned(16))) uint16_t sw[WF_ROWS][WF_KC + 8];  // (+16 bytes: see WmmaSmem)
+    __shared__ __attribute__((aligned(16))) uint16_t sx[WF_TOK][WF_KC + 8];
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, i = lane & 15, hi = lane >> 4;
+    const int nr = (N + WF_ROWS - 1) / WF_ROWS, ntk = (T + WF_TOK - 1) / WF_TOK;
+    const int g = blockIdx.x / (WF_GROUP * ntk), rem = blockIdx.x % (WF_GROUP * ntk);
+    const int gr = min(WF_GROUP, nr - g * WF_GROUP);
+    const int r0 = (g * WF_GROUP + rem % gr) * WF_ROWS, t0 = rem / gr * WF_TOK;
+
+    // One chunk in registers: WF_ROWS rows x 8 uint4 of weights; WF_TOK tokens x 8 uint4 (XH) or 16 float4 of
+    // activations
+    constexpr int CW = WF_ROWS * WF_KC / 8 / WM_THREADS, CX = WF_TOK * WF_KC / (XH ? 8 : 4) / WM_THREADS;
+    uint4 gw[CW];
+    typedef typename std::conditional<XH, uint4, float4>::type xchunk_t;
+    xchunk_t gx[CX];
+    auto load_chunk = [&](int k0) {
+#pragma unroll
+        for (int c = 0; c < CW; ++c) {
+            const int task = tid + WM_THREADS * c, row = r0 + (task >> 3), kw = k0 + 8 * (task & 7);
+            gw[c] = row < N && kw < K ? *(const uint4 *)(W + (long long)row * row_bytes + 2 * kw) : uint4{0, 0, 0, 0};
+        }
+#pragma unroll
+        for (int c = 0; c < CX; ++c) {
+            const int task = tid + WM_THREADS * c;
+            if constexpr (XH) {
+                const int tt = t0 + (task >> 3), kx = k0 + 8 * (task & 7);
+                gx[c] = tt < T && kx < K ? *(const uint4 *)((const uint16_t *)xv + (long long)tt * K + kx)
+                                         : uint4{0, 0, 0, 0};
+            } else {
+                const int tt = t0 + (task >> 4), kx = k0 + 4 * (task & 15);
+                gx[c] = tt < T && kx < K ? *(const float4 *)((const float *)xv + (long long)tt * K + kx)
+                                         : float4{0, 0, 0, 0};
+            }
+        }
+    };
+    auto store_chunk = [&]() {
+#pragma unroll
+        for (int c = 0; c < CW; ++c) {
+            const int task = tid + WM_THREADS * c;
+            *(uint4 *)&sw[task >> 3][8 * (task & 7)] = gw[c];
+        }
+#pragma unroll
+        for (int c = 0; c < CX; ++c) {
+            const int task = tid + WM_THREADS * c;
+            if constexpr (XH)
+                *(uint4 *)&sx[task >> 3][8 * (task & 7)] = gx[c];
+            else
+                *(uint2 *)&sx[task >> 4][4 * (task & 15)] = uint2{P::pack(gx[c].x, gx[c].y), P::pack(gx[c].z, gx[c].w)};
+        }
+    };
+
+    v8f_t acc[WF_NT];
+#pragma unroll
+    for (int n = 0; n < WF_NT; ++n) acc[n] = v8f_t{};
+    load_chunk(0);
+    for (int k0 = 0; k0 < K; k0 += WF_KC) {
+        store_chunk();
+        __syncthreads();
+        if (k0 + WF_KC < K) load_chunk(k0 + WF_KC);  // in flight during the WMMAs below
+#pragma unroll
+        for (int s = 0; s < WF_KC / 16; ++s) {
+            const v16s_t b = *(const v16s_t *)&sw[16 * w + i][16 * s];
+#pragma unroll
+            for (int n = 0; n < WF_NT; ++n) acc[n] = P::mma(*(const v16s_t *)&sx[16 * n + i][16 * s], b, acc[n]);
+        }
+        __syncthreads();
+    }
+
+    // C column l % 16 = weight row 16 w + l % 16, row 2 r + l / 16 = token
+    const int row = r0 + 16 * w + i;
+    if (row >= N) return;
+#pragma unroll
+    for (int n = 0; n < WF_NT; ++n)
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int tt = t0 + 16 * n + 2 * r + hi;
+            if (tt < T) y[(long long)tt * N + row] = acc[n][r];
+        }
+}
+
+// matmul_wmma_f_<type>: same arguments as matmul_f_<type>; matmul_wmma_h_<type>: x from round_half_<type>
+// (n8 groups of 8 floats -> 8 16-bit values; grid ceil(n8 / 256), block 256)
+#define MATMUL_WMMA_F_KERNELS(name, P)                                                                         \
+    extern "C" __global__ void __launch_bounds__(WM_THREADS)                                                   \
+        matmul_wmma_f_##name(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K, int T) { \
+        wmma_f<P, false>(W, row_bytes, x, y, N, K, T);                                                         \
+    }                                                                                                          \
+    extern "C" __global__ void __launch_bounds__(WM_THREADS) matmul_wmma_h_##name(                             \
+        const uint8_t *W, long long row_bytes, const uint16_t *x, float *y, int N, int K, int T) {             \
+        wmma_f<P, true>(W, row_bytes, x, y, N, K, T);                                                          \
+    }                                                                                                          \
+    extern "C" __global__ void __launch_bounds__(256) round_half_##name(const float4 *x, uint4 *xh, long long n8) { \
+        const long long j = (long long)blockIdx.x * 256 + threadIdx.x;                                         \
+        if (j >= n8) return;                                                                                   \
+        const float4 a = x[2 * j], b = x[2 * j + 1];                                                           \
+        xh[j] = uint4{P::pack(a.x, a.y), P::pack(a.z, a.w), P::pack(b.x, b.y), P::pack(b.z, b.w)};             \
+    }
+
+MATMUL_WMMA_F_KERNELS(f16, WFF16)
+MATMUL_WMMA_F_KERNELS(bf16, WFBF16)
 
 // ================================================================ int8 copy of a float LM head (opt-in)
 //

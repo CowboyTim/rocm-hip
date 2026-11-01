@@ -2703,7 +2703,31 @@ allows it on a tied head).
 
 Correct output; generation 4.1 tok/s (54 GB per token: the bandwidth); prefill **7.8 tok/s** (2,661 tokens in
 342 s): dense BF16 runs matmul_f_bf16 (float, 8 tokens per weight read). Needs a BF16 WMMA matmul
-(v_wmma_f32_16x16x16_bf16, activations rounded to BF16 as ggml does). Not started.
+(v_wmma_f32_16x16x16_bf16, activations rounded to BF16 as ggml does).
+
+**F16 / BF16 WMMA prefill — DONE ✅ (2026-11-01, user: "perhaps first BF16 WMMA kernel").** `matmul_wmma_h_<type>`
+(F16 and BF16, one template over a policy: the WMMA builtin and the activation rounding) on 128-row x 128-token
+tiles, 8 waves, 64-value K chunks staged in LDS (next chunk's loads in flight during the WMMAs); activations
+rounded to the weight type as ggml (BF16 round-to-nearest-even, F16 `__float2half`) by `round_half_<type>` into a
+new engine scratch (`Scratch::xh`, q8_max_k values) right before each matmul, through `qmatvec_launch_batch_h`;
+`matmul_wmma_f_<type>` rounds float x itself (plain `qmatvec_launch_batch`, e.g. tests). From 32 tokens and N >= 64,
+K % 8 == 0; `QMATVEC_NO_WMMA[_MM]` turns it off.
+- What bounds it (microbenchmark on the 27B's shapes, 2,048 tokens): the WMMAs from LDS alone reach ~40 TFLOPS;
+  with real loads the kernel moves ~600 GB/s from L2 / MALL however it is split between weights and activations,
+  so speed follows bytes per FLOP: float activations converted in the kernel 21 TFLOPS (FFN gate), pre-rounded
+  16-bit activations 37 (gate) / 34 (qkv) / 23 (FFN down, K 17408) / 26 (ssm_out). Workgroup order: groups of 4
+  row blocks x every token tile (rows first): 4 beat 1, 2, 8, 16 and 40; grouping token tiles too did nothing.
+  256-row tiles were slower (LDS occupancy); 128- vs 64-token tiles +0..25%; 128-value K chunks no better; weights
+  copied to hipMalloc memory (TLB) no better.
+- Checks: matvec_verify (F16 tensors of Qwen3.5-0.8B, BF16 of the 27B, both kernels): 70-token batches within
+  1.3e-6 of sum |w| of the single-token sums. forward_verify on a new reference of Qwen3.5-0.8B UD-Q8_K_XL (F16 /
+  Q8_0; /data/q4_0/refs/ref_qwen35_08b_f16, 22 tokens) with QMATVEC_WMMA_MIN_T=2: all pass, worst layer 0.999395
+  (0.999582 token by token), next token = llama.cpp's. Greedy tokens with and without WMMA identical (0.8B and 27B,
+  long prompt). ROCmFP4 35B forward_verify unchanged.
+- Speed, 2,426-token prompt: **27B BF16 7.8 -> 409 tok/s** (stock llama.cpp ROCm llama-bench pp2048: 329);
+  matmuls 75% of the GPU time (~28 TFLOPS), round_half 3%, add_rmsnorm 7%, DeltaNet 7%. **Qwen3.5-0.8B (F16
+  matrices) 2,976 -> 8,980 tok/s.** Left: MoE experts in F16 / BF16 (no model here has them) still run
+  matmul_f_id; FFN down (K 17408) is the slowest shape (23 TFLOPS).
 
 ### Web service: nginx -> Perl, SSE — DONE ✅ (2026-10-22)
 

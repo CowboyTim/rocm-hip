@@ -33,6 +33,9 @@ static hipFunction_t g_fn_wmma[QMV_MAX_TYPE];   // WMMA tiled int8 kernels, matm
 static hipFunction_t g_fn_wmma_id[QMV_MAX_TYPE];  // WMMA on MoE expert tiles, matmul_wmma_id_<type> (W4)
 static hipFunction_t g_fn_mmf[QMV_MAX_TYPE];     // batched float kernels, matmul_f_<type>
 static hipFunction_t g_fn_mmf_id[QMV_MAX_TYPE];  // expert-tiled batched float kernels, matmul_f_id_<type>
+static hipFunction_t g_fn_wmmaf[QMV_MAX_TYPE];   // WMMA float kernels (F16, BF16 prefill), matmul_wmma_f_<type>
+static hipFunction_t g_fn_wmmah[QMV_MAX_TYPE];   // the same on 16-bit x, matmul_wmma_h_<type>
+static hipFunction_t g_round_half[QMV_MAX_TYPE];  // x -> 16-bit x for them, round_half_<type>
 static hipFunction_t g_lr_fast = nullptr;         // matvec_q8_lr_q4_0_rocmfp4_fast
 static hipFunction_t g_fn_q8t[QMV_MAX_TYPE];     // int8 kernels for 2..4 tokens, matvec_q8t_<type>
 static hipFunction_t g_scale_out = nullptr, g_scale_out_id = nullptr, g_scale_out_tiles = nullptr;
@@ -41,6 +44,8 @@ static int g_wmma_min_t = 32;  // smaller batches, and N < 64 (a 64-row tile mos
 #define QMV_MM_TB 16      // tokens per tile, must match MM_TB in matvec_q.hip
 #define QMV_WM_ROWS 128       // weight rows per workgroup of matmul_wmma[_id]_<rocmfp4 type>, WM_ROWS in matvec_q.hip
 #define QMV_WM_THREADS 256    // its block size
+#define QMV_WF_ROWS 128      // weight rows per workgroup of matmul_wmma_[fh]_<type>, WF_ROWS in matvec_q.hip
+#define QMV_WF_TOK 128       // tokens per workgroup, WF_TOK
 #define QMV_WMMA_ID_TB 64  // entries per expert tile of matmul_wmma_id_<type> (4 sub-tiles of 16)
 
 // The int8 kernels of the K-quants read the activations' Q8_K form; the other types' (ROCmFP4, MXFP4, NVFP4, Q4_0, Q5_1,
@@ -84,6 +89,9 @@ int qmatvec_init(const char *co_path) {
     memset(g_fn_wmma_id, 0, sizeof(g_fn_wmma_id));
     memset(g_fn_mmf, 0, sizeof(g_fn_mmf));
     memset(g_fn_mmf_id, 0, sizeof(g_fn_mmf_id));
+    memset(g_fn_wmmaf, 0, sizeof(g_fn_wmmaf));
+    memset(g_fn_wmmah, 0, sizeof(g_fn_wmmah));
+    memset(g_round_half, 0, sizeof(g_round_half));
     memset(g_fn_q8t, 0, sizeof(g_fn_q8t));
     for (int t = 0; t < QMV_MAX_TYPE; ++t) {
         const qt_traits *tr = qt_get_traits(t);
@@ -111,6 +119,12 @@ int qmatvec_init(const char *co_path) {
         if (hipModuleGetFunction(&g_fn_mmf[t], g_mod, name) != hipSuccess) g_fn_mmf[t] = nullptr;
         snprintf(name, sizeof(name), "matmul_f_id_%s", tr->name);
         if (hipModuleGetFunction(&g_fn_mmf_id[t], g_mod, name) != hipSuccess) g_fn_mmf_id[t] = nullptr;
+        snprintf(name, sizeof(name), "matmul_wmma_f_%s", tr->name);
+        if (hipModuleGetFunction(&g_fn_wmmaf[t], g_mod, name) != hipSuccess) g_fn_wmmaf[t] = nullptr;
+        snprintf(name, sizeof(name), "matmul_wmma_h_%s", tr->name);
+        if (hipModuleGetFunction(&g_fn_wmmah[t], g_mod, name) != hipSuccess) g_fn_wmmah[t] = nullptr;
+        snprintf(name, sizeof(name), "round_half_%s", tr->name);
+        if (hipModuleGetFunction(&g_round_half[t], g_mod, name) != hipSuccess) g_round_half[t] = nullptr;
     }
     if (hipModuleGetFunction(&g_quant, g_mod, "quantize_q8") != hipSuccess) g_quant = nullptr;
     if (hipModuleGetFunction(&g_mm_f32, g_mod, "matmul_f32") != hipSuccess) g_mm_f32 = nullptr;
@@ -139,6 +153,9 @@ void qmatvec_free(void) {
     memset(g_fn_wmma_id, 0, sizeof(g_fn_wmma_id));
     memset(g_fn_mmf, 0, sizeof(g_fn_mmf));
     memset(g_fn_mmf_id, 0, sizeof(g_fn_mmf_id));
+    memset(g_fn_wmmaf, 0, sizeof(g_fn_wmmaf));
+    memset(g_fn_wmmah, 0, sizeof(g_fn_wmmah));
+    memset(g_round_half, 0, sizeof(g_round_half));
     memset(g_fn_q8t, 0, sizeof(g_fn_q8t));
     g_quant = nullptr;
     g_mm_f32 = g_mm_f32_tile = g_quant_rows_q8_0 = g_mv_q8_0s = g_lr_fast = nullptr;
@@ -279,6 +296,11 @@ hipError_t qmatvec_launch(int type, const void *W, size_t row_bytes, const float
 
 hipError_t qmatvec_launch_batch(int type, const void *W, size_t row_bytes, const float *x, float *y, int N, int K,
                                 int T, hipStream_t stream) {
+    return qmatvec_launch_batch_h(type, W, row_bytes, x, nullptr, 0, y, N, K, T, stream);
+}
+
+hipError_t qmatvec_launch_batch_h(int type, const void *W, size_t row_bytes, const float *x, uint16_t *xh,
+                                  size_t xh_bytes, float *y, int N, int K, int T, hipStream_t stream) {
     if (T > 1 && type == QT_F32 && g_mm_f32 && K % (4 * QMV_F32_PARTS) == 0 && row_bytes == (size_t)K * 4 &&
         (((uintptr_t)W | (uintptr_t)x) & 15) == 0) {
         long long rb = (long long)row_bytes;
@@ -293,6 +315,27 @@ hipError_t qmatvec_launch_batch(int type, const void *W, size_t row_bytes, const
             e = hipModuleLaunchKernel(g_mm_f32, (unsigned)((N + QMV_MF32_ROWS - 1) / QMV_MF32_ROWS),
                                       (unsigned)((T + QMV_MF32_TT - 1) / QMV_MF32_TT), 1, 32 * QMV_F32_PARTS, 1, 1, 0,
                                       stream, args, nullptr);
+        return post_scale1(e, W, y, N, N, T, stream);
+    }
+    // F16 / BF16 prefill batches in the WMMA mode: matmul_wmma_h_<type> on x rounded to 16 bits into xh, or
+    // matmul_wmma_f_<type> rounding x itself (FP32 sums in another order than matvec_<type>'s)
+    if (type >= 0 && type < QMV_MAX_TYPE && g_fn_wmmaf[type] && g_use_wmma && T >= g_wmma_min_t && N >= 64 &&
+        K % 8 == 0 && row_bytes == (size_t)K * 2 && (((uintptr_t)W | (uintptr_t)x | (uintptr_t)xh) & 15) == 0) {
+        long long rb = (long long)row_bytes;
+        const unsigned grid = (unsigned)((N + QMV_WF_ROWS - 1) / QMV_WF_ROWS) * (unsigned)((T + QMV_WF_TOK - 1) / QMV_WF_TOK);
+        hipError_t e;
+        if (xh && xh_bytes >= (size_t)T * K * 2 && g_fn_wmmah[type] && g_round_half[type]) {
+            long long n8 = (long long)T * K / 8;
+            void *ra[] = {(void *)&x, (void *)&xh, &n8};
+            e = hipModuleLaunchKernel(g_round_half[type], (unsigned)((n8 + 255) / 256), 1, 1, 256, 1, 1, 0, stream, ra,
+                                      nullptr);
+            void *args[] = {(void *)&W, &rb, (void *)&xh, (void *)&y, &N, &K, &T};
+            if (e == hipSuccess)
+                e = hipModuleLaunchKernel(g_fn_wmmah[type], grid, 1, 1, QMV_WM_THREADS, 1, 1, 0, stream, args, nullptr);
+        } else {
+            void *args[] = {(void *)&W, &rb, (void *)&x, (void *)&y, &N, &K, &T};
+            e = hipModuleLaunchKernel(g_fn_wmmaf[type], grid, 1, 1, QMV_WM_THREADS, 1, 1, 0, stream, args, nullptr);
+        }
         return post_scale1(e, W, y, N, N, T, stream);
     }
     if (T > 1 && type >= 0 && type < QMV_MAX_TYPE && g_fn_mmf[type]) {  // same sums as T launches of matvec_<type>

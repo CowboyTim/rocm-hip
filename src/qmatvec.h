@@ -33,10 +33,16 @@ int qmatvec_supported(int type);
 hipError_t qmatvec_launch(int type, const void *W, size_t row_bytes, const float *x, float *y, int N, int K,
                           hipStream_t stream);
 
-// The same for T rows of x [K] -> y [N]: one batched launch for F32 (bit-identical to qmatvec_launch per row),
-// otherwise one qmatvec_launch per row.
+// The same for T rows of x [K] -> y [N]: one batched launch (F32 and the matmul_f kernels bit-identical to
+// qmatvec_launch per row; F16 / BF16 batches of 32+ tokens on WMMA tiles unless QMATVEC_NO_WMMA),
+// else one qmatvec_launch per row.
 hipError_t qmatvec_launch_batch(int type, const void *W, size_t row_bytes, const float *x, float *y, int N, int K,
                                 int T, hipStream_t stream);
+
+// The same with a scratch buffer xh of xh_bytes (16-byte aligned; NULL: none): F16 / BF16 prefill batches round x
+// to the weight type into it first (T * K * 2 bytes), and the WMMA kernel then reads half the activation bytes.
+hipError_t qmatvec_launch_batch_h(int type, const void *W, size_t row_bytes, const float *x, uint16_t *xh,
+                                  size_t xh_bytes, float *y, int N, int K, int T, hipStream_t stream);
 
 // Int8 copy of a float (F32 / F16 / BF16) matrix, for the opt-in Q8_0 LM head: ggml's Q8_0 quantization
 // (per 32 values d = amax / 127 as FP16, q = round(x / d)) in a split layout, values qs [N][K] (16-byte

@@ -76,6 +76,8 @@ static void q8_roundtrip(int wtype, const float *x, float *out, int K) {
 
 static ShmBuf g_q8mem;
 static qmatvec_q8 g_q8;
+static uint16_t *g_xh = nullptr;  // 16-bit x scratch for qmatvec_launch_batch_h
+static size_t g_xh_n = 0;
 
 static bool run_one(gguf_model_t *g, int64_t idx, ShmBuf &xb, ShmBuf &yb) {
     const char *name = gguf_tensor_name(g, idx);
@@ -141,7 +143,54 @@ static bool run_one(gguf_model_t *g, int64_t idx, ShmBuf &xb, ShmBuf &yb) {
     }
     printf("  [%s] %-32s %-18s %6d x %-6d worst rel err %.2e (row %d)%s\n", bad ? "FAIL" : "PASS", name, tr->name,
            N, K, worst, worst_n, bad ? " <-- rows over 1e-5" : "");
-    if (!qmatvec_q8_supported(type, K) || K > g_q8.max_k) return bad == 0;
+
+    // Float batched kernels (qmatvec_launch_batch) on T = 70 tokens vs T single-token launches: F16 / BF16 take
+    // the WMMA kernel there (another FP32 summation order, so 1e-5 of sum |w|, |x| <= 1), the others matmul_f
+    bool okf = true;
+    if (type == QT_F16 || type == QT_BF16 || !qmatvec_q8_supported(type, K)) {
+        const int T = 70;
+        if ((size_t)T * K * sizeof(float) > xb.n || (size_t)T * N * sizeof(float) > yb.n) {
+            printf("  [SKIP] %-32s float batched check exceeds test buffers\n", name);
+        } else {
+            std::vector<float> xs((size_t)T * K), single((size_t)T * N);
+            uint32_t s2 = 4242u;
+            for (size_t i = 0; i < xs.size(); ++i) {
+                s2 = s2 * 1664525u + 1013904223u;
+                xs[i] = ((int)(s2 >> 9) - (1 << 22)) / (float)(1 << 22);
+            }
+            memcpy(x, xs.data(), xs.size() * sizeof(float));
+            for (int t = 0; t < T && e == hipSuccess; ++t)
+                e = qmatvec_launch(type, W, rb, x + (size_t)t * K, y + (size_t)t * N, N, K, 0);
+            if (e == hipSuccess) e = hipDeviceSynchronize();
+            if (e == hipSuccess) memcpy(single.data(), y, single.size() * sizeof(float));
+            // without and with the 16-bit x scratch (qmatvec_launch_batch_h)
+            for (const bool h : {false, true}) {
+                if (h && type != QT_F16 && type != QT_BF16) continue;
+                if (e == hipSuccess)
+                    e = h ? qmatvec_launch_batch_h(type, W, rb, x, g_xh, g_xh_n, y, N, K, T, 0)
+                          : qmatvec_launch_batch(type, W, rb, x, y, N, K, T, 0);
+                if (e == hipSuccess) e = hipDeviceSynchronize();
+                if (e != hipSuccess) {
+                    printf("  [FAIL] %-32s float batched launch: %s\n", name, hipGetErrorString(e));
+                    return false;
+                }
+                double worstf = 0.0;
+                for (int n = 0; n < N; ++n) {
+                    qt_to_float(type, W + (size_t)n * rb, row.data(), K);
+                    double m = 0.0;
+                    for (int k = 0; k < K; ++k) m += std::fabs((double)row[k]);
+                    for (int t = 0; t < T; ++t) {
+                        const size_t i = (size_t)t * N + n;
+                        worstf = std::max(worstf, std::fabs((double)y[i] - single[i]) / (m + 1e-30));
+                    }
+                }
+                okf = okf && worstf <= 1e-5;
+                printf("  [%s] %-32s %-18s float batched%s, %d tokens  worst diff vs single %.2e of sum|w|\n",
+                       worstf <= 1e-5 ? "PASS" : "FAIL", name, tr->name, h ? " (16-bit x)" : "", T, worstf);
+            }
+        }
+    }
+    if (!qmatvec_q8_supported(type, K) || K > g_q8.max_k) return bad == 0 && okf;
 
     // int8 path
     memset(y, 0, (size_t)N * sizeof(float));
@@ -225,7 +274,7 @@ static bool run_one(gguf_model_t *g, int64_t idx, ShmBuf &xb, ShmBuf &yb) {
         printf("  [%s] %-32s %-18s batched, %d tokens  worst diff vs single %.2e of sum|w|%s\n", okb ? "PASS" : "FAIL",
                name, tr->name, T, worstb, exact ? " (must be 0)" : "");
     }
-    return bad == 0 && bad8 == 0 && okb_all;
+    return bad == 0 && okf && bad8 == 0 && okb_all;
 }
 
 int main(int argc, char **argv) {
@@ -244,11 +293,14 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    ShmBuf xb, yb;
-    if (!xb.alloc("matvec_verify_x.bin", 64u << 20) || !yb.alloc("matvec_verify_y.bin", 64u << 20)) {
+    ShmBuf xb, yb, xhb;
+    if (!xb.alloc("matvec_verify_x.bin", 64u << 20) || !yb.alloc("matvec_verify_y.bin", 64u << 20) ||
+        !xhb.alloc("matvec_verify_xh.bin", 32u << 20)) {
         fprintf(stderr, "cannot allocate /dev/shm buffers\n");
         return 2;
     }
+    g_xh = (uint16_t *)xhb.p;
+    g_xh_n = xhb.n;
 
     std::vector<int64_t> todo;
     if (argc > 2) {
