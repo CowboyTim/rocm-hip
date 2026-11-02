@@ -2742,6 +2742,15 @@ expert), WStageIQ<P> (WMMA staging; wmma_q8k now takes the staging class, the K-
   llama.cpp's for IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS. TQ1_0 and TQ2_0 hold the same ternary values: identical results
   through their two decoders.
 - 0.6B speed (2,426 tokens): prefill int8 3,800-4,560 -> WMMA 7,080-7,800 tok/s (IQ4_XS 8,837), generation 165-181.
+- 35B (imatrix from the same text; the MTP block blk.40 has no imatrix data, so llama-quantize refuses the very
+  low-bit types for it: --tensor-type 'blk\.40\.=q4_K'): IQ3_S (401 iq3_s incl. experts) and IQ3_XXS (360 iq3_xxs
+  incl. 120 of 123 expert tensors, 20 iq2_s, 11 iq3_s). forward_verify: all 67 per-matrix / expert (by id, grouped
+  prefill) checks pass for both; decode drift IQ3_S worst 0.9896 (1 layer below 0.99), IQ3_XXS 0.981 (Q4_0 0.984 on
+  this prompt). Greedy text: IQ3_S = stock llama.cpp ROCm's (40 tokens); IQ3_XXS a late near tie where llama.cpp CPU,
+  llama.cpp ROCm and the engine choose three different continuations. Speed (2,426 tokens): IQ3_S prefill 1,820,
+  generation 81 tok/s; IQ3_XXS 759 (int8) -> 1,913 (WMMA), generation 86.
+- Not made for the 35B: the IQ2 / IQ1 / TQ models (12-22 min of CPU each): the kernels are the same generic ones over
+  the policies, whose decoding the 0.6B checks bit-exact per type, and IQ3_S / IQ3_XXS cover the expert paths.
 
 ### Quant types: IQ4_XS (2026-11-02, user: "push, then continue")
 
