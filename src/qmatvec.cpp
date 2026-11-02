@@ -258,6 +258,33 @@ hipError_t qmatvec_launch(int type, const void *W, size_t row_bytes, const float
 #define QMV_MF32_ROWS 16  // must match MF32_ROWS in matvec_q.hip
 #define QMV_MMF_TT 8   // must match MMF_TT in matvec_q.hip
 
+static unsigned wf_grid(int N, int T) {
+    return (unsigned)((N + QMV_WF_ROWS - 1) / QMV_WF_ROWS) * (unsigned)((T + QMV_WF_TOK - 1) / QMV_WF_TOK);
+}
+
+int qmatvec_half_supported(int type, const void *W, size_t row_bytes, int N, int K, int T) {
+    return type >= 0 && type < QMV_MAX_TYPE && g_fn_wmmaf[type] && g_use_wmma && T >= g_wmma_min_t && N >= 64 &&
+           K % 8 == 0 && row_bytes >= (size_t)K * 2 && row_bytes % 16 == 0 && ((uintptr_t)W & 15) == 0;
+}
+
+hipError_t qmatvec_round_half(int type, const float *x, uint16_t *xh, long long n, hipStream_t stream) {
+    if (type < 0 || type >= QMV_MAX_TYPE || !g_round_half[type]) return hipErrorInvalidDeviceFunction;
+    if (n % 8 != 0 || (((uintptr_t)x | (uintptr_t)xh) & 15) != 0) return hipErrorInvalidValue;
+    long long n8 = n / 8;
+    void *args[] = {(void *)&x, (void *)&xh, &n8};
+    return hipModuleLaunchKernel(g_round_half[type], (unsigned)((n8 + 255) / 256), 1, 1, 256, 1, 1, 0, stream, args,
+                                 nullptr);
+}
+
+hipError_t qmatvec_launch_batch_hx(int type, const void *W, size_t row_bytes, const uint16_t *xh, float *y, int N,
+                                   int K, int T, hipStream_t stream) {
+    if (!qmatvec_half_supported(type, W, row_bytes, N, K, T) || !g_fn_wmmah[type]) return hipErrorInvalidDeviceFunction;
+    if (((uintptr_t)xh & 15) != 0) return hipErrorInvalidValue;
+    long long rb = (long long)row_bytes;
+    void *args[] = {(void *)&W, &rb, (void *)&xh, (void *)&y, &N, &K, &T};
+    return hipModuleLaunchKernel(g_fn_wmmah[type], wf_grid(N, T), 1, 1, QMV_WF_THREADS, 1, 1, 0, stream, args, nullptr);
+}
+
 hipError_t qmatvec_launch_batch(int type, const void *W, size_t row_bytes, const float *x, float *y, int N, int K,
                                 int T, hipStream_t stream) {
     return qmatvec_launch_batch_h(type, W, row_bytes, x, nullptr, 0, y, N, K, T, stream);
@@ -283,31 +310,15 @@ hipError_t qmatvec_launch_batch_h(int type, const void *W, size_t row_bytes, con
     }
     // F16 / BF16 prefill batches in the WMMA mode: matmul_wmma_h_<type> on x rounded to 16 bits into xh, or
     // matmul_wmma_f_<type> rounding x itself (FP32 sums in another order than matvec_<type>'s)
-    if (type >= 0 && type < QMV_MAX_TYPE && g_fn_wmmaf[type] && g_use_wmma && T >= g_wmma_min_t && N >= 64 &&
-        K % 8 == 0 && row_bytes >= (size_t)K * 2 && row_bytes % 16 == 0 &&
-        (((uintptr_t)W | (uintptr_t)x | (uintptr_t)xh) & 15) == 0) {
-        long long rb = (long long)row_bytes;
-        const unsigned grid =
-            (unsigned)((N + QMV_WF_ROWS - 1) / QMV_WF_ROWS) * (unsigned)((T + QMV_WF_TOK - 1) / QMV_WF_TOK);
-        hipError_t e;
-        // xh rows padded by 8 values: rows a multiple of 4 KB apart (K = 6144: 12 KB) put a tile's loads in the
-        // same memory channels, 21 vs 28 TFLOPS on 5120 x 6144 (the weights' own rows have the same effect, 26 vs
-        // 41, but stay as the GGUF has them)
-        const int ldx = K + 8;
-        if (xh && xh_bytes >= (size_t)T * ldx * 2 && g_fn_wmmah[type] && g_round_half[type]) {
-            long long n8 = (long long)T * K / 8, ldx_ll = ldx;
-            int k8 = K / 8, ldx8 = ldx / 8;
-            void *ra[] = {(void *)&x, (void *)&xh, &k8, &ldx8, &n8};
-            e = hipModuleLaunchKernel(g_round_half[type], (unsigned)((n8 + 255) / 256), 1, 1, 256, 1, 1, 0, stream, ra,
-                                      nullptr);
-            void *args[] = {(void *)&W, &rb, (void *)&xh, &ldx_ll, (void *)&y, &N, &K, &T};
-            if (e == hipSuccess)
-                e = hipModuleLaunchKernel(g_fn_wmmah[type], grid, 1, 1, QMV_WF_THREADS, 1, 1, 0, stream, args, nullptr);
-        } else {
-            void *args[] = {(void *)&W, &rb, (void *)&x, (void *)&y, &N, &K, &T};
-            e = hipModuleLaunchKernel(g_fn_wmmaf[type], grid, 1, 1, QMV_WF_THREADS, 1, 1, 0, stream, args, nullptr);
+    if (qmatvec_half_supported(type, W, row_bytes, N, K, T) && (((uintptr_t)x | (uintptr_t)xh) & 15) == 0) {
+        if (xh && xh_bytes >= (size_t)T * K * 2 && g_fn_wmmah[type]) {
+            const hipError_t e = qmatvec_round_half(type, x, xh, (long long)T * K, stream);
+            return e != hipSuccess ? e : qmatvec_launch_batch_hx(type, W, row_bytes, xh, y, N, K, T, stream);
         }
-        return e;
+        long long rb = (long long)row_bytes;
+        void *args[] = {(void *)&W, &rb, (void *)&x, (void *)&y, &N, &K, &T};
+        return hipModuleLaunchKernel(g_fn_wmmaf[type], wf_grid(N, T), 1, 1, QMV_WF_THREADS, 1, 1, 0, stream, args,
+                                     nullptr);
     }
     if (T > 1 && type >= 0 && type < QMV_MAX_TYPE && g_fn_mmf[type]) {  // same sums as T launches of matvec_<type>
         const qt_traits *tr = qt_get_traits(type);
@@ -373,6 +384,8 @@ void qmatvec_q8_bind(qmatvec_q8 *q, void *mem, int max_k) {
     p += align16(k / 16 * 4);
     q->s0 = (int32_t *)p;
     q->max_k = max_k;
+    q->xh = nullptr;
+    q->xh_bf16 = 0;
 }
 
 // ROCmFP4 weights read only the Q8_0 side of the quantized input (32-value blocks), so their rows need not be

@@ -40,10 +40,17 @@ hipError_t qmatvec_launch_batch(int type, const void *W, size_t row_bytes, const
                                 int T, hipStream_t stream);
 
 // The same with a scratch buffer xh of xh_bytes (16-byte aligned; NULL: none): F16 / BF16 prefill batches round x
-// to the weight type into it first (T rows of K + 8 values, 2 bytes each), and the WMMA kernel then reads half the
-// activation bytes.
+// to the weight type into it first (T * K values), and the WMMA kernel then reads half the activation bytes.
 hipError_t qmatvec_launch_batch_h(int type, const void *W, size_t row_bytes, const float *x, uint16_t *xh,
                                   size_t xh_bytes, float *y, int N, int K, int T, hipStream_t stream);
+
+// The parts of that for callers that keep the 16-bit copy (a producer kernel wrote it through qmatvec_q8.xh, or one
+// rounding serves several matmuls on the same x): whether the F16 / BF16 WMMA matmul takes this batch; x -> xh
+// rounded to the type (n values, n % 8 == 0); the matmul on xh (T rows of K values).
+int qmatvec_half_supported(int type, const void *W, size_t row_bytes, int N, int K, int T);
+hipError_t qmatvec_round_half(int type, const float *x, uint16_t *xh, long long n, hipStream_t stream);
+hipError_t qmatvec_launch_batch_hx(int type, const void *W, size_t row_bytes, const uint16_t *xh, float *y, int N,
+                                   int K, int T, hipStream_t stream);
 
 // Int8 copy of a float (F32 / F16 / BF16) matrix, for the opt-in Q8_0 LM head: ggml's Q8_0 quantization
 // (per 32 values d = amax / 127 as FP16, q = round(x / d)) in a split layout, values qs [N][K] (16-byte
@@ -69,6 +76,8 @@ typedef struct qmatvec_q8 {
     int32_t *s0;   // per 32 values [K / 32]: ggml's Q8_1 s, F16(d * sum of the block's q), as float bits (the
                    // offsets of Q5_1 / Q4_1 weights: m * s)
     int max_k;
+    uint16_t *xh;  // optional (NULL: none): the values rounded to BF16 (xh_bf16) or F16 [K], for the F16 / BF16 WMMA
+    int xh_bf16;   // matmuls (qmatvec_launch_batch_hx); q0 .. s0 may then be NULL (no int8 output)
 } qmatvec_q8;
 
 // The output pointers as kernels take them (Q8Out in q8_device.h): pass by value to kernels that quantize
@@ -80,10 +89,12 @@ typedef struct qmatvec_q8_out {
     float *dK;
     int32_t *bsK;
     int32_t *s0;
+    uint16_t *xh;
+    int xh_bf16;
 } qmatvec_q8_out;
 
 static inline qmatvec_q8_out qmatvec_q8_outputs(const qmatvec_q8 *q) {
-    qmatvec_q8_out o = {0, 0, 0, 0, 0, 0};
+    qmatvec_q8_out o = {0, 0, 0, 0, 0, 0, 0, 0};
     if (q) {
         o.q0 = q->q0;
         o.d0 = q->d0;
@@ -91,6 +102,8 @@ static inline qmatvec_q8_out qmatvec_q8_outputs(const qmatvec_q8 *q) {
         o.dK = q->dK;
         o.bsK = q->bsK;
         o.s0 = q->s0;
+        o.xh = q->xh;
+        o.xh_bf16 = q->xh_bf16;
     }
     return o;
 }

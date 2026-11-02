@@ -167,9 +167,12 @@ struct Scratch {
     qmatvec_q8 q8;
     int q8_max_k = 0;
     // The current matmul input rounded to 16 bits for the F16 / BF16 WMMA kernels (qmatvec_launch_batch_h):
-    // q8_max_k values, rows padded by 8
+    // q8_max_k values
     uint16_t* xh = nullptr;
     size_t xh_bytes = 0;
+    // What the producer kernels write through (QwenModel::q8_for): q8 int8 only, q8h int8 and the 16-bit copy into xh,
+    // qh the 16-bit copy only (the same buffers; consumers read the int8 forms through q8)
+    qmatvec_q8 q8h, qh;
 
     ShmRegion mem;
 
@@ -197,7 +200,7 @@ struct Scratch {
                                 b * HCD, b * HCD, b * HCD, b * R, b * RP, b * HCD, b * NHC,
                                 b * PE, b * PHCD, b * PE, b * PHCD, b * PHCD, b * NU * GU, b * ZX,
                                 b * LT, b * LT, b * LU, (qmatvec_q8_bytes(q8_max_k) + 3) / 4,
-                                ((size_t)q8_max_k + 8 * b) / 2};
+                                (size_t)q8_max_k / 2};
         float *xh_f = nullptr, *ids_f = nullptr, *gt = nullptr, *gp = nullptr, *gn = nullptr, *ge = nullptr, *gs = nullptr, *gc = nullptr;
         float** const ptrs[] = {&x, &x_alt, &xn, &qfull, &q, &k, &v, &attn, &proj, &ffg, &ffu, &act, &logits,
                                 &qkv, &conv, &z, &alpha, &beta, &lin,
@@ -220,7 +223,7 @@ struct Scratch {
         g_tile_n = (int*)gc;
         qmatvec_q8_bind(&q8, q8mem, q8_max_k);
         xh = (uint16_t*)xh_f;
-        xh_bytes = ((size_t)q8_max_k + 8 * b) * 2;
+        xh_bytes = (size_t)q8_max_k * 2;
         return true;
     }
 };
@@ -352,6 +355,12 @@ struct QwenModel {
     bool use_q8 = getenv("QWEN_MATVEC_FP32") == nullptr;
     const float* q8_src = nullptr;
     int q8_k = 0, q8_t = 0;
+    // F16 / BF16 WMMA prefill: producers also write their output rounded to 16 bits into s.xh (of type h_type) when
+    // the model has F16 / BF16 matrices; h_src[h_k] for h_t rows is what s.xh holds (NULL: nothing usable)
+    bool use_h = false;
+    int h_type = 0;
+    const float* h_src = nullptr;
+    int h_k = 0, h_t = 0;
     // Opt-in Q8_0 copy of a float LM head (qwen_model_set_lm_head_q8), built on the GPU when first enabled
     ShmRegion head_mem;
     int8_t* head_q = nullptr;
@@ -505,6 +514,23 @@ struct QwenModel {
             }
             use_q8 = any;
         }
+        // Producers write the 16-bit copy only for models whose matrices are all float: with int8 matrices as well
+        // (Qwen3.5-0.8B UD-Q8_K_XL: Q8_0 and F16) most producer outputs feed int8 matmuls, and writing the copy for
+        // all of them cost more (-2% prefill) than rounding per F16 matmul
+        if (!use_q8) {  // F16 / BF16 matrices that prefill runs (not the embeddings, read on the CPU, nor the LM head)
+            int nf16 = 0, nbf16 = 0;
+            for (int64_t i = 0; i < gguf_n_tensors(eng->gguf); ++i) {
+                const char* nm = gguf_tensor_name(eng->gguf, i);
+                const int ty = gguf_tensor_type(eng->gguf, i);
+                if (gguf_tensor_dims(eng->gguf, i) < 2 || (ty != QT_F16 && ty != QT_BF16) ||
+                    strcmp(nm, "token_embd.weight") == 0 || strcmp(nm, "output.weight") == 0 ||
+                    strcmp(nm, "per_layer_token_embd.weight") == 0)
+                    continue;
+                ++(ty == QT_BF16 ? nbf16 : nf16);
+            }
+            use_h = nf16 + nbf16 > 0;
+            h_type = nbf16 >= nf16 ? QT_BF16 : QT_F16;
+        }
         bool has_linear = false;
         for (const LayerWeights& L : eng->layers) has_linear |= L.kind == LAYER_LINEAR_ATTN;
         if (has_linear) {
@@ -544,6 +570,13 @@ struct QwenModel {
             qwen_set_error("scratch allocation failed");
             return false;
         }
+        s.q8h = s.q8;
+        s.q8h.xh = s.xh;
+        s.q8h.xh_bf16 = h_type == QT_BF16;
+        memset(&s.qh, 0, sizeof s.qh);
+        s.qh.max_k = s.q8_max_k;
+        s.qh.xh = s.xh;
+        s.qh.xh_bf16 = h_type == QT_BF16;
         if (!rs.alloc(eng)) {
             qwen_set_error("recurrent state allocation failed");
             return false;
@@ -559,17 +592,23 @@ struct QwenModel {
     // The int8 buffer for a producer kernel to quantize its T rows of K values into, or NULL (float path).
     // K % 256 == 0: both formats. q8_0_rows: also rows of K % 32 == 0 (only Q8_0 is complete per row, which
     // is all the ROCmFP4 kernels read; qmatvec_q8_supported keeps K-quants to K % 256), for the producers that
-    // handle them (swiglu, qmatvec_quantize).
+    // handle them (swiglu, qmatvec_quantize). Prefill batches of models with F16 / BF16 matrices: also (or only)
+    // the 16-bit copy, which the WMMA matmuls read (from 32 rows, QMATVEC_WMMA_MIN_T's default).
     const qmatvec_q8* q8_for(int K, int T, bool q8_0_rows = false) const {
-        return use_q8 && K % (q8_0_rows ? 32 : 256) == 0 && (long long)K * T <= s.q8_max_k ? &s.q8 : nullptr;
+        const bool fit = K % (q8_0_rows ? 32 : 256) == 0 && (long long)K * T <= s.q8_max_k;
+        const bool i8 = use_q8 && fit, h = use_h && fit && T >= 32;
+        return i8 ? (h ? &s.q8h : &s.q8) : h ? &s.qh : nullptr;
     }
 
     // A producer kernel just wrote T rows of x[K], quantized into q (NULL: not quantized); the next matmuls
     // read it
     void mark(const float* x, int K, int T, const qmatvec_q8* q) {
-        q8_src = q ? x : nullptr;
+        q8_src = q && q->qK ? x : nullptr;
         q8_k = K;
         q8_t = T;
+        h_src = q && q->xh ? x : nullptr;
+        h_k = K;
+        h_t = T;
     }
 
     // T rows of x[K] were written by a kernel that cannot quantize its output: quantize them in a separate launch
@@ -581,15 +620,24 @@ struct QwenModel {
     }
 
     // Y[t] = W X[t] for T rows on the GPU (X, Y in pinned memory, rows of W.K / W.N values). c: profile
-    // section. Uses the int8 kernels when there is one for the type and s.q8 holds these rows; otherwise the
-    // float kernels (batched; F16 / BF16 prefill rounds x into s.xh for the WMMA kernels).
+    // section. Uses the int8 kernels when there is one for the type and s.q8 holds these rows; F16 / BF16 prefill
+    // the WMMA kernels on the 16-bit copy in s.xh (written by x's producer, else rounded here: then s.xh no longer
+    // holds h_src's); otherwise the float kernels.
     bool matvec(const QuantWeight& W, const float* x, float* y, int T, ProfCat c) {
         prof.bytes[c] += (double)W.row_bytes * W.N;
         const bool q8 = q8_src == x && q8_k == W.K && q8_t == T && qmatvec_q8_supported(W.type, W.K);
         hipError_t e = hipSuccess;
         if (q8 && T == 1) e = qmatvec_launch_q8(W.type, W.data, W.row_bytes, &s.q8, y, W.N, W.K, 0);
         else if (q8) e = qmatvec_launch_q8_batch(W.type, W.data, W.row_bytes, &s.q8, y, W.N, W.N, W.K, T, 0);
-        else e = qmatvec_launch_batch_h(W.type, W.data, W.row_bytes, x, s.xh, s.xh_bytes, y, W.N, W.K, T, 0);
+        else if (qmatvec_half_supported(W.type, W.data, W.row_bytes, W.N, W.K, T) &&
+                 (size_t)T * W.K * 2 <= s.xh_bytes) {
+            if (h_src != x || h_k != W.K || h_t != T || h_type != W.type) {
+                h_src = nullptr;
+                e = qmatvec_round_half(W.type, x, s.xh, (long long)T * W.K, 0);
+            }
+            if (e == hipSuccess) e = qmatvec_launch_batch_hx(W.type, W.data, W.row_bytes, s.xh, y, W.N, W.K, T, 0);
+        } else
+            e = qmatvec_launch_batch(W.type, W.data, W.row_bytes, x, y, W.N, W.K, T, 0);
         if (e != hipSuccess) {
             qwen_set_error("qmatvec type %d %dx%d (T %d): %s", W.type, W.N, W.K, T, hipGetErrorString(e));
             return false;

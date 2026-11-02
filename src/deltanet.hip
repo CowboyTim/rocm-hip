@@ -229,5 +229,5 @@ deltanet_norm(float* out, const float* z, const float* norm_w, float eps, int si
     const float zi = z[i];
     const float y = v * rsqrtf(ss / DS + eps) * norm_w[t & (DS - 1)] * (sigmoid_gate ? 1.0f / (1.0f + __expf(-zi)) : silu(zi));
     out[i] = y;
-    if (o.qK) q8_block_value(y, true, blockIdx.x, t, sh, o);
+    if (q8_wanted(o)) q8_block_value(y, true, blockIdx.x, t, sh, o);
 }

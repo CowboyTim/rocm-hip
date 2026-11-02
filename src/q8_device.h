@@ -8,6 +8,8 @@
 //   Q8_K (K-quant weights): d = 1 / (-127 / max) with max the signed value of largest |x| (first on ties),
 //                           q = min(127, round-half-even(x * -127 / max)), plus the sum of every 16 q values.
 // Bit-identical to ggml's CPU quantizers, so each block's integer dot product matches the reference exactly.
+// And / or the value rounded to 16 bits (BF16 round-to-nearest-even or F16), the input of the F16 / BF16 WMMA
+// matmuls (qmatvec_launch_batch_hx), so that no separate pass re-reads the activations to round them.
 
 #ifndef Q8_DEVICE_H
 #define Q8_DEVICE_H
@@ -15,7 +17,8 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
-// Output pointers; the same layout as the first members of qmatvec_q8 (qmatvec.h). qK == nullptr: no output.
+// Output pointers; the layout of qmatvec_q8_out (qmatvec.h). qK == nullptr: no int8 output; xh == nullptr: no
+// 16-bit output.
 struct Q8Out {
     int8_t* q0;
     float* d0;
@@ -23,7 +26,21 @@ struct Q8Out {
     float* dK;
     int* bsK;
     int* s0;  // per Q8_0 block, ggml's Q8_1 s: F16(d * sum of its 32 q), d = amax / 127 unrounded; float bits
+    uint16_t* xh;  // the values as BF16 (xh_bf16) or F16
+    int xh_bf16;
 };
+
+// Whether a producer kernel has anything to write through o (uniform: a kernel argument)
+__device__ __forceinline__ bool q8_wanted(const Q8Out& o) { return o.qK || o.xh; }
+
+// v rounded to BF16 (to nearest, ties to even) or F16, as ggml converts F16 / BF16 matmul inputs
+__device__ __forceinline__ uint16_t half_bits(float v, int bf16) {
+    if (bf16) {
+        const uint32_t u = __float_as_uint(v);
+        return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+    }
+    return __half_as_ushort(__float2half(v));
+}
 
 // Shared scratch for one 256-thread group
 struct Q8Shared {
@@ -36,6 +53,8 @@ struct Q8Shared {
 // the same number of times (it contains a __syncthreads); threads of an inactive group pass active = false.
 __device__ __forceinline__ void q8_block_value(float v, bool active, int b, int t, Q8Shared& sh, const Q8Out& o) {
     const int lane = t & 31, w = t >> 5, i = b * 256 + t;
+    if (o.xh && active) o.xh[i] = half_bits(v, o.xh_bf16);
+    if (!o.qK) return;  // (uniform)
     const float a = active ? fabsf(v) : 0.0f;
 
     // Q8_0 over the wave's 32 values

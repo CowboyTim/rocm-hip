@@ -52,7 +52,7 @@ add_rmsnorm(const float* x_in, const float* add, float* x_out, const float* w, f
         v = v * inv * (w ? w[i] : 1.0f);
         y[i] = v;
     }
-    if (o.qK) q8_block_value(v, active, blockIdx.y * (n / 256) + blockIdx.x, t, sh, o);  // uniform; n % 256 == 0
+    if (q8_wanted(o)) q8_block_value(v, active, blockIdx.y * (n / 256) + blockIdx.x, t, sh, o);  // uniform; n % 256 == 0
 }
 
 // add_rmsnorm_rows: the same for many rows (prefill): grid T, block 256, one workgroup per row, which it reads
@@ -96,7 +96,7 @@ add_rmsnorm_rows(const float* x_in, const float* add, float* x_out, const float*
             if (add) x_out[k] = x[j];
             const float v = x[j] * inv * (w ? w[k] : 1.0f);
             y[k] = v;
-            if (o.qK) q8_block_value(v, true, blockIdx.x * nb + j, t, sh, o);
+            if (q8_wanted(o)) q8_block_value(v, true, blockIdx.x * nb + j, t, sh, o);
         }
 }
 
@@ -110,7 +110,7 @@ swiglu(const float* g, const float* u, float* out, int n, Q8Out o) {
         v = a / (1.0f + __expf(-a)) * u[i];
         out[i] = v;
     }
-    if (o.qK) q8_block_value(v, i < n, blockIdx.x, threadIdx.x, sh, o);  // uniform; n % 32 == 0 when set
+    if (q8_wanted(o)) q8_block_value(v, i < n, blockIdx.x, threadIdx.x, sh, o);  // uniform; n % 32 == 0 when set
 }
 
 // ---------------------------------------------------------------- mixture of experts (qwen35moe)
@@ -373,7 +373,7 @@ hc_norm(const float* res_in, float* res_out, const float* cur, const float* inje
             if (cur) xo[k] = v[j];
             const float out = v[j] * inv * w[c * n + k];
             y[(size_t)r * n + k] = out;
-            if (o.qK) q8_block_value(out, true, r * nb + j, tid, sh, o);
+            if (q8_wanted(o)) q8_block_value(out, true, r * nb + j, tid, sh, o);
         }
 }
 
@@ -390,7 +390,7 @@ hc_lowrank(const float* lo, float* out, int n, int np, int T, float scale, Q8Out
         }
         out[i] = v;
     }
-    if (o.qK) q8_block_value(v, active, blockIdx.x, threadIdx.x, sh, o);  // uniform
+    if (q8_wanted(o)) q8_block_value(v, active, blockIdx.x, threadIdx.x, sh, o);  // uniform
 }
 
 extern "C" __global__ void __launch_bounds__(256)
@@ -405,7 +405,7 @@ hc_mix(const float* xn, const float* gate, float* out, int n, int hc, Q8Out o) {
         v *= 1.0f / (float)hc;
         out[(size_t)t * n + i] = v;
     }
-    if (o.qK) q8_block_value(v, i < n, t * (n / 256) + blockIdx.x, threadIdx.x, sh, o);  // uniform
+    if (q8_wanted(o)) q8_block_value(v, i < n, t * (n / 256) + blockIdx.x, threadIdx.x, sh, o);  // uniform
 }
 
 // mtp_concat  grid (ceil(2n / 256), T * hc): out[t][c] = [e[t] | h[t][c]] (n values each), the MTP head's
@@ -601,7 +601,7 @@ gemma_attn_post(const float* x, const float* a, const float* w_a, float* x_out, 
             const float y = v[j] * inv * w1[k];
             y1[row + k] = y;
             if (w2) y2[row + k] = v[j] * inv * w2[k];
-            if (o1.qK) q8_block_value(y, true, blockIdx.x * nb + j, t, sh, o1);
+            if (q8_wanted(o1)) q8_block_value(y, true, blockIdx.x * nb + j, t, sh, o1);
         }
 }
 
@@ -651,7 +651,7 @@ gemma_ffn_post(const float* x, const float* mlp, const float* down, const float*
             const int k = t + 256 * j;
             const float v = h[j] * inv * w_next[k];
             y[row + k] = v;
-            if (o.qK) q8_block_value(v, true, tk * nb + j, t, sh, o);
+            if (q8_wanted(o)) q8_block_value(v, true, tk * nb + j, t, sh, o);
         }
 }
 
@@ -667,7 +667,7 @@ geglu(const float* gate, const float* up, float* out, int n, int h, int gs, int 
         v = g * up[(size_t)r * us + c];
         out[i] = v;
     }
-    if (o.qK) q8_block_value(v, i < n, blockIdx.x, threadIdx.x, sh, o);  // uniform; n % 32 == 0 when set
+    if (q8_wanted(o)) q8_block_value(v, i < n, blockIdx.x, threadIdx.x, sh, o);  // uniform; n % 32 == 0 when set
 }
 
 extern "C" __global__ void __launch_bounds__(256)
@@ -787,7 +787,7 @@ mamba_gnorm(const float* y, const float* zx, long long ld, const float* w, float
             const int k = g * gs + tid + 256 * jj;
             const float r = v[jj] * inv * w[k];
             out[(size_t)t * d_inner + k] = r;
-            if (o.qK) q8_block_value(r, true, (t * d_inner + g * gs) / 256 + jj, tid, sh, o);
+            if (q8_wanted(o)) q8_block_value(r, true, (t * d_inner + g * gs) / 256 + jj, tid, sh, o);
         }
 }
 
@@ -834,5 +834,5 @@ relu2(const float* in, float* out, int n, int h, int stride, Q8Out o) {
         v = r * r;
         out[i] = v;
     }
-    if (o.qK) q8_block_value(v, i < n, blockIdx.x, threadIdx.x, sh, o);  // uniform; n % 32 == 0 when set
+    if (q8_wanted(o)) q8_block_value(v, i < n, blockIdx.x, threadIdx.x, sh, o);  // uniform; n % 32 == 0 when set
 }

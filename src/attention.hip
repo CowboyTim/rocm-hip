@@ -282,7 +282,7 @@ __device__ __forceinline__ void attn_combine_body(const float* part_ml, const fl
     float r = num / den;
     if (gated) r /= 1.0f + __expf(-qfull[(size_t)h * 2 * D + D + d]);
     out[h * D + d] = r;
-    if (o.qK) q8_block_value(r, true, z * nb + blockIdx.x, threadIdx.x, sh, o);  // uniform: one 256-block
+    if (q8_wanted(o)) q8_block_value(r, true, z * nb + blockIdx.x, threadIdx.x, sh, o);  // uniform: one 256-block
 }
 
 // ---------------------------------------------------------------- prefill: query-tiled flash attention
