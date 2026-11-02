@@ -64,11 +64,13 @@ Weights stay in their GGUF blocks; each type has a CPU decoder (tests) and GPU k
 - **Float path** (`matvec_<type>`, `matmul_f_<type>`): decode and FMA; any type, any K; used where no int8
   kernel applies (e.g. Q8_0, F16).
 - **F16 / BF16 WMMA** (`matmul_wmma_h_<type>`, prefill from 32 tokens): `v_wmma_f32_16x16x16_f16 / _bf16` on
-  256-row x 128-token tiles (16 waves); the activations are rounded to the weight type first (`round_half_<type>`
-  into the engine's scratch, rows padded by 8 values, `qmatvec_launch_batch_h`), so the kernel reads 2 bytes per
-  activation; it is bound by L2 / MALL bytes, not by the WMMAs (~40 TFLOPS from LDS alone, 24-40 in practice;
-  weight rows a multiple of 4 KB apart alias in the memory channels and are the slow shapes). `matmul_wmma_f_<type>` rounds
-  float activations itself, for callers without a scratch.
+  256-row x 128-token tiles (16 waves) of activations already rounded to the weight type, so the kernel reads 2 bytes
+  per activation: in an all-float model the producer kernels write that copy as they write the float output
+  (`q8_device.h`, tracked like the int8 copy), else one `round_half_<type>` pass per matmul. It is bound by L2 /
+  MALL bytes, not by the WMMAs (~40 TFLOPS from LDS alone, 33-45 in practice). Weight rows a multiple of 2 or 4 KB
+  apart (K = 5120, 6144, 17408) put a workgroup's loads in the same memory channels: each row block starts its K
+  loop at a different chunk (13 per block), so the blocks in flight spread over the channels. `matmul_wmma_f_<type>`
+  rounds float activations itself, for callers without a scratch.
 - **Int8 path** (`matvec_q8_<type>`): the activation is quantized once (by the producing kernel, `q8_device.h`)
   to ggml's activation format for the weight type (Q8_0 for ROCmFP4, Q8_K for K-quants); weights are decoded
   four values at a time into packed int8 (`v_perm` codebook lookup for ROCmFP4) and multiplied with
@@ -97,11 +99,11 @@ activations). The IQ1 / IQ2 / IQ3 / TQ super-block types share one set of kernel
 32-value sub-block to int8 (codebook lookups in `iq_grids.h`, generated from ggml by `tools/gen_iq_grids.py`; IQ1's
 ±1/8 delta folded in as 8·g ± 1) with an integer scale per 16 values, so the integer sums are ggml's. NVFP4 from
 ModelOpt / compressed-tensors checkpoints carries a global scale per tensor (per expert), `<weight>.scale`: the
-loader registers it with qmatvec (`qmatvec_set_out_scale`), and every qmatvec launch on that matrix multiplies its
-outputs by it afterwards (`scale_out*` kernels: dense rows, expert slots by id, expert-grouped tiles), as
-llama.cpp's `ggml_mul` after the matmul. F32, F16 and BF16 have dedicated 16-byte-load float kernels (F16 / BF16
-round the activations to their type first, as ggml). The CPU decoders are bit-exact against the reference's on real
-tensors (`tests/dequant_verify`).
+loader registers it with qmatvec (`qmatvec_set_out_scale`), and every qmatvec launch on that matrix passes it to the
+kernel (`OScale` / `OScaleId`: per matrix, per expert, the shared expert's), which stores sum × scale, the same bits
+as llama.cpp's `ggml_mul` after the matmul and no extra pass over the outputs. F32, F16 and BF16 have dedicated
+16-byte-load float kernels (F16 / BF16 round the activations to their type first, as ggml). The CPU decoders are
+bit-exact against the reference's on real tensors (`tests/dequant_verify`).
 
 **ROCmFP4** (as the reference's `rocmfp4.h` defines it): `Q4_0_ROCMFP4` (type 100) blocks of 32 values in 18
 bytes, `qs[16] e[2]`: values 0..15 are the low nibbles (scale `e[0]`), 16..31 the high nibbles (`e[1]`); 4.5
@@ -231,11 +233,11 @@ tokens after a short prompt. Runs vary by about ±5%.
 | Model | Quantization (size) | Generation | Prefill |
 |---|---|---|---|
 | Qwen3-0.6B | Q8_0 (0.6 GB) | 184 tok/s | 7,200 tok/s |
-| Qwen3.5-0.8B | UD-Q8_K_XL (1.2 GB): Q8_0 / F16 matrices | 120 tok/s | 9,050 tok/s (2026-11-01, F16 WMMA) |
+| Qwen3.5-0.8B | UD-Q8_K_XL (1.2 GB): Q8_0 / F16 matrices | 120 tok/s | 9,470 tok/s (2026-11-02, F16 WMMA) |
 | Qwen3.5-4B | ROCmFP4 (2.9 GB) | 59 tok/s | 1,850 tok/s |
 | Qwen3.6-35B-A3B | ROCmFP4 (20 GB), BF16 head | 62 tok/s (more with the int8 head option) | 2,075 tok/s |
 | Qwen3.8-27B (dense) | Q4_0_ROCMFP4_FAST (14.6 GB) | 13.8 tok/s (~200 GB/s of weights) | 296 tok/s |
-| Qwen3.5-27B (dense) | BF16 (54 GB) | 4.1 tok/s (the bandwidth) | 467 tok/s (2026-11-01; stock llama.cpp ROCm pp2048 329) |
+| Qwen3.5-27B (dense) | BF16 (54 GB) | 4.1 tok/s (the bandwidth) | 510-529 tok/s (2026-11-02; stock llama.cpp ROCm pp2048 329) |
 | Qwen3.5-122B-A10B | UD-Q4_K_XL (77 GB): Q4_K / Q5_K experts, Q8_0 dense | 22.6 tok/s | 620 tok/s |
 | Qwen3.8-Flash-Next (177B) | Q4_0_ROCmFP4_FAST (94 GB) | 34–38 tok/s; 48–55 with the MTP head | 826 tok/s |
 

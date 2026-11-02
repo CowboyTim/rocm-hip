@@ -2719,6 +2719,38 @@ matvec, batched dense + expert, WMMA dense + expert), BlkIQ4_NL for the float pa
   4,213 -> 9,140 tok/s. IQ4_XS (256-value super-blocks, 6-bit sub-scales, the same table) would follow on the
   K-quant kernels.
 
+### Performance round: fewer passes over memory (2026-11-02, user: "do all of the performance ones in 1 go, mind to not copy around memory ... less copy on memory bandwidth helps for tg")
+
+UMA: every extra pass over activations or outputs takes memory bandwidth from token generation. A/B against the
+previous commit's build (a worktree in /data/rocm-hip-base), 2,426-token prompt unless noted:
+- **NVFP4 scale in the stores (5055593).** The general kernel families take the output scale as their last argument
+  (OScale: a dense launch's up to 4 matrices; OScaleId: per-expert values or one value, the shared expert's, a pair
+  launch's two matrices) and store sum * s; the scale_out* passes are gone. Same bits: the exact-transform scaled 35B
+  equals the unscaled one on all 69 forward_verify lines and on greedy tokens (WMMA and int8 paths). NVFP4-Fast 35B
+  prefill 2,094 -> 2,260 tok/s, generation 60.3 -> 61.3. ROCmFP4 35B unchanged (2,290-2,316 / 61.4).
+- **Producers write the 16-bit copy (088b2d0).** q8_block_value (every producer kernel, and quantize_q8 for the
+  others) also writes its value rounded to BF16 / F16 when qmatvec_q8.xh is set; the engine tracks it like the int8
+  copy (mark / produced: q8 / q8h / qh variants of s.q8), and matvec() uses it (qmatvec_launch_batch_hx), else rounds
+  once into s.xh (qmatvec_round_half) without caching that. Only for all-float models: on Qwen3.5-0.8B (Q8_0 + F16)
+  writing it for every producer output cost 2%, so mixed models round per F16 matmul as before. Rows unpadded (no
+  difference at 256-row tiles). 27B ~458 -> 466 tok/s.
+- **K rotation against row aliasing (35e4c0c).** Synthetic BF16 matrices in hipMalloc memory, 1,024 tokens: rows a
+  multiple of 2 / 4 KB apart cost up to 2x (5120 x 6144 24 vs 46 TFLOPS at K 6208). Row block b now starts at K chunk
+  13 b and wraps (rotating per token tile or both lost the weight sharing; strides 1, 3, 7, 13, 29 tried): 5120 x
+  6144 24 -> 34, 5120 x 17408 37 -> 41, 17408 x 5120 39 -> 42, 10240 x 5120 38 -> 43, padded shapes unchanged.
+  27B 466 -> 510-529 tok/s; 151-token prompt 184 -> 239; Qwen3.5-0.8B (F16 matrices) 8,900 -> 9,470.
+- **Small batches.** Staging the 27B on huge pages (qwen_demo --stage /dev/shm, the existing stage_dir option; a
+  one-time copy at load, the source's page cache dropped behind it, reused by later loads) gave 151 tokens 184 -> 248
+  tok/s and long prompts 475 -> 519 before the rotation: the GGUF's 4 KB page-cache pages cost TLB misses when each
+  chunk touches 256 rows. Not made the default.
+- **Tried, no gain: IQ WMMA staging prefetch** (the block read into registers in load(), decoded in store() with a
+  compile-time sub-block index; no scratch, 210-228 VGPRs): 35B IQ3_S 1,868 vs 1,868 tok/s, 0.6B IQ types -1%;
+  reverted. The 0.6B IQ types run ~8,200 tok/s on an idle CPU (the 7,100-7,800 above were measured during quantizing).
+- **forward_verify faults (open, pre-existing).** On the 35B, about 1 run in 3 aborts with a GPU memory fault at a
+  non-canonical address (0xd5..-0xe7..), in different kernels (quantize_q8, deltanet_pre, matvec_q8_id_q5_K), the
+  previous commit's build too; qwen_demo runs never fault. Memory was tight (4 GB free, 106 GB page cache) and the
+  test registers / unregisters many small /dev/shm buffers. Rerun until clean.
+
 ### Quant types: IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, TQ1_0, TQ2_0 (2026-11-02, user: "do the quantizations first")
 
 All nine are 256-value super-blocks that ggml dots with Q8_K, summing integer terms per 32-value sub-block times a
