@@ -87,6 +87,20 @@ static void deq_q4_0(const void *src, float *y, int64_t n) {
     }
 }
 
+// IQ4_NL: d(f16) qs[16], Q4_0's layout; a nibble indexes ggml's kvalues_iq4nl
+static const int8_t iq4nl_values[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+static void deq_iq4_nl(const void *src, float *y, int64_t n) {
+    const uint8_t *b = (const uint8_t *)src;
+    for (int64_t i = 0; i < n / 32; ++i, b += 18, y += 32) {
+        const float d = rd_fp16(b);
+        const uint8_t *qs = b + 2;
+        for (int j = 0; j < 16; ++j) {
+            y[j]      = d * iq4nl_values[qs[j] & 0x0F];
+            y[j + 16] = d * iq4nl_values[qs[j] >> 4];
+        }
+    }
+}
+
 // Q4_1: d(f16) m(f16) qs[16]
 static void deq_q4_1(const void *src, float *y, int64_t n) {
     const uint8_t *b = (const uint8_t *)src;
@@ -402,6 +416,7 @@ static const qt_traits k_traits[] = {
     {QT_Q4_K,              "q4_K",              256, 144, deq_q4_K,         1},
     {QT_Q5_K,              "q5_K",              256, 176, deq_q5_K,         1},
     {QT_Q6_K,              "q6_K",              256, 210, deq_q6_K,         1},
+    {QT_IQ4_NL,            "iq4_nl",            32,  18,  deq_iq4_nl,       1},
     {QT_BF16,              "bf16",              1,   2,   deq_bf16,         1},
     {QT_MXFP4,             "mxfp4",             32,  17,  deq_mxfp4,        1},
     {QT_NVFP4,             "nvfp4",             64,  36,  deq_nvfp4,        1},

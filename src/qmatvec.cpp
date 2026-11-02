@@ -61,9 +61,9 @@ static bool block_per_lane(int type) { return type == QT_Q5_1 || type == QT_Q4_1
 static const int32_t *q8_sums(int type, const qmatvec_q8 *q) { return block_per_lane(type) ? q->s0 : q->bsK; }
 
 // The Q8_0-activation types whose int8 kernels give a lane a pair of 32-value blocks (36 / 68 bytes: ROCmFP4, Q4_0,
-// Q8_0; NVFP4's one 64-value block), and those that give it a quad of 17-byte blocks (ROCmFP4_FAST, MXFP4)
+// IQ4_NL, Q8_0; NVFP4's one 64-value block), and those that give it a quad of 17-byte blocks (ROCmFP4_FAST, MXFP4)
 static bool pair_type(int type) {
-    return type == QT_Q4_0_ROCMFP4 || type == QT_Q4_0 || type == QT_Q8_0 || type == QT_NVFP4;
+    return type == QT_Q4_0_ROCMFP4 || type == QT_Q4_0 || type == QT_IQ4_NL || type == QT_Q8_0 || type == QT_NVFP4;
 }
 static bool quad_type(int type) { return type == QT_Q4_0_ROCMFP4_FAST || type == QT_MXFP4; }
 

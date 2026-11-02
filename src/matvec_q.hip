@@ -64,6 +64,22 @@ struct BlkQ4_0 {
     }
 };
 
+__constant__ int8_t k_iq4nl_values[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+struct BlkIQ4_NL {  // Q4_0's layout, a nibble indexing ggml's kvalues_iq4nl
+    static constexpr int QK = 32, BYTES = 18;
+    __device__ static float dot(const uint8_t *b, const float *x) {
+        const float d = fp16(b);
+        const uint8_t *qs = b + 2;
+        float s = 0.0f;
+        for (int j = 0; j < 16; ++j) {
+            s += d * k_iq4nl_values[qs[j] & 0x0F] * x[j];
+            s += d * k_iq4nl_values[qs[j] >> 4] * x[j + 16];
+        }
+        return s;
+    }
+};
+
 struct BlkQ4_1 {
     static constexpr int QK = 32, BYTES = 20;
     __device__ static float dot(const uint8_t *b, const float *x) {
@@ -796,6 +812,7 @@ matmul_f_bf16(const uint8_t *W, long long row_bytes, const float *x, float *y, i
 }
 
 MATVEC_KERNEL(q4_0, BlkQ4_0)
+MATVEC_KERNEL(iq4_nl, BlkIQ4_NL)
 MATVEC_KERNEL(q4_1, BlkQ4_1)
 MATVEC_KERNEL(q5_0, BlkQ5_0)
 MATVEC_KERNEL(q5_1, BlkQ5_1)
@@ -842,6 +859,7 @@ __device__ void matvec_id_impl(const uint8_t *W, long long row_bytes, const int 
 MATVEC_ID_KERNEL(f32, BlkF32, false)
 MATVEC_ID_KERNEL(f16, BlkF16, false)
 MATVEC_ID_KERNEL(q4_0, BlkQ4_0, false)
+MATVEC_ID_KERNEL(iq4_nl, BlkIQ4_NL, false)
 MATVEC_ID_KERNEL(q4_1, BlkQ4_1, false)
 MATVEC_ID_KERNEL(q5_0, BlkQ5_0, false)
 MATVEC_ID_KERNEL(q5_1, BlkQ5_1, false)
@@ -912,6 +930,7 @@ __device__ void matmul_f_id_impl(MMF_ID_ARGS) {
 MATMUL_F_ID_KERNEL(f32, BlkF32)
 MATMUL_F_ID_KERNEL(f16, BlkF16)
 MATMUL_F_ID_KERNEL(q4_0, BlkQ4_0)
+MATMUL_F_ID_KERNEL(iq4_nl, BlkIQ4_NL)
 MATMUL_F_ID_KERNEL(q4_1, BlkQ4_1)
 MATMUL_F_ID_KERNEL(q5_0, BlkQ5_0)
 MATMUL_F_ID_KERNEL(q5_1, BlkQ5_1)
@@ -1029,6 +1048,18 @@ struct P4Q4_0 {
     __device__ static float block(int s0, int s1, const float e[2], float dx) { return e[0] * dx * (float)(s0 + s1); }
 };
 
+// IQ4_NL: Q4_0's blocks, a nibble indexing ggml's kvalues_iq4nl (16 int8 values, two v_perm tables of 8); as
+// ggml's vec_dot_iq4_nl_q8_0: (d_w d_x) * sumi
+struct P4IQ4_NL : P4Q4_0 {
+    __device__ static int dec4(uint32_t n) {
+        const uint32_t sel = n & 0x07070707u;
+        const uint32_t lo = __builtin_amdgcn_perm(0xF6EADDCFu, 0xBFAD9881u, sel);  // -127 .. -10
+        const uint32_t hi = __builtin_amdgcn_perm(0x71594535u, 0x26190D01u, sel);  // 1 .. 113
+        const uint32_t m = ((n >> 3) & 0x01010101u) * 0xFFu;
+        return (int)((lo & ~m) | (hi & m));
+    }
+};
+
 struct P4NVFP4 {
     static constexpr bool BLOCK_SCALE = false;
     __device__ static void pair(const uint32_t w[9], uint32_t qs[2][4], float e[2][2]) {
@@ -1122,6 +1153,10 @@ __device__ __forceinline__ float mv_rocmfp4(const uint8_t *wr, const int8_t *q8,
 __device__ __forceinline__ float mv_q4_0(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
                                          int lane, int L) {
     return mv_p4<P4Q4_0>(wr, q8, d8, K, lane, L);
+}
+__device__ __forceinline__ float mv_iq4_nl(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
+                                           int lane, int L) {
+    return mv_p4<P4IQ4_NL>(wr, q8, d8, K, lane, L);
 }
 
 // The 17-byte FP4 block types (16 nibble bytes, values j in the low nibbles and j + 16 in the high ones, and one
@@ -1759,6 +1794,7 @@ matvec_q8_lr_q4_0_rocmfp4_fast(const uint8_t *W, long long row_bytes, const floa
 
 MATVEC_Q8_KERNELS(q4_0_rocmfp4, mv_rocmfp4, 0)
 MATVEC_Q8_KERNELS(q4_0, mv_q4_0, 0)
+MATVEC_Q8_KERNELS(iq4_nl, mv_iq4_nl, 0)
 MATVEC_Q8_KERNELS(q4_0_rocmfp4_fast, mv_rocmfp4_fast, 0)
 MATVEC_Q8_KERNELS(mxfp4, mv_mxfp4, 0)
 MATVEC_Q8_KERNELS(nvfp4, mv_nvfp4, 0)
@@ -2084,6 +2120,7 @@ __device__ __forceinline__ void mmb_q5_K_exp(MM_BARGS, const RowsExpert &rm) { m
 
 MATMUL_Q8_KERNELS(q4_0_rocmfp4, (mmb_p4<P4ROCmFP4, RowsLinear>), (mmb_p4<P4ROCmFP4, RowsExpert>))
 MATMUL_Q8_KERNELS(q4_0, (mmb_p4<P4Q4_0, RowsLinear>), (mmb_p4<P4Q4_0, RowsExpert>))
+MATMUL_Q8_KERNELS(iq4_nl, (mmb_p4<P4IQ4_NL, RowsLinear>), (mmb_p4<P4IQ4_NL, RowsExpert>))
 MATMUL_Q8_KERNELS(q4_0_rocmfp4_fast, (mmb_fast<PFROCmFP4, RowsLinear>), (mmb_fast<PFROCmFP4, RowsExpert>))
 MATMUL_Q8_KERNELS(mxfp4, (mmb_fast<PFMXFP4, RowsLinear>), (mmb_fast<PFMXFP4, RowsExpert>))
 MATMUL_Q8_KERNELS(nvfp4, (mmb_p4<P4NVFP4, RowsLinear>), (mmb_p4<P4NVFP4, RowsExpert>))
@@ -2488,6 +2525,7 @@ __device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, 
 
 MATMUL_WMMA_Q80_KERNELS(q4_0_rocmfp4, WStageP4<P4ROCmFP4>)
 MATMUL_WMMA_Q80_KERNELS(q4_0, WStageP4<P4Q4_0>)
+MATMUL_WMMA_Q80_KERNELS(iq4_nl, WStageP4<P4IQ4_NL>)
 MATMUL_WMMA_Q80_KERNELS(q4_0_rocmfp4_fast, WStageFast<>)
 MATMUL_WMMA_Q80_KERNELS(mxfp4, WStageFast<PFMXFP4>)
 MATMUL_WMMA_Q80_KERNELS(nvfp4, WStageP4<P4NVFP4>)

@@ -2699,6 +2699,26 @@ allows it on a tied head).
   (`cmake --build llama.cpp/build-cpu --target llama-completion`). ref_dump: REF_DUMP_NO_CB=1 runs without the eval
   callback (llama.cpp's normal graph execution; only the next token).
 
+### Quant types: IQ4_NL (2026-11-02, user: "yes" to the easiest next step)
+
+IQ4_NL (type 20) is Q4_0's 18-byte block (F16 d, 16 nibble bytes: values j low, j + 16 high) with a nibble
+indexing ggml's kvalues_iq4nl {-127, ..., 113} instead of nibble - 8; ggml's dot is Q4_0's (Q8_0 activations,
+(d_w d_x) * sumi). So: P4IQ4_NL derives from P4Q4_0 and only replaces dec4 (two v_perm lookups into the low and
+high 8-entry int8 tables, bit 3 choosing), plus one line per kernel family (matvec / id / mmf_id float, int8
+matvec, batched dense + expert, WMMA dense + expert), BlkIQ4_NL for the float path and a CPU decoder.
+- Test models (fork llama-quantize --allow-requantize IQ4_NL, /data/q4_0): Qwen3-0.6B-IQ4_NL (from Q8_0; 193 IQ4_NL
+  matrices, Q5_K / Q6_K rest), Qwen3.6-35B-A3B-IQ4_NL (from ROCmFP4; 391 IQ4_NL incl. all experts, 51 Q5_K;
+  quantizing took 12 min). References /data/q4_0/refs/ref06_IQ4_NL, ref35_IQ4_NL (the 20-token sky prompt).
+- dequant_verify bit-exact (3 tensors). matvec_verify: float 2e-8, int8 1e-8, 11-token batches bit-equal to single
+  tokens, 70-token WMMA 3e-8. forward_verify 0.6B: all pass (worst layer 0.9956, next token = llama.cpp's). 35B:
+  all 67 per-matrix / expert / grouped-prefill checks pass (0 .. 4e-7), next token = llama.cpp's; the whole-model
+  drift checks fail on this prompt as Q4_0's do (IQ4_NL worst layer 0.988, 10 layers below 0.99; Q4_0 0.984, 14).
+- Greedy text: 35B = stock llama.cpp ROCm's (32 tokens). 0.6B: same 18 tokens, then near ties where llama.cpp's own
+  CPU and ROCm builds disagree with each other too.
+- Speed, 2,426-token prompt: 35B prefill 832 (int8, no WMMA) -> 2,242 tok/s (WMMA), generation 75.5 tok/s; 0.6B
+  4,213 -> 9,140 tok/s. IQ4_XS (256-value super-blocks, 6-bit sub-scales, the same table) would follow on the
+  K-quant kernels.
+
 ### BF16 dense prefill (ABC.gguf, a Qwen3.5 27B in BF16, 2026-10-25)
 
 Correct output; generation 4.1 tok/s (54 GB per token: the bandwidth); prefill **7.8 tok/s** (2,661 tokens in
