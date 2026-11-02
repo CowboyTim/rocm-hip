@@ -1,11 +1,13 @@
 // demo_qwen.cpp -- text generation with the Qwen3.5 forward pass.
 // Usage: ./qwen_demo <model.gguf> "prompt text" | @prompt_file [n_gen] [--temp T] [--top-k K] [--top-p P] [--min-p P]
 //                    [--repeat-penalty R] [--seed S] [--lm-head-q8] [--ctx N (default 4096)]
-//                    [--draft mtp.gguf [--drafts 0..3]] [--batch N] [--kv-q8]
+//                    [--draft mtp.gguf [--drafts 0..3]] [--batch N] [--kv-q8] [--stage DIR]
 //
 // --draft: an MTP draft head for speculative decoding; generation then runs through inference_generate_stream
 // (ignoring end-of-generation tokens, as this demo does not stop at them either); --drafts: drafts per pass.
 // --batch: tokens per prefill micro-batch (16 .. 8192; default 1024).
+// --stage: copy the GPU's tensors to DIR (a huge-page tmpfs, e.g. /dev/shm) and map them from there
+// (inference_load_opts.stage_dir; a later run reuses the copy).
 // (0: adaptive, the default).
 // Greedy by default (--temp 0). QWEN_PROFILE=1 prints the time breakdown.
 
@@ -24,7 +26,7 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         printf("Usage: %s <model.gguf> \"prompt text\" [n_gen] [--temp T] [--top-k K] [--top-p P] [--min-p P] "
                "[--repeat-penalty R] [--seed S] [--lm-head-q8] [--ctx N] [--draft mtp.gguf [--drafts 0..3]]\n"
-               "       [--batch N] [--kv-q8]\n",
+               "       [--batch N] [--kv-q8] [--stage DIR]\n",
                argv[0]);
         return 1;
     }
@@ -53,6 +55,7 @@ int main(int argc, char** argv) {
     int drafts = -1;  // drafts per pass (0: adaptive; -1: the library's default)
     int batch = 0;    // tokens per prefill micro-batch (0: the library's default)
     bool kv_q8 = false;  // a Q8_0 KV cache
+    const char* stage_dir = nullptr;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         const char* v = i + 1 < argc ? argv[i + 1] : "0";
@@ -68,17 +71,20 @@ int main(int argc, char** argv) {
         else if (a == "--drafts") { drafts = atoi(v); ++i; }
         else if (a == "--batch") { batch = atoi(v); ++i; }
         else if (a == "--kv-q8") kv_q8 = true;
+        else if (a == "--stage") { stage_dir = v; ++i; }
         else n_gen = atoi(argv[i]);
     }
     printf("Sampling: temp %g top_k %d top_p %g min_p %g repeat_penalty %g seed %llu\n", sp.temperature, sp.top_k,
            sp.top_p, sp.min_p, sp.repeat_penalty, (unsigned long long)sp.seed);
 
     printf("Loading model: %s\n", model_path);
-    inference_model_t* engine = inference_load_model(model_path);
+    const inference_load_opts lo = {stage_dir};
+    inference_model_t* engine = inference_load_model_ex(model_path, stage_dir ? &lo : nullptr);
     if (!engine) {
         fprintf(stderr, "Failed to load model: %s\n", inference_get_last_error());
         return 1;
     }
+    if (stage_dir) printf("Stage: %s\n", inference_stage_info(engine));
 
     printf("Initializing KV cache...\n");
     if (batch > 0 && inference_set_prefill_batch(engine, batch) != 0) {

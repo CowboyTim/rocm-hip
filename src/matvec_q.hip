@@ -3384,6 +3384,7 @@ struct WFBF16 {
 
 #define WF_KC 64
 #define WF_GROUP 2
+#define WF_ROT 13  // K chunks between the start chunks of consecutive row blocks
 #define WF_WAVES 16
 #define WF_THREADS (32 * WF_WAVES)  // QMV_WF_THREADS
 #define WF_ROWS (16 * WF_WAVES)  // weight rows per workgroup, 16 per wave (QMV_WF_ROWS in qmatvec.cpp)
@@ -3447,11 +3448,17 @@ __device__ __forceinline__ void wmma_f(const uint8_t *W, long long row_bytes, co
     v8f_t acc[WF_NT];
 #pragma unroll
     for (int n = 0; n < WF_NT; ++n) acc[n] = v8f_t{};
-    load_chunk(0);
-    for (int k0 = 0; k0 < K; k0 += WF_KC) {
+    // Row block b starts at chunk 13 b (mod the chunk count) and wraps around: weight rows a multiple of 2 or 4 KB
+    // apart (the 27B's K = 5120, 6144, 17408) put every row's chunk of a workgroup in the same memory channels, and
+    // the row blocks in flight then read different ones (5120 x 6144: 24 -> 34 TFLOPS, 5120 x 17408 37 -> 41,
+    // 17408 x 5120 39 -> 42; unaliased K unchanged). The token tiles of a row block keep its order, sharing its weights.
+    const int nch = (K + WF_KC - 1) / WF_KC;
+    const int c0 = (int)((unsigned)(r0 / WF_ROWS) * (unsigned)WF_ROT % (unsigned)nch);
+    load_chunk(c0 * WF_KC);
+    for (int c = 0; c < nch; ++c) {
         store_chunk();
         __syncthreads();
-        if (k0 + WF_KC < K) load_chunk(k0 + WF_KC);  // in flight during the WMMAs below
+        if (c + 1 < nch) load_chunk((c0 + c + 1) % nch * WF_KC);  // in flight during the WMMAs below
 #pragma unroll
         for (int s = 0; s < WF_KC / 16; ++s) {
             const v16s_t b = *(const v16s_t *)&sw[16 * w + i][16 * s];
