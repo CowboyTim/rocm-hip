@@ -140,7 +140,7 @@ struct ShmBuf {
 
 // Activation round trip through ggml's vec_dot_type for weight type wtype (ggml-cpu.c type_traits_cpu)
 static void ref_act_roundtrip(int wtype, const float* x, float* out, int K) {
-    const bool q8k = wtype >= QT_Q2_K && wtype <= QT_Q6_K;
+    const bool q8k = (wtype >= QT_Q2_K && wtype <= QT_Q6_K) || wtype == QT_IQ4_XS;
     const bool q80 = wtype == QT_Q4_0 || wtype == QT_Q4_1 || wtype == QT_Q5_0 || wtype == QT_Q5_1 ||
                      wtype == QT_Q8_0 || wtype == QT_Q4_0_ROCMFP4 || wtype == QT_Q4_0_ROCMFP4_FAST ||
                      wtype == QT_MXFP4 || wtype == QT_NVFP4 || wtype == QT_IQ4_NL;

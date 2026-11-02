@@ -88,16 +88,16 @@ Weights stay in their GGUF blocks; each type has a CPU decoder (tests) and GPU k
 - **LM head**: on the last row only (two rows in a verify pass); opt-in int8 copy of a float head
   (`inference_set_lm_head_q8`).
 
-Supported weight types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K–Q6_K, IQ4_NL, MXFP4, NVFP4, ROCmFP4 and
-ROCmFP4_FAST; int8 kernels (single token, batched, WMMA dense and expert) for all but the float types. Types that
-share a layout share the kernels through a small policy struct: the 36-byte pair family (ROCmFP4, Q4_0, IQ4_NL,
-NVFP4), the 17-byte quad family (ROCmFP4_FAST, MXFP4), a block per lane (Q4_1, Q5_0, Q5_1) and the K-quants. NVFP4 from
-ModelOpt / compressed-tensors checkpoints carries a global scale per tensor (per expert), `<weight>.scale`: the
-loader registers it with qmatvec (`qmatvec_set_out_scale`), and every qmatvec launch on that matrix multiplies its
-outputs by it afterwards (`scale_out*` kernels: dense rows, expert slots by id, expert-grouped tiles), as llama.cpp's
-`ggml_mul` after the matmul. F32, F16 and BF16 have dedicated 16-byte-load float kernels (F16 / BF16
-round the activations to their type first, as ggml). The CPU decoders are bit-exact against the reference's on real
-tensors (`tests/dequant_verify`).
+Supported weight types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K–Q6_K, IQ4_NL, IQ4_XS, MXFP4, NVFP4,
+ROCmFP4 and ROCmFP4_FAST; int8 kernels (single token, batched, WMMA dense and expert) for all but the float types.
+Types that share a layout share the kernels through a small policy struct: the 36-byte pair family (ROCmFP4, Q4_0,
+IQ4_NL, NVFP4), the 17-byte quad family (ROCmFP4_FAST, MXFP4), a block per lane (Q4_1, Q5_0, Q5_1) and the K-quants
+(with IQ4_XS, which also reads Q8_K activations). NVFP4 from ModelOpt / compressed-tensors checkpoints carries a
+global scale per tensor (per expert), `<weight>.scale`: the loader registers it with qmatvec
+(`qmatvec_set_out_scale`), and every qmatvec launch on that matrix multiplies its outputs by it afterwards
+(`scale_out*` kernels: dense rows, expert slots by id, expert-grouped tiles), as llama.cpp's `ggml_mul` after the
+matmul. F32, F16 and BF16 have dedicated 16-byte-load float kernels (F16 / BF16 round the activations to their type
+first, as ggml). The CPU decoders are bit-exact against the reference's on real tensors (`tests/dequant_verify`).
 
 **ROCmFP4** (as the reference's `rocmfp4.h` defines it): `Q4_0_ROCMFP4` (type 100) blocks of 32 values in 18
 bytes, `qs[16] e[2]`: values 0..15 are the low nibbles (scale `e[0]`), 16..31 the high nibbles (`e[1]`); 4.5

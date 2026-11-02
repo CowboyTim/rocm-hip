@@ -49,10 +49,11 @@ static int g_wmma_min_t = 32;  // smaller batches, and N < 64 (a 64-row tile mos
 #define QMV_WF_THREADS 512   // its block size, WF_THREADS
 #define QMV_WMMA_ID_TB 64  // entries per expert tile of matmul_wmma_id_<type> (4 sub-tiles of 16)
 
-// The int8 kernels of the K-quants read the activations' Q8_K form; the other types' (ROCmFP4, MXFP4, NVFP4, Q4_0, Q5_1,
-// Q8_0, ...) the Q8_0 form
+// The int8 kernels of the K-quants and IQ4_XS read the activations' Q8_K form; the other types' (ROCmFP4, MXFP4, NVFP4,
+// Q4_0, Q5_1, Q8_0, ...) the Q8_0 form
 static bool reads_q8k(int type) {
-    return type == QT_Q2_K || type == QT_Q3_K || type == QT_Q4_K || type == QT_Q5_K || type == QT_Q6_K;
+    return type == QT_Q2_K || type == QT_Q3_K || type == QT_Q4_K || type == QT_Q5_K || type == QT_Q6_K ||
+           type == QT_IQ4_XS;
 }
 
 // The kernels' bs argument: the Q8_K group sums for K-quants, the Q8_0 block sums for the block-per-lane types (Q5_1,

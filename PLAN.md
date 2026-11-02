@@ -2719,6 +2719,30 @@ matvec, batched dense + expert, WMMA dense + expert), BlkIQ4_NL for the float pa
   4,213 -> 9,140 tok/s. IQ4_XS (256-value super-blocks, 6-bit sub-scales, the same table) would follow on the
   K-quant kernels.
 
+### Quant types: IQ4_XS (2026-11-02, user: "push, then continue")
+
+IQ4_XS (type 23): 256 values in 136 bytes, d (F16), scales_h (u16), scales_l[4], then 8 x 16 bytes laid out as IQ4_NL
+blocks; sub-block ib has the 6-bit scale ls = scales_l nibble | 2 bits of scales_h << 4 and weight d (ls - 32).
+ggml dots it with Q8_K (vec_dot_iq4_xs_q8_K), so it joins the K-quant kernels: reads_q8k, mv_iq4_xs / mmb_iq4_xs
+(lane s = sub-block s: IQ4_NL's dec4 on its 16 bytes, isum = (ls - 32) * dot, d_w d_x isum per lane, the same
+order in both, so batches are bit-equal to single tokens), WStageK<7> for WMMA (one scale per 32 values: two
+chained WMMAs, like Q4_K; no mins), BlkIQ4_XS for the float path, a CPU decoder.
+- Test models (fork llama-quantize --allow-requantize IQ4_XS, no imatrix, /data/q4_0): Qwen3-0.6B-IQ4_XS (from
+  Q8_0), Qwen3.6-35B-A3B-IQ4_XS (from ROCmFP4: 391 IQ4_XS incl. experts; the down experts of layers 0-4 and
+  attn_qkv / attn_v / shared down Q5_K). References /data/q4_0/refs/ref06_IQ4_XS, ref35_IQ4_XS (sky prompt).
+- dequant_verify bit-exact; matvec_verify: float 6e-8, int8 1.5e-8, 11-token batches bit-equal, 70-token WMMA 2e-8.
+- forward_verify 35B: all per-matrix / expert (by id and grouped) checks pass at ~1e-7, next token = llama.cpp's.
+  The whole-model drift checks fail (decode: worst layer 0.944 at layer 36, 16 below 0.99; IQ4_NL 0.988, Q4_0
+  0.984 on this prompt): it grows smoothly over the layers, and the float kernels (QWEN_MATVEC_FP32, no int8
+  activations) drift as much (0.88 at the last layer), while the int8 path is 1.000000 at layer 0: this model
+  (requantized twice, no imatrix) on this prompt, not a kernel. 0.6B: worst 0.9899 (float path 0.9904).
+- Greedy text (35B): llama.cpp CPU, llama.cpp ROCm and the engine choose three different tokens after "because"
+  (" gas" / " the" / " molecules": a near tie); the rest of the sentence agrees.
+- Speed, 2,426-token prompt: 35B prefill 836 -> 2,140 tok/s (WMMA), generation 77 tok/s; 0.6B 4,707 -> 8,837.
+- Open: one forward_verify run on the 35B hit a GPU memory fault in matvec_q8_id_q5_K (the per-token down-expert
+  check of blk.0, 20 tokens x 8 experts), right after the reference dump; four later runs (one repeating that
+  sequence exactly) and the engine itself run clean. Not reproduced; the test's int8 buffers are sized for it.
+
 ### BF16 dense prefill (ABC.gguf, a Qwen3.5 27B in BF16, 2026-10-25)
 
 Correct output; generation 4.1 tok/s (54 GB per token: the bandwidth); prefill **7.8 tok/s** (2,661 tokens in

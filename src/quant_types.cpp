@@ -101,6 +101,25 @@ static void deq_iq4_nl(const void *src, float *y, int64_t n) {
     }
 }
 
+// IQ4_XS: d(f16) scales_h(u16) scales_l[4] qs[128] = 136 B per 256 values; sub-block ib (32 values) has the 6-bit
+// scale ls = scales_l nibble ib | 2 bits ib of scales_h << 4, d * (ls - 32), and IQ4_NL's 16 bytes at qs + 16 ib
+static void deq_iq4_xs(const void *src, float *y, int64_t n) {
+    const uint8_t *b = (const uint8_t *)src;
+    for (int64_t i = 0; i < n / 256; ++i, b += 136) {
+        const float d = rd_fp16(b);
+        const int sh = b[2] | (b[3] << 8);
+        for (int ib = 0; ib < 8; ++ib, y += 32) {
+            const int ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) | (((sh >> (2 * ib)) & 3) << 4);
+            const float dl = d * (ls - 32);
+            const uint8_t *qs = b + 8 + 16 * ib;
+            for (int j = 0; j < 16; ++j) {
+                y[j]      = dl * iq4nl_values[qs[j] & 0x0F];
+                y[j + 16] = dl * iq4nl_values[qs[j] >> 4];
+            }
+        }
+    }
+}
+
 // Q4_1: d(f16) m(f16) qs[16]
 static void deq_q4_1(const void *src, float *y, int64_t n) {
     const uint8_t *b = (const uint8_t *)src;
@@ -417,6 +436,7 @@ static const qt_traits k_traits[] = {
     {QT_Q5_K,              "q5_K",              256, 176, deq_q5_K,         1},
     {QT_Q6_K,              "q6_K",              256, 210, deq_q6_K,         1},
     {QT_IQ4_NL,            "iq4_nl",            32,  18,  deq_iq4_nl,       1},
+    {QT_IQ4_XS,            "iq4_xs",            256, 136, deq_iq4_xs,       1},
     {QT_BF16,              "bf16",              1,   2,   deq_bf16,         1},
     {QT_MXFP4,             "mxfp4",             32,  17,  deq_mxfp4,        1},
     {QT_NVFP4,             "nvfp4",             64,  36,  deq_nvfp4,        1},

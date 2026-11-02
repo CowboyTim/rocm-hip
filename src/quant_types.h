@@ -30,6 +30,7 @@ enum qt_type {
     QT_Q5_K = 13,
     QT_Q6_K = 14,
     QT_IQ4_NL = 20,
+    QT_IQ4_XS = 23,
     QT_BF16 = 30,
     QT_MXFP4 = 39,
     QT_NVFP4 = 40,
