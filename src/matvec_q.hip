@@ -16,6 +16,9 @@
 
 #include "q8_device.h"
 
+#define IQ_TABLE(type, name, size) __constant__ type name[size]
+#include "iq_grids.h"
+
 #define ROWS_PER_BLOCK 4
 
 __device__ __forceinline__ float fp16(const uint8_t *p) {
@@ -293,6 +296,189 @@ struct BlkIQ4_XS {
                 s += dl * k_iq4nl_values[qs[j] & 0x0F] * x[j];
                 s += dl * k_iq4nl_values[qs[j] >> 4] * x[j + 16];
             }
+        }
+        return s;
+    }
+};
+
+// ---------------------------------------------------------------- IQ1 / IQ2 / IQ3 and ternary super-block types
+//
+// 256 values per block; ggml dots them with Q8_K activations, summing integer terms per 32-value sub-block (scaled by
+// a small odd integer) and multiplying by d and a constant once per block. A policy P gives BYTES, d() (the block's
+// float factor: d times ggml's constant, 1/8 for IQ1 / IQ2, 1/4 for IQ3_XXS) and sub(b, s, v, sc): sub-block s as
+// 32 int8 values (v[k]: values 4k .. 4k + 3) and the integer scales of its values 0..15 and 16..31, so that the
+// sub-block's term is sc[0] dot(v[0..3], x) + sc[1] dot(v[4..7], x), ggml's integer sums exactly. IQ1's +-1/8 delta
+// is folded into the values (8 g +- 1 with d / 8): 8 sumi + delta sum x, ggml's sumi + 1/8 sumi1. Blocks are 2-aligned
+// (IQ1_M 4-aligned); the codebooks (iq_grids.h) are __constant__ tables read with per-lane indices.
+__device__ __forceinline__ uint32_t iq_u16(const uint8_t *p) { return *(const uint16_t *)p; }
+__device__ __forceinline__ uint32_t iq_u32(const uint8_t *p) { return iq_u16(p) | iq_u16(p + 2) << 16; }
+// Grid bytes (never 0) negated where bit j of nib is set: (x ^ m) + 1 per negated byte, no carries
+__device__ __forceinline__ uint32_t iq_sign4(uint32_t x, uint32_t nib) {
+    const uint32_t m = ((nib * 0x00204081u) & 0x01010101u) * 0xFFu;
+    return (x ^ m) + (m & 0x01010101u);
+}
+__device__ __forceinline__ void iq_grid8(uint32_t *v, uint64_t g, uint32_t sgn) {
+    v[0] = iq_sign4((uint32_t)g, sgn & 0xF);
+    v[1] = iq_sign4((uint32_t)(g >> 32), sgn >> 4);
+}
+// IQ1 grid bytes -1 / 0 / 1 -> 8 g + 1 (8 g - 1 when neg): one v_perm (bytes 0, 1 and 7 of the table)
+__device__ __forceinline__ uint32_t iq1_vals(uint32_t g, bool neg) {
+    return __builtin_amdgcn_perm(neg ? 0xF7000000u : 0xF9000000u, neg ? 0x000007FFu : 0x00000901u, g & 0x07070707u);
+}
+
+struct IQ2XXS {  // d, per 32 values 4 grid bytes, then a u32 of 4 x 7 sign bits (ksigns) and a 4-bit scale
+    static constexpr int BYTES = 66;
+    __device__ static float d(const uint8_t *b) { return 0.125f * fp16(b); }
+    __device__ static void sub(const uint8_t *b, int s, uint32_t v[8], int sc[2]) {
+        const uint8_t *q = b + 2 + 8 * s;
+        const uint32_t a = iq_u32(q + 4);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) iq_grid8(v + 2 * l, iq2xxs_grid[q[l]], ksigns_iq2xs[(a >> (7 * l)) & 127]);
+        sc[0] = sc[1] = 2 * (int)(a >> 28) + 1;
+    }
+};
+struct IQ2XS {  // d, qs[32] u16 (9-bit grid index, 7 sign bits), scales[8] (4 bits per 16 values)
+    static constexpr int BYTES = 74;
+    __device__ static float d(const uint8_t *b) { return 0.125f * fp16(b); }
+    __device__ static void sub(const uint8_t *b, int s, uint32_t v[8], int sc[2]) {
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t q = iq_u16(b + 2 + 2 * (4 * s + l));
+            iq_grid8(v + 2 * l, iq2xs_grid[q & 511], ksigns_iq2xs[q >> 9]);
+        }
+        sc[0] = 2 * (b[66 + s] & 0xF) + 1;
+        sc[1] = 2 * (b[66 + s] >> 4) + 1;
+    }
+};
+struct IQ2S {  // d, qs[32] (grid index low bits), signs[32], qh[8] (2 high bits per 8 values), scales[8]
+    static constexpr int BYTES = 82;
+    __device__ static float d(const uint8_t *b) { return 0.125f * fp16(b); }
+    __device__ static void sub(const uint8_t *b, int s, uint32_t v[8], int sc[2]) {
+        const uint32_t qh = b[66 + s];
+#pragma unroll
+        for (int l = 0; l < 4; ++l)
+            iq_grid8(v + 2 * l, iq2s_grid[b[2 + 4 * s + l] | ((qh << (8 - 2 * l)) & 0x300)], b[34 + 4 * s + l]);
+        sc[0] = 2 * (b[74 + s] & 0xF) + 1;
+        sc[1] = 2 * (b[74 + s] >> 4) + 1;
+    }
+};
+struct IQ3XXS {  // d, qs[64] (4-value grid indices), per 32 values a u32 of 4 x 7 sign bits and a 4-bit scale
+    static constexpr int BYTES = 98;
+    __device__ static float d(const uint8_t *b) { return 0.25f * fp16(b); }
+    __device__ static void sub(const uint8_t *b, int s, uint32_t v[8], int sc[2]) {
+        const uint8_t *q = b + 2 + 8 * s;
+        const uint32_t a = iq_u32(b + 66 + 4 * s);
+#pragma unroll
+        for (int l = 0; l < 4; ++l)
+            iq_grid8(v + 2 * l, iq3xxs_grid[q[2 * l]] | (uint64_t)iq3xxs_grid[q[2 * l + 1]] << 32,
+                     ksigns_iq2xs[(a >> (7 * l)) & 127]);
+        sc[0] = sc[1] = 2 * (int)(a >> 28) + 1;
+    }
+};
+struct IQ3S {  // d, qs[64] (grid index low bits), qh[8] (the 9th bits), signs[32], scales[4] (4 bits per 32 values)
+    static constexpr int BYTES = 110;
+    __device__ static float d(const uint8_t *b) { return fp16(b); }
+    __device__ static void sub(const uint8_t *b, int s, uint32_t v[8], int sc[2]) {
+        const uint8_t *q = b + 2 + 8 * s;
+        const uint32_t qh = b[66 + s];
+#pragma unroll
+        for (int l = 0; l < 4; ++l)
+            iq_grid8(v + 2 * l,
+                     iq3s_grid[q[2 * l] | ((qh << (8 - 2 * l)) & 256)] |
+                         (uint64_t)iq3s_grid[q[2 * l + 1] | ((qh << (7 - 2 * l)) & 256)] << 32,
+                     b[74 + 4 * s + l]);
+        sc[0] = sc[1] = 2 * ((b[106 + s / 2] >> (4 * (s & 1))) & 0xF) + 1;
+    }
+};
+struct IQ1S {  // d, qs[32] (grid index low bits), qh[8] u16 (3 high bits per 8 values, a 3-bit scale, delta sign)
+    static constexpr int BYTES = 50;
+    __device__ static float d(const uint8_t *b) { return 0.125f * fp16(b); }
+    __device__ static void sub(const uint8_t *b, int s, uint32_t v[8], int sc[2]) {
+        const uint32_t qh = iq_u16(b + 34 + 2 * s);
+        const bool neg = qh & 0x8000;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint64_t g = iq1s_grid[b[2 + 4 * s + l] | (((qh >> (3 * l)) & 7) << 8)];
+            v[2 * l] = iq1_vals((uint32_t)g, neg);
+            v[2 * l + 1] = iq1_vals((uint32_t)(g >> 32), neg);
+        }
+        sc[0] = sc[1] = 2 * (int)((qh >> 12) & 7) + 1;
+    }
+};
+struct IQ1M {  // qs[32], qh[16] (3 high bits and a delta sign per 8 values), scales[8] (3 bits per 16 values; the
+               // FP16 d in the top nibbles of the four u16)
+    static constexpr int BYTES = 56;
+    __device__ static float d(const uint8_t *b) {
+        const uint32_t s0 = iq_u16(b + 48), s1 = iq_u16(b + 50), s2 = iq_u16(b + 52), s3 = iq_u16(b + 54);
+        const uint32_t h = (s0 >> 12) | ((s1 >> 8) & 0x00f0) | ((s2 >> 4) & 0x0f00) | (s3 & 0xf000);
+        return 0.125f * __half2float(__ushort_as_half((uint16_t)h));
+    }
+    __device__ static void sub(const uint8_t *b, int s, uint32_t v[8], int sc[2]) {
+        const uint8_t *qs = b + 4 * s, *qh = b + 32 + 2 * s;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t h = qh[l / 2] >> (4 * (l & 1));
+            const uint64_t g = iq1s_grid[qs[l] | ((h & 7) << 8)];
+            v[2 * l] = iq1_vals((uint32_t)g, h & 8);
+            v[2 * l + 1] = iq1_vals((uint32_t)(g >> 32), h & 8);
+        }
+        const uint32_t w = iq_u16(b + 48 + 2 * (s / 2)) >> (6 * (s & 1));
+        sc[0] = 2 * (int)(w & 7) + 1;
+        sc[1] = 2 * (int)((w >> 3) & 7) + 1;
+    }
+};
+struct TQ2 {  // qs[64] (2 bits per value, q - 1), d: per 32 bytes, bits 2 l of byte m are value 32 l + m
+    static constexpr int BYTES = 66;
+    __device__ static float d(const uint8_t *b) { return fp16(b + 64); }
+    __device__ static void sub(const uint8_t *b, int s, uint32_t v[8], int sc[2]) {
+#pragma unroll
+        for (int k = 0; k < 8; ++k)
+            v[k] = __builtin_amdgcn_perm(0u, 0x000100FFu, (iq_u32(b + 32 * (s >> 2) + 4 * k) >> (2 * (s & 3))) & 0x03030303u);
+        sc[0] = sc[1] = 1;
+    }
+};
+struct TQ1 {  // qs[48] (5 base-3 digits per byte), qh[4] (4 digits per byte), d. Values: bytes 0..31 digit l
+              // (32 l + m), bytes 32..47 digit l (160 + 16 l + m), qh byte j digit l (240 + 4 l + j)
+    static constexpr int BYTES = 54;
+    __device__ static float d(const uint8_t *b) { return fp16(b + 52); }
+    __device__ static uint32_t trit(uint32_t q, int l) {  // ggml's: ((q * 3^l mod 256) * 3) >> 8
+        const uint32_t p = l == 0 ? 1 : l == 1 ? 3 : l == 2 ? 9 : l == 3 ? 27 : 81;
+        return (((q * p) & 0xFF) * 3) >> 8;
+    }
+    __device__ static void sub(const uint8_t *b, int s, uint32_t v[8], int sc[2]) {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            uint32_t w = 0;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int i = 4 * k + e;
+                int byte, dig;
+                if (s < 5) byte = i, dig = s;
+                else if (s < 7) byte = 32 + (i & 15), dig = 2 * (s - 5) + (i >> 4);
+                else if (i < 16) byte = 32 + i, dig = 4;
+                else byte = 48 + ((i - 16) & 3), dig = (i - 16) >> 2;
+                w |= ((trit(b[byte], dig) - 1) & 0xFFu) << (8 * e);
+            }
+            v[k] = w;
+        }
+        sc[0] = sc[1] = 1;
+    }
+};
+
+// The float path: the same values, times d and the scales in float
+template <class P>
+struct BlkIQ {
+    static constexpr int QK = 256, BYTES = P::BYTES;
+    __device__ static float dot(const uint8_t *b, const float *x) {
+        const float d = P::d(b);
+        float s = 0.0f;
+        for (int sb = 0; sb < 8; ++sb) {
+            uint32_t v[8];
+            int sc[2];
+            P::sub(b, sb, v, sc);
+            for (int k = 0; k < 8; ++k)
+                for (int e = 0; e < 4; ++e)
+                    s += d * (float)sc[k / 4] * (float)(int8_t)(v[k] >> (8 * e)) * x[32 * sb + 4 * k + e];
         }
         return s;
     }
@@ -836,6 +1022,15 @@ matmul_f_bf16(const uint8_t *W, long long row_bytes, const float *x, float *y, i
 MATVEC_KERNEL(q4_0, BlkQ4_0)
 MATVEC_KERNEL(iq4_nl, BlkIQ4_NL)
 MATVEC_KERNEL(iq4_xs, BlkIQ4_XS)
+MATVEC_KERNEL(iq2_xxs, BlkIQ<IQ2XXS>)
+MATVEC_KERNEL(iq2_xs, BlkIQ<IQ2XS>)
+MATVEC_KERNEL(iq2_s, BlkIQ<IQ2S>)
+MATVEC_KERNEL(iq3_xxs, BlkIQ<IQ3XXS>)
+MATVEC_KERNEL(iq3_s, BlkIQ<IQ3S>)
+MATVEC_KERNEL(iq1_s, BlkIQ<IQ1S>)
+MATVEC_KERNEL(iq1_m, BlkIQ<IQ1M>)
+MATVEC_KERNEL(tq1_0, BlkIQ<TQ1>)
+MATVEC_KERNEL(tq2_0, BlkIQ<TQ2>)
 MATVEC_KERNEL(q4_1, BlkQ4_1)
 MATVEC_KERNEL(q5_0, BlkQ5_0)
 MATVEC_KERNEL(q5_1, BlkQ5_1)
@@ -884,6 +1079,15 @@ MATVEC_ID_KERNEL(f16, BlkF16, false)
 MATVEC_ID_KERNEL(q4_0, BlkQ4_0, false)
 MATVEC_ID_KERNEL(iq4_nl, BlkIQ4_NL, false)
 MATVEC_ID_KERNEL(iq4_xs, BlkIQ4_XS, false)
+MATVEC_ID_KERNEL(iq2_xxs, BlkIQ<IQ2XXS>, false)
+MATVEC_ID_KERNEL(iq2_xs, BlkIQ<IQ2XS>, false)
+MATVEC_ID_KERNEL(iq2_s, BlkIQ<IQ2S>, false)
+MATVEC_ID_KERNEL(iq3_xxs, BlkIQ<IQ3XXS>, false)
+MATVEC_ID_KERNEL(iq3_s, BlkIQ<IQ3S>, false)
+MATVEC_ID_KERNEL(iq1_s, BlkIQ<IQ1S>, false)
+MATVEC_ID_KERNEL(iq1_m, BlkIQ<IQ1M>, false)
+MATVEC_ID_KERNEL(tq1_0, BlkIQ<TQ1>, false)
+MATVEC_ID_KERNEL(tq2_0, BlkIQ<TQ2>, false)
 MATVEC_ID_KERNEL(q4_1, BlkQ4_1, false)
 MATVEC_ID_KERNEL(q5_0, BlkQ5_0, false)
 MATVEC_ID_KERNEL(q5_1, BlkQ5_1, false)
@@ -956,6 +1160,15 @@ MATMUL_F_ID_KERNEL(f16, BlkF16)
 MATMUL_F_ID_KERNEL(q4_0, BlkQ4_0)
 MATMUL_F_ID_KERNEL(iq4_nl, BlkIQ4_NL)
 MATMUL_F_ID_KERNEL(iq4_xs, BlkIQ4_XS)
+MATMUL_F_ID_KERNEL(iq2_xxs, BlkIQ<IQ2XXS>)
+MATMUL_F_ID_KERNEL(iq2_xs, BlkIQ<IQ2XS>)
+MATMUL_F_ID_KERNEL(iq2_s, BlkIQ<IQ2S>)
+MATMUL_F_ID_KERNEL(iq3_xxs, BlkIQ<IQ3XXS>)
+MATMUL_F_ID_KERNEL(iq3_s, BlkIQ<IQ3S>)
+MATMUL_F_ID_KERNEL(iq1_s, BlkIQ<IQ1S>)
+MATMUL_F_ID_KERNEL(iq1_m, BlkIQ<IQ1M>)
+MATMUL_F_ID_KERNEL(tq1_0, BlkIQ<TQ1>)
+MATMUL_F_ID_KERNEL(tq2_0, BlkIQ<TQ2>)
 MATMUL_F_ID_KERNEL(q4_1, BlkQ4_1)
 MATMUL_F_ID_KERNEL(q5_0, BlkQ5_0)
 MATMUL_F_ID_KERNEL(q5_1, BlkQ5_1)
@@ -1540,6 +1753,31 @@ __device__ __forceinline__ float mv_iq4_xs(const uint8_t *wr, const int8_t *q8, 
     return acc;
 }
 
+// The IQ1 / IQ2 / IQ3 / TQ policies: lane s (0..7) of its block takes sub-block s, as mv_iq4_xs
+template <class P>
+__device__ __forceinline__ float mv_iqk(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
+                                        int lane, int L) {
+    (void)bs;
+    const int sub = lane >> 3, s = lane & 7;
+    const int nb = K / 256;
+    float acc = 0.0f;
+    for (int ib = sub; ib < nb; ib += L / 8) {
+        const uint8_t *b = wr + (long long)ib * P::BYTES;
+        uint32_t v[8];
+        int sc[2];
+        P::sub(b, s, v, sc);
+        const int *xb = (const int *)(q8 + (long long)ib * 256 + 32 * s);
+        int d0 = 0, d1 = 0;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            d0 = dot4((int)v[k], xb[k], d0);
+            d1 = dot4((int)v[4 + k], xb[4 + k], d1);
+        }
+        acc += P::d(b) * d8[ib] * (float)(sc[0] * d0 + sc[1] * d1);
+    }
+    return acc;
+}
+
 __device__ __forceinline__ float mv_q4_K(const uint8_t *wr, const int8_t *q8, const float *d8, const int *bs, int K,
                                          int lane, int L) {
     return mv_kquant<false>(wr, q8, d8, bs, K, lane, L);
@@ -1857,6 +2095,15 @@ MATVEC_Q8_KERNELS(q6_K, mv_q6_K, 1)
 MATVEC_Q8_KERNELS(q2_K, mv_q2_K, 1)
 MATVEC_Q8_KERNELS(q3_K, mv_q3_K, 1)
 MATVEC_Q8_KERNELS(iq4_xs, mv_iq4_xs, 1)
+MATVEC_Q8_KERNELS(iq2_xxs, mv_iqk<IQ2XXS>, 1)
+MATVEC_Q8_KERNELS(iq2_xs, mv_iqk<IQ2XS>, 1)
+MATVEC_Q8_KERNELS(iq2_s, mv_iqk<IQ2S>, 1)
+MATVEC_Q8_KERNELS(iq3_xxs, mv_iqk<IQ3XXS>, 1)
+MATVEC_Q8_KERNELS(iq3_s, mv_iqk<IQ3S>, 1)
+MATVEC_Q8_KERNELS(iq1_s, mv_iqk<IQ1S>, 1)
+MATVEC_Q8_KERNELS(iq1_m, mv_iqk<IQ1M>, 1)
+MATVEC_Q8_KERNELS(tq1_0, mv_iqk<TQ1>, 1)
+MATVEC_Q8_KERNELS(tq2_0, mv_iqk<TQ2>, 1)
 
 // ================================================================ batched int8 matmul (prefill)
 //
@@ -2075,6 +2322,35 @@ __device__ __forceinline__ void mmb_iq4_xs(MM_BARGS, const RM &rm) {
     MM_STORE
 }
 
+// The IQ1 / IQ2 / IQ3 / TQ policies: mv_iqk's lanes and sums, the sub-block decoded once per tile of tokens
+template <class P, class RM>
+__device__ __forceinline__ void mmb_iqk(MM_BARGS, const RM &rm) {
+    (void)bs;
+    MM_ROW_SETUP
+    const int sub = lane >> 3, s = lane & 7;
+    const int nb = K / 256;
+    for (int ib = sub; ib < nb; ib += KQ_BLOCKS_PER_ITER) {
+        const uint8_t *b = wr + (long long)ib * P::BYTES;
+        uint32_t v[8];
+        int sc[2];
+        P::sub(b, s, v, sc);
+        const float dw = P::d(b);
+        for (int j = 0; j < MM_TB; ++j) {
+            if (j >= nt) break;
+            const long long t = rm.in(j);
+            const int *xb = (const int *)(q8 + t * K + (long long)ib * 256 + 32 * s);
+            int d0 = 0, d1 = 0;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                d0 = dot4((int)v[k], xb[k], d0);
+                d1 = dot4((int)v[4 + k], xb[4 + k], d1);
+            }
+            acc[j] += dw * d8[t * nb + ib] * (float)(sc[0] * d0 + sc[1] * d1);
+        }
+    }
+    MM_STORE
+}
+
 template <class PF, class RM>
 __device__ __forceinline__ void mmb_fast(MM_BARGS, const RM &rm) {
     (void)bs;
@@ -2218,6 +2494,15 @@ MATMUL_Q8_KERNELS(q5_K, mmb_q5_K_lin, mmb_q5_K_exp)
 MATMUL_Q8_KERNELS(q2_K, (mmb_k2<false, RowsLinear>), (mmb_k2<false, RowsExpert>))
 MATMUL_Q8_KERNELS(q3_K, (mmb_k2<true, RowsLinear>), (mmb_k2<true, RowsExpert>))
 MATMUL_Q8_KERNELS(iq4_xs, mmb_iq4_xs<RowsLinear>, mmb_iq4_xs<RowsExpert>)
+MATMUL_Q8_KERNELS(iq2_xxs, (mmb_iqk<IQ2XXS, RowsLinear>), (mmb_iqk<IQ2XXS, RowsExpert>))
+MATMUL_Q8_KERNELS(iq2_xs, (mmb_iqk<IQ2XS, RowsLinear>), (mmb_iqk<IQ2XS, RowsExpert>))
+MATMUL_Q8_KERNELS(iq2_s, (mmb_iqk<IQ2S, RowsLinear>), (mmb_iqk<IQ2S, RowsExpert>))
+MATMUL_Q8_KERNELS(iq3_xxs, (mmb_iqk<IQ3XXS, RowsLinear>), (mmb_iqk<IQ3XXS, RowsExpert>))
+MATMUL_Q8_KERNELS(iq3_s, (mmb_iqk<IQ3S, RowsLinear>), (mmb_iqk<IQ3S, RowsExpert>))
+MATMUL_Q8_KERNELS(iq1_s, (mmb_iqk<IQ1S, RowsLinear>), (mmb_iqk<IQ1S, RowsExpert>))
+MATMUL_Q8_KERNELS(iq1_m, (mmb_iqk<IQ1M, RowsLinear>), (mmb_iqk<IQ1M, RowsExpert>))
+MATMUL_Q8_KERNELS(tq1_0, (mmb_iqk<TQ1, RowsLinear>), (mmb_iqk<TQ1, RowsExpert>))
+MATMUL_Q8_KERNELS(tq2_0, (mmb_iqk<TQ2, RowsLinear>), (mmb_iqk<TQ2, RowsExpert>))
 
 // ================================================================ WMMA tiled matmul (prefill, Phase 20 W2)
 //
@@ -2826,7 +3111,7 @@ struct WmmaKSmem {
 // RM: the tile's tokens (WRowsLinear, or WRowsExpert: one expert's entries, MoE prefill), as in wmma_q80. NT: the
 // 16-token sub-tiles computed (4 for a dense tile; an expert tile takes the fewest that cover its entries: a few
 // entries in 4 sub-tiles made the kernel slower than the dot4 one below ~300 tokens per batch)
-template <int KT, int NT, class RM>
+template <class WS, int NT, class RM>
 __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8,
                                          const int *bs, float *y, long long ldy, int N, int K, const RM &rm,
                                          WmmaKSmem &sm) {
@@ -2849,7 +3134,7 @@ __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, 
 #pragma unroll
         for (int r = 0; r < 8; ++r) acc[n][r] = 0.0f;
 
-    WStageK<KT> ws;
+    WS ws;
     uint4 gx[4];
     const int wr_row = tid >> 1, part = tid & 1;
     const int xt0 = tid >> 1, xc = (tid & 1) * 64;
@@ -2867,7 +3152,7 @@ __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, 
         const int bk = k0 / 256, hh = (k0 / 128) & 1;
         if (tid < 64) {
             sdx[tid] = tid < T ? d8[rm.in(tid) * nbk + bk] : 0.0f;
-        } else if (WStageK<KT>::MINS == 4) {
+        } else if (WS::MINS == 4) {
             const int tt = tid - 64;
             const long long t = tt < T ? rm.in(tt) : 0;
 #pragma unroll
@@ -2876,7 +3161,7 @@ __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, 
                 sbs[tt][s2] = tt < T ? bs[t * (K / 16) + bk * 16 + 2 * sub] + bs[t * (K / 16) + bk * 16 + 2 * sub + 1]
                                      : 0;
             }
-        } else if (WStageK<KT>::MINS == 8) {
+        } else if (WS::MINS == 8) {
             const int tt = tid - 64;
             const long long t = tt < T ? rm.in(tt) : 0;
 #pragma unroll
@@ -2898,7 +3183,7 @@ __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, 
             for (int r = 0; r < 8; ++r) isum[n][r] = 0;
         // Q4_K / Q5_K: one scale per 32-value sub-block, so its two 16-value WMMAs chain in the int32 accumulator
         // and are scaled once (the same integer sums); Q2_K, Q3_K, Q6_K: a scale per 16 values
-        constexpr int GW = WStageK<KT>::GW, NM = WStageK<KT>::MINS;
+        constexpr int GW = WS::GW, NM = WS::MINS;
 #pragma unroll 1
         for (int g = 0; g < WM_KC / 16; g += GW) {
             v8i_t c[NT];
@@ -2966,31 +3251,72 @@ __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, 
 // matmul_wmma_<type> (dense: 4 sub-tiles of 16 tokens) and matmul_wmma_id_<type> (MoE prefill: grid (ceil(N / 64),
 // max_tiles) over moe_group's expert tiles of up to 64 entries (QMV_WMMA_ID_TB), block 128; the arguments of
 // matmul_q8_id_<type>; the fewest sub-tiles that cover the tile's entries)
-#define MATMUL_WMMA_Q8K_KERNELS(name, KT)                                                                    \
+#define MATMUL_WMMA_Q8K_KERNELS(name, WS)                                                                    \
     extern "C" __global__ void __launch_bounds__(128)                                                        \
         matmul_wmma_##name(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8,          \
                            const int *bs, float *y, long long ldy, int N, int K, int T) {                    \
         __shared__ __attribute__((aligned(16))) WmmaKSmem sm;                                                \
         const int t0 = blockIdx.y * WM_TILE;                                                                 \
-        wmma_q8k<KT, 4>(W, row_bytes, q8, d8, bs, y, ldy, N, K, WRowsLinear{t0, min(WM_TILE, T - t0)}, sm);   \
+        wmma_q8k<WS, 4>(W, row_bytes, q8, d8, bs, y, ldy, N, K, WRowsLinear{t0, min(WM_TILE, T - t0)}, sm);   \
     }                                                                                                        \
     extern "C" __global__ void __launch_bounds__(128) matmul_wmma_id_##name(MMID_ARGS) {                      \
         const int k = blockIdx.y;                                                                            \
         if (k >= *n_tiles) return;                                                                           \
         __shared__ __attribute__((aligned(16))) WmmaKSmem sm;                                                \
         const WRowsExpert rm{tile_e[k], tile_n[k], in_rows + tile_start[k], out_rows + tile_start[k]};       \
-        if (rm.nt <= 16) wmma_q8k<KT, 1>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                       \
-        else if (rm.nt <= 32) wmma_q8k<KT, 2>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                  \
-        else if (rm.nt <= 48) wmma_q8k<KT, 3>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                  \
-        else wmma_q8k<KT, 4>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                                   \
+        if (rm.nt <= 16) wmma_q8k<WS, 1>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                       \
+        else if (rm.nt <= 32) wmma_q8k<WS, 2>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                  \
+        else if (rm.nt <= 48) wmma_q8k<WS, 3>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                  \
+        else wmma_q8k<WS, 4>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                                   \
     }
 
-MATMUL_WMMA_Q8K_KERNELS(q2_K, 2)
-MATMUL_WMMA_Q8K_KERNELS(q3_K, 3)
-MATMUL_WMMA_Q8K_KERNELS(q4_K, 4)
-MATMUL_WMMA_Q8K_KERNELS(q5_K, 5)
-MATMUL_WMMA_Q8K_KERNELS(q6_K, 6)
-MATMUL_WMMA_Q8K_KERNELS(iq4_xs, 7)
+MATMUL_WMMA_Q8K_KERNELS(q2_K, WStageK<2>)
+MATMUL_WMMA_Q8K_KERNELS(q3_K, WStageK<3>)
+MATMUL_WMMA_Q8K_KERNELS(q4_K, WStageK<4>)
+MATMUL_WMMA_Q8K_KERNELS(q5_K, WStageK<5>)
+MATMUL_WMMA_Q8K_KERNELS(q6_K, WStageK<6>)
+MATMUL_WMMA_Q8K_KERNELS(iq4_xs, WStageK<7>)
+
+// The IQ1 / IQ2 / IQ3 / TQ types: each thread decodes its two 32-value sub-blocks of the chunk with the policy's
+// sub() straight from global memory in store() (load() only notes the block)
+template <class P>
+struct WStageIQ {
+    static constexpr int BYTES = P::BYTES, MINS = 0, GW = 1;
+    const uint8_t *b;
+    bool ok;
+    __device__ void load(const uint8_t *W, long long rb, int row, bool okr, int k0, int) {
+        ok = okr;
+        b = W + (long long)(okr ? row : 0) * rb + (long long)(k0 / 256) * BYTES;
+    }
+    __device__ void store(int8_t *srow, int *gsc, float *dw, float *dmin, int *, int k0, int part) const {
+        const int hh = (k0 / 128) & 1;
+        uint32_t *dst = (uint32_t *)(srow + 64 * part);
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {  // sub-block 4 hh + 2 part + j: local groups 4 part + 2 j (+1)
+            uint32_t v[8];
+            int sc[2] = {0, 0};
+            if (ok) P::sub(b, 4 * hh + 2 * part + j, v, sc);
+#pragma unroll
+            for (int k = 0; k < 8; ++k) dst[8 * j + k] = ok ? v[k] : 0u;
+            gsc[4 * part + 2 * j] = sc[0];
+            gsc[4 * part + 2 * j + 1] = sc[1];
+        }
+        if (part == 0) {
+            *dw = ok ? P::d(b) : 0.0f;
+            *dmin = 0.0f;
+        }
+    }
+};
+
+MATMUL_WMMA_Q8K_KERNELS(iq2_xxs, WStageIQ<IQ2XXS>)
+MATMUL_WMMA_Q8K_KERNELS(iq2_xs, WStageIQ<IQ2XS>)
+MATMUL_WMMA_Q8K_KERNELS(iq2_s, WStageIQ<IQ2S>)
+MATMUL_WMMA_Q8K_KERNELS(iq3_xxs, WStageIQ<IQ3XXS>)
+MATMUL_WMMA_Q8K_KERNELS(iq3_s, WStageIQ<IQ3S>)
+MATMUL_WMMA_Q8K_KERNELS(iq1_s, WStageIQ<IQ1S>)
+MATMUL_WMMA_Q8K_KERNELS(iq1_m, WStageIQ<IQ1M>)
+MATMUL_WMMA_Q8K_KERNELS(tq1_0, WStageIQ<TQ1>)
+MATMUL_WMMA_Q8K_KERNELS(tq2_0, WStageIQ<TQ2>)
 
 // ---------------------------------------------------------------- WMMA for F16 / BF16 weights (dense prefill)
 //

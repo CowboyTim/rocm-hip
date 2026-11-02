@@ -29,9 +29,18 @@ enum qt_type {
     QT_Q4_K = 12,
     QT_Q5_K = 13,
     QT_Q6_K = 14,
+    QT_IQ2_XXS = 16,
+    QT_IQ2_XS = 17,
+    QT_IQ3_XXS = 18,
+    QT_IQ1_S = 19,
     QT_IQ4_NL = 20,
+    QT_IQ3_S = 21,
+    QT_IQ2_S = 22,
     QT_IQ4_XS = 23,
+    QT_IQ1_M = 29,
     QT_BF16 = 30,
+    QT_TQ1_0 = 34,
+    QT_TQ2_0 = 35,
     QT_MXFP4 = 39,
     QT_NVFP4 = 40,
     QT_Q4_0_ROCMFP4      = 100,
@@ -57,6 +66,10 @@ size_t qt_row_size(int type, int64_t ne0);
 
 // Decode n values; returns 0 on success, -1 if the type is unsupported or n is misaligned.
 int qt_to_float(int type, const void *src, float *dst, int64_t n);
+
+// 1 when ggml dots this weight type with Q8_K activations (the K-quants, IQ1 .. IQ4_XS super-block types, TQ1_0 /
+// TQ2_0); the other quantized types use Q8_0
+int qt_vec_dot_q8k(int type);
 
 // Scalar helpers shared with other host code
 float qt_fp16_to_fp32(uint16_t h);

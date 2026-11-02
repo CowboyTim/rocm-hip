@@ -8,6 +8,9 @@
 
 #include <string.h>
 
+#define IQ_TABLE(type, name, size) static const type name[size]
+#include "iq_grids.h"
+
 // ---------------------------------------------------------------- scalars
 
 float qt_fp16_to_fp32(uint16_t h) {
@@ -419,6 +422,164 @@ static void deq_nvfp4(const void *src, float *y, int64_t n) {
     }
 }
 
+// ---------------------------------------------------------------- IQ1 / IQ2 / IQ3 and ternary (as ggml's dequantize_row_*)
+
+static inline uint16_t rd_u16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static inline uint32_t rd_u32(const uint8_t *p) { return (uint32_t)p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
+
+// 8 grid bytes (a uint64 entry) times signs bit j of sgn
+static void iq_grid8(float *y, float s, uint64_t g, unsigned sgn) {
+    for (int j = 0; j < 8; ++j) y[j] = s * (float)(uint8_t)(g >> (8 * j)) * ((sgn >> j) & 1 ? -1.0f : 1.0f);
+}
+
+// IQ2_XXS: d, qs[32] u16; per 32 values two u32: 4 grid bytes, then 4 x 7 sign bits and a 4-bit scale
+static void deq_iq2_xxs(const void *src, float *y, int64_t n) {
+    const uint8_t *b = (const uint8_t *)src;
+    for (int64_t i = 0; i < n / 256; ++i, b += 66) {
+        const float d = rd_fp16(b);
+        for (int ib = 0; ib < 8; ++ib) {
+            const uint8_t *q = b + 2 + 8 * ib;
+            const uint32_t a1 = rd_u32(q + 4);
+            const float db = d * (0.5f + (a1 >> 28)) * 0.25f;
+            for (int l = 0; l < 4; ++l, y += 8) iq_grid8(y, db, iq2xxs_grid[q[l]], ksigns_iq2xs[(a1 >> (7 * l)) & 127]);
+        }
+    }
+}
+
+// IQ2_XS: d, qs[32] u16 (9-bit grid index, 7 sign bits), scales[8] (4 bits per 16 values)
+static void deq_iq2_xs(const void *src, float *y, int64_t n) {
+    const uint8_t *b = (const uint8_t *)src;
+    for (int64_t i = 0; i < n / 256; ++i, b += 74) {
+        const float d = rd_fp16(b);
+        for (int ib = 0; ib < 8; ++ib) {
+            const uint8_t sc = b[66 + ib];
+            for (int l = 0; l < 4; ++l, y += 8) {
+                const uint16_t q = rd_u16(b + 2 + 2 * (4 * ib + l));
+                const float db = d * (0.5f + ((l < 2 ? sc : sc >> 4) & 0xF)) * 0.25f;
+                iq_grid8(y, db, iq2xs_grid[q & 511], ksigns_iq2xs[q >> 9]);
+            }
+        }
+    }
+}
+
+// IQ2_S: d, qs[32] (grid index low 8 bits), signs[32], qh[8] (2 high bits per 8 values), scales[8]
+static void deq_iq2_s(const void *src, float *y, int64_t n) {
+    const uint8_t *b = (const uint8_t *)src;
+    for (int64_t i = 0; i < n / 256; ++i, b += 82) {
+        const float d = rd_fp16(b);
+        const uint8_t *qs = b + 2, *signs = b + 34, *qh = b + 66, *sc = b + 74;
+        for (int ib = 0; ib < 8; ++ib)
+            for (int l = 0; l < 4; ++l, y += 8) {
+                const float db = d * (0.5f + ((l < 2 ? sc[ib] : sc[ib] >> 4) & 0xF)) * 0.25f;
+                iq_grid8(y, db, iq2s_grid[qs[4 * ib + l] | ((qh[ib] << (8 - 2 * l)) & 0x300)], signs[4 * ib + l]);
+            }
+    }
+}
+
+// IQ3_XXS: d, qs[64] (4-value grid indices), then per 32 values a u32: 4 x 7 sign bits, a 4-bit scale
+static void deq_iq3_xxs(const void *src, float *y, int64_t n) {
+    const uint8_t *b = (const uint8_t *)src;
+    for (int64_t i = 0; i < n / 256; ++i, b += 98) {
+        const float d = rd_fp16(b);
+        for (int ib = 0; ib < 8; ++ib) {
+            const uint8_t *q = b + 2 + 8 * ib;
+            const uint32_t a = rd_u32(b + 66 + 4 * ib);
+            const float db = d * (0.5f + (a >> 28)) * 0.5f;
+            for (int l = 0; l < 4; ++l, y += 8) {
+                const uint64_t g = iq3xxs_grid[q[2 * l]] | (uint64_t)iq3xxs_grid[q[2 * l + 1]] << 32;
+                iq_grid8(y, db, g, ksigns_iq2xs[(a >> (7 * l)) & 127]);
+            }
+        }
+    }
+}
+
+// IQ3_S: d, qs[64] (grid index low 8 bits), qh[8] (the 9th bits), signs[32], scales[4] (4 bits per 32 values)
+static void deq_iq3_s(const void *src, float *y, int64_t n) {
+    const uint8_t *b = (const uint8_t *)src;
+    for (int64_t i = 0; i < n / 256; ++i, b += 110) {
+        const float d = rd_fp16(b);
+        const uint8_t *qs = b + 2, *qh = b + 66, *signs = b + 74, *sc = b + 106;
+        for (int ib = 0; ib < 8; ++ib) {
+            const float db = d * (1 + 2 * ((sc[ib / 2] >> (4 * (ib % 2))) & 0xF));
+            for (int l = 0; l < 4; ++l, y += 8) {
+                const uint8_t *q = qs + 8 * ib + 2 * l;
+                const uint64_t g = iq3s_grid[q[0] | ((qh[ib] << (8 - 2 * l)) & 256)] |
+                                   (uint64_t)iq3s_grid[q[1] | ((qh[ib] << (7 - 2 * l)) & 256)] << 32;
+                iq_grid8(y, db, g, signs[4 * ib + l]);
+            }
+        }
+    }
+}
+
+// IQ1_S: d, qs[32] (grid index low 8 bits), qh[8] u16 (3 high bits per 8 values, a 3-bit scale, the delta sign)
+static void deq_iq1_s(const void *src, float *y, int64_t n) {
+    const uint8_t *b = (const uint8_t *)src;
+    for (int64_t i = 0; i < n / 256; ++i, b += 50) {
+        const float d = rd_fp16(b);
+        for (int ib = 0; ib < 8; ++ib) {
+            const uint16_t qh = rd_u16(b + 34 + 2 * ib);
+            const float dl = d * (2 * ((qh >> 12) & 7) + 1), delta = qh & 0x8000 ? -0.125f : 0.125f;
+            for (int l = 0; l < 4; ++l, y += 8) {
+                const uint64_t g = iq1s_grid[b[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8)];
+                for (int j = 0; j < 8; ++j) y[j] = dl * ((float)(int8_t)(g >> (8 * j)) + delta);
+            }
+        }
+    }
+}
+
+// IQ1_M: qs[32], qh[16] (3 high bits and a delta sign per 8 values), scales[8] (3 bits per 16 values; the FP16 d in
+// the top nibbles of the four u16)
+static void deq_iq1_m(const void *src, float *y, int64_t n) {
+    const uint8_t *b = (const uint8_t *)src;
+    for (int64_t i = 0; i < n / 256; ++i, b += 56) {
+        uint16_t sc[4];
+        for (int k = 0; k < 4; ++k) sc[k] = rd_u16(b + 48 + 2 * k);
+        const uint16_t dh = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+        const uint8_t dd[2] = {(uint8_t)dh, (uint8_t)(dh >> 8)};
+        const float d = rd_fp16(dd);
+        for (int ib = 0; ib < 8; ++ib) {
+            const uint8_t *qs = b + 4 * ib, *qh = b + 32 + 2 * ib;
+            for (int l = 0; l < 4; ++l, y += 8) {
+                const float dl = d * (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3 * (l / 2))) & 7) + 1);
+                const uint8_t h = qh[l / 2] >> (4 * (l % 2));
+                const float delta = h & 0x08 ? -0.125f : 0.125f;
+                const uint64_t g = iq1s_grid[qs[l] | ((h & 7) << 8)];
+                for (int j = 0; j < 8; ++j) y[j] = dl * ((float)(int8_t)(g >> (8 * j)) + delta);
+            }
+        }
+    }
+}
+
+// TQ1_0: qs[48] (5 trits per byte: base-3 digits as fixed point), qh[4] (4 trits per byte), d. Value order: bytes
+// 0..31 digit l, then bytes 32..47 digit l, then qh digit l
+static int tq_trit(uint8_t q, int l) {
+    static const uint8_t pow3[6] = {1, 3, 9, 27, 81, 243};
+    return (((uint16_t)(uint8_t)(q * pow3[l]) * 3) >> 8) - 1;
+}
+static void deq_tq1_0(const void *src, float *y, int64_t n) {
+    const uint8_t *b = (const uint8_t *)src;
+    for (int64_t i = 0; i < n / 256; ++i, b += 54) {
+        const float d = rd_fp16(b + 52);
+        for (int l = 0; l < 5; ++l)
+            for (int m = 0; m < 32; ++m) *y++ = tq_trit(b[m], l) * d;
+        for (int l = 0; l < 5; ++l)
+            for (int m = 0; m < 16; ++m) *y++ = tq_trit(b[32 + m], l) * d;
+        for (int l = 0; l < 4; ++l)
+            for (int j = 0; j < 4; ++j) *y++ = tq_trit(b[48 + j], l) * d;
+    }
+}
+
+// TQ2_0: qs[64] (2 bits per value, q - 1), d. Per 32 bytes: bits 2l of byte m are value 32 l + m
+static void deq_tq2_0(const void *src, float *y, int64_t n) {
+    const uint8_t *b = (const uint8_t *)src;
+    for (int64_t i = 0; i < n / 256; ++i, b += 66) {
+        const float d = rd_fp16(b + 64);
+        for (int j = 0; j < 64; j += 32)
+            for (int l = 0; l < 4; ++l)
+                for (int m = 0; m < 32; ++m) *y++ = (float)(((b[j + m] >> (2 * l)) & 3) - 1) * d;
+    }
+}
+
 // ---------------------------------------------------------------- table
 
 // verified: 1 = bit-exact vs `ref_dump dequant` on a real GGUF tensor (tests/dequant_verify)
@@ -437,12 +598,32 @@ static const qt_traits k_traits[] = {
     {QT_Q6_K,              "q6_K",              256, 210, deq_q6_K,         1},
     {QT_IQ4_NL,            "iq4_nl",            32,  18,  deq_iq4_nl,       1},
     {QT_IQ4_XS,            "iq4_xs",            256, 136, deq_iq4_xs,       1},
+    {QT_IQ2_XXS,           "iq2_xxs",           256, 66,  deq_iq2_xxs,      1},
+    {QT_IQ2_XS,            "iq2_xs",            256, 74,  deq_iq2_xs,       1},
+    {QT_IQ2_S,             "iq2_s",             256, 82,  deq_iq2_s,        1},
+    {QT_IQ3_XXS,           "iq3_xxs",           256, 98,  deq_iq3_xxs,      1},
+    {QT_IQ3_S,             "iq3_s",             256, 110, deq_iq3_s,        1},
+    {QT_IQ1_S,             "iq1_s",             256, 50,  deq_iq1_s,        1},
+    {QT_IQ1_M,             "iq1_m",             256, 56,  deq_iq1_m,        1},
+    {QT_TQ1_0,             "tq1_0",             256, 54,  deq_tq1_0,        1},
+    {QT_TQ2_0,             "tq2_0",             256, 66,  deq_tq2_0,        1},
     {QT_BF16,              "bf16",              1,   2,   deq_bf16,         1},
     {QT_MXFP4,             "mxfp4",             32,  17,  deq_mxfp4,        1},
     {QT_NVFP4,             "nvfp4",             64,  36,  deq_nvfp4,        1},
     {QT_Q4_0_ROCMFP4,      "q4_0_rocmfp4",      32,  18,  deq_rocmfp4,      1},
     {QT_Q4_0_ROCMFP4_FAST, "q4_0_rocmfp4_fast", 32,  17,  deq_rocmfp4_fast, 1},
 };
+
+int qt_vec_dot_q8k(int type) {
+    switch (type) {
+    case QT_Q2_K: case QT_Q3_K: case QT_Q4_K: case QT_Q5_K: case QT_Q6_K: case QT_IQ4_XS:
+    case QT_IQ2_XXS: case QT_IQ2_XS: case QT_IQ2_S: case QT_IQ3_XXS: case QT_IQ3_S: case QT_IQ1_S: case QT_IQ1_M:
+    case QT_TQ1_0: case QT_TQ2_0:
+        return 1;
+    default:
+        return 0;
+    }
+}
 
 const qt_traits *qt_get_traits(int type) {
     for (size_t i = 0; i < sizeof(k_traits) / sizeof(k_traits[0]); ++i) {

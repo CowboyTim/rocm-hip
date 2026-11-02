@@ -54,7 +54,7 @@ struct ShmBuf {
 // x quantized and decoded back as ggml's CPU reference does for this weight type's vec_dot_type:
 // Q8_0 (x86 SIMD quantize_row_q8_0) for ROCmFP4 and Q8_0, Q8_K (quantize_row_q8_K_ref) for K-quants
 static void q8_roundtrip(int wtype, const float *x, float *out, int K) {
-    if ((wtype >= QT_Q2_K && wtype <= QT_Q6_K) || wtype == QT_IQ4_XS) {
+    if (qt_vec_dot_q8k(wtype)) {
         for (int b = 0; b < K; b += 256) {
             float amax = 0.0f, mx = 0.0f;
             for (int j = 0; j < 256; ++j)
