@@ -19,6 +19,21 @@
 #define IQ_TABLE(type, name, size) __constant__ type name[size]
 #include "iq_grids.h"
 
+// Output scales: NVFP4's global scale per matrix or per expert (llama.cpp's <weight>.scale, ModelOpt's
+// weight_scale_2), which the reference multiplies into the matmul's outputs (ggml_mul). The kernels apply it as they
+// store, out = sum * s (the same bits as a multiply afterwards, without another pass over the outputs); 1 for every
+// other matrix. OScale: a dense launch's up to 4 matrices; OScaleId: an expert launch's per-expert values es[m] (or
+// one value s[m]) and the extra matrix's (id -1) sx[m], m = 1 for a pair launch's second matrix. qmatvec.cpp mirrors
+// both.
+struct OScale {
+    float s[4];
+};
+struct OScaleId {
+    const float *es[2];
+    float s[2], sx[2];
+    __device__ float of(int m, int e) const { return e < 0 ? sx[m] : es[m] ? es[m][e] : s[m]; }
+};
+
 #define ROWS_PER_BLOCK 4
 
 __device__ __forceinline__ float fp16(const uint8_t *p) {
@@ -623,7 +638,7 @@ struct BlkROCmFP4Fast {
 // ---------------------------------------------------------------- generic kernel
 
 template <typename B>
-__device__ void matvec_impl(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K) {
+__device__ void matvec_impl(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K, float sc) {
     const int lane = threadIdx.x & 31;
     const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
     if (row >= N) return;
@@ -632,12 +647,13 @@ __device__ void matvec_impl(const uint8_t *W, long long row_bytes, const float *
     float acc = 0.0f;
     for (int ib = lane; ib < nb; ib += 32) acc += B::dot(wr + (long long)ib * B::BYTES, x + (long long)ib * B::QK);
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
-    if (lane == 0) y[row] = acc;
+    if (lane == 0) y[row] = acc * sc;
 }
 
 // Wave-cooperative variant: every lane works on every block (B::lane_dot gives the lane's share)
 template <typename B>
-__device__ void matvec_coop_impl(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K) {
+__device__ void matvec_coop_impl(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K,
+                                 float sc) {
     const int lane = threadIdx.x & 31;
     const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
     if (row >= N) return;
@@ -647,13 +663,14 @@ __device__ void matvec_coop_impl(const uint8_t *W, long long row_bytes, const fl
 #pragma unroll 4
     for (int ib = 0; ib < nb; ++ib) acc += B::lane_dot(wr + (long long)ib * B::BYTES, x + (long long)ib * B::QK, lane);
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
-    if (lane == 0) y[row] = acc;
+    if (lane == 0) y[row] = acc * sc;
 }
 
 #define MATVEC_COOP_KERNEL(name, B)                                                                       \
     extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)                                     \
-        matvec_##name(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K) {    \
-        matvec_coop_impl<B>(W, row_bytes, x, y, N, K);                                                     \
+        matvec_##name(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K,     \
+                      OScale osc) {                                                                       \
+        matvec_coop_impl<B>(W, row_bytes, x, y, N, K, osc.s[0]);                                           \
     }
 
 // Several tokens (prefill on the float path, e.g. rows too short for the int8 kernels: the qwen4exp mixers'
@@ -663,7 +680,7 @@ __device__ void matvec_coop_impl(const uint8_t *W, long long row_bytes, const fl
 #define MMF_TT 8
 template <typename B>
 __device__ void matmul_float_impl(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K,
-                                  int T) {
+                                  int T, float sc) {
     const int lane = threadIdx.x & 31;
     const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
     if (row >= N) return;
@@ -683,19 +700,20 @@ __device__ void matmul_float_impl(const uint8_t *W, long long row_bytes, const f
     for (int j = 0; j < MMF_TT; ++j) {
         float a = acc[j];
         for (int off = 16; off > 0; off >>= 1) a += __shfl_xor(a, off, 32);
-        if (lane == 0 && j < nt) y[(size_t)(t0 + j) * N + row] = a;
+        if (lane == 0 && j < nt) y[(size_t)(t0 + j) * N + row] = a * sc;
     }
 }
 
 #define MATVEC_KERNEL(name, B)                                                                            \
     extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)                                     \
-        matvec_##name(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K) {    \
-        matvec_impl<B>(W, row_bytes, x, y, N, K);                                                          \
+        matvec_##name(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K,     \
+                      OScale osc) {                                                                       \
+        matvec_impl<B>(W, row_bytes, x, y, N, K, osc.s[0]);                                                \
     }                                                                                                     \
     extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)                                     \
         matmul_f_##name(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K,     \
-                        int T) {                                                                          \
-        matmul_float_impl<B>(W, row_bytes, x, y, N, K, T);                                                 \
+                        int T, OScale osc) {                                                              \
+        matmul_float_impl<B>(W, row_bytes, x, y, N, K, T, osc.s[0]);                                       \
     }
 
 // F16: dedicated kernels instead of the generic one-value-per-lane loop (2-byte loads: 56-142 GB/s on the
@@ -1049,7 +1067,7 @@ MATVEC_KERNEL(nvfp4, BlkNVFP4)
 // ids / x_per_slot convention as matvec_q8_id_<type> below, on the FP32 input rows.
 template <typename B, bool COOP>
 __device__ void matvec_id_impl(const uint8_t *W, long long row_bytes, const int *ids, int n_used, int x_per_slot,
-                               const float *x, float *y, int N, int K) {
+                               const float *x, float *y, int N, int K, const OScaleId &osc) {
     const int lane = threadIdx.x & 31;
     const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
     if (row >= N) return;
@@ -1064,14 +1082,14 @@ __device__ void matvec_id_impl(const uint8_t *W, long long row_bytes, const int 
         for (int ib = lane; ib < nb; ib += 32) acc += B::dot(wr + (long long)ib * B::BYTES, xr + (long long)ib * B::QK);
     }
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
-    if (lane == 0) y[((long long)t * n_used + slot) * N + row] = acc;
+    if (lane == 0) y[((long long)t * n_used + slot) * N + row] = acc * osc.of(0, e);
 }
 
 #define MATVEC_ID_KERNEL(name, B, COOP)                                                                   \
     extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)                                     \
         matvec_id_##name(const uint8_t *W, long long row_bytes, const int *ids, int n_used, int x_per_slot, \
-                         const float *x, float *y, int N, int K) {                                        \
-        matvec_id_impl<B, COOP>(W, row_bytes, ids, n_used, x_per_slot, x, y, N, K);                        \
+                         const float *x, float *y, int N, int K, OScaleId osc) {                          \
+        matvec_id_impl<B, COOP>(W, row_bytes, ids, n_used, x_per_slot, x, y, N, K, osc);                   \
     }
 
 MATVEC_ID_KERNEL(f32, BlkF32, false)
@@ -1126,12 +1144,13 @@ matvec_id_bf16(const uint8_t *W, long long row_bytes, const int *ids, int n_used
         const int *tile_e, const int *tile_start, const int *tile_n, const int *in_rows, const int *out_rows
 
 template <typename B>
-__device__ void matmul_f_id_impl(MMF_ID_ARGS) {
+__device__ void matmul_f_id_impl(MMF_ID_ARGS, const OScaleId &osc) {
     const int lane = threadIdx.x & 31;
     const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5), k = blockIdx.y;
     if (row >= N || k >= *n_tiles) return;
     const int nt = tile_n[k], *in = in_rows + tile_start[k], *out = out_rows + tile_start[k];
     const uint8_t *wr = W + ((long long)tile_e[k] * N + row) * row_bytes;
+    const float sc = osc.of(0, tile_e[k]);
     const int nb = K / B::QK;
     float acc[MMF_ID_TB];
 #pragma unroll
@@ -1146,13 +1165,14 @@ __device__ void matmul_f_id_impl(MMF_ID_ARGS) {
     for (int j = 0; j < MMF_ID_TB; ++j) {
         float a = acc[j];
         for (int off = 16; off > 0; off >>= 1) a += __shfl_xor(a, off, 32);
-        if (lane == 0 && j < nt) y[(long long)out[j] * N + row] = a;
+        if (lane == 0 && j < nt) y[(long long)out[j] * N + row] = a * sc;
     }
 }
 
 #define MATMUL_F_ID_KERNEL(name, B)                                                                       \
-    extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matmul_f_id_##name(MMF_ID_ARGS) {   \
-        matmul_f_id_impl<B>(W, row_bytes, x, y, N, K, n_tiles, tile_e, tile_start, tile_n, in_rows, out_rows); \
+    extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)                                     \
+        matmul_f_id_##name(MMF_ID_ARGS, OScaleId osc) {                                                   \
+        matmul_f_id_impl<B>(W, row_bytes, x, y, N, K, n_tiles, tile_e, tile_start, tile_n, in_rows, out_rows, osc); \
     }
 
 MATMUL_F_ID_KERNEL(f32, BlkF32)
@@ -1888,13 +1908,13 @@ __device__ __forceinline__ float mv_q5_K(const uint8_t *wr, const int8_t *q8, co
         const uint8_t *Wx, const uint8_t *W2x
 
 #define MATVEC_Q8_KERNELS(name, FN, KQ)                                                                  \
-    extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matvec_q8_##name(Q8_ARGS) {        \
+    extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matvec_q8_##name(Q8_ARGS, OScale osc) {        \
         Q8_ROW_SETUP                                                                                     \
         float acc = FN(wr, q8, d8, bs, K, gl, L);                                                        \
         Q8_REDUCE(acc)                                                                                   \
-        if (gl == 0) *yr = acc;                                                                          \
+        if (gl == 0) *yr = acc * osc.s[mat];                                                                          \
     }                                                                                                    \
-    extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matvec_q8_id_##name(Q8ID_ARGS) {   \
+    extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matvec_q8_id_##name(Q8ID_ARGS, OScaleId osc) {   \
         Q8_ROW_INDEX                                                                                     \
         if (row >= N) return;                                                                            \
         const bool m2 = (int)blockIdx.y >= n_used; /* grid y = 2 n_used: the second matrix (W2 -> y2) */  \
@@ -1905,7 +1925,7 @@ __device__ __forceinline__ float mv_q5_K(const uint8_t *wr, const int8_t *q8, co
         float acc = FN(wr, q8 + in_row * K, d8 + in_row * (K / ((KQ) == 1 ? 256 : 32)),                \
                        bs + in_row * (K / ((KQ) == 2 ? 32 : 16)), K, gl, L);                             \
         Q8_REDUCE(acc)                                                                                   \
-        if (gl == 0) (m2 ? y2 : y)[((long long)t * n_used + slot) * N + row] = acc;                      \
+        if (gl == 0) (m2 ? y2 : y)[((long long)t * n_used + slot) * N + row] = acc * osc.of(m2, e);                      \
     }
 
 // The same for NT tokens (2..4): each lane decodes its quads once and applies them to every token's Q8_0 input
@@ -2128,6 +2148,7 @@ MATVEC_Q8_KERNELS(tq2_0, mv_iqk<TQ2>, 1)
 struct RowsLinear {  // prefill: tokens t0 .. t0 + nt - 1, rows t of the input and of y
     long long t0;
     int nt;
+    float sc;  // output scale (OScale)
     __device__ const uint8_t *row_ptr(const uint8_t *W, int row, long long rb, int) const { return W + (long long)row * rb; }
     __device__ long long in(int j) const { return t0 + j; }
     __device__ long long out(int j) const { return t0 + j; }
@@ -2136,6 +2157,7 @@ struct RowsLinear {  // prefill: tokens t0 .. t0 + nt - 1, rows t of the input a
 struct RowsExpert {  // MoE prefill: one expert's tile of (token, slot) entries, rows from lists
     int e, nt;
     const int *in_rows, *out_rows;
+    float sc;
     __device__ const uint8_t *row_ptr(const uint8_t *W, int row, long long rb, int N) const {
         return W + ((long long)e * N + row) * rb;
     }
@@ -2156,7 +2178,7 @@ struct RowsExpert {  // MoE prefill: one expert's tile of (token, slot) entries,
     _Pragma("unroll") for (int j = 0; j < MM_TB; ++j) {                             \
         float a = acc[j];                                                           \
         for (int off = 16; off > 0; off >>= 1) a += __shfl_xor(a, off, 32);         \
-        if (lane == 0 && j < nt) y[rm.out(j) * ldy + row] = a;                      \
+        if (lane == 0 && j < nt) y[rm.out(j) * ldy + row] = a * rm.sc;              \
     }
 
 // ROCmFP4 / Q4_0 (P: the 18-byte block policy)
@@ -2466,15 +2488,16 @@ __device__ __forceinline__ void mmb_q5_K_exp(MM_BARGS, const RowsExpert &rm) { m
         const int *out_rows
 
 #define MATMUL_Q8_KERNELS(name, BODY_LIN, BODY_EXP)                                                       \
-    extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matmul_q8_##name(MM_ARGS) {         \
+    extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matmul_q8_##name(MM_ARGS, OScale osc) {         \
         const int t0 = blockIdx.y * MM_TB;                                                                \
-        const RowsLinear rm{t0, min(MM_TB, T - t0)};                                                      \
+        const RowsLinear rm{t0, min(MM_TB, T - t0), osc.s[0]};                                            \
         BODY_LIN(W, row_bytes, q8, d8, bs, y, ldy, N, K, rm);                                             \
     }                                                                                                     \
-    extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matmul_q8_id_##name(MMID_ARGS) {    \
+    extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) matmul_q8_id_##name(MMID_ARGS, OScaleId osc) {    \
         const int k = blockIdx.y;                                                                         \
         if (k >= *n_tiles) return;                                                                        \
-        const RowsExpert rm{tile_e[k], tile_n[k], in_rows + tile_start[k], out_rows + tile_start[k]};     \
+        const RowsExpert rm{tile_e[k], tile_n[k], in_rows + tile_start[k], out_rows + tile_start[k],       \
+                            osc.of(0, tile_e[k])};                                                        \
         BODY_EXP(W, row_bytes, q8, d8, bs, y, N, N, K, rm);                                               \
     }
 
@@ -2673,6 +2696,7 @@ struct WStagePB {  // Q5_1 / Q4_1 / Q5_0: a scale d (and offset m: MIN) per 32 v
 // rows a workgroup's tile covers
 struct WRowsLinear {  // prefill: tokens t0 .. t0 + nt - 1
     int t0, nt;
+    float sc;  // output scale (OScale)
     __device__ const uint8_t *base(const uint8_t *W, long long, int) const { return W; }
     __device__ long long in(int j) const { return t0 + j; }
     __device__ long long out(int j) const { return t0 + j; }
@@ -2681,6 +2705,7 @@ struct WRowsLinear {  // prefill: tokens t0 .. t0 + nt - 1
 struct WRowsExpert {  // MoE prefill: one expert's tile of (token, slot) entries (moe_group)
     int e, nt;
     const int *in_rows, *out_rows;
+    float sc;
     __device__ const uint8_t *base(const uint8_t *W, long long rb, int N) const { return W + (long long)e * N * rb; }
     __device__ long long in(int j) const { return in_rows[j]; }
     __device__ long long out(int j) const { return out_rows[j]; }
@@ -2848,7 +2873,7 @@ __device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, 
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 const int tt = 16 * n + 2 * r + hi;
-                if (tt < T) y[rm.out(tt) * ldy + row] = acc[n][r];
+                if (tt < T) y[rm.out(tt) * ldy + row] = acc[n][r] * rm.sc;
             }
         }
     } else {  // C column l % 16 = token, row 2 r + l / 16 = weight row
@@ -2860,7 +2885,7 @@ __device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, 
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 const int row = r0 + 16 * w + 2 * r + hi;
-                if (row < N) y[orow * ldy + row] = acc[n][r];
+                if (row < N) y[orow * ldy + row] = acc[n][r] * rm.sc;
             }
         }
     }
@@ -2872,17 +2897,18 @@ __device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, 
 #define MATMUL_WMMA_Q80_KERNELS(name, WS)                                                                    \
     extern "C" __global__ void __launch_bounds__(WM_THREADS)                                                 \
         matmul_wmma_##name(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8,          \
-                           const int *bs, float *y, long long ldy, int N, int K, int T) {                    \
+                           const int *bs, float *y, long long ldy, int N, int K, int T, OScale osc) {                    \
         __shared__ __attribute__((aligned(16))) WmmaSmemSel<WS::MIN>::type sm;                               \
         const int t0 = blockIdx.y * WM_TILE;                                                                 \
-        const WRowsLinear rm{t0, min(WM_TILE, T - t0)};                                                      \
+        const WRowsLinear rm{t0, min(WM_TILE, T - t0), osc.s[0]};                                            \
         wmma_q80<WS, 4>(W, row_bytes, q8, d8, bs, y, ldy, N, K, rm, sm);                                     \
     }                                                                                                        \
-    extern "C" __global__ void __launch_bounds__(WM_THREADS) matmul_wmma_id_##name(MMID_ARGS) {               \
+    extern "C" __global__ void __launch_bounds__(WM_THREADS) matmul_wmma_id_##name(MMID_ARGS, OScaleId osc) {               \
         __shared__ __attribute__((aligned(16))) WmmaSmemSel<WS::MIN>::type sm;                               \
         const int k = blockIdx.y;                                                                            \
         if (k >= *n_tiles) return;                                                                           \
-        const WRowsExpert rm{tile_e[k], tile_n[k], in_rows + tile_start[k], out_rows + tile_start[k]};       \
+        const WRowsExpert rm{tile_e[k], tile_n[k], in_rows + tile_start[k], out_rows + tile_start[k],         \
+                             osc.of(0, tile_e[k])};                                                          \
         if (rm.nt <= 16)                                                                                     \
             wmma_q80<WS, 1>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                                   \
         else if (rm.nt <= 32)                                                                                \
@@ -3243,7 +3269,7 @@ __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, 
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             const int row = r0 + 16 * w + 2 * r + hi;
-            if (row < N) y[orow * ldy + row] = acc[n][r];
+            if (row < N) y[orow * ldy + row] = acc[n][r] * rm.sc;
         }
     }
 }
@@ -3254,16 +3280,17 @@ __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, 
 #define MATMUL_WMMA_Q8K_KERNELS(name, WS)                                                                    \
     extern "C" __global__ void __launch_bounds__(128)                                                        \
         matmul_wmma_##name(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8,          \
-                           const int *bs, float *y, long long ldy, int N, int K, int T) {                    \
+                           const int *bs, float *y, long long ldy, int N, int K, int T, OScale osc) {                    \
         __shared__ __attribute__((aligned(16))) WmmaKSmem sm;                                                \
         const int t0 = blockIdx.y * WM_TILE;                                                                 \
-        wmma_q8k<WS, 4>(W, row_bytes, q8, d8, bs, y, ldy, N, K, WRowsLinear{t0, min(WM_TILE, T - t0)}, sm);   \
+        wmma_q8k<WS, 4>(W, row_bytes, q8, d8, bs, y, ldy, N, K, WRowsLinear{t0, min(WM_TILE, T - t0), osc.s[0]}, sm);   \
     }                                                                                                        \
-    extern "C" __global__ void __launch_bounds__(128) matmul_wmma_id_##name(MMID_ARGS) {                      \
+    extern "C" __global__ void __launch_bounds__(128) matmul_wmma_id_##name(MMID_ARGS, OScaleId osc) {                      \
         const int k = blockIdx.y;                                                                            \
         if (k >= *n_tiles) return;                                                                           \
         __shared__ __attribute__((aligned(16))) WmmaKSmem sm;                                                \
-        const WRowsExpert rm{tile_e[k], tile_n[k], in_rows + tile_start[k], out_rows + tile_start[k]};       \
+        const WRowsExpert rm{tile_e[k], tile_n[k], in_rows + tile_start[k], out_rows + tile_start[k],         \
+                             osc.of(0, tile_e[k])};                                                          \
         if (rm.nt <= 16) wmma_q8k<WS, 1>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                       \
         else if (rm.nt <= 32) wmma_q8k<WS, 2>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                  \
         else if (rm.nt <= 48) wmma_q8k<WS, 3>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                  \
@@ -3520,44 +3547,4 @@ matvec_q8_0s(const int8_t *qs, const __half *d, const int8_t *q8, const float *d
     }
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
     if (lane == 0) y[row] = acc;
-}
-
-// ================================================================ output scales
-//
-// NVFP4's global scale per matrix (or per expert), llama.cpp's <weight>.scale (ModelOpt's weight_scale_2): the
-// matmul's outputs are multiplied by it after the matmul, as the reference's ggml_mul does (qmatvec.cpp launches
-// these after the matmul kernels of a registered matrix; see qmatvec_set_out_scale).
-
-// Up to 4 outputs (blockIdx.y): T rows ld[m] apart of N[m] values each, times s[m]
-struct ScaleOut {
-    float *y[4];
-    long long ld[4];
-    int N[4];
-    float s[4];
-};
-
-extern "C" __global__ void __launch_bounds__(256) scale_out(ScaleOut o, int T) {
-    const int m = blockIdx.y;
-    const long long i = (long long)blockIdx.x * 256 + threadIdx.x, n = o.N[m];
-    if (i >= n * T) return;
-    o.y[m][(i / n) * o.ld[m] + i % n] *= o.s[m];
-}
-
-// Expert outputs: row r < R of y (N values) times es[ids[r]] (sw when es is NULL), sx for an id of -1 (the extra
-// matrix). Grid (ceil(N / 256), R).
-extern "C" __global__ void __launch_bounds__(256)
-scale_out_id(float *y, int N, const int *ids, const float *es, float sw, float sx) {
-    const int i = blockIdx.x * 256 + threadIdx.x, r = blockIdx.y, e = ids[r];
-    if (i < N) y[(long long)r * N + i] *= e < 0 ? sx : es ? es[e] : sw;
-}
-
-// Expert-grouped outputs (gpu_moe_group tiles): tile k's rows out_rows[tile_start[k] ..] of y times es[tile_e[k]]
-// (sw when es is NULL). Grid (ceil(N / 256), max_tiles).
-extern "C" __global__ void __launch_bounds__(256)
-scale_out_tiles(float *y, int N, const int *n_tiles, const int *tile_e, const int *tile_start, const int *tile_n,
-                const int *out_rows, const float *es, float sw) {
-    const int i = blockIdx.x * 256 + threadIdx.x, k = blockIdx.y;
-    if (i >= N || k >= *n_tiles) return;
-    const float s = es ? es[tile_e[k]] : sw;
-    for (int j = 0; j < tile_n[k]; ++j) y[(long long)out_rows[tile_start[k] + j] * N + i] *= s;
 }
