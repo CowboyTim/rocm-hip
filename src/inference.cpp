@@ -398,8 +398,13 @@ static bool load_layer(inference_model* m, gguf_model_t* g, int i, LayerWeights&
         if (!bind_weight(g, nm(i, "attn_k.weight"), L.Wk, true)) return false;
         if (!bind_weight(g, nm(i, "attn_v.weight"), L.Wv, true)) return false;
         if (!bind_weight(g, nm(i, "attn_output.weight"), L.Wo, true)) return false;
-        if (!bind_norm(g, nm(i, "attn_q_norm.weight"), HD, L.q_norm, true)) return false;
-        if (!bind_norm(g, nm(i, "attn_k_norm.weight"), HD, L.k_norm, true)) return false;
+        // q / k RMSNorm (Qwen3 and later); Qwen2 has none, and biases on q / k / v instead
+        const bool qk_norm = find_tensor_index(g, nm(i, "attn_q_norm.weight")) >= 0;
+        if (!bind_norm(g, nm(i, "attn_q_norm.weight"), HD, L.q_norm, qk_norm)) return false;
+        if (!bind_norm(g, nm(i, "attn_k_norm.weight"), HD, L.k_norm, qk_norm)) return false;
+        if (!bind_norm(g, nm(i, "attn_q.bias"), L.Wq.N, L.bq, false)) return false;
+        if (!bind_norm(g, nm(i, "attn_k.bias"), L.Wk.N, L.bk, false)) return false;
+        if (!bind_norm(g, nm(i, "attn_v.bias"), L.Wv.N, L.bv, false)) return false;
         // Gated attention (Qwen3.5 and later): attn_q holds Q and the output gate, head_dim each, interleaved per
         // head; Qwen3: Q only. The first attention layer decides, the others must agree.
         if (L.kv_slot == 0) m->attn_gated = L.Wq.N == 2 * HQ * HD;
@@ -409,11 +414,13 @@ static bool load_layer(inference_model* m, gguf_model_t* g, int i, LayerWeights&
             !check_shape("attn_output", i, L.Wo, E, HQ * HD)) return false;
     }
 
-    // FFN: MoE (router ffn_gate_inp + 3-D expert tensors + a sigmoid-gated shared expert) or dense SwiGLU
+    // FFN: MoE (router ffn_gate_inp + 3-D expert tensors + a sigmoid-gated shared expert, none in qwen3moe) or dense
+    // SwiGLU
     L.moe = find_tensor_index(g, nm(i, "ffn_gate_inp.weight")) >= 0;
     if (L.moe) {
         const int NE = m->n_expert, FE = m->n_ff_exp, FS = m->n_ff_shexp;
-        if (NE <= 0 || m->n_expert_used <= 0 || m->n_expert_used > NE || FE <= 0 || FS <= 0) {
+        L.shexp = find_tensor_index(g, nm(i, "ffn_gate_shexp.weight")) >= 0;
+        if (NE <= 0 || m->n_expert_used <= 0 || m->n_expert_used > NE || FE <= 0 || (L.shexp ? FS <= 0 : FS != 0)) {
             set_error("blk.%d: bad MoE hparams (experts %d used %d ff_exp %d ff_shexp %d)", i, NE,
                       m->n_expert_used, FE, FS);
             return false;
@@ -422,17 +429,18 @@ static bool load_layer(inference_model* m, gguf_model_t* g, int i, LayerWeights&
         if (!bind_weight(g, nm(i, "ffn_gate_exps.weight"), L.We_gate, true)) return false;
         if (!bind_weight(g, nm(i, "ffn_up_exps.weight"), L.We_up, true)) return false;
         if (!bind_weight(g, nm(i, "ffn_down_exps.weight"), L.We_down, true)) return false;
-        if (!bind_weight(g, nm(i, "ffn_gate_shexp.weight"), L.W_gate, true)) return false;
-        if (!bind_weight(g, nm(i, "ffn_up_shexp.weight"), L.W_up, true)) return false;
-        if (!bind_weight(g, nm(i, "ffn_down_shexp.weight"), L.W_down, true)) return false;
-        if (!bind_norm(g, nm(i, "ffn_gate_inp_shexp.weight"), E, L.shexp_gate, true)) return false;
         if (!check_shape("ffn_gate_inp", i, L.W_router, NE, E) ||
             !check_shape("ffn_gate_exps", i, L.We_gate, NE * FE, E) ||
             !check_shape("ffn_up_exps", i, L.We_up, NE * FE, E) ||
-            !check_shape("ffn_down_exps", i, L.We_down, NE * E, FE) ||
-            !check_shape("ffn_gate_shexp", i, L.W_gate, FS, E) ||
-            !check_shape("ffn_up_shexp", i, L.W_up, FS, E) ||
-            !check_shape("ffn_down_shexp", i, L.W_down, E, FS)) return false;
+            !check_shape("ffn_down_exps", i, L.We_down, NE * E, FE)) return false;
+        if (L.shexp &&
+            (!bind_weight(g, nm(i, "ffn_gate_shexp.weight"), L.W_gate, true) ||
+             !bind_weight(g, nm(i, "ffn_up_shexp.weight"), L.W_up, true) ||
+             !bind_weight(g, nm(i, "ffn_down_shexp.weight"), L.W_down, true) ||
+             !bind_norm(g, nm(i, "ffn_gate_inp_shexp.weight"), E, L.shexp_gate, true) ||
+             !check_shape("ffn_gate_shexp", i, L.W_gate, FS, E) || !check_shape("ffn_up_shexp", i, L.W_up, FS, E) ||
+             !check_shape("ffn_down_shexp", i, L.W_down, E, FS)))
+            return false;
     } else {
         if (!bind_weight(g, nm(i, "ffn_gate.weight"), L.W_gate, true)) return false;
         if (!bind_weight(g, nm(i, "ffn_up.weight"), L.W_up, true)) return false;

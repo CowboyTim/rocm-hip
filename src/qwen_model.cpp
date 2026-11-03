@@ -546,8 +546,8 @@ struct QwenModel {
         }
         if (eng->n_kv_layers > 0) {
             const int hd = eng->head_dim;
-            if ((hd != 128 && hd != 256 && !(hd == 512 && eng->gemma4)) || (long long)eng->n_head * hd % 256 != 0) {
-                qwen_set_error("head_dim %d / %d heads: the attention kernels are built for head_dim 128 or 256 "
+            if (hd != 64 && hd != 128 && hd != 256 && !(hd == 512 && eng->gemma4)) {
+                qwen_set_error("head_dim %d / %d heads: the attention kernels are built for head_dim 64, 128 or 256 "
                                "(and 512 for Gemma-4)", hd, eng->n_head);
                 return false;
             }
@@ -601,8 +601,14 @@ struct QwenModel {
     }
 
     // A producer kernel just wrote T rows of x[K], quantized into q (NULL: not quantized); the next matmuls
-    // read it
+    // read it. Rows of K % 32 == 0 but not % 256 (Qwen2.5-0.5B's 896), which the producer kernels cannot quantize
+    // (their 256-value blocks would span rows), are quantized here in a separate launch for the Q8_0-activation
+    // kernels, which beats their float path by far (Qwen2.5-0.5B prefill 2,712 -> 14,442 tok/s)
     void mark(const float* x, int K, int T, const qmatvec_q8* q) {
+        if (!q && K % 256 != 0) {
+            const qmatvec_q8* q2 = q8_for(K, T, true);
+            if (q2 && qmatvec_quantize(x, K * T, q2, 0) == hipSuccess) q = q2;
+        }
         q8_src = q && q->qK ? x : nullptr;
         q8_k = K;
         q8_t = T;
@@ -721,6 +727,8 @@ struct QwenModel {
                 o.gated = eng->attn_gated ? 1 : 0;
                 o.kv_stride = kv_cache_row_halves(kvc);
                 o.kv_q8 = kv_cache_type(kvc) == KV_CACHE_Q8_0;
+                o.no_qk_norm = !L.q_norm;  // Qwen2: none, biases instead
+                o.bq = L.bq, o.bk = L.bk, o.bv = L.bv;
                 return check(attention_forward_opts(s.qfull + r * L.Wq.N, s.k + r * L.Wk.N, s.v + r * L.Wv.N, L.q_norm,
                                                     L.k_norm, K, V, kv_cache_block_shift(kvc),
                                                     kv_cache_block_stride(kvc), HQ, HKV, eng->n_rot, pos, Tr,
@@ -852,7 +860,7 @@ struct QwenModel {
     // same width, type and row size as the experts, and s.xn quantized
     bool shared_as_slot(const LayerWeights& L) const {
         const int E = eng->n_embd, FE = eng->n_ff_exp;
-        return s.B >= 2 && eng->n_ff_shexp == FE && q8_src == s.xn && q8_k == E && q8_t == 1 &&
+        return L.shexp && s.B >= 2 && eng->n_ff_shexp == FE && q8_src == s.xn && q8_k == E && q8_t == 1 &&
                L.W_gate.type == L.We_gate.type && L.W_up.type == L.We_up.type && L.We_gate.type == L.We_up.type &&
                L.W_down.type == L.We_down.type && L.W_gate.row_bytes == L.We_gate.row_bytes &&
                L.W_down.row_bytes == L.We_down.row_bytes && qmatvec_q8_supported(L.We_gate.type, E) &&
@@ -906,13 +914,15 @@ struct QwenModel {
             (grouped && !check(gpu_moe_group(s.ids, T, NU, NE, s.g_tile, s.g_tok, s.g_pair, s.g_ntiles,
                                              s.g_tile_e, s.g_tile_start, s.g_tile_n, 0), "moe_group")) ||
             !matvec_id_gate_up(L.We_gate, L.We_up, s.xn, s.moe_g, s.moe_u, FE, T, grouped, P_FFN) ||
-            !matvec_pair(L.W_gate, L.W_up, s.xn, s.ffg, s.ffu, T, P_FFN))
+            (L.shexp && !matvec_pair(L.W_gate, L.W_up, s.xn, s.ffg, s.ffu, T, P_FFN)))
             return false;
 
         const qmatvec_q8* qx = q8_for(FE, T * NU, true);
         if (!check(gpu_swiglu(s.moe_g, s.moe_u, s.moe_act, T * NU * FE, qx, 0), "swiglu (experts)")) return false;
         mark(s.moe_act, FE, T * NU, qx);
         if (!matvec_id(L.We_down, s.moe_act, 1, s.moe_down, E, T, grouped, P_FFN)) return false;
+        if (!L.shexp)  // qwen3moe: the routed experts only
+            return check(gpu_moe_combine(s.moe_down, s.wts, nullptr, nullptr, s.proj, NU, E, T, 0), "moe_combine");
 
         const qmatvec_q8* qs = q8_for(FS, T, true);
         if (!check(gpu_swiglu(s.ffg, s.ffu, s.act, T * FS, qs, 0), "swiglu (shared expert)")) return false;

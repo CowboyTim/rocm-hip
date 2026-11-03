@@ -68,8 +68,9 @@ struct LayerWeights {
     QuantWeight W_gate, W_up, W_down;                 // MLP (SwiGLU); the shared expert when moe
     const float* attn_norm = nullptr;                 // [n_embd] F32, pre-mixer RMSNorm gamma
     const float* ffn_norm = nullptr;                  // [n_embd] F32, post_attention_norm (pre-FFN)
-    const float* q_norm = nullptr;                    // [head_dim] F32, full attention only
-    const float* k_norm = nullptr;                    // [head_dim] F32, full attention only
+    const float* q_norm = nullptr;                    // [head_dim] F32, full attention only; none in Qwen2
+    const float* k_norm = nullptr;                    // [head_dim] F32, full attention only; none in Qwen2
+    const float *bq = nullptr, *bk = nullptr, *bv = nullptr;  // attn_q / k / v biases (Qwen2), F32; else NULL
 
     // Gated DeltaNet (LAYER_LINEAR_ATTN only, Phase 20 Step 5)
     QuantWeight W_qkv;                                // attn_qkv: [Q (n_group*d_state) | K (same) | V (d_inner)]
@@ -87,6 +88,7 @@ struct LayerWeights {
     QuantWeight We_gate, We_up;                       // ffn_{gate,up}_exps: [n_expert * n_ff_exp x n_embd]
     QuantWeight We_down;                              // ffn_down_exps: [n_expert * n_embd x n_ff_exp]
     const float* shexp_gate = nullptr;                // ffn_gate_inp_shexp: [n_embd] F32, shared-expert gate
+    bool shexp = false;                               // a shared expert (W_gate / W_up / W_down); none in qwen3moe
 
     // Hyper-connections (qwen4exp): mixers before the token mixer and before the FFN (attn_norm / ffn_norm unset)
     HcMix hc_attn, hc_ffn;

@@ -46,14 +46,14 @@ static inline size_t attention_part_acc_floats(int n_q, int n_ctx, int T) {
 }
 
 // T tokens at positions pos0 .. pos0 + T - 1; token t attends to positions 0 .. pos0 + t. Per token row t:
-//   head_dim D = 128 or 256; gated: qfull [n_q][2 * D] (attn_q output, [Q | gate] per head; Qwen3.5 and later),
+//   head_dim D = 64, 128, 256 or 512; gated: qfull [n_q][2 * D] (attn_q output, [Q | gate] per head; Qwen3.5 and later),
 //   else qfull [n_q][D] (Qwen3) and no output gate. k, v [n_kv * D] (attn_k / attn_v outputs), q: scratch
 //   [n_q * D], out [n_q * D]. q_norm, k_norm [D]; K, V: the layer's cache (row p at
 //   (p >> kv_shift) * kv_bstride + (p & (2^kv_shift - 1)) * kv_stride halves from row 0, kv_stride = n_kv * D:
 //   kv_cache.h's blocks; a contiguous cache passes kv_shift 30, kv_bstride 0); part_ml / part_acc: scratch sized
 //   by the helpers above.
 //   q8: if not NULL, out is also quantized into it (flattened [T * n_q * D]) for the int8 attn_output matmul.
-//   n_q must be a multiple of 256 / D.
+//   With q8, n_q * D must be a multiple of 256.
 hipError_t attention_forward(const float* qfull, const float* k, const float* v, const float* q_norm,
                              const float* k_norm, __half* K, __half* V, int kv_shift, long long kv_bstride, int n_q,
                              int n_kv, int n_rot, int pos0, int T,
@@ -77,6 +77,9 @@ typedef struct {
                      // token attends to all of its positions, or to |p - z| <= window / 2 with a window
                      // (llama.cpp's symmetric sliding window)
                      // values; kv_stride is then the row stride in halves (kv_cache_row_halves), 0: n_kv * D * 17 / 32
+    const float* bq;  // biases added to attn_q / attn_k / attn_v's outputs before the norms and RoPE (Qwen2); NULL:
+    const float* bk;  // none
+    const float* bv;
 } attention_opts;
 
 hipError_t attention_forward_opts(const float* qfull, const float* k, const float* v, const float* q_norm,

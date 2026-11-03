@@ -144,7 +144,8 @@ __device__ __forceinline__ void attn_prep_body(const float* qfull, const float* 
                                                const float* k_norm, float* q_out, __half* K, __half* V, int kv_stride,
                                                int kv_shift, long long kv_bstride, int n_q, int n_kv, int n_rot,
                                                int pos0, float freq_base, float eps, int gated, int rot_pairs,
-                                               int v_norm, int qk_norm, int kv_q8) {
+                                               int v_norm, int qk_norm, int kv_q8, const float* bq, const float* bk,
+                                               const float* bv) {
     const int b = blockIdx.x, d = threadIdx.x, z = blockIdx.y, pos = pos0 + z;
     const int qs = gated ? 2 * D : D;  // a head's stride in attn_q's output
     qfull += (size_t)z * n_q * qs;
@@ -154,12 +155,13 @@ __device__ __forceinline__ void attn_prep_body(const float* qfull, const float* 
     __half* k_row = K + kv_row(pos, kv_stride, kv_shift, kv_bstride);
     __half* v_row = V + kv_row(pos, kv_stride, kv_shift, kv_bstride);
     if (b < n_q) {
-        const float x = qfull[(size_t)b * qs + d];
+        const float x = qfull[(size_t)b * qs + d] + (bq ? bq[(size_t)b * qs + d] : 0.0f);
         q_out[b * D + d] = norm_rope<D>(x, q_norm, n_rot, rot_pairs, pos, freq_base, eps, qk_norm);
     } else {
         const int g = b - n_q;
-        const float x = norm_rope<D>(k[g * D + d], k_norm, n_rot, rot_pairs, pos, freq_base, eps, qk_norm);
-        const float vv = v[g * D + d];
+        const float x = norm_rope<D>(k[g * D + d] + (bk ? bk[g * D + d] : 0.0f), k_norm, n_rot, rot_pairs, pos,
+                                     freq_base, eps, qk_norm);
+        const float vv = v[g * D + d] + (bv ? bv[g * D + d] : 0.0f);
         const float vx = v_norm ? norm_rope<D>(vv, nullptr, 0, 0, pos, freq_base, eps) : vv;
         if (kv_q8) {  // uniform: a wave's 32 dims are one block
             const int drow = kvq_drow(kv_stride), e = g * D + d;
@@ -263,9 +265,12 @@ template <int D>
 __device__ __forceinline__ void attn_combine_body(const float* part_ml, const float* part_acc, int n_chunks, int n_q,
                                                   const float* qfull, float* out, Q8Out o, int gated) {
     __shared__ Q8Shared sh;
-    // workgroup: 256 values of the token's n_q * D (256 / D heads, or 256 / D of one head for D 512)
-    const int e = blockIdx.x * 256 + threadIdx.x, h = e / D, d = e % D, z = blockIdx.y;
-    const int nb = n_q * D / 256;  // 256-value blocks per token
+    // workgroup: 256 values of the token's n_q * D (256 / D heads, or 256 / D of one head for D 512); the last one
+    // partly past n_q * D when that is not a multiple of 256 (no int8 output then)
+    const int e = blockIdx.x * 256 + threadIdx.x, z = blockIdx.y;
+    const bool active = e < n_q * D;
+    const int h = active ? e / D : 0, d = e % D;
+    const int nb = (n_q * D + 255) / 256;  // 256-value blocks per token
     part_ml += (size_t)2 * z * n_q * n_chunks;
     part_acc += (size_t)z * n_q * n_chunks * D;
     qfull += (size_t)z * (gated ? 2 : 1) * n_q * D;
@@ -281,8 +286,8 @@ __device__ __forceinline__ void attn_combine_body(const float* part_ml, const fl
     }
     float r = num / den;
     if (gated) r /= 1.0f + __expf(-qfull[(size_t)h * 2 * D + D + d]);
-    out[h * D + d] = r;
-    if (q8_wanted(o)) q8_block_value(r, true, z * nb + blockIdx.x, threadIdx.x, sh, o);  // uniform: one 256-block
+    if (active) out[h * D + d] = r;
+    if (q8_wanted(o)) q8_block_value(r, active, z * nb + blockIdx.x, threadIdx.x, sh, o);  // uniform: one 256-block
 }
 
 // ---------------------------------------------------------------- prefill: query-tiled flash attention
@@ -374,8 +379,8 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
             *(uint4*)&sK[gl][p][d] = ku;
         }
 #pragma unroll
-        for (int k = 0; k < NG * (FB / 2) * (DH / 8) / NTH; ++k) {
-            const int idx = tid + NTH * k, pp = idx % (FB / 2), r = idx / (FB / 2);
+        for (int idx = tid; idx < NG * (FB / 2) * (DH / 8); idx += NTH) {  // (D 64: fewer tasks than threads)
+            const int pp = idx % (FB / 2), r = idx / (FB / 2);
             const int gl = r / (DH / 8), d = 8 * (r % (DH / 8));
             uint4 v0 = make_uint4(0, 0, 0, 0), v1 = v0;
             const int col = (g0 + gl) * D + ds * DH + d;
@@ -535,16 +540,18 @@ __device__ void attn_bidir_body(const float* q, const __half* K, const __half* V
     out[((size_t)z * n_q + h) * D + t] = acc / sum;
 }
 
-// The kernels for each head size: attn_<kernel>_128 (Qwen3), attn_<kernel>_256 (Qwen3.5 and later, Gemma-4's
-// sliding layers), attn_<kernel>_512 (Gemma-4's global layers; its flash kernel is attn_flash_512_h2s2)
+// The kernels for each head size: attn_<kernel>_64 (Qwen2.5-0.5B), attn_<kernel>_128 (Qwen2 / Qwen3), attn_<kernel>_256
+// (Qwen3.5 and later, Gemma-4's sliding layers), attn_<kernel>_512 (Gemma-4's global layers; its flash kernel is
+// attn_flash_512_h2s2)
 #define ATTN_DECODE_KERNELS(D)                                                                                \
     extern "C" __global__ void __launch_bounds__(D)                                                          \
         attn_prep_##D(const float* qfull, const float* k, const float* v, const float* q_norm,                \
                       const float* k_norm, float* q_out, __half* K, __half* V, int kv_stride, int kv_shift,    \
                       long long kv_bstride, int n_q, int n_kv, int n_rot, int pos0, float freq_base, float eps, \
-                      int gated, int rot_pairs, int v_norm, int qk_norm, int kv_q8) {                        \
+                      int gated, int rot_pairs, int v_norm, int qk_norm, int kv_q8, const float* bq,         \
+                      const float* bk, const float* bv) {                                                    \
         attn_prep_body<D>(qfull, k, v, q_norm, k_norm, q_out, K, V, kv_stride, kv_shift, kv_bstride, n_q, n_kv, \
-                          n_rot, pos0, freq_base, eps, gated, rot_pairs, v_norm, qk_norm, kv_q8);            \
+                          n_rot, pos0, freq_base, eps, gated, rot_pairs, v_norm, qk_norm, kv_q8, bq, bk, bv); \
     }                                                                                                        \
     extern "C" __global__ void __launch_bounds__(CH)                                                         \
         attn_partial_##D(const float* q, const __half* K, const __half* V, int kv_stride, int kv_shift,       \
@@ -592,6 +599,7 @@ __device__ void attn_bidir_body(const float* q, const __half* K, const __half* V
     ATTN_FLASH_KERNEL_KQ(NAME, D, NG, NH, TT, DS, false)                                                      \
     ATTN_FLASH_KERNEL_KQ(NAME##_q8, D, NG, NH, TT, DS, true)
 
+ATTN_KERNELS(64)
 ATTN_KERNELS(128)
 ATTN_KERNELS(256)
 ATTN_DECODE_KERNELS(512)
@@ -601,3 +609,9 @@ ATTN_FLASH_KERNEL_NAMED(attn_flash_128_g2, 128, 2, 4, 1, 1)
 // Gemma-4: sliding layers (D 256, ratio 2), global layers (D 512, ratio 8; 59 KB of LDS)
 ATTN_FLASH_KERNEL_NAMED(attn_flash_256_h2t2, 256, 1, 2, 2, 1)
 ATTN_FLASH_KERNEL_NAMED(attn_flash_512_h2s2, 512, 1, 2, 1, 2)
+// Other ratios (Qwen2 / Qwen2.5: 6 and 7): 2 heads x 32 tokens (ratio a multiple of 2), 1 head x 64 tokens (any)
+ATTN_FLASH_KERNEL_NAMED(attn_flash_64_h2t2, 64, 1, 2, 2, 1)
+ATTN_FLASH_KERNEL_NAMED(attn_flash_128_h2t2, 128, 1, 2, 2, 1)
+ATTN_FLASH_KERNEL_NAMED(attn_flash_64_h1t4, 64, 1, 1, 4, 1)
+ATTN_FLASH_KERNEL_NAMED(attn_flash_128_h1t4, 128, 1, 1, 4, 1)
+ATTN_FLASH_KERNEL_NAMED(attn_flash_256_h1t4, 256, 1, 1, 4, 1)

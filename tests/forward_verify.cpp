@@ -793,10 +793,26 @@ int main(int argc, char** argv) {
         const int P = 2500, DQ = HQ * HD, DKV = HKV * HD, pos = P - 1;
         const bool gated = m->attn_gated;
         const int QS = gated ? 2 * HD : HD;  // a head's stride in attn_q's output ([Q | gate] when gated)
-        if ((HD != 128 && HD != 256) || attention_init("attention.co") != 0) {
+        if ((HD != 64 && HD != 128 && HD != 256) || attention_init("attention.co") != 0) {
             fprintf(stderr, "attention kernels unavailable\n");
             return 1;
         }
+        // The layer's attention as the engine runs it: q / k / v biases (Qwen2), q / k RMSNorm unless there is none
+        attention_opts ao = {};
+        ao.head_dim = HD;
+        ao.gated = m->attn_gated ? 1 : 0;
+        ao.no_qk_norm = !L.q_norm;
+        ao.bq = L.bq, ao.bk = L.bk, ao.bv = L.bv;
+        // CPU: x (+ bias) -> RMSNorm (if any) -> NeoX RoPE at pos
+        auto qk_ref = [&](const float* x, const float* bias, const float* norm, float* out, int p) {
+            std::vector<float> t(x, x + HD);
+            if (bias)
+                for (int i = 0; i < HD; ++i) t[i] += bias[i];
+            if (norm) qwen_rmsnorm(t.data(), norm, out, HD, eps);
+            else memcpy(out, t.data(), HD * sizeof(float));
+            qwen_rope_neox(out, m->n_rot, p, m->rope_freq_base);
+        };
+        auto v_ref = [&](const float* v, int i) { return v[i] + (L.bv ? L.bv[i] : 0.0f); };
         ShmBuf b_qf, b_k, b_v, b_q, b_ml, b_acc, b_out, b_K, b_V;
         if (!b_qf.alloc("fwdv_at_qf.bin", 2 * DQ) || !b_k.alloc("fwdv_at_k.bin", DKV) || !b_v.alloc("fwdv_at_v.bin", DKV) ||
             !b_q.alloc("fwdv_at_q.bin", DQ) || !b_ml.alloc("fwdv_at_ml.bin", attention_part_ml_floats(HQ, P, 1)) ||
@@ -816,17 +832,13 @@ int main(int argc, char** argv) {
         // CPU reference first (the kernel writes row pos of K/V itself)
         std::vector<float> q(DQ), kk(DKV), ref_out(DQ);
         std::vector<__half> Kr(K, K + (size_t)P * DKV), Vr(Vc, Vc + (size_t)P * DKV);
-        for (int h = 0; h < HQ; ++h) {
-            qwen_rmsnorm(&b_qf.p[(size_t)h * QS], L.q_norm, &q[(size_t)h * HD], HD, eps);
-            qwen_rope_neox(&q[(size_t)h * HD], m->n_rot, pos, m->rope_freq_base);
-        }
-        for (int g = 0; g < HKV; ++g) {
-            qwen_rmsnorm(&b_k.p[(size_t)g * HD], L.k_norm, &kk[(size_t)g * HD], HD, eps);
-            qwen_rope_neox(&kk[(size_t)g * HD], m->n_rot, pos, m->rope_freq_base);
-        }
+        for (int h = 0; h < HQ; ++h)
+            qk_ref(&b_qf.p[(size_t)h * QS], L.bq ? L.bq + (size_t)h * QS : nullptr, L.q_norm, &q[(size_t)h * HD], pos);
+        for (int g = 0; g < HKV; ++g)
+            qk_ref(&b_k.p[(size_t)g * HD], L.bk ? L.bk + (size_t)g * HD : nullptr, L.k_norm, &kk[(size_t)g * HD], pos);
         for (int i = 0; i < DKV; ++i) {
             Kr[(size_t)pos * DKV + i] = __float2half(kk[i]);
-            Vr[(size_t)pos * DKV + i] = __float2half(b_v.p[i]);
+            Vr[(size_t)pos * DKV + i] = __float2half(v_ref(b_v.p, i));
         }
         qwen_attention(q.data(), Kr.data(), Vr.data(), DKV, P, HQ, HKV, HD, 1.0f / sqrtf((float)HD), ref_out.data());
         if (gated)
@@ -834,9 +846,9 @@ int main(int argc, char** argv) {
                 for (int d = 0; d < HD; ++d)
                     ref_out[(size_t)h * HD + d] *= qwen_sigmoid(b_qf.p[(size_t)h * QS + HD + d]);
 
-        hipError_t e = attention_forward(b_qf.p, b_k.p, b_v.p, L.q_norm, L.k_norm, K, Vc, 30, 0, HQ, HKV, m->n_rot, pos, 1,
-                                         m->rope_freq_base, eps, b_q.p, b_ml.p, b_acc.p, b_out.p, HD,
-                                         m->attn_gated ? 1 : 0, nullptr, 0);
+        hipError_t e = attention_forward_opts(b_qf.p, b_k.p, b_v.p, L.q_norm, L.k_norm, K, Vc, 30, 0, HQ, HKV, m->n_rot,
+                                              pos, 1, m->rope_freq_base, eps, b_q.p, b_ml.p, b_acc.p, b_out.p, &ao,
+                                              nullptr, 0);
         if (e == hipSuccess) e = hipDeviceSynchronize();
         if (e != hipSuccess) { fprintf(stderr, "attention kernels: %s\n", hipGetErrorString(e)); return 1; }
         Stat sq, skv, so;
@@ -875,21 +887,19 @@ int main(int argc, char** argv) {
             // reference K/V rows for the batch positions, then attention per token
             for (int t = 0; t < TB; ++t) {
                 std::vector<float> kt(DKV);
-                for (int g = 0; g < HKV; ++g) {
-                    qwen_rmsnorm(&c_k.p[(size_t)t * DKV + (size_t)g * HD], L.k_norm, &kt[(size_t)g * HD], HD, eps);
-                    qwen_rope_neox(&kt[(size_t)g * HD], m->n_rot, pos0 + t, m->rope_freq_base);
-                }
+                for (int g = 0; g < HKV; ++g)
+                    qk_ref(&c_k.p[(size_t)t * DKV + (size_t)g * HD], L.bk ? L.bk + (size_t)g * HD : nullptr, L.k_norm,
+                           &kt[(size_t)g * HD], pos0 + t);
                 for (int i = 0; i < DKV; ++i) {
                     Kr[(size_t)(pos0 + t) * DKV + i] = __float2half(kt[i]);
-                    Vr[(size_t)(pos0 + t) * DKV + i] = __float2half(c_v.p[(size_t)t * DKV + i]);
+                    Vr[(size_t)(pos0 + t) * DKV + i] = __float2half(v_ref(&c_v.p[(size_t)t * DKV], i));
                 }
             }
             std::vector<float> refb((size_t)TB * DQ), qt(DQ);
             for (int t = 0; t < TB; ++t) {
-                for (int h = 0; h < HQ; ++h) {
-                    qwen_rmsnorm(&c_qf.p[(size_t)t * HQ * QS + (size_t)h * QS], L.q_norm, &qt[(size_t)h * HD], HD, eps);
-                    qwen_rope_neox(&qt[(size_t)h * HD], m->n_rot, pos0 + t, m->rope_freq_base);
-                }
+                for (int h = 0; h < HQ; ++h)
+                    qk_ref(&c_qf.p[(size_t)t * HQ * QS + (size_t)h * QS], L.bq ? L.bq + (size_t)h * QS : nullptr,
+                           L.q_norm, &qt[(size_t)h * HD], pos0 + t);
                 qwen_attention(qt.data(), Kr.data(), Vr.data(), DKV, pos0 + t + 1, HQ, HKV, HD, 1.0f / sqrtf((float)HD),
                                &refb[(size_t)t * DQ]);
                 if (gated)
@@ -910,20 +920,25 @@ int main(int argc, char** argv) {
             }
             qmatvec_q8_bind(&q8a, qa.p, nq8);
             qmatvec_q8_bind(&q8b, qb.p, nq8);
-            e = attention_forward(c_qf.p, c_k.p, c_v.p, L.q_norm, L.k_norm, K, Vc, 30, 0, HQ, HKV, m->n_rot, pos0, TB,
-                                  m->rope_freq_base, eps, c_q.p, c_ml.p, c_acc.p, c_out.p, HD,
-                                  m->attn_gated ? 1 : 0, &q8a, 0);
-            if (e == hipSuccess) e = qmatvec_quantize(c_out.p, nq8, &q8b, 0);
+            const bool with_q8 = DQ % 256 == 0;  // (the int8 output needs whole 256-value blocks per token)
+            e = attention_forward_opts(c_qf.p, c_k.p, c_v.p, L.q_norm, L.k_norm, K, Vc, 30, 0, HQ, HKV, m->n_rot, pos0,
+                                       TB, m->rope_freq_base, eps, c_q.p, c_ml.p, c_acc.p, c_out.p, &ao,
+                                       with_q8 ? &q8a : nullptr, 0);
+            if (e == hipSuccess && with_q8) e = qmatvec_quantize(c_out.p, nq8, &q8b, 0);
             if (e == hipSuccess) e = hipDeviceSynchronize();
             if (e != hipSuccess) { fprintf(stderr, "batched attention kernels: %s\n", hipGetErrorString(e)); return 1; }
-            const bool q8_same = memcmp(qa.p, qb.p, qmatvec_q8_bytes(nq8)) == 0;
-            if (!q8_same) ++g_fail;
-            printf("  [%s] GPU attention batched, %d tok: output quantized in the same launches %s\n",
-                   q8_same ? "PASS" : "FAIL", TB, q8_same ? "as qmatvec_quantize" : "DIFFERS from qmatvec_quantize");
+            if (with_q8) {
+                const bool q8_same = memcmp(qa.p, qb.p, qmatvec_q8_bytes(nq8)) == 0;
+                if (!q8_same) ++g_fail;
+                printf("  [%s] GPU attention batched, %d tok: output quantized in the same launches %s\n",
+                       q8_same ? "PASS" : "FAIL", TB, q8_same ? "as qmatvec_quantize" : "DIFFERS from qmatvec_quantize");
+            }
             Stat sb;
             for (int t = 0; t < TB; ++t) sb.add(c_out.p + (size_t)t * DQ, &refb[(size_t)t * DQ], DQ);
             snprintf(what, sizeof(what), "GPU attention batched, %d tok at pos %d..%d", TB, pos0, P - 1);
-            report(what, sb, 2e-3);
+            // Without q / k norms (Qwen2: biases of up to ~130 on k, ~80 on q) the scores are large and attn_flash's FP16
+            // Q (as ggml's flash attention) costs more relative precision: 7e-3 at 40 tokens (attn_partial 1.7e-3)
+            report(what, sb, TB >= 16 && !L.q_norm ? 1e-2 : 2e-3);
 
             // The same with the KV cache's block layout (kv_cache.h; 64-position blocks here, each a K segment then
             // a V segment): only the addressing differs, so the output and the rows attn_prep writes must be the
@@ -944,9 +959,9 @@ int main(int argc, char** argv) {
                     memcpy(Kb + at(p), K + (size_t)p * DKV, DKV * sizeof(__half));
                     memcpy(Vb + at(p), Vc + (size_t)p * DKV, DKV * sizeof(__half));
                 }
-                e = attention_forward(c_qf.p, c_k.p, c_v.p, L.q_norm, L.k_norm, Kb, Vb, BS, bstride, HQ, HKV, m->n_rot,
-                                      pos0, TB, m->rope_freq_base, eps, c_q.p, c_ml.p, c_acc.p, outb.p, HD,
-                                      m->attn_gated ? 1 : 0, nullptr, 0);
+                e = attention_forward_opts(c_qf.p, c_k.p, c_v.p, L.q_norm, L.k_norm, Kb, Vb, BS, bstride, HQ, HKV,
+                                           m->n_rot, pos0, TB, m->rope_freq_base, eps, c_q.p, c_ml.p, c_acc.p, outb.p,
+                                           &ao, nullptr, 0);
                 if (e == hipSuccess) e = hipDeviceSynchronize();
                 if (e != hipSuccess) { fprintf(stderr, "blocked attention: %s\n", hipGetErrorString(e)); return 1; }
                 bool same = memcmp(outb.p, c_out.p, (size_t)TB * DQ * sizeof(float)) == 0;
