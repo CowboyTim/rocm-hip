@@ -2765,8 +2765,9 @@ ATTN_NO_GQA=1 turns it off (A/B). Q8_0 KV caches: see the next section.
 attn_partial_gqa_body takes KQ as attn_partial / attn_flash do: K 8 int8 values (one 8-byte load) times their block's
 fp16 scale, V one int8 value and its scale per position; instantiated as attn_partial_gqa{8,16}[s]_<D>_q8
 (g_partial_gqa[dim][kq][...]), so a Q8_0 cache takes the same per-KV-head path (64-position chunks with part_slots).
-- Checked with a harness of attention_forward_opts on synthetic data (the cache filled by 512-token batches, then a
-  decode token; output vs a CPU reference computed from the cache's own values and the prepped q): relative error
+- New test `attn_decode_verify` (no model; run from build/co): attention_forward_opts on synthetic data (the cache
+  filled by 512-token batches, then 1- and 3-token decode steps; every output vs a CPU reference computed from the
+  cache's own values and the prepped q, bound 1e-5), and the timing below: relative error
   2e-7 .. 5e-7 for D 64 / 128 / 256, ratios 2 / 7 / 8 / 16, sliding window 1024, 100 .. 3,000 positions, F16 and
   Q8_0, both paths (ATTN_NO_GQA=1). (Q8_0 rows need 256-value multiples: Qwen2.5-0.5B's 2 x 64 cannot use it.)
 - Per decode call, the harness cycling 24 cache copies (past the 32 MB MALL, as a model's layers are), Q8_0 cache,

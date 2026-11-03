@@ -225,7 +225,7 @@ less well and 2 is best; the adaptive default is within ~1% of the best fixed co
 | `generate_verify` | streaming, stop strings, chat turns with prefix reuse, LM-head option |
 | `mtp_verify` | draft acceptance, speculative = plain (greedy, sampled, library) |
 | `store_verify.sh` | the KV block store across processes (optionally with a draft head) |
-| `matvec_verify`, `dequant_verify`, `kv_verify`, `tokenizer_*`, `sampler_verify`, `capi_smoke` | kernels, decoders, tokenizer, C API |
+| `matvec_verify`, `dequant_verify`, `attn_decode_verify`, `kv_verify`, `tokenizer_*`, `sampler_verify`, `capi_smoke` | kernels, decoders, tokenizer, C API |
 | `perl/ROCm-Inference/t/*.t` | the Perl binding (GPU tests with `ROCM_INFERENCE_TEST_*`) |
 
 Models without room for their weights are verified on small random-weight replicas with the real tensor
