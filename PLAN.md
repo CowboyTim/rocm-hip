@@ -2775,8 +2775,11 @@ fp16 scale, V one int8 value and its scale per position; instantiated as attn_pa
   Qwen3.6-35B (D 256, 16 / 2) 154 -> 78, ratio 16 296 -> 139, D 256 16 / 8 at 3k 268 -> 207 (windowed 104 -> 83);
   100 positions ~21 -> ~24 us (as with F16). With the per-KV-head path a Q8_0 cache is now as fast as F16 or faster
   (Qwen3-30B shape 61 vs 74 us: half the bytes).
-- Not run end to end here: /models and /data were not mounted in this container (no model files); to confirm on
-  the next session with models: `qwen_demo --kv-q8` greedy text with and without ATTN_NO_GQA=1, tok/s at 2.4k.
+- End to end (qwen_demo, 3.1k-token prompt, 128 generated, greedy), generation tok/s F16 cache / Q8_0 cache /
+  Q8_0 per head (ATTN_NO_GQA=1): Qwen3-30B-A3B 45.5 / **46.4** / 37.6 (+24%), Qwen2.5-7B 26.8 / **27.1** / 25.4,
+  Qwen3.6-35B ROCmFP4 61.3 / **62.1** / 60.4. A Q8_0 cache is now as fast as F16 (it was 17% slower on the 30B).
+  Greedy text per KV head = per head on the 30B and 7B; on the 35B the two split at token 26 at a near-tie
+  ("high performance" / "high bandwidth"), as its F16 cache's two paths do at token 68 (summation order).
 
 ### Performance round: fewer passes over memory (2026-11-02, user: "do all of the performance ones in 1 go, mind to not copy around memory ... less copy on memory bandwidth helps for tg")
 
