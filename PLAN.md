@@ -2740,8 +2740,25 @@ Qwen/Qwen3-30B-A3B-GGUF Q8_0); references /data/q4_0/refs/ref_qwen25_{05b,15b,7b
   and q's 79, and attn_flash's FP16 Q (as ggml's) costs relative precision there (7e-3; attn_partial 1.7e-3).
 - Speed (2,426-token prompt / 128 generated) vs stock llama.cpp ROCm llama-bench (pp2048 / tg128): 0.5B 14,442 / 201
   (14,821 / 255), 1.5B 5,776 / 95 (5,690 / 108), 7B 1,285 / 26.3 (1,538 / 28.6), 30B-A3B 2,162 / 44.0 (1,357 /
-  52.6). **Open: generation on these Q8_0 models is 8-21% behind llama.cpp** (7B reads 8.1 GB at ~213 vs ~232 GB/s;
-  the 30B's expert path more), and the 7B's prefill 16%.
+  52.6). The generation gap closed afterwards (next section); the 7B's prefill is still 16% behind.
+
+### Decode attention for grouped-query models (2026-11-03, user: "yes, do item 1 first")
+
+Profiles at 2.4k context showed the gap to llama.cpp was the decode attention, not the matmuls (which run at ~215
+GB/s, as llama.cpp's): attn_partial took one workgroup per query head, so a KV head's K / V rows were read once per
+query head of its group (Qwen3-30B: 8x, 101 us per layer and token). attn_partial_gqa<RMAX>[s]_<D> (D 64 / 128 / 256,
+up to 8 or 16 query heads per KV head, F16 cache) takes a KV head per workgroup and scores all its query heads from one
+read of each K row and accumulates V once for them; over 64-position chunks (4 threads per position) when the
+caller's partial-result buffers hold the 4x slots (attention_opts.part_slots: the engine passes its scratch's,
+sized for prefill batches), so a decode step has enough workgroups (40 at 256 positions: no faster than before). The
+V loop issues 8 positions' loads at a time. Per layer 101 -> 50 us (attn_combine 15 -> 19 us, 4x the chunks).
+ATTN_NO_GQA=1 turns it off (A/B). Q8_0 KV caches keep attn_partial_q8.
+- Generation at 2.4k context, before -> after (stock llama.cpp ROCm tg128 @ d2048): Qwen2.5-0.5B 202 -> 244 (242),
+  1.5B 96 -> 104 (103), 7B 27.0 -> 27.5 (27.8), Qwen3-30B-A3B 44.3 -> 50.0 (49.8), Qwen3.6-35B ROCmFP4 61.9 -> 63.5.
+  (At a 7-token context the engine was already at llama.cpp's speed: 251 / 109 / 28.2 / 55.5.)
+- forward_verify passes on Qwen3-30B, Qwen2.5-7B / 0.5B, Qwen3-0.6B, Qwen3.6-35B (the 8-token batch and the engine's
+  decode take the 64-position kernel); greedy text = llama.cpp's on the 30B and 7B.
+- Tried: fewer lanes per row for the Q8_0 matvec (32 is best: 16 / 8 / 4 lanes 3-8% slower).
 
 ### Performance round: fewer passes over memory (2026-11-02, user: "do all of the performance ones in 1 go, mind to not copy around memory ... less copy on memory bandwidth helps for tg")
 

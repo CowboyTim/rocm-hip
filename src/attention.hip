@@ -540,6 +540,154 @@ __device__ void attn_bidir_body(const float* q, const __half* K, const __half* V
     out[((size_t)z * n_q + h) * D + t] = acc / sum;
 }
 
+// attn_partial for grouped-query attention, F16 cache (decode and small batches): one workgroup per KV head g and
+// chunk of PW positions instead of per query head and 256 positions, scoring all R = n_q / n_kv of g's query heads
+// from one read of each K row and accumulating V once for them (attn_partial reads the chunk's K and V R times).
+// PW 64 (the host's choice when the caller's slots allow: 4x the workgroups, which a decode step needs to have
+// enough loads in flight) or 256 (CH). The results as attn_partial's, per (query head, chunk), for attn_combine.
+// grid (n_kv, n_chunks, T), block 256: CH / PW threads per position score its D dims in parts; for V, thread t
+// takes dim t % D and every NPG-th position (NPG = 256 / D), the position groups added in LDS. R <= RMAX.
+template <int D, int RMAX, int PW>
+__device__ __forceinline__ void attn_partial_gqa_body(const float* q, const __half* K, const __half* V, int kv_stride,
+                                                      int kv_shift, long long kv_bstride, int pos0, int n_q,
+                                                      int n_kv_heads, float scale, float* part_ml, float* part_acc,
+                                                      int window) {
+    constexpr int TPP = CH / PW, DP = D / TPP;  // threads per position, dims per thread
+    constexpr int NPG = CH / D;                  // V position groups
+    __shared__ float sq[RMAX][D];
+    __shared__ float sw[RMAX][PW];
+    __shared__ float sacc[NPG > 1 ? NPG - 1 : 1][RMAX][D];
+    __shared__ float sm[RMAX], sl[RMAX];
+    const int R = n_q / n_kv_heads;
+    const int g = blockIdx.x, c = blockIdx.y, t = threadIdx.x, n_chunks = gridDim.y, z = blockIdx.z;
+    const int n_kv = pos0 + z + 1;
+    const int lo = window > 0 ? n_kv - window : 0;  // first position this token sees (sliding window)
+    const int h0 = g * R;
+    q += (size_t)z * n_q * D;
+    part_ml += (size_t)2 * z * n_q * n_chunks;
+    part_acc += (size_t)z * n_q * n_chunks * D;
+    if (c * PW + PW <= lo) {  // the whole chunk is before the window (uniform): it contributes nothing
+        for (int i = t; i < R * D; i += CH) part_acc[((size_t)(h0 + i / D) * n_chunks + c) * D + i % D] = 0.0f;
+        if (t < R) {
+            part_ml[2 * ((size_t)(h0 + t) * n_chunks + c)] = -INFINITY;
+            part_ml[2 * ((size_t)(h0 + t) * n_chunks + c) + 1] = 0.0f;
+        }
+        return;
+    }
+    for (int i = t; i < R * D; i += CH) sq[i / D][i % D] = q[(size_t)h0 * D + i];
+    __syncthreads();
+
+    // Scores of position p for the R heads: thread part tp of TPP reads DP dims of the K row (8 halves at a time)
+    const int pl = t / TPP, tp = t % TPP, p = c * PW + pl;
+    float s[RMAX];
+#pragma unroll
+    for (int r = 0; r < RMAX; ++r) s[r] = 0.0f;
+    const bool valid = p < n_kv && p >= lo;
+    if (valid) {
+        const uint4* kr = (const uint4*)(K + kv_row(p, kv_stride, kv_shift, kv_bstride) + (size_t)g * D + tp * DP);
+#pragma unroll 2
+        for (int i = 0; i < DP / 8; ++i) {
+            const uint4 u = kr[i];
+            const __half2* h2 = (const __half2*)&u;
+            float f[8];
+#pragma unroll
+            for (int k2 = 0; k2 < 4; ++k2) {
+                const float2 x = __half22float2(h2[k2]);
+                f[2 * k2] = x.x, f[2 * k2 + 1] = x.y;
+            }
+#pragma unroll
+            for (int r = 0; r < RMAX; ++r)
+                if (r < R)
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) s[r] += f[j] * sq[r][tp * DP + 8 * i + j];
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < RMAX; ++r)
+        if (r < R) {
+#pragma unroll
+            for (int off = 1; off < TPP; off <<= 1) s[r] += __shfl_xor(s[r], off, 32);  // (TPP adjacent lanes)
+            if (tp == 0) sw[r][pl] = valid ? s[r] * scale : -INFINITY;
+        }
+    __syncthreads();
+
+    // Softmax statistics per head (a wave per head); the scores become their exp(s - m)
+    const int w = t >> 5, lane = t & 31;
+    for (int r = w; r < R; r += CH / 32) {
+        float m = -INFINITY;
+        for (int k = lane; k < PW; k += 32) m = fmaxf(m, sw[r][k]);
+        m = wave_max(m);
+        float l = 0.0f;
+        for (int k = lane; k < PW; k += 32) {
+            const float e = sw[r][k] > -INFINITY ? __expf(sw[r][k] - m) : 0.0f;
+            sw[r][k] = e;
+            l += e;
+        }
+        l = wave_sum(l);
+        if (lane == 0) sm[r] = m, sl[r] = l;
+    }
+    __syncthreads();
+
+    // acc[r][d] over this chunk's positions, V read once for the R heads; 8 positions' loads issued together
+    const int d = t % D, pg = t / D;
+    const int p0 = c * PW, i0 = max(0, lo - p0), np = max(0, min(PW, n_kv - p0));
+    float a[RMAX];
+#pragma unroll
+    for (int r = 0; r < RMAX; ++r) a[r] = 0.0f;
+    const __half* vb = V + (size_t)g * D + d;
+    constexpr int VU = 8;
+    for (int i = i0 + (pg - i0 % NPG + NPG) % NPG; i < np; i += VU * NPG) {
+        float v[VU];
+#pragma unroll
+        for (int u = 0; u < VU; ++u) {
+            const int iu = i + u * NPG;
+            v[u] = iu < np ? __half2float(vb[kv_row(p0 + iu, kv_stride, kv_shift, kv_bstride)]) : 0.0f;
+        }
+#pragma unroll
+        for (int u = 0; u < VU; ++u) {
+            const int iu = min(i + u * NPG, PW - 1);  // (v is 0 past np)
+#pragma unroll
+            for (int r = 0; r < RMAX; ++r)
+                if (r < R) a[r] += sw[r][iu] * v[u];
+        }
+    }
+    if (NPG > 1 && pg > 0)
+#pragma unroll
+        for (int r = 0; r < RMAX; ++r)
+            if (r < R) sacc[pg - 1][r][d] = a[r];
+    __syncthreads();
+    if (pg == 0)
+#pragma unroll
+        for (int r = 0; r < RMAX; ++r)
+            if (r < R) {
+                float x = a[r];
+#pragma unroll
+                for (int k = 1; k < NPG; ++k) x += sacc[k - 1][r][d];
+                part_acc[((size_t)(h0 + r) * n_chunks + c) * D + d] = x;
+            }
+    if (t < R) {
+        part_ml[2 * ((size_t)(h0 + t) * n_chunks + c)] = sm[t];
+        part_ml[2 * ((size_t)(h0 + t) * n_chunks + c) + 1] = sl[t];
+    }
+}
+
+// attn_partial_gqa<RMAX>_<D> (256-position chunks) and attn_partial_gqa<RMAX>s_<D> (64)
+#define ATTN_GQA_KERNEL(NAME, D, RMAX, PW)                                                                    \
+    extern "C" __global__ void __launch_bounds__(CH)                                                         \
+        NAME(const float* q, const __half* K, const __half* V, int kv_stride, int kv_shift, long long kv_bstride, \
+             int pos0, int n_q, int n_kv_heads, float scale, float* part_ml, float* part_acc, int window) {    \
+        attn_partial_gqa_body<D, RMAX, PW>(q, K, V, kv_stride, kv_shift, kv_bstride, pos0, n_q, n_kv_heads,   \
+                                           scale, part_ml, part_acc, window);                                \
+    }
+#define ATTN_GQA_KERNELS(D)                                                                                   \
+    ATTN_GQA_KERNEL(attn_partial_gqa8_##D, D, 8, 256)                                                         \
+    ATTN_GQA_KERNEL(attn_partial_gqa16_##D, D, 16, 256)                                                       \
+    ATTN_GQA_KERNEL(attn_partial_gqa8s_##D, D, 8, 64)                                                         \
+    ATTN_GQA_KERNEL(attn_partial_gqa16s_##D, D, 16, 64)
+ATTN_GQA_KERNELS(64)
+ATTN_GQA_KERNELS(128)
+ATTN_GQA_KERNELS(256)
+
 // The kernels for each head size: attn_<kernel>_64 (Qwen2.5-0.5B), attn_<kernel>_128 (Qwen2 / Qwen3), attn_<kernel>_256
 // (Qwen3.5 and later, Gemma-4's sliding layers), attn_<kernel>_512 (Gemma-4's global layers; its flash kernel is
 // attn_flash_512_h2s2)

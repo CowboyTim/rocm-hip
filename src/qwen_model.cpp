@@ -105,6 +105,7 @@ struct ShmRegion {
 // generating). Each array holds B rows of the per-token size given in brackets.
 struct Scratch {
     int B = 0;                // tokens per forward (rows)
+    long long part_slots = 0; // attention partial-result slots part_ml / part_acc hold (attention_opts.part_slots)
     float* x = nullptr;       // residual stream [E]
     float* x_alt = nullptr;   // the other residual buffer: add_rmsnorm writes x + add here, then they swap
     float* xn = nullptr;      // normed input to the projections [E]
@@ -188,6 +189,7 @@ struct Scratch {
         const int ZX = m->nemotron ? DI + conv_dim + NV : 0;  // Nemotron-H's ssm_in rows
         const int LT = m->moe_latent, LU = m->moe_latent > 0 ? E : 0;
         B = rows;
+        part_slots = (long long)attention_part_slots(n_ctx, rows);
         const size_t b = (size_t)rows;
         q8_max_k = (std::max({E, HQ * HD, DI, FF, NU * FE, HCD}) + 255) / 256 * 256 * rows;
         const size_t sizes[] = {b * E, b * E, b * E, b * 2 * HQ * HD, b * HQ * HD,
@@ -723,6 +725,7 @@ struct QwenModel {
                 __half* V = kv_cache_v_row(kvc, L.kv_slot, 0);
                 if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
                 attention_opts o = {};
+                o.part_slots = s.part_slots;
                 o.head_dim = eng->head_dim;
                 o.gated = eng->attn_gated ? 1 : 0;
                 o.kv_stride = kv_cache_row_halves(kvc);
@@ -1224,6 +1227,7 @@ struct QwenModel {
                 __half* V = kv_cache_v_row(kvc, L.kv_slot, 0);
                 if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
                 attention_opts o = {};
+                o.part_slots = s.part_slots;
                 o.head_dim = L.head_dim;
                 o.kv_stride = kv_cache_row_halves(kvc);
                 o.kv_q8 = kv_cache_type(kvc) == KV_CACHE_Q8_0;
@@ -1462,6 +1466,7 @@ struct QwenModel {
                 __half* V = kv_cache_v_row(kvc, L.kv_slot, 0);
                 if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
                 attention_opts o = {};
+                o.part_slots = s.part_slots;
                 o.head_dim = HD;
                 o.kv_stride = kv_cache_row_halves(kvc);
                 o.kv_q8 = kv_cache_type(kvc) == KV_CACHE_Q8_0;

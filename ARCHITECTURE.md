@@ -162,7 +162,9 @@ on the last token and one sync. Prefill runs this in micro-batches of up to 1,02
 scratch per token on Qwen3.8).
 
 - **Attention**: gated Q (`[Q | gate]` per head), q/k RMSNorm, partial NeoX / IMRoPE, GQA, sigmoid output gate.
-  Decode: split-K partial attention over 256-position chunks + combine; prefill: FP16 WMMA flash attention.
+  Decode: split-K partial attention over 256-position chunks + combine (with several query heads per KV head: one
+  workgroup per KV head over 64-position chunks, reading K / V once for its query heads); prefill: FP16 WMMA flash
+  attention.
 - **Gated DeltaNet**: conv1d (state of the last 3 inputs) + SiLU, L2-normed q/k, decay `exp(softplus(alpha +
   dt) * A)` and `sigmoid(beta)`, the delta rule over a 128×128 state per value head (8 lanes per column, shuffle
   reductions), gated RMSNorm (`SiLU(z)`; `sigmoid(z)` for qwen4exp).

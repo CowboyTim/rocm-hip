@@ -80,6 +80,8 @@ typedef struct {
     const float* bq;  // biases added to attn_q / attn_k / attn_v's outputs before the norms and RoPE (Qwen2); NULL:
     const float* bk;  // none
     const float* bv;
+    long long part_slots;  // partial-result slots part_ml / part_acc hold (attention_part_slots(n_ctx, rows) of the
+                           // caller's sizing); 0: those of this call's T. More let decoding use smaller chunks.
 } attention_opts;
 
 hipError_t attention_forward_opts(const float* qfull, const float* k, const float* v, const float* q_norm,
