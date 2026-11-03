@@ -2752,13 +2752,30 @@ read of each K row and accumulates V once for them; over 64-position chunks (4 t
 caller's partial-result buffers hold the 4x slots (attention_opts.part_slots: the engine passes its scratch's,
 sized for prefill batches), so a decode step has enough workgroups (40 at 256 positions: no faster than before). The
 V loop issues 8 positions' loads at a time. Per layer 101 -> 50 us (attn_combine 15 -> 19 us, 4x the chunks).
-ATTN_NO_GQA=1 turns it off (A/B). Q8_0 KV caches keep attn_partial_q8.
+ATTN_NO_GQA=1 turns it off (A/B). Q8_0 KV caches: see the next section.
 - Generation at 2.4k context, before -> after (stock llama.cpp ROCm tg128 @ d2048): Qwen2.5-0.5B 202 -> 244 (242),
   1.5B 96 -> 104 (103), 7B 27.0 -> 27.5 (27.8), Qwen3-30B-A3B 44.3 -> 50.0 (49.8), Qwen3.6-35B ROCmFP4 61.9 -> 63.5.
   (At a 7-token context the engine was already at llama.cpp's speed: 251 / 109 / 28.2 / 55.5.)
 - forward_verify passes on Qwen3-30B, Qwen2.5-7B / 0.5B, Qwen3-0.6B, Qwen3.6-35B (the 8-token batch and the engine's
   decode take the 64-position kernel); greedy text = llama.cpp's on the 30B and 7B.
 - Tried: fewer lanes per row for the Q8_0 matvec (32 is best: 16 / 8 / 4 lanes 3-8% slower).
+
+### Decode attention per KV head for a Q8_0 KV cache (2026-11-03, user: "do 2 now")
+
+attn_partial_gqa_body takes KQ as attn_partial / attn_flash do: K 8 int8 values (one 8-byte load) times their block's
+fp16 scale, V one int8 value and its scale per position; instantiated as attn_partial_gqa{8,16}[s]_<D>_q8
+(g_partial_gqa[dim][kq][...]), so a Q8_0 cache takes the same per-KV-head path (64-position chunks with part_slots).
+- Checked with a harness of attention_forward_opts on synthetic data (the cache filled by 512-token batches, then a
+  decode token; output vs a CPU reference computed from the cache's own values and the prepped q): relative error
+  2e-7 .. 5e-7 for D 64 / 128 / 256, ratios 2 / 7 / 8 / 16, sliding window 1024, 100 .. 3,000 positions, F16 and
+  Q8_0, both paths (ATTN_NO_GQA=1). (Q8_0 rows need 256-value multiples: Qwen2.5-0.5B's 2 x 64 cannot use it.)
+- Per decode call, the harness cycling 24 cache copies (past the 32 MB MALL, as a model's layers are), Q8_0 cache,
+  per head -> per KV head: Qwen2.5-7B shape (D 128, 28 / 4) at 2.4k 166 -> 68 us, Qwen3-30B (32 / 4) 202 -> 61,
+  Qwen3.6-35B (D 256, 16 / 2) 154 -> 78, ratio 16 296 -> 139, D 256 16 / 8 at 3k 268 -> 207 (windowed 104 -> 83);
+  100 positions ~21 -> ~24 us (as with F16). With the per-KV-head path a Q8_0 cache is now as fast as F16 or faster
+  (Qwen3-30B shape 61 vs 74 us: half the bytes).
+- Not run end to end here: /models and /data were not mounted in this container (no model files); to confirm on
+  the next session with models: `qwen_demo --kv-q8` greedy text with and without ATTN_NO_GQA=1, tok/s at 2.4k.
 
 ### Performance round: fewer passes over memory (2026-11-02, user: "do all of the performance ones in 1 go, mind to not copy around memory ... less copy on memory bandwidth helps for tg")
 

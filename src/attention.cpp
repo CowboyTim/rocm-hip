@@ -24,9 +24,9 @@ static hipFunction_t g_flash128_g2_q8 = nullptr, g_flash256_h2t2_q8 = nullptr, g
 // Other ratios: attn_flash_<D>_h2t2 (D 64 / 128, ratio a multiple of 2), attn_flash_<D>_h1t4 (D 64 / 128 / 256, any);
 // [i] as g_prep, [k][1] the Q8_0-cache variants
 static hipFunction_t g_flash_h2t2[ATTN_NDIMS][2], g_flash_h1t4[ATTN_NDIMS][2];
-// attn_partial_gqa{8,16}[s]_<D> (D 64 / 128 / 256, F16 cache): attn_partial with the query heads of a KV head
-// together; [i][0 / 1] up to 8 / 16 query heads per KV head, [i][2 / 3] the same over 64-position chunks
-static hipFunction_t g_partial_gqa[ATTN_NDIMS][4];
+// attn_partial_gqa{8,16}[s]_<D>[_q8] (D 64 / 128 / 256): attn_partial with the query heads of a KV head together;
+// [i][kq][0 / 1] up to 8 / 16 query heads per KV head, [i][kq][2 / 3] the same over 64-position chunks (kq: Q8_0 cache)
+static hipFunction_t g_partial_gqa[ATTN_NDIMS][2][4];
 static bool g_gqa_off = false;
 
 // attn_flash takes batches of at least this many tokens. QMATVEC_NO_WMMA (qmatvec.h) also turns it off, so
@@ -72,11 +72,13 @@ int attention_init(const char* co_path) {
             if (hipModuleGetFunction(&g_flash_h2t2[i][q], g_mod, n) != hipSuccess) g_flash_h2t2[i][q] = nullptr;
             snprintf(n, sizeof(n), "attn_flash_%d_h1t4%s", attn_dim(i), q ? "_q8" : "");
             if (hipModuleGetFunction(&g_flash_h1t4[i][q], g_mod, n) != hipSuccess) g_flash_h1t4[i][q] = nullptr;
-            for (int sm = 0; sm < 2; ++sm) {
-                snprintf(n, sizeof(n), "attn_partial_gqa%d%s_%d", q ? 16 : 8, sm ? "s" : "", attn_dim(i));
-                hipFunction_t& f = g_partial_gqa[i][2 * sm + q];
-                if (hipModuleGetFunction(&f, g_mod, n) != hipSuccess) f = nullptr;
-            }
+            for (int sm = 0; sm < 2; ++sm)
+                for (int kq = 0; kq < 2; ++kq) {
+                    snprintf(n, sizeof(n), "attn_partial_gqa%d%s_%d%s", q ? 16 : 8, sm ? "s" : "", attn_dim(i),
+                             kq ? "_q8" : "");
+                    hipFunction_t& f = g_partial_gqa[i][kq][2 * sm + q];
+                    if (hipModuleGetFunction(&f, g_mod, n) != hipSuccess) f = nullptr;
+                }
         }
     }
     if (hipModuleGetFunction(&g_flash128_g2, g_mod, "attn_flash_128_g2") != hipSuccess) g_flash128_g2 = nullptr;
@@ -98,7 +100,7 @@ void attention_free(void) {
     for (int i = 0; i < ATTN_NDIMS; ++i) {
         g_prep[i] = g_partial[i] = g_combine[i] = g_flash[i] = g_partial_q8[i] = g_flash_q8[i] = g_bidir[i] = nullptr;
         g_flash_h2t2[i][0] = g_flash_h2t2[i][1] = g_flash_h1t4[i][0] = g_flash_h1t4[i][1] = nullptr;
-        for (int k = 0; k < 4; ++k) g_partial_gqa[i][k] = nullptr;
+        for (int k = 0; k < 8; ++k) g_partial_gqa[i][k / 4][k % 4] = nullptr;
     }
     g_flash128_g2 = g_flash256_h2t2 = g_flash512_h2s2 = nullptr;
     g_flash128_g2_q8 = g_flash256_h2t2_q8 = g_flash512_h2s2_q8 = nullptr;
@@ -202,11 +204,12 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
     // attn_partial: one chunk per slot, so the tokens run in groups of slots / chunks. Several query heads per KV head:
     // attn_partial_gqa (K / V read once for the group, not ratio times), over 64-position chunks when the slots
     // hold them (a decode step needs the 4x workgroups: Qwen3-30B at 2.4k positions has 4 KV heads x 10 chunks)
-    const bool gqa_ok = !kv_q8 && !g_gqa_off && ratio >= 2 && ratio <= 16 && g_partial_gqa[hi][ratio > 8];
+    const hipFunction_t* gq = g_partial_gqa[hi][kv_q8 ? 1 : 0];
+    const bool gqa_ok = !g_gqa_off && ratio >= 2 && ratio <= 16 && gq[ratio > 8];
     const int nc_s = (n_last + 63) / 64;
-    const bool small = gqa_ok && g_partial_gqa[hi][2 + (ratio > 8)] && slots >= nc_s;
+    const bool small = gqa_ok && gq[2 + (ratio > 8)] && slots >= nc_s;
     const int pw = small ? 64 : ATTN_CHUNK;
-    const hipFunction_t gqa = gqa_ok ? g_partial_gqa[hi][(small ? 2 : 0) + (ratio > 8)] : nullptr;
+    const hipFunction_t gqa = gqa_ok ? gq[(small ? 2 : 0) + (ratio > 8)] : nullptr;
     const int group = (int)std::max<long long>(1, slots / (small ? nc_s : nc));
     for (int z0 = 0; z0 < T; z0 += group) {
         const int tg = std::min(group, T - z0), p0 = pos0 + z0;

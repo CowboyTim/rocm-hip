@@ -547,7 +547,8 @@ __device__ void attn_bidir_body(const float* q, const __half* K, const __half* V
 // enough loads in flight) or 256 (CH). The results as attn_partial's, per (query head, chunk), for attn_combine.
 // grid (n_kv, n_chunks, T), block 256: CH / PW threads per position score its D dims in parts; for V, thread t
 // takes dim t % D and every NPG-th position (NPG = 256 / D), the position groups added in LDS. R <= RMAX.
-template <int D, int RMAX, int PW>
+// KQ: a Q8_0 cache (each 8 int8 K values times their block's scale; V values one int8 and its scale).
+template <int D, int RMAX, int PW, bool KQ = false>
 __device__ __forceinline__ void attn_partial_gqa_body(const float* q, const __half* K, const __half* V, int kv_stride,
                                                       int kv_shift, long long kv_bstride, int pos0, int n_q,
                                                       int n_kv_heads, float scale, float* part_ml, float* part_acc,
@@ -584,16 +585,25 @@ __device__ __forceinline__ void attn_partial_gqa_body(const float* q, const __ha
     for (int r = 0; r < RMAX; ++r) s[r] = 0.0f;
     const bool valid = p < n_kv && p >= lo;
     if (valid) {
-        const uint4* kr = (const uint4*)(K + kv_row(p, kv_stride, kv_shift, kv_bstride) + (size_t)g * D + tp * DP);
+        const __half* krow = K + kv_row(p, kv_stride, kv_shift, kv_bstride);
 #pragma unroll 2
         for (int i = 0; i < DP / 8; ++i) {
-            const uint4 u = kr[i];
-            const __half2* h2 = (const __half2*)&u;
             float f[8];
+            if constexpr (KQ) {
+                const int e = g * D + tp * DP + 8 * i;
+                const uint2 u = *(const uint2*)((const int8_t*)krow + e);
+                const int8_t* qv = (const int8_t*)&u;
+                const float sc = __half2float(((const __half*)((const int8_t*)krow + kvq_drow(kv_stride)))[e / 32]);
 #pragma unroll
-            for (int k2 = 0; k2 < 4; ++k2) {
-                const float2 x = __half22float2(h2[k2]);
-                f[2 * k2] = x.x, f[2 * k2 + 1] = x.y;
+                for (int j = 0; j < 8; ++j) f[j] = (float)qv[j] * sc;
+            } else {
+                const uint4 u = ((const uint4*)(krow + (size_t)g * D + tp * DP))[i];
+                const __half2* h2 = (const __half2*)&u;
+#pragma unroll
+                for (int k2 = 0; k2 < 4; ++k2) {
+                    const float2 x = __half22float2(h2[k2]);
+                    f[2 * k2] = x.x, f[2 * k2 + 1] = x.y;
+                }
             }
 #pragma unroll
             for (int r = 0; r < RMAX; ++r)
@@ -641,7 +651,12 @@ __device__ __forceinline__ void attn_partial_gqa_body(const float* q, const __ha
 #pragma unroll
         for (int u = 0; u < VU; ++u) {
             const int iu = i + u * NPG;
-            v[u] = iu < np ? __half2float(vb[kv_row(p0 + iu, kv_stride, kv_shift, kv_bstride)]) : 0.0f;
+            if constexpr (KQ)
+                v[u] = iu < np ? kv_value<true>(V + kv_row(p0 + iu, kv_stride, kv_shift, kv_bstride), g * D + d,
+                                                kvq_drow(kv_stride))
+                               : 0.0f;
+            else
+                v[u] = iu < np ? __half2float(vb[kv_row(p0 + iu, kv_stride, kv_shift, kv_bstride)]) : 0.0f;
         }
 #pragma unroll
         for (int u = 0; u < VU; ++u) {
@@ -671,14 +686,17 @@ __device__ __forceinline__ void attn_partial_gqa_body(const float* q, const __ha
     }
 }
 
-// attn_partial_gqa<RMAX>_<D> (256-position chunks) and attn_partial_gqa<RMAX>s_<D> (64)
-#define ATTN_GQA_KERNEL(NAME, D, RMAX, PW)                                                                    \
+// attn_partial_gqa<RMAX>_<D> (256-position chunks) and attn_partial_gqa<RMAX>s_<D> (64); NAME_q8 for a Q8_0 cache
+#define ATTN_GQA_KERNEL_KQ(NAME, D, RMAX, PW, KQ)                                                             \
     extern "C" __global__ void __launch_bounds__(CH)                                                         \
         NAME(const float* q, const __half* K, const __half* V, int kv_stride, int kv_shift, long long kv_bstride, \
              int pos0, int n_q, int n_kv_heads, float scale, float* part_ml, float* part_acc, int window) {    \
-        attn_partial_gqa_body<D, RMAX, PW>(q, K, V, kv_stride, kv_shift, kv_bstride, pos0, n_q, n_kv_heads,   \
-                                           scale, part_ml, part_acc, window);                                \
+        attn_partial_gqa_body<D, RMAX, PW, KQ>(q, K, V, kv_stride, kv_shift, kv_bstride, pos0, n_q,           \
+                                               n_kv_heads, scale, part_ml, part_acc, window);                \
     }
+#define ATTN_GQA_KERNEL(NAME, D, RMAX, PW)                                                                    \
+    ATTN_GQA_KERNEL_KQ(NAME, D, RMAX, PW, false)                                                              \
+    ATTN_GQA_KERNEL_KQ(NAME##_q8, D, RMAX, PW, true)
 #define ATTN_GQA_KERNELS(D)                                                                                   \
     ATTN_GQA_KERNEL(attn_partial_gqa8_##D, D, 8, 256)                                                         \
     ATTN_GQA_KERNEL(attn_partial_gqa16_##D, D, 16, 256)                                                       \
