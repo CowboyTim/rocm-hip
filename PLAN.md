@@ -2719,6 +2719,30 @@ matvec, batched dense + expert, WMMA dense + expert), BlkIQ4_NL for the float pa
   4,213 -> 9,140 tok/s. IQ4_XS (256-value super-blocks, 6-bit sub-scales, the same table) would follow on the
   K-quant kernels.
 
+### qwen2 / Qwen2.5 and qwen3moe (2026-11-03, user: "do qwen2/qwen2.5, qwen3moe, for completeness")
+
+Test models (downloaded with the user's OK to /data/hf/qwen-gguf: Qwen/Qwen2.5-{0.5B,1.5B,7B}-Instruct-GGUF Q8_0,
+Qwen/Qwen3-30B-A3B-GGUF Q8_0); references /data/q4_0/refs/ref_qwen25_{05b,15b,7b}, ref_qwen3_30b (sky prompt).
+- **qwen2** (e700fdd): Qwen3's dense layout without q / k norms and with attn_{q,k,v}.bias (F32): the loader takes
+  the norms as optional and binds the biases; attn_prep adds them before RoPE (in the kernel that already reads q / k
+  / v: no extra pass). New attention kernels: head_dim 64 (0.5B: 14 x 64), attn_flash variants with 2 heads (even
+  ratios: 1.5B's 6) and 1 head (any ratio: 0.5B / 7B's 7) per workgroup (the V staging loop rewritten for fewer
+  tasks than threads), attn_combine with a partial last block (896 values per token). Rows of K % 32 but not % 256
+  (896) are quantized in a separate launch in mark() so that the Q8_0 matmuls run int8 (0.5B prefill 2,712 ->
+  14,442 tok/s). Fixed on the way: attn_partial's token groups did not offset the producer-written 16-bit copy (only
+  the int8 forms), and the test's blocked-KV comparison ran without the layer's options.
+- **qwen3moe**: Qwen3's attention and a MoE without a shared expert: the loader makes the shared expert optional
+  (expert_shared_feed_forward_length 0), moe_core skips its matmuls, moe_router / moe_combine get NULL for it (as for
+  Gemma-4). No expert_weights_scale in the file (llama.cpp: no scaling).
+- Checks: forward_verify passes on all four (worst layer 0.5B 0.9990, 1.5B 0.9993, 7B 0.9996, 30B 0.9935; next
+  token = llama.cpp's; prefill vs token by token >= 0.9945); greedy text = llama.cpp's (0.5B 24 tokens, 1.5B 32, 7B
+  to the end of text, 30B 40). The 40-token flash check without q / k norms allows 1e-2: Qwen2's k biases reach 130
+  and q's 79, and attn_flash's FP16 Q (as ggml's) costs relative precision there (7e-3; attn_partial 1.7e-3).
+- Speed (2,426-token prompt / 128 generated) vs stock llama.cpp ROCm llama-bench (pp2048 / tg128): 0.5B 14,442 / 201
+  (14,821 / 255), 1.5B 5,776 / 95 (5,690 / 108), 7B 1,285 / 26.3 (1,538 / 28.6), 30B-A3B 2,162 / 44.0 (1,357 /
+  52.6). **Open: generation on these Q8_0 models is 8-21% behind llama.cpp** (7B reads 8.1 GB at ~213 vs ~232 GB/s;
+  the 30B's expert path more), and the 7B's prefill 16%.
+
 ### Performance round: fewer passes over memory (2026-11-02, user: "do all of the performance ones in 1 go, mind to not copy around memory ... less copy on memory bandwidth helps for tg")
 
 UMA: every extra pass over activations or outputs takes memory bandwidth from token generation. A/B against the
