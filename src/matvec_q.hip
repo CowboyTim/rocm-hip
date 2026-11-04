@@ -2543,7 +2543,7 @@ MATMUL_Q8_KERNELS(tq2_0, (mmb_iqk<TQ2, RowsLinear>), (mmb_iqk<TQ2, RowsExpert>))
 // WMMA wave32 layout (tests/wmma_layout_verify): A row i / B column i in lanes i and i + 16, 16 int8 each;
 // C column l % 16, row 2r + l / 16.
 // Q5_1 (BLOCK_SCALE with MIN): the block's offset m adds m * d_x * (sum of the block's x q) per block, from the
-// quantizer's block sums. grid (ceil(N / WM_ROWS), ceil(T / 64)), block WM_THREADS. K % 128 == 0, or K % 64 == 0
+// quantizer's block sums. grid (ceil(T / 64), ceil(N / WM_ROWS)), block WM_THREADS. K % 128 == 0, or K % 64 == 0
 // for the policies of 2 blocks per thread (all but ROCmFP4_FAST): the last chunk is then half, the rest zeros.
 
 typedef int v4i_t __attribute__((ext_vector_type(4)));
@@ -2694,9 +2694,14 @@ struct WStagePB {  // Q5_1 / Q4_1 / Q5_0: a scale d (and offset m: MIN) per 32 v
 
 // Token-row maps for the WMMA kernels: which weight rows (an expert's, for MoE) and which input / output token
 // rows a workgroup's tile covers
+// rb: the workgroup's block of weight rows. The dense kernels take it from blockIdx.y and the token tile from
+// blockIdx.x, so that the workgroups running at once are the token tiles of one row block: its weight rows come from
+// DRAM once and from L2 for the others, and the batch's activations stay in the MALL (rows first, every workgroup
+// read different weights, the whole matrix once per 64 tokens: Qwen2.5-7B prefill ~170 GB/s of weights)
 struct WRowsLinear {  // prefill: tokens t0 .. t0 + nt - 1
     int t0, nt;
     float sc;  // output scale (OScale)
+    int rb;
     __device__ const uint8_t *base(const uint8_t *W, long long, int) const { return W; }
     __device__ long long in(int j) const { return t0 + j; }
     __device__ long long out(int j) const { return t0 + j; }
@@ -2706,6 +2711,7 @@ struct WRowsExpert {  // MoE prefill: one expert's tile of (token, slot) entries
     int e, nt;
     const int *in_rows, *out_rows;
     float sc;
+    int rb;
     __device__ const uint8_t *base(const uint8_t *W, long long rb, int N) const { return W + (long long)e * N * rb; }
     __device__ long long in(int j) const { return in_rows[j]; }
     __device__ long long out(int j) const { return out_rows[j]; }
@@ -2749,7 +2755,7 @@ __device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, 
     auto &sew = sm.sew;
     auto &sdx = sm.sdx;
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
-    const int r0 = blockIdx.x * WM_ROWS, T = rm.nt;
+    const int r0 = rm.rb * WM_ROWS, T = rm.nt;
     const int nb = K / 32;
     const uint8_t *Wb = rm.base(W, row_bytes, N);
 
@@ -2891,7 +2897,7 @@ __device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, 
     }
 }
 
-// matmul_wmma_<type>: grid (ceil(N / WM_ROWS), ceil(T / 64)). matmul_wmma_id_<type> (MoE prefill): grid
+// matmul_wmma_<type>: grid (ceil(T / 64), ceil(N / WM_ROWS)). matmul_wmma_id_<type> (MoE prefill): grid
 // (ceil(N / WM_ROWS), max_tiles) over moe_group's expert tiles of up to 64 entries (QMV_WMMA_ID_TB in qmatvec.cpp), so a
 // batch reads each expert's weights once per 64 of its entries; same arguments as matmul_q8_id_<type>.
 #define MATMUL_WMMA_Q80_KERNELS(name, WS)                                                                    \
@@ -2899,8 +2905,8 @@ __device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, 
         matmul_wmma_##name(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8,          \
                            const int *bs, float *y, long long ldy, int N, int K, int T, OScale osc) {                    \
         __shared__ __attribute__((aligned(16))) WmmaSmemSel<WS::MIN>::type sm;                               \
-        const int t0 = blockIdx.y * WM_TILE;                                                                 \
-        const WRowsLinear rm{t0, min(WM_TILE, T - t0), osc.s[0]};                                            \
+        const int t0 = blockIdx.x * WM_TILE;                                                                 \
+        const WRowsLinear rm{t0, min(WM_TILE, T - t0), osc.s[0], (int)blockIdx.y};                           \
         wmma_q80<WS, 4>(W, row_bytes, q8, d8, bs, y, ldy, N, K, rm, sm);                                     \
     }                                                                                                        \
     extern "C" __global__ void __launch_bounds__(WM_THREADS) matmul_wmma_id_##name(MMID_ARGS, OScaleId osc) {               \
@@ -2908,7 +2914,7 @@ __device__ __forceinline__ void wmma_q80(const uint8_t *W, long long row_bytes, 
         const int k = blockIdx.y;                                                                            \
         if (k >= *n_tiles) return;                                                                           \
         const WRowsExpert rm{tile_e[k], tile_n[k], in_rows + tile_start[k], out_rows + tile_start[k],         \
-                             osc.of(0, tile_e[k])};                                                          \
+                             osc.of(0, tile_e[k]), (int)blockIdx.x};                                         \
         if (rm.nt <= 16)                                                                                     \
             wmma_q80<WS, 1>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                                   \
         else if (rm.nt <= 32)                                                                                \
@@ -3150,7 +3156,7 @@ __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, 
     auto &sdx = sm.sdx;
     auto &sbs = sm.sbs;
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
-    const int r0 = blockIdx.x * WM_TILE, T = rm.nt;
+    const int r0 = rm.rb * WM_TILE, T = rm.nt;
     const int nbk = K / 256;
     const uint8_t *Wb = rm.base(W, row_bytes, N);
 
@@ -3282,15 +3288,16 @@ __device__ __forceinline__ void wmma_q8k(const uint8_t *W, long long row_bytes, 
         matmul_wmma_##name(const uint8_t *W, long long row_bytes, const int8_t *q8, const float *d8,          \
                            const int *bs, float *y, long long ldy, int N, int K, int T, OScale osc) {                    \
         __shared__ __attribute__((aligned(16))) WmmaKSmem sm;                                                \
-        const int t0 = blockIdx.y * WM_TILE;                                                                 \
-        wmma_q8k<WS, 4>(W, row_bytes, q8, d8, bs, y, ldy, N, K, WRowsLinear{t0, min(WM_TILE, T - t0), osc.s[0]}, sm);   \
+        const int t0 = blockIdx.x * WM_TILE;                                                                 \
+        wmma_q8k<WS, 4>(W, row_bytes, q8, d8, bs, y, ldy, N, K,                                              \
+                        WRowsLinear{t0, min(WM_TILE, T - t0), osc.s[0], (int)blockIdx.y}, sm);               \
     }                                                                                                        \
     extern "C" __global__ void __launch_bounds__(128) matmul_wmma_id_##name(MMID_ARGS, OScaleId osc) {                      \
         const int k = blockIdx.y;                                                                            \
         if (k >= *n_tiles) return;                                                                           \
         __shared__ __attribute__((aligned(16))) WmmaKSmem sm;                                                \
         const WRowsExpert rm{tile_e[k], tile_n[k], in_rows + tile_start[k], out_rows + tile_start[k],         \
-                             osc.of(0, tile_e[k])};                                                          \
+                             osc.of(0, tile_e[k]), (int)blockIdx.x};                                         \
         if (rm.nt <= 16) wmma_q8k<WS, 1>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                       \
         else if (rm.nt <= 32) wmma_q8k<WS, 2>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                  \
         else if (rm.nt <= 48) wmma_q8k<WS, 3>(W, row_bytes, q8, d8, bs, y, N, N, K, rm, sm);                  \

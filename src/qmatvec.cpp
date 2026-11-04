@@ -522,7 +522,8 @@ hipError_t qmatvec_launch_q8_batch(int type, const void *W, size_t row_bytes, co
         // tiles of 64 tokens x 128 rows (Q8_0-activation types, 256 threads) or 64 rows (K-quants, 128 threads);
         // bs: the K-quants' group sums (for the mins), Q5_1's block sums (offsets)
         const int rows = kq ? 64 : QMV_WM_ROWS, threads = kq ? 128 : QMV_WM_THREADS;
-        return hipModuleLaunchKernel(g_fn_wmma[type], (unsigned)((N + rows - 1) / rows), (unsigned)((T + 63) / 64), 1,
+        // grid (token tiles, row blocks): a row block's token tiles run together (matvec_q.hip WRowsLinear)
+        return hipModuleLaunchKernel(g_fn_wmma[type], (unsigned)((T + 63) / 64), (unsigned)((N + rows - 1) / rows), 1,
                                      (unsigned)threads, 1, 1, 0, stream, args, nullptr);
     }
     const unsigned gx = (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK);

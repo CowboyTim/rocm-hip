@@ -2951,6 +2951,22 @@ scaling), which the engine only read as Gemma-4's "rotate the first pairs". Now:
     correctly; attn_decode_verify passes. forward_verify on the 35B faulted 3 of 5 runs (2 GB free, 112 GB
     page cache) in its layer-0 router check, before any attention: the known intermittent fault (open item).
 
+### Prefill matmuls: dense WMMA grid ordered by token tile (2026-11-04, user: "then go for prefill")
+
+Ablations of matmul_wmma_q8_0 (Qwen2.5-7B, 2.3k prompt, 1,520 ms in all): the epilogue -371 ms, the WMMAs -401,
+the next chunk's loads -444: all alike, i.e. memory. Each workgroup takes 128 weight rows x 64 tokens and the grid
+ran row blocks first, so the workgroups in flight read different weights and the whole matrix came from DRAM once
+per 64 tokens (~37 x 7 GB for 2,306 tokens in 1.5 s: ~170 GB/s). Now the dense kernels (matmul_wmma_<type>, both
+families) run grid (token tiles, row blocks): a row block's token tiles run together, its weights come from DRAM
+once and from L2 for the rest, and the batch's activations (~3.6 MB) stay in the MALL. The row block reaches
+wmma_q80 / wmma_q8k through the row map (WRowsLinear / WRowsExpert.rb); the expert kernels keep their order (each
+tile is another expert). matvec_verify (Q8_0, ROCmFP4_FAST, Q3_K: 70-token batches) and forward_verify (Qwen2.5-7B
+pass; Qwen3.6-35B Q4_0 the same figures as before) unchanged.
+- matmul_wmma_q8_0 1,520 -> 1,146 ms; after it the loads cost 76 ms, the WMMAs 367, the epilogue 246 (28.5 TOPS of
+  ~55: compute now; the epilogue is ggml's exact per-block scaling).
+- Prefill: Qwen2.5-7B 2.3k 1,440 -> 1,585 tok/s (llama.cpp pp2048 1,473); Qwen3.6-35B 3.1k ~2,300 -> 2,345, 33k
+  1,673 -> 1,681; Qwen3-30B 3.1k ~2,135 -> 2,172 (MoE prefill is mostly the expert kernels).
+
 ### forward_verify fault: a test buffer overrun (2026-11-04, user: "yes" to fixing it)
 
 The fault addresses had one shape (0x4c464462a000, 0x4e3ab022a000, 0x55f1e862a000, 0x4d1dc882a000, ...): page
