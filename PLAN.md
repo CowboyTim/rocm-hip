@@ -2976,6 +2976,7 @@ pass; Qwen3.6-35B Q4_0 the same figures as before) unchanged.
   operands while block j's WMMAs run (software pipelining, 173 VGPRs, no spills) was 10% slower (7,098-7,117 vs
   6,270-6,627 ms): reverted. Left: the epilogue's exact per-block scaling (an inexact variant would trade the
   "same products as ggml" rule), occupancy (32 KB of LDS: 2 workgroups per CU), bigger tiles (tried 2026-10-21).
+  Tabled (2026-11-04, user: "move on, table this for now").
 
 ### forward_verify fault: a test buffer overrun (2026-11-04, user: "yes" to fixing it)
 
