@@ -89,6 +89,8 @@ DEQUANT_VERIFY   = $(BINDIR)/dequant_verify
 MATVEC_VERIFY    = $(BINDIR)/matvec_verify
 # Phase 20 Step 3c: engine pieces vs the llama.cpp reference activations (ref_dump acts). Run from build/co.
 FORWARD_VERIFY   = $(BINDIR)/forward_verify
+# Perplexity on a text as llama.cpp's llama-perplexity computes it (tests/regress.sh); run from build/co
+PERPLEXITY       = $(BINDIR)/perplexity
 GEMMA4_VERIFY    = $(BINDIR)/gemma4_verify
 SEQ_VERIFY       = $(BINDIR)/seq_verify
 EMBED_VERIFY     = $(BINDIR)/embed_verify
@@ -292,6 +294,9 @@ $(FORWARD_VERIFY): $(TESTSDIR)/forward_verify.cpp $(QWEN_MODEL_LIB) $(INFERENCE_
 $(ATTN_DECODE_VERIFY): $(TESTSDIR)/attn_decode_verify.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/attention.co
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/attn_decode_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
 
+$(PERPLEXITY): $(TESTSDIR)/perplexity.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/matvec_q.co $(CODIR)/deltanet.co $(CODIR)/attention.co $(CODIR)/gpu_ops.co
+	$(CLANG) $(CXXFLAGS) -fopenmp -I. $(TESTSDIR)/perplexity.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -fopenmp -o $@
+
 $(GEMMA4_VERIFY): $(TESTSDIR)/gemma4_verify.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/matvec_q.co $(CODIR)/deltanet.co $(CODIR)/attention.co $(CODIR)/gpu_ops.co
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/gemma4_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
 
@@ -358,6 +363,15 @@ $(REF_DUMP_STOCK): tools/ref_oracle/ref_dump.cpp
 		-Wl,-rpath,$(abspath $(REF_STOCK_B)/bin) -lllama -lggml -lggml-base -lggml-cpu -fopenmp -lpthread -ldl \
 		-o $@
 
+# The regression suite (tests/regress.sh, tests/regress.tsv): `make regress` the quick tier (small models, minutes),
+# `make regress-full` all of it (Qwen3.6 / 3.8 and the other big models, KV cache types, long context)
+regress: all
+	tests/regress.sh --quick
+regress-full: all
+	tests/regress.sh
+
+.PHONY: regress regress-full
+
 clean:
 	rm -rf $(BUILDDIR) *.co
 
@@ -386,4 +400,4 @@ verify_minimal: $(TEST_TARGET)
 	./$(TEST_TARGET) 2>&1 || echo "Test exited with code $?"
 
 # Last, so that every variable above is defined when its prerequisites are expanded
-all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(ATTN_DECODE_VERIFY) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(GENERATE_VERIFY) $(GEMMA4_VERIFY) $(SEQ_VERIFY) $(EMBED_VERIFY) $(QWEN4EXP_VERIFY) $(MTP_VERIFY) $(E2E_TEST) $(MATVEC_BENCH) $(WMMA_LAYOUT_VERIFY) $(CAPI_SMOKE) $(STORE_VERIFY)
+all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(ATTN_DECODE_VERIFY) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(PERPLEXITY) $(GENERATE_VERIFY) $(GEMMA4_VERIFY) $(SEQ_VERIFY) $(EMBED_VERIFY) $(QWEN4EXP_VERIFY) $(MTP_VERIFY) $(E2E_TEST) $(MATVEC_BENCH) $(WMMA_LAYOUT_VERIFY) $(CAPI_SMOKE) $(STORE_VERIFY)

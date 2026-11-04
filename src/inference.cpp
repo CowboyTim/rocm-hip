@@ -1560,6 +1560,14 @@ int inference_prefill(inference_model_t* m, const int32_t* tokens, int n) {
     return 0;
 }
 
+int inference_prefill_logits(inference_model_t* m, const int32_t* tokens, int n, float* logits) {
+    if (!m || !m->qwen || !logits) { clear_error(); set_error("Invalid state or arguments"); return -1; }
+    qwen_model_set_all_logits(m->qwen, logits);
+    const int rc = inference_prefill(m, tokens, n);
+    qwen_model_set_all_logits(m->qwen, nullptr);
+    return rc;
+}
+
 int inference_decode_token(inference_model_t* m, int token_id, int* next_token_out) {
     clear_error();
     if (!next_token_out) { set_error("Invalid args"); return -1; }

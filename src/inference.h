@@ -138,6 +138,10 @@ int inference_n_past(const inference_model_t* model);
 // than n inference_decode_token calls, same results). Afterwards the logits are those of the last token.
 // Returns 0 on success, INFERENCE_ERR_CONTEXT_FULL if they don't fit, negative on error.
 int inference_prefill(inference_model_t* model, const int32_t* tokens, int n);
+// The same, and the logits after every one of the n tokens into logits ([n][vocab_size] floats): row i is the
+// distribution of the token after tokens[i] (perplexity; the LM head runs on all rows, one batched matmul per
+// prefill batch, so a smaller inference_set_prefill_batch keeps its scratch down: batch x vocab floats).
+int inference_prefill_logits(inference_model_t* model, const int32_t* tokens, int n, float* logits);
 
 // Single-token decode step: runs one forward pass for token_id at position n_past, appends it to the
 // KV cache and recurrent state, and returns the greedy next token. Use inference_get_logits (or

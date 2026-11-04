@@ -179,6 +179,12 @@ static int g_fail = 0;
 
 // FORWARD_VERIFY_LAYERS=1 prints the per-layer end-to-end diff
 static bool verbose_layers() { return getenv("FORWARD_VERIFY_LAYERS") != nullptr; }
+// The whole-model checks' cosine threshold: 0.99, or FORWARD_VERIFY_MIN_COS (a 4-bit MoE model drifts below 0.99
+// in its middle layers on some prompts; tests/regress.tsv sets it per model)
+static double min_cos() {
+    static const double c = getenv("FORWARD_VERIFY_MIN_COS") ? atof(getenv("FORWARD_VERIFY_MIN_COS")) : 0.99;
+    return c;
+}
 // FORWARD_VERIFY_TRACE=1: a sync and a line on stderr at each marked step (to find a step that faults)
 static void trace(const char* what) {
     static const bool on = getenv("FORWARD_VERIFY_TRACE") != nullptr;
@@ -1113,15 +1119,15 @@ int main(int argc, char** argv) {
             for (int r = 0; r < rows; ++r)
                 s.add(&ctx.l_out[((size_t)l * T + T - rows + r) * E], &a[(size_t)r * E], E);
             if (s.min_cos < worst) { worst = s.min_cos; worst_l = l; }
-            if (s.min_cos <= 0.99) ++n_bad;
+            if (s.min_cos <= min_cos()) ++n_bad;
             if (verbose_layers())
                 printf("    l_out-%-2d %-6s cos %.6f  max|d|/max|ref| %.2e\n", l,
                        m->layers[l].kind == LAYER_FULL_ATTN ? "attn" : "linear", s.min_cos, s.max_rel);
         }
         const bool ok = n_bad == 0;
         if (!ok) ++g_fail;
-        printf("  [%s] engine l_out, all %d layers x %d tokens   worst cos %.6f (layer %d), %d below 0.99\n",
-               ok ? "PASS" : "FAIL", m->n_layer, T, worst, worst_l, n_bad);
+        printf("  [%s] engine l_out, all %d layers x %d tokens   worst cos %.6f (layer %d), %d below %g\n",
+               ok ? "PASS" : "FAIL", m->n_layer, T, worst, worst_l, n_bad, min_cos());
 
         int best = 0;
         for (int i = 1; i < V; ++i)
@@ -1171,7 +1177,7 @@ int main(int argc, char** argv) {
         for (int i = 1; i < V; ++i)
             if (plogits[i] > plogits[pbest]) pbest = i;
         const bool exact = dmax == 0.0 && lmax == 0.0;
-        const bool pok = exact || (pcos >= 0.99 && rcos > 0.99 && pbest == next_token);
+        const bool pok = exact || (pcos >= min_cos() && rcos > min_cos() && pbest == next_token);
         if (!pok) ++g_fail;
         printf("  [%s] prefill (%d tokens, one call, max batch %d) vs token by token: %s max |d| l_out %.3g, logits %.3g;"
                " worst layer cos vs token by token %.6f, vs reference %.6f\n",

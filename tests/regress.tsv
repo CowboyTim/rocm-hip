@@ -1,0 +1,69 @@
+# tests/regress.tsv -- the regression suite's checks (tests/regress.sh). Tab-separated:
+# tier	kind	name	model	args	expect	tol
+# tier: quick (small models, minutes) or full. ppl: expect = the baseline perplexity on wikitext-2 test (llama.cpp's
+# llama-perplexity agrees within ~0.5%, K-quants ~1%: PLAN.md "Regression suite"), tol in percent; the chunk settings in
+# args. fv: args = the llama.cpp reference dump (tools/ref_oracle), expect = the minimum cosine. --update rewrites
+# the ppl baselines.
+# no model
+quick	test	attn_decode	-	attn_decode_verify --no-timing	-	-
+# small models
+quick	ppl	qwen25_05b	/data/hf/qwen-gguf/qwen2.5-0.5b-instruct-q8_0.gguf	--ctx 512 --chunks 20	16.8243	0.2
+quick	ppl	qwen3_06b	/models/Qwen3-0.6B-Q8_0.gguf	--ctx 512 --chunks 20	23.6061	0.2
+quick	ppl	llama32_1b	/data/hf/llama-gguf/Llama-3.2-1B-Instruct-Q8_0.gguf	--ctx 512 --chunks 20	15.6063	0.2
+quick	ppl	qwen35_4b	/models/Qwen3.5-4B-ROCMFP4.gguf	--ctx 512 --chunks 20	10.3231	0.2
+quick	ppl	qwen35_4b_q4kv	/models/Qwen3.5-4B-ROCMFP4.gguf	--ctx 512 --chunks 20 --kv q4_0	10.4103	0.2
+# every quant type (a 0.6B model: the 1-bit, TQ and IQ2_XXS files are broken at this size, in llama.cpp too)
+quick	ppl	qwen3_06b_q4_0	/data/q4_0/Qwen3-0.6B-Q4_0.gguf	--ctx 512 --chunks 20	26.7957	0.2
+quick	ppl	qwen3_06b_q4_1	/data/q4_0/Qwen3-0.6B-Q4_1.gguf	--ctx 512 --chunks 20	27.4798	0.2
+quick	ppl	qwen3_06b_q5_0	/data/q4_0/Qwen3-0.6B-Q5_0.gguf	--ctx 512 --chunks 20	25.1946	0.2
+quick	ppl	qwen3_06b_q5_1	/data/q4_0/Qwen3-0.6B-Q5_1.gguf	--ctx 512 --chunks 20	24.5875	0.2
+quick	ppl	qwen3_06b_q2_k	/data/q4_0/Qwen3-0.6B-Q2_K.gguf	--ctx 512 --chunks 20	220.5694	0.2
+quick	ppl	qwen3_06b_q3_k_s	/data/q4_0/Qwen3-0.6B-Q3_K_S.gguf	--ctx 512 --chunks 20	35.5985	0.2
+quick	ppl	qwen3_06b_iq4_nl	/data/q4_0/Qwen3-0.6B-IQ4_NL.gguf	--ctx 512 --chunks 20	26.1150	0.2
+quick	ppl	qwen3_06b_iq4_xs	/data/q4_0/Qwen3-0.6B-IQ4_XS.gguf	--ctx 512 --chunks 20	26.2208	0.2
+quick	ppl	qwen3_06b_iq3_s	/data/q4_0/Qwen3-0.6B-IQ3_S.gguf	--ctx 512 --chunks 20	31.7280	0.2
+quick	ppl	qwen3_06b_iq3_xxs	/data/q4_0/Qwen3-0.6B-IQ3_XXS.gguf	--ctx 512 --chunks 20	46.5139	0.2
+quick	ppl	qwen3_06b_iq2_s	/data/q4_0/Qwen3-0.6B-IQ2_S.gguf	--ctx 512 --chunks 20	89.5383	0.2
+quick	ppl	qwen3_06b_iq2_xs	/data/q4_0/Qwen3-0.6B-IQ2_XS.gguf	--ctx 512 --chunks 20	253.7155	0.2
+quick	ppl	qwen3_06b_iq2_xxs	/data/q4_0/Qwen3-0.6B-IQ2_XXS.gguf	--ctx 512 --chunks 20	1363.3598	0.2
+quick	ppl	qwen3_06b_iq1_s	/data/q4_0/Qwen3-0.6B-IQ1_S.gguf	--ctx 512 --chunks 20	24556.8511	0.2
+quick	ppl	qwen3_06b_iq1_m	/data/q4_0/Qwen3-0.6B-IQ1_M.gguf	--ctx 512 --chunks 20	5821.7986	0.2
+quick	ppl	qwen3_06b_tq1_0	/data/q4_0/Qwen3-0.6B-TQ1_0.gguf	--ctx 512 --chunks 20	22081427.4364	0.2
+quick	ppl	qwen3_06b_tq2_0	/data/q4_0/Qwen3-0.6B-TQ2_0.gguf	--ctx 512 --chunks 20	22081427.4364	0.2
+quick	ppl	qwen3_06b_mxfp4	/data/q4_0/Qwen3-0.6B-MXFP4.gguf	--ctx 512 --chunks 20	29.1163	0.2
+quick	ppl	qwen3_06b_nvfp4	/data/q4_0/Qwen3-0.6B-NVFP4.gguf	--ctx 512 --chunks 20	27.6044	0.2
+quick	ppl	qwen3_06b_nvfp4_scaled	/data/q4_0/Qwen3-0.6B-NVFP4-scaled.gguf	--ctx 512 --chunks 20	27.6044	0.2
+quick	fv	fv_qwen25_05b	/data/hf/qwen-gguf/qwen2.5-0.5b-instruct-q8_0.gguf	$REFS/ref_qwen25_05b	0.99	-
+quick	fv	fv_llama32_1b	/data/hf/llama-gguf/Llama-3.2-1B-Instruct-Q8_0.gguf	$REFS/ref_llama32_1b	0.99	-
+quick	mv	mv_qwen25_7b	/data/hf/qwen-gguf/qwen2.5-7b-instruct-q8_0-00001-of-00003.gguf	blk.0.ffn_down.weight blk.0.attn_q.weight	-	-
+quick	mv	mv_qwen36_35b	/models/Qwen3.6-35B-A3B-ROCMFP4.gguf	blk.0.ffn_down_exps.weight blk.3.attn_q.weight	-	-
+# Qwen3.6 / 3.8 (the main models), every KV cache type, and long context
+full	ppl	qwen36_35b	/models/Qwen3.6-35B-A3B-ROCMFP4.gguf	--ctx 512 --chunks 20	6.8527	0.2
+full	ppl	qwen36_35b_q8kv	/models/Qwen3.6-35B-A3B-ROCMFP4.gguf	--ctx 512 --chunks 20 --kv q8_0	6.8718	0.2
+full	ppl	qwen36_35b_q4kv	/models/Qwen3.6-35B-A3B-ROCMFP4.gguf	--ctx 512 --chunks 20 --kv q4_0	6.8778	0.2
+full	ppl	qwen36_35b_16k_q8kv	/models/Qwen3.6-35B-A3B-ROCMFP4.gguf	--ctx 16384 --chunks 2 --kv q8_0	4.8861	0.2
+full	ppl	qwen38_27b	/models/Qwen3.8-27B-Q4_0_ROCMFP4_FAST.gguf	--ctx 512 --chunks 10	7.6476	0.2
+full	ppl	qwen38_flash	/models/Qwen3.8-Flash-Next-Uncensored-Q4_0-ROCmFP4-FAST-00001-of-00003.gguf	--ctx 512 --chunks 10	2.1396	0.2
+# the 35B in every quant type present (2- to 5-bit, FP4 kinds)
+full	ppl	qwen36_35b_q4_0	/data/q4_0/Qwen3.6-35B-A3B-Q4_0.gguf	--ctx 512 --chunks 20	6.9540	0.2
+full	ppl	qwen36_35b_q4_1	/data/q4_0/Qwen3.6-35B-A3B-Q4_1.gguf	--ctx 512 --chunks 20	7.0628	0.2
+full	ppl	qwen36_35b_q5_0	/data/q4_0/Qwen3.6-35B-A3B-Q5_0.gguf	--ctx 512 --chunks 20	6.9174	0.2
+full	ppl	qwen36_35b_q5_1	/data/q4_0/Qwen3.6-35B-A3B-Q5_1.gguf	--ctx 512 --chunks 20	6.8667	0.2
+full	ppl	qwen36_35b_q2_k	/data/q4_0/Qwen3.6-35B-A3B-Q2_K.gguf	--ctx 512 --chunks 20	11.6507	0.2
+full	ppl	qwen36_35b_q3_k_s	/data/q4_0/Qwen3.6-35B-A3B-Q3_K_S.gguf	--ctx 512 --chunks 20	7.7855	0.2
+full	ppl	qwen36_35b_iq4_nl	/data/q4_0/Qwen3.6-35B-A3B-IQ4_NL.gguf	--ctx 512 --chunks 20	6.9755	0.2
+full	ppl	qwen36_35b_iq4_xs	/data/q4_0/Qwen3.6-35B-A3B-IQ4_XS.gguf	--ctx 512 --chunks 20	6.9709	0.2
+full	ppl	qwen36_35b_iq3_s	/data/q4_0/Qwen3.6-35B-A3B-IQ3_S.gguf	--ctx 512 --chunks 20	7.3364	0.2
+full	ppl	qwen36_35b_iq3_xxs	/data/q4_0/Qwen3.6-35B-A3B-IQ3_XXS.gguf	--ctx 512 --chunks 20	7.5269	0.2
+full	ppl	qwen36_35b_mxfp4	/data/q4_0/Qwen3.6-35B-A3B-MXFP4.gguf	--ctx 512 --chunks 20	6.9641	0.2
+full	ppl	qwen36_35b_nvfp4	/data/q4_0/Qwen3.6-35B-A3B-NVFP4.gguf	--ctx 512 --chunks 20	7.2451	0.2
+full	ppl	qwen36_35b_nvfp4_scaled	/data/q4_0/Qwen3.6-35B-A3B-NVFP4-scaled.gguf	--ctx 512 --chunks 20	7.2451	0.2
+full	ppl	qwen36_35b_nvfp4_fast	/data/q4_0/Qwen3.6-35B-A3B-NVFP4-Fast.gguf	--ctx 512 --chunks 20	6.7181	0.2
+full	fv	fv_qwen36_35b_q4_0	/data/q4_0/Qwen3.6-35B-A3B-Q4_0.gguf	$REFS/ref35_Q4_0	0.985	-
+# other architectures
+full	ppl	qwen25_7b	/data/hf/qwen-gguf/qwen2.5-7b-instruct-q8_0-00001-of-00003.gguf	--ctx 512 --chunks 20	7.5229	0.2
+full	ppl	qwen3_30b	/data/hf/qwen-gguf/Qwen3-30B-A3B-Q8_0.gguf	--ctx 512 --chunks 20	9.4331	0.2
+full	ppl	gemma4_26b	/models/gemma-4-26B-A4B-it-UD-Q8_K_XL.gguf	--ctx 512 --chunks 20	22178.7405	0.2
+full	ppl	nemotron3_nano	/models/Nemotron-3-Nano-30B-A3B-Q8_0.gguf	--ctx 512 --chunks 20	8.5443	0.2
+full	fv	fv_qwen3_30b	/data/hf/qwen-gguf/Qwen3-30B-A3B-Q8_0.gguf	$REFS/ref_qwen3_30b	0.99	-
+full	fv	fv_qwen25_7b	/data/hf/qwen-gguf/qwen2.5-7b-instruct-q8_0-00001-of-00003.gguf	$REFS/ref_qwen25_7b	0.99	-

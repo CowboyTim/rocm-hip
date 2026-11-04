@@ -40,6 +40,9 @@ int qwen_model_forward(qwen_model_t* model, int token_id, int pos, float* logits
 // instead of once per token. Same results as n qwen_model_forward calls. logits (optional, [vocab_size]) gets
 // the last token's logits; qwen_model_logits() has them too. Returns 0 on success.
 int qwen_model_prefill(qwen_model_t* model, const int* tokens, int n, int pos0, float* logits);
+// While logits is set (NULL: off), each forward pass also writes the logits of all its rows there, [rows][vocab],
+// advancing past them (inference_prefill_logits)
+void qwen_model_set_all_logits(qwen_model_t* model, float* logits);
 
 // Tests, hyper-connection models only: run layers [l0, l1) on n tokens from position 0 (fresh state), starting from
 // the residual streams res_in [n][n_hc * n_embd] instead of the embeddings; the layer callback sees each layer's

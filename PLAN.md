@@ -2978,6 +2978,47 @@ pass; Qwen3.6-35B Q4_0 the same figures as before) unchanged.
   "same products as ggml" rule), occupancy (32 KB of LDS: 2 workgroups per CU), bigger tiles (tried 2026-10-21).
   Tabled (2026-11-04, user: "move on, table this for now").
 
+### Regression suite: perplexity, quant types, KV cache types, long context (2026-11-04, user: "let's do 1, for regression tests")
+
+- **tests/perplexity.cpp** computes perplexity as llama.cpp's llama-perplexity does: chunks of --ctx tokens, BOS
+  per chunk when the tokenizer adds one, positions ctx/2 .. ctx-2 scored. The logits of every position come from
+  the new `inference_prefill_logits` (the model's `all_out`: `lm_head_all` runs one batched LM-head matvec
+  over the batch's rows, softcap included). The scored half is prefilled in pieces of 512, so a 16k context holds
+  512 x vocab floats; the softmax runs on the CPU cores (OpenMP). Text: wikitext-2 test
+  (/data/hf/wikitext/wikitext-2-raw/wiki.test.raw).
+- **Agreement with llama.cpp** (ctx 512, 20 chunks unless noted): Qwen2.5-0.5B 16.8242 vs 16.8228. Qwen3-0.6B
+  in 20 quant types: all usable types within 0.6% (Q8_0 23.6061 / 23.6459, Q4_0 26.7957 / 26.7474, IQ4_XS
+  26.2208 / 26.0642, MXFP4 29.1163 / 29.1347, NVFP4 27.6044 / 27.5998). The 1-bit, TQ and IQ2_XXS files are
+  broken at 0.6B in llama.cpp too (ppl 10^3 - 10^7).
+  Qwen3.6-35B (engine / llama.cpp):
+
+  | type | engine | llama.cpp | | type | engine | llama.cpp |
+  |---|---|---|---|---|---|---|
+  | Q5_1 | 6.8667 | 6.8967 | | IQ4_XS | 6.9709 | 6.9650 |
+  | Q5_0 | 6.9174 | 6.9160 | | IQ3_S | 7.3364 | 7.3476 |
+  | Q4_1 | 7.0628 | 7.0815 | | IQ3_XXS | 7.5269 | 7.4986 |
+  | Q4_0 | 6.9540 | 6.9559 | | MXFP4 | 6.9641 | 6.9608 |
+  | Q3_K_S | 7.7855 | 7.7381 | | NVFP4 | 7.2451 | 7.2448 |
+  | Q2_K | 11.6507 | 11.4959 | | NVFP4-scaled | 7.2451 | 7.2548 (fork, CPU) |
+  | IQ4_NL | 6.9755 | 6.9784 | | NVFP4-Fast | 6.7181 | 6.7301 |
+
+  ROCMFP4 (/models): 6.8527. Qwen3.8-Flash-Next first 3 chunks 2.7755 / 3.8238 / 3.0080 vs the fork's 2.7109 /
+  3.8054 / 3.0031 (10 chunks: 2.1396; it is that low). Gemma-4-26B-it gives ~22,000 in both engines (3 chunks:
+  18,853 vs upstream HIP 22,265): an instruct model on raw text, not a defect. A lead: the K-quants sit
+  highest (Q2_K +1.3% at 35B, +1.8% at 0.6B; Q3_K_S +0.6%); every other type is within 0.5%.
+- **KV cache types and long context (Qwen3.6-35B ROCMFP4):** 512 x 20: F16 6.8527, Q8_0 6.8718, Q4_0 6.8778;
+  16k x 2 chunks: F16 4.8886, Q8_0 4.8861, Q4_0 4.9104.
+- **tests/regress.sh + tests/regress.tsv** (`make regress`: quick tier, ~2 min; `make regress-full`: all, ~10
+  min with warm caches). Rows: ppl (baseline, tolerance 0.2%), fv (forward_verify vs a llama.cpp reference
+  dump with a minimum cosine, FORWARD_VERIFY_MIN_COS, new), mv (matvec_verify), test (a test binary;
+  attn_decode_verify --no-timing, new: 31 s instead of 96). Models not present are skipped. 57 rows: quick =
+  attn_decode, small models in every quant type, the Q4_0 KV cache, fv Qwen2.5-0.5B / Llama-3.2-1B, mv;
+  full = Qwen3.6-35B (every KV type, 16k, every quant type), Qwen3.8-27B / Flash, Qwen2.5-7B, Qwen3-30B, Gemma
+  4, Nemotron 3, fv 35B Q4_0 / 30B / 7B. The suite is deterministic (every value reproduces exactly); a change
+  meant to move numbers re-records with `--update` and says why in its commit.
+- The 35B Q4_0 forward_verify row uses min cos 0.985 (worst 0.988955 at layer 21: smooth drift, the next
+  token matches llama.cpp's; see the fault section below).
+
 ### forward_verify fault: a test buffer overrun (2026-11-04, user: "yes" to fixing it)
 
 The fault addresses had one shape (0x4c464462a000, 0x4e3ab022a000, 0x55f1e862a000, 0x4d1dc882a000, ...): page

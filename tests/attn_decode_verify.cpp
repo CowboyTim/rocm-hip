@@ -31,6 +31,8 @@ static T* alloc(size_t n) {
     return (T*)p;
 }
 
+static bool g_timing = true;
+
 static float h2f(uint16_t h) { return __half2float(*(__half*)&h); }
 
 struct Cfg {
@@ -40,9 +42,10 @@ struct Cfg {
 
 // Largest error of the decode tokens' outputs relative to the largest reference value; *us: one decode step
 static double run(const Cfg& c, int kq, double* us) {
-    const int D = c.D, n_q = c.n_q, n_kv = c.n_kv, n_ctx = 4096, rows = 1024, T0 = 512, TD = 3, L = 24;
-    std::mt19937 rng(1234);
-    std::normal_distribution<float> nd(0.0f, 1.0f);
+    const int D = c.D, n_q = c.n_q, n_kv = c.n_kv, n_ctx = 4096, rows = 1024, T0 = 512, TD = 3, L = g_timing ? 24 : 1;
+    // inputs uniform in [-1.7, 1.7) (about unit variance) from an LCG: std::normal_distribution took most of the run
+    uint32_t rng = 1234;
+    auto nd = [&]() { rng = rng * 1664525u + 1013904223u; return ((rng >> 8) * (1.0f / 16777216.0f) * 2.0f - 1.0f) * 1.7f; };
     const int kv_stride = kq ? n_kv * D * (kq == 1 ? 17 : 9) / 32 : n_kv * D;  // F16, Q8_0, Q4_0 rows
     const size_t layer = (size_t)n_ctx * kv_stride;
     __half* K = alloc<__half>(layer * L);
@@ -68,8 +71,8 @@ static double run(const Cfg& c, int kq, double* us) {
                                   out, &o, nullptr, 0));
     };
     auto fill = [&](int T) {
-        for (size_t i = 0; i < (size_t)T * n_q * D; ++i) qfull[i] = nd(rng);
-        for (size_t i = 0; i < (size_t)T * n_kv * D; ++i) k[i] = nd(rng), v[i] = nd(rng);
+        for (size_t i = 0; i < (size_t)T * n_q * D; ++i) qfull[i] = nd();
+        for (size_t i = 0; i < (size_t)T * n_kv * D; ++i) k[i] = nd(), v[i] = nd();
     };
     for (int p0 = 0; p0 < c.npos; p0 += T0) {
         const int T = std::min(T0, c.npos - p0);
@@ -118,6 +121,13 @@ static double run(const Cfg& c, int kq, double* us) {
         }
     }
     // Timing: the 1-token step over L copies of the cache (each step rewrites row npos of its copy)
+    *us = 0.0;
+    if (!g_timing) {
+        for (void* p : {(void*)K, (void*)V, (void*)qfull, (void*)k, (void*)v, (void*)qn, (void*)kn, (void*)q,
+                        (void*)out, (void*)pml, (void*)pacc})
+            CK(hipHostFree(p));
+        return maxerr / std::max(maxref, 1e-9);
+    }
     for (int l = 1; l < L; ++l) memcpy(K + l * layer, K, layer * 2), memcpy(V + l * layer, V, layer * 2);
     const int reps = 20 * L;
     hipEvent_t e0, e1;
@@ -141,7 +151,12 @@ static double run(const Cfg& c, int kq, double* us) {
 }
 
 int main(int argc, char** argv) {
-    const char* co = argc > 1 ? argv[1] : "attention.co";
+    // [attention.co] [--no-timing]: the checks only (tests/regress.sh), not the timing loops
+    const char* co = "attention.co";
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--no-timing")) g_timing = false;
+        else co = argv[i];
+    }
     const Cfg cfgs[] = {
         {"Qwen2.5-0.5B", 64, 14, 2, 2400, 0},  // ratio 7
         {"Qwen2.5-7B", 128, 28, 4, 2400, 0},

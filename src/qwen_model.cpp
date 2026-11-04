@@ -1059,6 +1059,39 @@ struct QwenModel {
     float* seqs_logits = nullptr;
     int seqs_logits_rows = 0;
 
+    // seqs_logits with room for n rows of logits
+    bool logits_rows(int n) {
+        if (n <= seqs_logits_rows) return true;
+        seqs_logits_mem.free();
+        size_t floats = (size_t)n * eng->vocab_size;
+        float** const pp[] = {&seqs_logits};
+        if (!seqs_logits_mem.alloc("/dev/shm/qwen_seqs_logits.bin", &floats, pp, 1)) {
+            seqs_logits_rows = 0;
+            qwen_set_error("no memory for %d rows of logits", n);
+            return false;
+        }
+        seqs_logits_rows = n;
+        return true;
+    }
+
+    // qwen_model_set_all_logits: while set, the LM head runs on every row of a forward pass (one batched matmul into
+    // seqs_logits) and their logits are copied here, row after row; the pointer advances past them (perplexity)
+    float* all_out = nullptr;
+    int lm_head_all(int T, float* logits_out) {
+        const int V = eng->vocab_size;
+        if (!logits_rows(T) || !matvec(eng->output, s.xn, seqs_logits, T, P_HEAD)) return -1;
+        if (eng->logit_softcap > 0.0f && !check(gpu_softcap(seqs_logits, T * V, eng->logit_softcap, 0), "softcap"))
+            return -1;
+        if (!sync()) return -1;
+        memcpy(all_out, seqs_logits, sizeof(float) * T * V);
+        all_out += (size_t)T * V;
+        memcpy(s.logits, seqs_logits + (size_t)(T - 1) * V, sizeof(float) * V);
+        if (logits_out) memcpy(logits_out, s.logits, sizeof(float) * V);
+        prof.lap(P_HEAD);
+        prof.tokens += T;
+        return 0;
+    }
+
     void use_seq(int r) {
         seq_select(bat[r].seq);
         eng->kvc = bat[r].kvc;
@@ -1080,17 +1113,7 @@ struct QwenModel {
                 return -1;
             }
         }
-        if (n > seqs_logits_rows) {
-            seqs_logits_mem.free();
-            size_t floats = (size_t)n * eng->vocab_size;
-            float** const pp[] = {&seqs_logits};
-            if (!seqs_logits_mem.alloc("/dev/shm/qwen_seqs_logits.bin", &floats, pp, 1)) {
-                seqs_logits_rows = 0;
-                qwen_set_error("batched decoding: no memory for %d rows of logits", n);
-                return -1;
-            }
-            seqs_logits_rows = n;
-        }
+        if (!logits_rows(n)) return -1;
         const int cur = cur_seq;
         inference_kv_cache_t *kvc = eng->kvc, *kvc_swa = eng->kvc_swa;
         bat = rows;
@@ -1121,6 +1144,7 @@ struct QwenModel {
         // a verify pass needs the logits of all its tokens (rows of spec_logits; the last one also in s.logits):
         // one launch on all rows where there is a few-token kernel for the head's type (each row as the
         // single-row launch gives it), else one per row
+        if (all_out) return lm_head_all(T, logits_out);
         const QuantWeight& H = eng->output;
         const int E = eng->n_embd, V = eng->vocab_size;
         if (spec_mid && T >= 2 && !head_q8 && q8_src == s.xn && qmatvec_q8_few_supported(H.type, E, T)) {
@@ -1421,7 +1445,7 @@ struct QwenModel {
         }
         if (eng->embed_pooling >= 0) return embed_pool(T) ? 0 : -1;
         if (bat ? lm_head_seqs(T) != 0 : lm_head(T, nullptr) != 0) return -1;
-        if (eng->logit_softcap > 0.0f &&
+        if (eng->logit_softcap > 0.0f && !all_out &&  // (lm_head_all caps its rows itself)
             (!check(gpu_softcap(bat ? seqs_logits : s.logits, bat ? T * V : V, eng->logit_softcap, 0), "softcap") ||
              !sync()))
             return -1;
@@ -2146,6 +2170,10 @@ void qwen_model_set_layer_callback(qwen_model_t* model, qwen_layer_cb cb, void* 
 int qwen_model_forward(qwen_model_t* model, int token_id, int pos, float* logits) {
     if (!model) return -1;
     return model->forward(&token_id, 1, pos, logits);
+}
+
+void qwen_model_set_all_logits(qwen_model_t* model, float* logits) {
+    if (model) model->all_out = logits;
 }
 
 int qwen_model_prefill(qwen_model_t* model, const int* tokens, int n, int pos0, float* logits) {
