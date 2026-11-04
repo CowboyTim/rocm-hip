@@ -2852,6 +2852,8 @@ scaling), which the engine only read as Gemma-4's "rotate the first pairs". Now:
   Qwen3.5-4B passes the full suite.
 - Left for `llama`: Mistral (llama arch, SentencePiece tokenizer) and Llama-3.1-8B untested (no files);
   llama 3.1's built-in tools (<|python_tag|> brave_search.call(...)) are not parsed.
+- The older architectures (gpt-oss, deepseek2, glm4, phi3, gemma2 / gemma3, Mistral) are tabled (2026-11-04,
+  user: "these are older archs, we can table those for now").
 
 ### Performance round: fewer passes over memory (2026-11-02, user: "do all of the performance ones in 1 go, mind to not copy around memory ... less copy on memory bandwidth helps for tg")
 
