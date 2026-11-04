@@ -58,6 +58,36 @@ static void free_seqs(inference_model_t* m);
 // lives inside them, and on UMA the registered host pointer is the device pointer, so nothing is copied. Tensors
 // only the CPU reads are left out: the token embeddings (when the LM head is not tied to them) and the PLE table
 // (qwen4exp: 35.8 GiB, 16 rows per token), so a model bigger than what may be pinned can still run.
+// How much of the (pinned, so resident) GGUF mapping is on 2 MB pages (gguf_mmap.cpp map_file), from
+// /proc/self/smaps: a file the page cache already held in 4 KB folios stays so until it is read again
+static void report_page_sizes(gguf_model_t* gguf) {
+    FILE* f = fopen("/proc/self/smaps", "r");
+    if (!f) return;
+    size_t rss = 0, pmd = 0, kb = 0;
+    bool in = false;
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        unsigned long lo, hi;
+        if (sscanf(line, "%lx-%lx ", &lo, &hi) == 2 && strchr(line, '-') < strchr(line, ' ')) {
+            in = false;
+            for (int i = 0; i < gguf_n_maps(gguf); ++i) {
+                size_t size = 0;
+                const uintptr_t b = (uintptr_t)gguf_map_at(gguf, i, &size);
+                in |= lo < b + size && hi > b;
+            }
+        } else if (in && sscanf(line, "Rss: %zu kB", &kb) == 1) {
+            rss += kb;
+        } else if (in && sscanf(line, "FilePmdMapped: %zu kB", &kb) == 1) {
+            pmd += kb;
+        }
+    }
+    fclose(f);
+    if (rss == 0) return;
+    INFER_LOG("[pin_model] %zu of %zu MB resident on 2 MB pages%s\n", pmd >> 10, rss >> 10,
+              pmd * 2 < rss ? " (the page cache holds the file in 4 KB pages: GGUF_RECACHE=1 reads it again as "
+                              "2 MB pages, faster for the GPU)" : "");
+}
+
 static bool pin_gguf(gguf_model_t* gguf, std::vector<const QuantWeight*> cpu_only_w,
                      std::vector<std::pair<void*, size_t>>& pinned, size_t& pinned_bytes, size_t& unpinned_bytes) {
     const size_t page = (size_t)sysconf(_SC_PAGESIZE);
@@ -69,6 +99,8 @@ static bool pin_gguf(gguf_model_t* gguf, std::vector<const QuantWeight*> cpu_onl
         if (e > b) skip.push_back({(const char*)b, (const char*)e});
     }
     std::sort(skip.begin(), skip.end());
+    // CPU-only tensors are read a row at a time, some from disk (the PLE table): 4 KB folios, not 2 MB reads
+    for (const auto& r : skip) (void)madvise((void*)r.first, (size_t)(r.second - r.first), MADV_NOHUGEPAGE);
     pinned_bytes = unpinned_bytes = 0;
     for (int i = 0; i < gguf_n_maps(gguf); ++i) {
         size_t size = 0;
@@ -96,6 +128,7 @@ static bool pin_gguf(gguf_model_t* gguf, std::vector<const QuantWeight*> cpu_onl
     }
     INFER_LOG("[pin_model] %d file(s): %zu MB registered, %zu MB left to the CPU\n", gguf_n_maps(gguf),
               pinned_bytes >> 20, unpinned_bytes >> 20);
+    report_page_sizes(gguf);
     return true;
 }
 

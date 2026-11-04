@@ -159,6 +159,29 @@ static char *read_string(const uint8_t **pp) {
  * Core: load and parse a single GGUF file via mmap()
  * --------------------------------------------------------------------------- */
 
+/* The file mapped read-only at a 2 MB-aligned address and advised MADV_HUGEPAGE, so that a cold read fills the page
+ * cache with 2 MB folios (ext4 has large folios since Linux 6.16; without the advice it reads 4 KB ones) and they
+ * are mapped as 2 MB pages: fewer TLB misses for the GPU, which reads the weights in place (Qwen3.5-27B BF16, a
+ * 161-token prompt: 208-228 -> 306 tok/s). Pages already cached as 4 KB folios stay so: GGUF_RECACHE=1 drops the
+ * file's cached pages first, to read them again (once; the engine logs how much is on 2 MB pages). GGUF_HUGE=0
+ * maps it plainly. */
+static void *map_file(int fd, size_t size) {
+    const char *env = getenv("GGUF_HUGE");
+    if (env && env[0] == '0') return mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (getenv("GGUF_RECACHE")) (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    const size_t A = 2u << 20, page = (size_t)sysconf(_SC_PAGESIZE);
+    const size_t len = (size + page - 1) / page * page;
+    void *r = mmap(NULL, len + A, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (r == MAP_FAILED) return mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    const uintptr_t a = ((uintptr_t)r + A - 1) & ~(uintptr_t)(A - 1);
+    void *m = mmap((void *)a, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
+    if (a > (uintptr_t)r) munmap(r, a - (uintptr_t)r);
+    if ((uintptr_t)r + len + A > a + len) munmap((void *)(a + len), (uintptr_t)r + len + A - (a + len));
+    if (m == MAP_FAILED) return mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    (void)madvise(m, size, MADV_HUGEPAGE);
+    return m;
+}
+
 static gguf_model_t *load_gguf(const char *path) {
     struct stat st;
     if (stat(path, &st) != 0) {
@@ -172,7 +195,7 @@ static gguf_model_t *load_gguf(const char *path) {
         return NULL;
     }
 
-    void *mapped = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    void *mapped = map_file(fd, (size_t)st.st_size);
     close(fd);
     if (mapped == MAP_FAILED) {
         INFER_LOG("gguf_mmap: mmap failed for '%s': %s\n", path, strerror(errno));

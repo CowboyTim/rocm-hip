@@ -2855,6 +2855,27 @@ scaling), which the engine only read as Gemma-4's "rotate the first pairs". Now:
 - The older architectures (gpt-oss, deepseek2, glm4, phi3, gemma2 / gemma3, Mistral) are tabled (2026-11-04,
   user: "these are older archs, we can table those for now").
 
+### Round "1, 2, 3, 4, 5 and 6" (2026-11-04: Q8_0 cache layout, Q8_0 prefill, Q4 KV, huge pages, launch gaps, MTP)
+
+- **1. Q8_0 decode attention: no change (measured).** The idea (scales at the row's end cost each head-row a
+  second cache line) does not hold: one scale line serves all KV heads of a row, which run at once. Tried on
+  attn_partial_gqa with a Q8_0 cache: 16-byte K pieces (16 int8 values), 4 V dims per thread (4-byte loads), and
+  128-position chunks (gqa*m kernels, ATTN_GQA_PW override), timed best of 5 over 24 cache copies (single runs
+  varied by up to 40%). The committed kernel (8-value K pieces, 2 V dims, 64 positions) is best or level
+  everywhere: 30B shape 32k Q8_0 321 vs F16 427 us, 35B shape 112k 1,365 vs 1,589 us (wider V loads need 8
+  position groups and 28 KB of LDS for their sums; 256-position chunks lose at 8-32k). Reverted. Pitfall
+  found again: `x = cond ? load : 0` can compile to a branch around the load (it serialized the loads).
+- **4. Weights on 2 MB pages (gguf_mmap.cpp map_file):** each GGUF is mapped 2 MB-aligned with MADV_HUGEPAGE,
+  so a cold read caches it in 2 MB folios (ext4 large folios, Linux 6.16+; without the advice a cold read made 4
+  KB ones: FileHugePages unchanged) and they are mapped as 2 MB pages (FilePmdMapped). What counts is the folio
+  size, not the CPU mapping: Qwen3.5-27B BF16 (ABC.gguf), 161-token prompt, prefill 208-228 -> 306 tok/s with
+  the cache in 2 MB folios, the plain mapping too; generation unchanged (4.2). Qwen3.8-27B ROCmFP4 ~320 either
+  way; staging (--stage) now gains nothing there either (324-334 vs 326-337). CPU-only tensors (PLE table,
+  untied token_embd) get MADV_NOHUGEPAGE (row reads from disk). A file the page cache already holds in 4 KB
+  folios stays so: after pinning the engine reads /proc/self/smaps and logs (INFERENCE_VERBOSE) how much is on 2
+  MB pages, with the hint GGUF_RECACHE=1 (drops the file's cached pages first: one re-read). Qwen3.8-Flash-Next
+  from cold: 63,358 of 63,787 MB on 2 MB pages, generation 35.2 tok/s (as before). GGUF_HUGE=0 maps plainly.
+
 ### Performance round: fewer passes over memory (2026-11-02, user: "do all of the performance ones in 1 go, mind to not copy around memory ... less copy on memory bandwidth helps for tg")
 
 UMA: every extra pass over activations or outputs takes memory bandwidth from token generation. A/B against the
