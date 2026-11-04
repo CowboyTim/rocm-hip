@@ -184,6 +184,8 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
     else if (D == 512 && ratio % 2 == 0) flash = g_flash512_h2s2[kq], nh = 2, ds = 2;
     else if (ratio % 2 == 0 && g_flash_h2t2[hi][kq]) flash = g_flash_h2t2[hi][kq], nh = 2, tt = 2;
     else if (g_flash_h1t4[hi][kq]) flash = g_flash_h1t4[hi][kq], nh = 1, tt = 4;
+    // waves per (head, token tile): attention.hip's ATTN_FLASH_SP (2 for D 256, which splits its dims over them)
+    const int sp = D == 256 && ds == 1 ? 2 : 1;
     if (T >= kFlashMinT && !g_flash_off && flash) {
         // Ranges of positions per token (each a multiple of 16 positions, at most ATTN_MAX_SPLITS): only as many
         // as it takes to give the GPU ~kFlashWgs workgroups. A prefill batch has enough without splitting, and
@@ -198,7 +200,7 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
         void* a_flash[] = {(void*)&qc, &K, &V, &kv_stride, &kv_shift, &kv_bstride, &pos0, &T, &n_q, &n_kv, &chunk,
                            &scale, &part_ml, &part_acc, &window};
         e = hipModuleLaunchKernel(flash, (unsigned)(n_q / nh * ds), (unsigned)((T + 16 * tt - 1) / (16 * tt)),
-                                  (unsigned)n_split, (unsigned)(32 * nh * tt), 1, 1, 0, stream, a_flash, nullptr);
+                                  (unsigned)n_split, (unsigned)(32 * nh * tt * sp), 1, 1, 0, stream, a_flash, nullptr);
         if (e != hipSuccess) return e;
         void* a_comb[] = {&part_ml, &part_acc, &n_split, &n_q, (void*)&qfull, &out, &o, &gated};
         return hipModuleLaunchKernel(g_combine[hi], (unsigned)NB, (unsigned)T, 1, 256, 1, 1, 0, stream, a_comb,

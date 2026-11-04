@@ -2930,8 +2930,26 @@ scaling), which the engine only read as Gemma-4's "rotate the first pairs". Now:
 - Qwen3-30B 31k prefill: F16 668 -> 770 tok/s, Q8_0 664-698 -> 731, Q4_0 624 -> 731 (now within 5% of F16).
   Greedy tokens identical to the previous kernels (48 tokens, 3.1k prompt) for Qwen3-30B and Qwen3.6-35B in
   F16 / Q8_0 / Q4_0, Gemma-4 26B (sliding window, D 256 / 512) F16 / Q8_0, Qwen2.5-0.5B (D 64).
-- Left: the D 256 kernels (Qwen3.5 / 3.6 / 3.8, Gemma-4) need fewer registers before a prefetch fits (acc over
-  128 output dims per wave); the 35B at 112k still prefills at ~720 tok/s.
+- **D 256 (2026-11-04, user: "Fix 1 & 2"; the KV block store already spares repeated prefixes, but first
+  loads, edits early in a file and misses still prefill).** Ablations of attn_flash_256_q8 (Qwen3.6-35B, 16k
+  prompt, 24.2 ms per call; each part removed in turn): P V -4.0 ms, Q K^T -3.9, staging -3.6, the softmax's
+  cross-lane reductions -7.4. So:
+  - **Softmax without __shfl_xor:** a row's 16 positions are one DPP row of lanes: its max by DPP row_xmask
+    moves (row16_max: ALU, where __shfl_xor is a ds_bpermute through the LDS crossbar); the row sums stay per
+    lane (rescaled with the row's alpha) and are added across the 16 lanes once after the last block. 24.2 ->
+    16.7 ms. Every flash kernel (not bit-identical to before: the sums' order).
+  - **SP = 2 waves per (head, token tile) for D 256** (ATTN_FLASH_SP; the host launches as many): each takes half
+    of Q K^T's dims (partial scores added through LDS, sS) and half the output dims, so 64 VGPRs of acc, room for
+    the prefetch and the wave's Q fragments in registers (QR), 8 waves per workgroup. Alone ~neutral (1,500 ->
+    1,457-1,499); with the DPP softmax it beats SP 1 (35B 33k Q8_0 1,673 vs 1,584, F16 1,571 vs 1,524).
+  - Prefill tok/s, before -> after: Qwen3.6-35B 33k Q8_0 ~1,500 -> 1,673, Q4_0 1,638, F16 1,571; 112k Q8_0
+    -> 936 (Q4_0 was 724); Qwen3-30B 31k F16 770 -> 870, Q8_0 731 -> 846, Q4_0 731 -> 837 (with the round
+    above: 668 / 664 / 624 at its start). Q4_0 now within 2% of Q8_0 on D 256 (item 2).
+  - Checks: forward_verify on Qwen3.6-35B Q4_0 (flash 40-token batch 6.36e-4 as before; the whole-model l_out
+    0.989 at layer 21 is pre-existing: the same with the previous kernels, token by token, no flash),
+    Qwen3-30B, Qwen2.5-0.5B pass; Gemma-4 (window, D 512) and Qwen3-0.6B (g2) summarize the 3k prompt
+    correctly; attn_decode_verify passes. forward_verify on the 35B faulted 3 of 5 runs (2 GB free, 112 GB
+    page cache) in its layer-0 router check, before any attention: the known intermittent fault (open item).
 - **Recaching.** inference_stage_info now says, when no staging was asked for, how much of the mapped GGUF is on
   2 MB pages ("not staged; 13240 of 13243 MB on 2 MB pages"); rocm-inference-server prints it at startup
   ("model memory: ...", with a hint when it is low) and takes --recache (GGUF_RECACHE=1 for the model's load:

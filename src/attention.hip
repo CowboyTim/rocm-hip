@@ -132,6 +132,25 @@ __device__ __forceinline__ float wave_sum(float v) {
     return v;
 }
 
+// v from the lane whose index differs in bits M (M < 16: within the lane's DPP row of 16): DPP row_xmask, an ALU
+// move instead of __shfl_xor's ds_bpermute through the LDS crossbar
+template <int M>
+__device__ __forceinline__ float row_xor(float v) {
+    return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x160 | M, 0xf, 0xf, false));
+}
+__device__ __forceinline__ float row16_max(float v) {
+    v = fmaxf(v, row_xor<1>(v));
+    v = fmaxf(v, row_xor<2>(v));
+    v = fmaxf(v, row_xor<4>(v));
+    return fmaxf(v, row_xor<8>(v));
+}
+__device__ __forceinline__ float row16_sum(float v) {
+    v += row_xor<1>(v);
+    v += row_xor<2>(v);
+    v += row_xor<4>(v);
+    return v + row_xor<8>(v);
+}
+
 __device__ __forceinline__ float wave_max(float v) {
     for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor(v, off, 32));
     return v;
@@ -406,12 +425,16 @@ typedef float v8f __attribute__((ext_vector_type(8)));
 // NG: KV heads per workgroup (its NH query heads read KV head h / (n_q / n_kv)): 1 when the ratio n_q / n_kv
 // is a multiple of NH, 2 for ratio 2 with NH 4 (Qwen3). Each block stages the NG KV heads' K / V rows; wave w
 // reads those of its own KV head (local index (w % NH) * NG / NH).
-template <int D, int NG, int NH, int TT, int DS, int KQ = 0>
+template <int D, int NG, int NH, int TT, int DS, int KQ = 0, int SP = 1>
 __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K, const __half* V, int kv_stride,
                                                 int kv_shift, long long kv_bstride, int pos0, int T, int n_q,
                                                 int n_kv_heads, int chunk, float scale, float* part_ml,
                                                 float* part_acc, int window) {
-    constexpr int NW = NH * TT, NTH = 32 * NW, DH = D / DS;  // waves, threads, output dims per workgroup
+    // SP waves per (head, token tile) split its D: the Q K^T sum (each a 1 / SP of the dims, added through LDS) and
+    // the output dims (DH / SP each), so a wave holds 1 / SP of the acc registers (D 256: 64 VGPRs, not 128 at the
+    // 256 limit), which leaves room for the prefetch and gives SP times the waves per workgroup
+    constexpr int NT = NH * TT, NW = NT * SP, NTH = 32 * NW, DH = D / DS;  // tiles, waves, threads, output dims
+    constexpr int DT = DH / 16 / SP;                                        // a wave's 16-dim output tiles
     // KG: K is not staged; each lane reads its position's K row from global memory (L2) as the WMMA operand,
     // which frees LDS for more workgroups per WGP (the Q rows then padded by 4 halves, not 8). D 512 (2 -> 3
     // workgroups per WGP: Gemma-4 prefill +5%) and D 128 (Qwen3-0.6B +9%); neutral for D 256, which keeps the
@@ -419,12 +442,14 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
     // rows inside its WMMA loop; staged, they are dequantized once (and prefetched)
     constexpr bool KG = DS > 1 || (D <= 128 && KQ == 0);
     constexpr int QP = D + (KG ? 4 : 8);  // padded LDS row of Q / K (halves)
-    __shared__ __attribute__((aligned(16))) _Float16 sQ[NW][FT][QP];
+    __shared__ __attribute__((aligned(16))) _Float16 sQ[NT][FT][QP];
     __shared__ __attribute__((aligned(16))) _Float16 sK[KG ? 1 : NG][KG ? 1 : FB][KG ? 8 : QP];
     __shared__ __attribute__((aligned(16))) _Float16 sVt[NG][DH][FB];  // V blocks transposed: [dim][position]
-    __shared__ __attribute__((aligned(16))) _Float16 sP[NW][FT][FB];
+    __shared__ __attribute__((aligned(16))) _Float16 sP[NT][FT][FB];
+    __shared__ float sS[SP > 1 ? NW : 1][8][32];  // the waves' partial scores (SP > 1)
     const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31, i = lane & 15, hi = lane >> 4;
-    const int hg = blockIdx.x / DS, ds = blockIdx.x % DS, hw = w % NH, tw = w / NH;
+    const int sp = w % SP, wt = w / SP;  // this wave's part of the tile's D, its tile
+    const int hg = blockIdx.x / DS, ds = blockIdx.x % DS, hw = wt % NH, tw = wt / NH;
     const int h = hg * NH + hw, g0 = hg * NH / (n_q / n_kv_heads), gw = hw * NG / NH;
     const int zt = blockIdx.y * FT * TT, z0 = zt + FT * tw, c = blockIdx.z, n_chunks = gridDim.z;
     const int zmax = min(T, zt + FT * TT) - 1;              // last token of the workgroup's tiles
@@ -433,21 +458,21 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
     const int lo0 = window > 0 ? pos0 + zt + 1 - window : 0;  // the first token's first position
     const int drow = KQ ? kvq_drow<KQ>(kv_stride) : 0;        // quantized rows: values per row
 
-    // This wave's Q rows (tokens z0 .. z0 + 15 of head h) to FP16; rows past T are zero
-    for (int idx = lane; idx < FT * D / 4; idx += 32) {
+    // This tile's Q rows (tokens z0 .. z0 + 15 of head h) to FP16 (its SP waves share them); rows past T are zero
+    for (int idx = lane + 32 * sp; idx < FT * D / 4; idx += 32 * SP) {
         const int rr = idx / (D / 4), d = 4 * (idx % (D / 4));
         float4 x = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         if (z0 + rr < T) x = *(const float4*)(q + ((size_t)(z0 + rr) * n_q + h) * D + d);
-        sQ[w][rr][d] = (_Float16)x.x, sQ[w][rr][d + 1] = (_Float16)x.y;
-        sQ[w][rr][d + 2] = (_Float16)x.z, sQ[w][rr][d + 3] = (_Float16)x.w;
+        sQ[wt][rr][d] = (_Float16)x.x, sQ[wt][rr][d + 1] = (_Float16)x.y;
+        sQ[wt][rr][d + 2] = (_Float16)x.z, sQ[wt][rr][d + 3] = (_Float16)x.w;
     }
 
     float m[8], l[8];
-    v8f acc[DH / 16];
+    v8f acc[DT];
 #pragma unroll
     for (int r = 0; r < 8; ++r) m[r] = -INFINITY, l[r] = 0.0f;
 #pragma unroll
-    for (int dt = 0; dt < DH / 16; ++dt) acc[dt] = (v8f){};
+    for (int dt = 0; dt < DT; ++dt) acc[dt] = (v8f){};
 
     // Stage the NG KV heads' K blocks (16 positions x D dims; 8 halves per uint4, consecutive lanes on consecutive
     // dims) and V blocks transposed (16 x the DH dims of slice ds): a thread takes positions 2 pp and 2 pp + 1 of 8
@@ -459,7 +484,7 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
     // load in a branch is waited for before the branch ends, which would chain them.
     // PF: prefetch block b + 1 during block b. Not with DH > 128: those kernels hold 128 VGPRs of acc and are at the
     // 256 limit already (the prefetch registers spilled: Qwen3.6-35B prefill -5%); Qwen3-30B (D 128) +17% at 31k
-    constexpr bool PF = DH <= 128;
+    constexpr bool PF = DH / SP <= 128;
     constexpr int NKF = KG ? 0 : NG * FB * D / 8 / NTH;                  // K uint4 per thread per block
     constexpr int NVF = (NG * (FB / 2) * (DH / 8) + NTH - 1) / NTH;      // V position pairs per thread per block
     const int plast = pos0 + zmax;
@@ -510,6 +535,16 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
     // the first block any token's window reaches (the ones before it contribute nothing)
     const int b0 = lo0 >= c * chunk + FB ? (lo0 - c * chunk - FB) / FB + 1 : 0;
     if (PF && b0 < nb) fetch(c * chunk + b0 * FB);
+    // QR: the wave's Q fragments held in registers (SP > 1: its 1 / SP of D, 64 VGPRs for D 256) instead of read from
+    // LDS for every block
+    constexpr bool QR = SP > 1;
+    constexpr int NQ = D / 16 / SP;
+    v16h qa[QR ? NQ : 1];
+    if constexpr (QR) {
+        __syncthreads();  // sQ written
+#pragma unroll
+        for (int k = 0; k < NQ; ++k) qa[k] = *(const v16h*)&sQ[wt][i][(sp * NQ + k) * 16];
+    }
 
 #pragma unroll 1
     for (int b = b0; b < nb; ++b) {
@@ -526,8 +561,8 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
             const bool kin = P0 + i <= pos0 + zmax;
             const __half* krow = K + kv_row(kin ? P0 + i : 0, kv_stride, kv_shift, kv_bstride);
 #pragma unroll
-            for (int kk = 0; kk < D / 16; ++kk) {
-                const v16h a = *(const v16h*)&sQ[w][i][kk * 16];
+            for (int kk = sp * (D / 16 / SP); kk < (sp + 1) * (D / 16 / SP); ++kk) {
+                const v16h a = QR ? qa[QR ? kk - sp * NQ : 0] : *(const v16h*)&sQ[wt][i][kk * 16];
                 v16h bk = {};
                 const int e = (g0 + gw) * D + 16 * kk;
                 uint4 lo = kv_load8<KQ>(krow, e, drow), hi8 = kv_load8<KQ>(krow, e + 8, drow);  // (unconditional)
@@ -539,64 +574,74 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
             }
         } else {
 #pragma unroll
-            for (int kk = 0; kk < D / 16; ++kk) {
-                const v16h a = *(const v16h*)&sQ[w][i][kk * 16];
+            for (int kk = sp * (D / 16 / SP); kk < (sp + 1) * (D / 16 / SP); ++kk) {
+                const v16h a = QR ? qa[QR ? kk - sp * NQ : 0] : *(const v16h*)&sQ[wt][i][kk * 16];
                 const v16h bk = *(const v16h*)&sK[gw][i][kk * 16];
                 s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bk, s);
             }
         }
+        if constexpr (SP > 1) {  // the tile's waves add their parts, in the same order in each
+#pragma unroll
+            for (int r = 0; r < 8; ++r) sS[w][r][lane] = s[r];
+            __syncthreads();
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                float t = 0.0f;
+#pragma unroll
+                for (int j = 0; j < SP; ++j) t += sS[wt * SP + j][r][lane];
+                s[r] = t;
+            }
+        }
 
-        // Online softmax; this lane holds position P0 + i of token rows 2 r + hi
+        // Online softmax; this lane holds position P0 + i of token rows 2 r + hi (a row's 16 positions are one DPP
+        // row of lanes: its max by DPP moves). l[r] is this lane's part of the row's sum, rescaled with the row
+        // (alpha is the same in its 16 lanes) and added up across them once, after the last block
         float alpha[8];
         bool rescale = false;
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             const int pz = pos0 + z0 + 2 * r + hi, pp = P0 + i;
             const float sv = pp <= pz && (window <= 0 || pp > pz - window) ? s[r] * scale : -INFINITY;
-            float mx = sv;
-#pragma unroll
-            for (int off = 1; off < 16; off <<= 1) mx = fmaxf(mx, __shfl_xor(mx, off, 32));
-            const float mn = fmaxf(m[r], mx);
+            const float mn = fmaxf(m[r], row16_max(sv));
             alpha[r] = mn == -INFINITY || mn == m[r] ? 1.0f : __expf(m[r] - mn);
             rescale |= alpha[r] != 1.0f;
             const float p = sv == -INFINITY ? 0.0f : __expf(sv - mn);
-            float ps = p;
-#pragma unroll
-            for (int off = 1; off < 16; off <<= 1) ps += __shfl_xor(ps, off, 32);
-            l[r] = l[r] * alpha[r] + ps;
+            l[r] = l[r] * alpha[r] + p;
             m[r] = mn;
-            sP[w][2 * r + hi][i] = (_Float16)p;
+            sP[wt][2 * r + hi][i] = (_Float16)p;  // (the tile's SP waves write the same values)
         }
         // The previous acc rescaled by exp(m_old - m_new): skipped (wave-uniform) when no row of the wave has a
         // new maximum, as in most blocks once the running maxima settle; the same values as multiplying by 1.0
         if (__ballot(rescale) != 0) {
 #pragma unroll
-            for (int dt = 0; dt < DH / 16; ++dt)
+            for (int dt = 0; dt < DT; ++dt)
 #pragma unroll
                 for (int r = 0; r < 8; ++r) acc[dt][r] *= alpha[r];
         }
         __syncthreads();  // sP rows are read by other lanes
 
         // acc += P V
-        const v16h a = *(const v16h*)&sP[w][i][0];
+        const v16h a = *(const v16h*)&sP[wt][i][0];
 #pragma unroll
-        for (int dt = 0; dt < DH / 16; ++dt) {
-            const v16h bv = *(const v16h*)&sVt[gw][dt * 16 + i][0];
+        for (int dt = 0; dt < DT; ++dt) {
+            const v16h bv = *(const v16h*)&sVt[gw][(sp * DT + dt) * 16 + i][0];
             acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bv, acc[dt]);
         }
     }
 
 #pragma unroll
+    for (int r = 0; r < 8; ++r) l[r] = row16_sum(l[r]);  // (all lanes, before any leaves the loop below)
+#pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int z = z0 + 2 * r + hi;
         if (z >= T) continue;
         const size_t pc = ((size_t)z * n_q + h) * n_chunks + c;
-        if (i == 0 && ds == 0) {
+        if (i == 0 && ds == 0 && sp == 0) {
             part_ml[2 * pc] = m[r];
             part_ml[2 * pc + 1] = l[r];
         }
 #pragma unroll
-        for (int dt = 0; dt < DH / 16; ++dt) part_acc[pc * D + ds * DH + dt * 16 + i] = acc[dt][r];
+        for (int dt = 0; dt < DT; ++dt) part_acc[pc * D + ds * DH + (sp * DT + dt) * 16 + i] = acc[dt][r];
     }
 }
 
@@ -938,14 +983,17 @@ ATTN_GQA_KERNELS(256)
 // attn_flash_<D> (ratio n_q / n_kv a multiple of 4: 4 heads x 16 tokens), attn_flash_<D>_g2 (ratio 2: 4 heads of
 // two KV heads), attn_flash_<D>_h2t2 (ratio a multiple of 2: 2 heads x 32 tokens), attn_flash_<D>_h2s2 (2 heads
 // x 16 tokens, D split over 2 workgroups)
-// (each also as NAME_q8 for a Q8_0 KV cache)
+// (each also as NAME_q8 / NAME_q4 for a Q8_0 / Q4_0 KV cache). ATTN_FLASH_SP: waves per (head, token tile), 2 for
+// D 256 (the host's attention.cpp launches as many: attn_flash_sp)
+#define ATTN_FLASH_SP(D, DS) ((D) == 256 && (DS) == 1 ? 2 : 1)
 #define ATTN_FLASH_KERNEL_KQ(NAME, D, NG, NH, TT, DS, KQ)                                                     \
-    extern "C" __global__ void __launch_bounds__(32 * (NH) * (TT))                                           \
+    extern "C" __global__ void __launch_bounds__(32 * (NH) * (TT) * ATTN_FLASH_SP(D, DS))                    \
         NAME(const float* q, const __half* K, const __half* V, int kv_stride, int kv_shift, long long kv_bstride, \
              int pos0, int T, int n_q, int n_kv_heads, int chunk, float scale, float* part_ml, float* part_acc,  \
              int window) {                                                                                   \
-        attn_flash_body<D, NG, NH, TT, DS, KQ>(q, K, V, kv_stride, kv_shift, kv_bstride, pos0, T, n_q,       \
-                                               n_kv_heads, chunk, scale, part_ml, part_acc, window);         \
+        attn_flash_body<D, NG, NH, TT, DS, KQ, ATTN_FLASH_SP(D, DS)>(q, K, V, kv_stride, kv_shift, kv_bstride, \
+                                                                     pos0, T, n_q, n_kv_heads, chunk, scale, \
+                                                                     part_ml, part_acc, window);             \
     }
 #define ATTN_FLASH_KERNEL_NAMED(NAME, D, NG, NH, TT, DS)                                                      \
     ATTN_FLASH_KERNEL_KQ(NAME, D, NG, NH, TT, DS, 0)                                                          \
