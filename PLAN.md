@@ -2967,6 +2967,16 @@ pass; Qwen3.6-35B Q4_0 the same figures as before) unchanged.
 - Prefill: Qwen2.5-7B 2.3k 1,440 -> 1,585 tok/s (llama.cpp pp2048 1,473); Qwen3.6-35B 3.1k ~2,300 -> 2,345, 33k
   1,673 -> 1,681; Qwen3-30B 3.1k ~2,135 -> 2,172 (MoE prefill is mostly the expert kernels).
 
+- **For Qwen3.6 / 3.8 (ROCmFP4_FAST weights) the grid order changes nothing** (A/B against the previous commit,
+  2 runs each: Qwen3.8-27B 375-401 vs 387-389 tok/s, Flash-Next 897-900 vs 856-883, i.e. noise): at ~4.5 bits per
+  weight the kernel is not bound by its weight reads. matmul_wmma_q4_0_rocmfp4_fast is 82% of Qwen3.8-27B's
+  prefill (3.1k prompt, 6,291 ms, ~26 TOPS of ~55). Its ablations: the WMMAs -2,275 ms (36%), the epilogue
+  (ggml's per-block e_w * d_x scaling) -1,188 (19%), the next chunk's loads -578 (9%), the 4-bit decode -361
+  (6%). The WMMA loop waits for its LDS operand loads (s_waitcnt lgkmcnt before the WMMAs); reading block j + 1's
+  operands while block j's WMMAs run (software pipelining, 173 VGPRs, no spills) was 10% slower (7,098-7,117 vs
+  6,270-6,627 ms): reverted. Left: the epilogue's exact per-block scaling (an inexact variant would trade the
+  "same products as ggml" rule), occupancy (32 KB of LDS: 2 workgroups per CU), bigger tiles (tried 2026-10-21).
+
 ### forward_verify fault: a test buffer overrun (2026-11-04, user: "yes" to fixing it)
 
 The fault addresses had one shape (0x4c464462a000, 0x4e3ab022a000, 0x55f1e862a000, 0x4d1dc882a000, ...): page
