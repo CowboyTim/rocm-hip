@@ -2902,6 +2902,18 @@ scaling), which the engine only read as Gemma-4's "rotate the first pairs". Now:
   (the CPU runs ahead), so a graph would save ~50 us of 16 ms per token, and its per-token parameter updates
   (positions, chunk grids) cost more code than that. Only fewer kernels would help (~120 small ones per token:
   at most ~4%); merging them was assessed as not worth it (6d, 2026-10-21) and stays so.
+- **6. MTP (Qwen3.8-Flash-Next + its head): both items measured, neither kept.**
+  - *Draft cost:* the head's LM head is ROCMFP4_FAST (248,320 x 2560, 338 MB), 1.57 ms per draft at ~215 GB/s,
+    already the bandwidth (an int8 copy would be twice the bytes). Tried a vocabulary shortlist: a compact copy
+    of the head's rows for the lowest 32,768 ids plus every token the head has seen (added as they come;
+    MTP_FULL_VOCAB=1 for A/B), argmax over it. Output identical (drafts are verified); tok/s quicksort 51.0 /
+    50.8 -> 53.3 / 52.0, story 41.3 / 41.5 -> 43.4 / 43.5, but Chinese 39.2 / 40.9 -> 31.0 / 34.4 (65,536 ids:
+    33.2 / 33.7): Chinese tokens are spread over the whole vocabulary. +2-5% here, -18% there: reverted (an
+    acceptance-driven switch would be the way, if ever).
+  - *Experts shared by the verified tokens:* rocprofv3 on 128 tokens with the head: the expert gate+up launch
+    takes 234 us for 3 tokens vs ~94 us for one (20 slots): 2.5x, not 3x, since the L2 / MALL already serves the
+    shared experts' second reads. Exact sharing would give ~2.24x (2 tokens share ~3.8 of 10 experts): ~10% of
+    the verify passes' expert time, ~3% of generation, for a new kernel family. Not done.
 
 ### Performance round: fewer passes over memory (2026-11-02, user: "do all of the performance ones in 1 go, mind to not copy around memory ... less copy on memory bandwidth helps for tg")
 
