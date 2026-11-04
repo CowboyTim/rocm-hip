@@ -2875,6 +2875,12 @@ scaling), which the engine only read as Gemma-4's "rotate the first pairs". Now:
   folios stays so: after pinning the engine reads /proc/self/smaps and logs (INFERENCE_VERBOSE) how much is on 2
   MB pages, with the hint GGUF_RECACHE=1 (drops the file's cached pages first: one re-read). Qwen3.8-Flash-Next
   from cold: 63,358 of 63,787 MB on 2 MB pages, generation 35.2 tok/s (as before). GGUF_HUGE=0 maps plainly.
+- **2. Q8_0 cache prefill: on par with F16 now.** attn_flash_128_q8 took 10.8 ms per call vs 7.97 for F16 (Qwen3-30B,
+  7.6k prompt): its staging dequantized each value as (float)q * scale -> half (~24 ALU ops per 8 values).
+  kv_load8<true> now does it in packed halves: byte q ^ 0x80 under the exponent of 1024 (v_perm) is the half 1152
+  + q, so (that - 1152) * scale (half2 ops) is the same rounding of the same exact product (greedy tokens with a
+  Q8_0 cache identical over 96 tokens). Prefill Qwen3-30B 7.6k 1,394-1,435 -> 1,477-1,557 tok/s (F16 1,506-1,552),
+  31k 566 -> 664 (F16 668); generation at 31k Q8_0 29.9 vs F16 27.7.
 
 ### Performance round: fewer passes over memory (2026-11-02, user: "do all of the performance ones in 1 go, mind to not copy around memory ... less copy on memory bandwidth helps for tg")
 

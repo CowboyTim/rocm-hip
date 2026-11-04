@@ -52,14 +52,22 @@ __device__ __forceinline__ uint4 kv_load8(const __half* row, int e, int drow) {
     if constexpr (!KQ) {
         return *(const uint4*)(row + e);
     } else {
+        // packed: byte q (as q + 128) under the exponent of 1024 is the half 1024 + 128 + q, so (that - 1152) *
+        // scale is q * scale rounded once, as (float)q * scale then to half (both products are exact)
         const int8_t* b = (const int8_t*)row;
         const uint2 q = *(const uint2*)(b + e);
-        const float sc = __half2float(((const __half*)(b + drow))[e / 32]);
-        const int8_t* qv = (const int8_t*)&q;
+        const __half2 sc = __half2half2(((const __half*)(b + drow))[e / 32]);
+        const __half2 bias = __float2half2_rn(1152.0f);
+        const uint32_t w[2] = {q.x ^ 0x80808080u, q.y ^ 0x80808080u};
         uint4 r;
-        __half* h = (__half*)&r;
+        __half2* h = (__half2*)&r;
 #pragma unroll
-        for (int i = 0; i < 8; ++i) h[i] = __float2half((float)qv[i] * sc);
+        for (int k = 0; k < 2; ++k) {
+            const uint32_t lo = __builtin_amdgcn_perm(0x64646464u, w[k], 0x04010400u);  // bytes 0, 1
+            const uint32_t hi = __builtin_amdgcn_perm(0x64646464u, w[k], 0x04030402u);  // bytes 2, 3
+            h[2 * k] = __hmul2(__hsub2(*(const __half2*)&lo, bias), sc);
+            h[2 * k + 1] = __hmul2(__hsub2(*(const __half2*)&hi, bias), sc);
+        }
         return r;
     }
 }
