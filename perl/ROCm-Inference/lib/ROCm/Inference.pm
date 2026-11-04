@@ -604,7 +604,10 @@ Qwen3.8's PLE table) mapped from the GGUF on disk. On 2 MB pages the model is pi
 stays: a later load of the same files maps it again without copying (it is named after the files' identity and
 the tensors staged; delete F<$dir/rocm-inference-stage-*.bin> to free it). Without room in C<$dir> or in memory the
 GGUF is mapped directly, as without the option. C<stage_info($m)> says which: C<"staged PATH (N MB)">,
-C<"reused PATH (N MB)"> or C<"not staged: WHY"> (C<""> when not asked for).
+C<"reused PATH (N MB)"> or C<"not staged: WHY">. When not asked for: how much of the mapped GGUF is on 2 MB pages,
+C<"not staged; X of Y MB on 2 MB pages"> (the GGUF is mapped for them; a file the page cache holds in 4 KB pages
+stays so until it is read again: C<$ENV{GGUF_RECACHE} = 1> before C<load_model> does that, or the server's
+C<--recache>).
 
 =item kv_cache_init($m, $n_ctx)
 

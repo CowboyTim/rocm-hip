@@ -16,7 +16,7 @@ use Web::Route;
 
 my %o = (listen => './rocm-inference.sock', max_tokens => 0);
 GetOptions(\%o, 'model=s', 'listen=s', 'mode=s', 'ctx=i', 'name=s', 'draft=s', 'store=s', 'max_tokens=i',
-           'swa-ring=i', 'stage=s', 'kv-type=s', 'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s',
+           'swa-ring=i', 'stage=s', 'recache', 'kv-type=s', 'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s',
            'thinking!', 'log!', 'help') or pod2usage(2);
 pod2usage(-verbose => 2, -exitval => 0) if $o{help};
 pod2usage("--model is required\n") unless $o{model};
@@ -25,8 +25,17 @@ ROCm::Inference::_require_minijinja()
 
 my $name = $o{name} // basename($o{model}) =~ s/(?:-\d{5}-of-\d{5})?\.gguf\z//r;
 print STDERR "loading $o{model} ...\n";
+# --recache: drop the model file's cached pages first, so that it is read again as 2 MB pages (the GPU reads the
+# weights in place: fewer TLB misses; it pays where the page cache holds the file in 4 KB pages)
+$ENV{GGUF_RECACHE} = 1 if $o{recache};
 my $m = load_model($o{model}, { stage => $o{stage} }) // die "cannot load $o{model}: " . last_error() . "\n";
-print STDERR "stage: ", stage_info($m), "\n" if $o{stage};
+delete $ENV{GGUF_RECACHE};
+my $pages = stage_info($m);
+print STDERR "stage: $pages\n" if $o{stage};
+if (!$o{stage} && $pages =~ /(\d+) of (\d+) MB on 2 MB pages/) {
+    print STDERR "model memory: $1 of $2 MB on 2 MB pages", ($1 * 2 < $2 ? " (--recache reads it again as 2 MB pages)" : ''),
+        "\n";
+}
 # a block store needs every layer's history: no sliding-window ring unless asked for
 my $ring = $o{'swa-ring'} // ($o{store} ? 0 : -1);
 set_swa_ring($m, $ring);
@@ -452,6 +461,13 @@ conversation's KV cache is this long: C<--parallel> N takes N times the memory.)
 
 Copy the model's GPU tensors to a stage file in F<dir> (a huge-page tmpfs such as F</dev/shm>) and run from there
 (C<load_model>'s C<stage>): later starts reuse it and pin in a fraction of the time.
+
+=item --recache
+
+Read the model file again into the page cache before using it: dropped first, then read as 2 MB pages, which the
+GPU reads the weights through with fewer TLB misses (a 27B BF16 model's short prompts +35-45%). Worth it once when
+the startup line C<model memory: X of Y MB on 2 MB pages> shows few (the file was cached as 4 KB pages, e.g. read
+by another program first); the pages stay cached that way for later starts. Costs one read of the file from disk.
 
 =item --kv-type auto|f16|q8_0|q4_0
 

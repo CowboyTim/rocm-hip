@@ -59,16 +59,36 @@ __device__ __forceinline__ __half2 kvq_pair(uint32_t w, uint32_t sel, __half2 bi
     return __hmul2(__hsub2(*(const __half2*)&h, bias), sc);
 }
 
-// 8 consecutive values e .. e + 7 (e % 8 == 0) of a cache row as fp16, in a uint4 (KQ: dequantized)
+// 8 consecutive values e .. e + 7 (e % 8 == 0) of a cache row in two steps: kv_fetch loads the raw words (and the
+// block's scale) without using them, so that the loads of a whole block can be in flight together (a dequantizing
+// load would wait for its data where it stands); kv_unpack turns them into 8 fp16 values in a uint4
+struct KvRaw {
+    uint4 u;   // F16: the values; Q8_0: u.x, u.y the 8 int8 values; Q4_0: u.x the 8 nibbles
+    __half s;  // the block's scale (quantized)
+};
 template <int KQ>
-__device__ __forceinline__ uint4 kv_load8(const __half* row, int e, int drow) {
+__device__ __forceinline__ KvRaw kv_fetch(const __half* row, int e, int drow) {
+    KvRaw r;
     if constexpr (KQ == 0) {
-        return *(const uint4*)(row + e);
+        r.u = *(const uint4*)(row + e);
+    } else if constexpr (KQ == 2) {
+        r.u.x = *(const uint32_t*)((const uint8_t*)row + e / 2);
+        r.s = kvq_scales<2>(row, drow)[e / 32];
+    } else {
+        const uint2 q = *(const uint2*)((const int8_t*)row + e);
+        r.u.x = q.x, r.u.y = q.y;
+        r.s = kvq_scales<1>(row, drow)[e / 32];
+    }
+    return r;
+}
+template <int KQ>
+__device__ __forceinline__ uint4 kv_unpack(const KvRaw& raw) {
+    if constexpr (KQ == 0) {
+        return raw.u;
     } else if constexpr (KQ == 2) {  // nibble n under the exponent of 1024 is the half 1024 + n: (that - 1032) * scale
-        const uint32_t w = *(const uint32_t*)((const uint8_t*)row + e / 2);
-        const __half2 sc = __half2half2(kvq_scales<2>(row, drow)[e / 32]);
+        const __half2 sc = __half2half2(raw.s);
         const __half2 bias = __float2half2_rn(1032.0f);
-        const uint32_t lo = w & 0x0F0F0F0Fu, hi = (w >> 4) & 0x0F0F0F0Fu;  // values e .. e + 3, e + 4 .. e + 7
+        const uint32_t lo = raw.u.x & 0x0F0F0F0Fu, hi = (raw.u.x >> 4) & 0x0F0F0F0Fu;  // values 0 .. 3, 4 .. 7
         uint4 r;
         __half2* h = (__half2*)&r;
         h[0] = kvq_pair(lo, 0x04010400u, bias, sc), h[1] = kvq_pair(lo, 0x04030402u, bias, sc);
@@ -77,11 +97,9 @@ __device__ __forceinline__ uint4 kv_load8(const __half* row, int e, int drow) {
     } else {
         // packed: byte q (as q + 128) under the exponent of 1024 is the half 1024 + 128 + q, so (that - 1152) *
         // scale is q * scale rounded once, as (float)q * scale then to half (both products are exact)
-        const int8_t* b = (const int8_t*)row;
-        const uint2 q = *(const uint2*)(b + e);
-        const __half2 sc = __half2half2(kvq_scales<1>(row, drow)[e / 32]);
+        const __half2 sc = __half2half2(raw.s);
         const __half2 bias = __float2half2_rn(1152.0f);
-        const uint32_t w[2] = {q.x ^ 0x80808080u, q.y ^ 0x80808080u};
+        const uint32_t w[2] = {raw.u.x ^ 0x80808080u, raw.u.y ^ 0x80808080u};
         uint4 r;
         __half2* h = (__half2*)&r;
 #pragma unroll
@@ -89,6 +107,10 @@ __device__ __forceinline__ uint4 kv_load8(const __half* row, int e, int drow) {
             h[2 * k] = kvq_pair(w[k], 0x04010400u, bias, sc), h[2 * k + 1] = kvq_pair(w[k], 0x04030402u, bias, sc);
         return r;
     }
+}
+template <int KQ>
+__device__ __forceinline__ uint4 kv_load8(const __half* row, int e, int drow) {
+    return kv_unpack<KQ>(kv_fetch<KQ>(row, e, drow));
 }
 
 // One value of a cache row as float
@@ -393,8 +415,9 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
     // KG: K is not staged; each lane reads its position's K row from global memory (L2) as the WMMA operand,
     // which frees LDS for more workgroups per WGP (the Q rows then padded by 4 halves, not 8). D 512 (2 -> 3
     // workgroups per WGP: Gemma-4 prefill +5%) and D 128 (Qwen3-0.6B +9%); neutral for D 256, which keeps the
-    // staging (half the L2 reads of K)
-    constexpr bool KG = DS > 1 || D <= 128;
+    // staging (half the L2 reads of K). Not for a quantized D 128 cache: every wave would dequantize the same K
+    // rows inside its WMMA loop; staged, they are dequantized once (and prefetched)
+    constexpr bool KG = DS > 1 || (D <= 128 && KQ == 0);
     constexpr int QP = D + (KG ? 4 : 8);  // padded LDS row of Q / K (halves)
     __shared__ __attribute__((aligned(16))) _Float16 sQ[NW][FT][QP];
     __shared__ __attribute__((aligned(16))) _Float16 sK[KG ? 1 : NG][KG ? 1 : FB][KG ? 8 : QP];
@@ -426,35 +449,56 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
 #pragma unroll
     for (int dt = 0; dt < DH / 16; ++dt) acc[dt] = (v8f){};
 
-#pragma unroll 1
-    for (int b = 0; b < nb; ++b) {
-        const int P0 = c * chunk + b * FB;
-        if (P0 + FB <= lo0) continue;  // before every token's window (uniform)
-        __syncthreads();  // the previous block's sK / sVt reads are done (and, the first time, sQ is written)
-        // Stage the NG KV heads' K blocks (16 positions x D dims; 8 halves per uint4, consecutive lanes on
-        // consecutive dims) and V blocks transposed (16 x the DH dims of slice ds): a thread takes positions 2 pp
-        // and 2 pp + 1 of 8 dims and writes each dim's pair as one dword, consecutive lanes on consecutive pairs
-        // (single halves from lanes 8 dims apart hit one LDS bank 32 times). Positions no token of the tiles
-        // sees are zeroed: they are masked, but 0 * (stale V) must stay 0. The loads are unconditional (the last
-        // position's row is read instead, then dropped): a load in a branch is waited for before the branch ends,
-        // which would chain them.
-        const int plast = pos0 + zmax;
+    // Stage the NG KV heads' K blocks (16 positions x D dims; 8 halves per uint4, consecutive lanes on consecutive
+    // dims) and V blocks transposed (16 x the DH dims of slice ds): a thread takes positions 2 pp and 2 pp + 1 of 8
+    // dims and writes each dim's pair as one dword, consecutive lanes on consecutive pairs (single halves from lanes
+    // 8 dims apart hit one LDS bank 32 times). Positions no token of the tiles sees are zeroed: they are masked, but
+    // 0 * (stale V) must stay 0. Block b + 1's raw words are fetched into registers before block b is computed
+    // (kfetch / vfetch), so that their loads are in flight meanwhile: a workgroup takes most of a CU's LDS, so no
+    // other one hides them. The loads are unconditional (the last position's row is read instead, then dropped): a
+    // load in a branch is waited for before the branch ends, which would chain them.
+    // PF: prefetch block b + 1 during block b. Not with DH > 128: those kernels hold 128 VGPRs of acc and are at the
+    // 256 limit already (the prefetch registers spilled: Qwen3.6-35B prefill -5%); Qwen3-30B (D 128) +17% at 31k
+    constexpr bool PF = DH <= 128;
+    constexpr int NKF = KG ? 0 : NG * FB * D / 8 / NTH;                  // K uint4 per thread per block
+    constexpr int NVF = (NG * (FB / 2) * (DH / 8) + NTH - 1) / NTH;      // V position pairs per thread per block
+    const int plast = pos0 + zmax;
+    KvRaw kraw[NKF > 0 ? NKF : 1], vraw[NVF][2];
+    auto fetch = [&](int P0) {
 #pragma unroll
-        for (int k = 0; k < (KG ? 0 : NG * FB * D / 8 / NTH); ++k) {
+        for (int k = 0; k < NKF; ++k) {
             const int idx = tid + NTH * k, gl = idx / (FB * D / 8), r = idx % (FB * D / 8);
             const int p = r / (D / 8), d = 8 * (r % (D / 8));
-            uint4 ku = kv_load8<KQ>(K + kv_row(min(P0 + p, plast), kv_stride, kv_shift, kv_bstride), (g0 + gl) * D + d,
-                                    drow);
+            kraw[k] = kv_fetch<KQ>(K + kv_row(min(P0 + p, plast), kv_stride, kv_shift, kv_bstride), (g0 + gl) * D + d,
+                                   drow);
+        }
+#pragma unroll
+        for (int k = 0; k < NVF; ++k) {
+            const int idx = min(tid + NTH * k, NG * (FB / 2) * (DH / 8) - 1);  // (D 64: fewer tasks than threads)
+            const int pp = idx % (FB / 2), r = idx / (FB / 2);
+            const int gl = r / (DH / 8), d = 8 * (r % (DH / 8));
+            const int col = (g0 + gl) * D + ds * DH + d;
+            vraw[k][0] = kv_fetch<KQ>(V + kv_row(min(P0 + 2 * pp, plast), kv_stride, kv_shift, kv_bstride), col, drow);
+            vraw[k][1] = kv_fetch<KQ>(V + kv_row(min(P0 + 2 * pp + 1, plast), kv_stride, kv_shift, kv_bstride), col,
+                                      drow);
+        }
+    };
+    auto stage = [&](int P0) {
+#pragma unroll
+        for (int k = 0; k < NKF; ++k) {
+            const int idx = tid + NTH * k, gl = idx / (FB * D / 8), r = idx % (FB * D / 8);
+            const int p = r / (D / 8), d = 8 * (r % (D / 8));
+            uint4 ku = kv_unpack<KQ>(kraw[k]);
             if (P0 + p > plast) ku = make_uint4(0, 0, 0, 0);
             *(uint4*)&sK[gl][p][d] = ku;
         }
 #pragma unroll
-        for (int idx = tid; idx < NG * (FB / 2) * (DH / 8); idx += NTH) {  // (D 64: fewer tasks than threads)
+        for (int k = 0; k < NVF; ++k) {
+            const int idx = tid + NTH * k;
+            if (idx >= NG * (FB / 2) * (DH / 8)) break;
             const int pp = idx % (FB / 2), r = idx / (FB / 2);
             const int gl = r / (DH / 8), d = 8 * (r % (DH / 8));
-            const int col = (g0 + gl) * D + ds * DH + d;
-            uint4 v0 = kv_load8<KQ>(V + kv_row(min(P0 + 2 * pp, plast), kv_stride, kv_shift, kv_bstride), col, drow);
-            uint4 v1 = kv_load8<KQ>(V + kv_row(min(P0 + 2 * pp + 1, plast), kv_stride, kv_shift, kv_bstride), col, drow);
+            uint4 v0 = kv_unpack<KQ>(vraw[k][0]), v1 = kv_unpack<KQ>(vraw[k][1]);
             if (P0 + 2 * pp > plast) v0 = make_uint4(0, 0, 0, 0);
             if (P0 + 2 * pp + 1 > plast) v1 = make_uint4(0, 0, 0, 0);
             const uint16_t* a0 = (const uint16_t*)&v0;
@@ -462,7 +506,19 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
 #pragma unroll
             for (int e = 0; e < 8; ++e) ((uint32_t*)&sVt[gl][d + e][0])[pp] = (uint32_t)a0[e] | ((uint32_t)a1[e] << 16);
         }
+    };
+    // the first block any token's window reaches (the ones before it contribute nothing)
+    const int b0 = lo0 >= c * chunk + FB ? (lo0 - c * chunk - FB) / FB + 1 : 0;
+    if (PF && b0 < nb) fetch(c * chunk + b0 * FB);
+
+#pragma unroll 1
+    for (int b = b0; b < nb; ++b) {
+        const int P0 = c * chunk + b * FB;
+        if (!PF) fetch(P0);
+        __syncthreads();  // the previous block's sK / sVt reads are done (and, the first time, sQ is written)
+        stage(P0);
         __syncthreads();
+        if (PF && b + 1 < nb) fetch(P0 + FB);  // block b + 1's loads, in flight while block b is computed
 
         // S = Q K^T for this wave's 16 tokens x 16 positions
         v8f s = {};

@@ -59,10 +59,11 @@ static void free_seqs(inference_model_t* m);
 // only the CPU reads are left out: the token embeddings (when the LM head is not tied to them) and the PLE table
 // (qwen4exp: 35.8 GiB, 16 rows per token), so a model bigger than what may be pinned can still run.
 // How much of the (pinned, so resident) GGUF mapping is on 2 MB pages (gguf_mmap.cpp map_file), from
-// /proc/self/smaps: a file the page cache already held in 4 KB folios stays so until it is read again
-static void report_page_sizes(gguf_model_t* gguf) {
+// /proc/self/smaps: a file the page cache already held in 4 KB folios stays so until it is read again. Returns
+// the summary for inference_stage_info ("" when unknown)
+static std::string report_page_sizes(gguf_model_t* gguf) {
     FILE* f = fopen("/proc/self/smaps", "r");
-    if (!f) return;
+    if (!f) return "";
     size_t rss = 0, pmd = 0, kb = 0;
     bool in = false;
     char line[512];
@@ -82,14 +83,18 @@ static void report_page_sizes(gguf_model_t* gguf) {
         }
     }
     fclose(f);
-    if (rss == 0) return;
-    INFER_LOG("[pin_model] %zu of %zu MB resident on 2 MB pages%s\n", pmd >> 10, rss >> 10,
-              pmd * 2 < rss ? " (the page cache holds the file in 4 KB pages: GGUF_RECACHE=1 reads it again as "
-                              "2 MB pages, faster for the GPU)" : "");
+    if (rss == 0) return "";
+    char b[256];
+    snprintf(b, sizeof b, "not staged; %zu of %zu MB on 2 MB pages%s", pmd >> 10, rss >> 10,
+             pmd * 2 < rss ? " (the page cache holds the file in 4 KB pages: GGUF_RECACHE=1 reads it again as 2 MB "
+                             "pages, faster for the GPU)" : "");
+    INFER_LOG("[pin_model] %s\n", b);
+    return b;
 }
 
 static bool pin_gguf(gguf_model_t* gguf, std::vector<const QuantWeight*> cpu_only_w,
-                     std::vector<std::pair<void*, size_t>>& pinned, size_t& pinned_bytes, size_t& unpinned_bytes) {
+                     std::vector<std::pair<void*, size_t>>& pinned, size_t& pinned_bytes, size_t& unpinned_bytes,
+                     std::string* pages = nullptr) {
     const size_t page = (size_t)sysconf(_SC_PAGESIZE);
     std::vector<std::pair<const char*, const char*>> skip;  // whole pages inside CPU-only tensors
     for (const QuantWeight* w : cpu_only_w) {
@@ -128,7 +133,8 @@ static bool pin_gguf(gguf_model_t* gguf, std::vector<const QuantWeight*> cpu_onl
     }
     INFER_LOG("[pin_model] %d file(s): %zu MB registered, %zu MB left to the CPU\n", gguf_n_maps(gguf),
               pinned_bytes >> 20, unpinned_bytes >> 20);
-    report_page_sizes(gguf);
+    const std::string p = report_page_sizes(gguf);
+    if (pages) *pages = p;
     return true;
 }
 
@@ -151,7 +157,10 @@ static bool pin_model_memory(inference_model* m) {
     }
     std::vector<const QuantWeight*> cpu_only = {&m->ple_table};
     if (m->output.data != m->token_embd.data) cpu_only.push_back(&m->token_embd);
-    return pin_gguf(m->gguf, cpu_only, m->pinned, m->pinned_bytes, m->unpinned_bytes);
+    std::string pages;
+    if (!pin_gguf(m->gguf, cpu_only, m->pinned, m->pinned_bytes, m->unpinned_bytes, &pages)) return false;
+    if (m->stage_info.empty()) m->stage_info = pages;  // (not staged: how the GGUF mapping is paged)
+    return true;
 }
 
 static void unpin_model_memory(inference_model* m) {

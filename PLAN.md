@@ -2915,6 +2915,30 @@ scaling), which the engine only read as Gemma-4's "rotate the first pairs". Now:
     shared experts' second reads. Exact sharing would give ~2.24x (2 tokens share ~3.8 of 10 experts): ~10% of
     the verify passes' expert time, ~3% of generation, for a new kernel family. Not done.
 
+### Long-context prefill, quantized-cache prefill, recaching (2026-11-04, user: "Fix 3, 4 and 5")
+
+- **Flash prefetch.** Qwen3.6-35B at 33k: attn_flash_256_q8 38% of prefill, ~10.5 TFLOP/s (~18% of the WMMA
+  peak): each 16-position block waited on its K / V staging loads behind barriers, with one or two workgroups
+  per CU (LDS) to hide them. kv_load8 is split into kv_fetch (raw words + scale, no use) and kv_unpack
+  (dequantize); attn_flash fetches block b + 1 into registers before computing block b (stage(): unpack into
+  LDS at the next block). Only where DH <= 128: the D 256 / 512 kernels hold 128 VGPRs of acc at the 256 limit,
+  and the prefetch spilled them (35B -5%); they fetch and stage in place as before (35B Q8_0 33k 1,451 ->
+  1,492-1,507, i.e. unchanged). The first block a window reaches is computed up front (b0) instead of a
+  `continue` per skipped block.
+- **Quantized D 128 caches stage K.** attn_flash_128 read K from global as the WMMA operand (KG), so with a
+  Q8_0 / Q4_0 cache every wave dequantized the same rows inside its WMMA loop; now KG only for F16 (and DS > 1).
+- Qwen3-30B 31k prefill: F16 668 -> 770 tok/s, Q8_0 664-698 -> 731, Q4_0 624 -> 731 (now within 5% of F16).
+  Greedy tokens identical to the previous kernels (48 tokens, 3.1k prompt) for Qwen3-30B and Qwen3.6-35B in
+  F16 / Q8_0 / Q4_0, Gemma-4 26B (sliding window, D 256 / 512) F16 / Q8_0, Qwen2.5-0.5B (D 64).
+- Left: the D 256 kernels (Qwen3.5 / 3.6 / 3.8, Gemma-4) need fewer registers before a prefetch fits (acc over
+  128 output dims per wave); the 35B at 112k still prefills at ~720 tok/s.
+- **Recaching.** inference_stage_info now says, when no staging was asked for, how much of the mapped GGUF is on
+  2 MB pages ("not staged; 13240 of 13243 MB on 2 MB pages"); rocm-inference-server prints it at startup
+  ("model memory: ...", with a hint when it is low) and takes --recache (GGUF_RECACHE=1 for the model's load:
+  the file read again as 2 MB pages; 0 -> 13,240 of 13,243 MB on the Qwen3.8-27B, kept for later starts). Not
+  automatic: when 2 MB folios cannot form (memory pressure, another process mapping the file), it would read the
+  file again at every start.
+
 ### Performance round: fewer passes over memory (2026-11-02, user: "do all of the performance ones in 1 go, mind to not copy around memory ... less copy on memory bandwidth helps for tg")
 
 UMA: every extra pass over activations or outputs takes memory bandwidth from token generation. A/B against the

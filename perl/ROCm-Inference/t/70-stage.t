@@ -24,7 +24,7 @@ sub run {
 }
 
 my $m = load_model($path);
-is(stage_info($m), '', 'no staging asked: no stage info');
+like(stage_info($m), qr/\Anot staged; \d+ of \d+ MB on 2 MB pages/, 'no staging asked: ' . stage_info($m));
 my $direct = run($m);
 undef $m;
 

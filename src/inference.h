@@ -50,7 +50,9 @@ typedef struct inference_load_opts {
 } inference_load_opts;
 inference_model_t* inference_load_model_ex(const char* gguf_path, const inference_load_opts* opts);
 // One line about staging for this model ("staged 31234 MB in <path>", "reused <path> (31234 MB)", "not staged: ..."),
-// or "" when it was not asked for. Valid while the model is.
+// or, when it was not asked for, how much of the mapped GGUF is on 2 MB pages ("not staged; 13240 of 13243 MB on
+// 2 MB pages": the GGUF is mapped for them; a file the page cache holds in 4 KB pages stays so until it is read
+// again, which the environment variable GGUF_RECACHE=1 does at the load). Valid while the model is.
 const char* inference_stage_info(const inference_model_t* model);
 
 // Reference counting for shared ownership
