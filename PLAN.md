@@ -2821,6 +2821,11 @@ row. Now:
   fails its "Is 91 prime?" check with thinking on, with either cache and either attention path; the suite was
   never run on it (Qwen3.5-4B / 35B / Gemma). Q8_0 prefill on Qwen3-30B is ~15% slower than F16 (7.6k 1,358 vs
   1,584; 31k 566 vs 658), on Qwen3.6-35B the same: a lead for later.
+- **Qwen2.5-7B prefill: on par now** (2026-11-04): 1,440 tok/s on a 2,306-token prompt vs llama.cpp pp2048 1,473
+  (the 16% gap of 2026-11-03 was 1,285 vs 1,538, before the attention work). 82% of it is matmul_wmma_q8_0 at ~23
+  TOPS on the 18944 x 3584 FFN matrices (~6 ms per 1,024 tokens each; llama.cpp's rate is the same); swiglu 5.5%,
+  attn_flash_128_h1t4 5.3%, add_rmsnorm_rows 4.6%. Left: attn_k / attn_v as two 4-workgroup launches (~1%); more
+  needs a faster int8 WMMA kernel (bigger tiles tried 2026-10-21: no gain).
 
 ### Performance round: fewer passes over memory (2026-11-02, user: "do all of the performance ones in 1 go, mind to not copy around memory ... less copy on memory bandwidth helps for tg")
 
