@@ -2950,6 +2950,20 @@ scaling), which the engine only read as Gemma-4's "rotate the first pairs". Now:
     Qwen3-30B, Qwen2.5-0.5B pass; Gemma-4 (window, D 512) and Qwen3-0.6B (g2) summarize the 3k prompt
     correctly; attn_decode_verify passes. forward_verify on the 35B faulted 3 of 5 runs (2 GB free, 112 GB
     page cache) in its layer-0 router check, before any attention: the known intermittent fault (open item).
+
+### forward_verify fault: a test buffer overrun (2026-11-04, user: "yes" to fixing it)
+
+The fault addresses had one shape (0x4c464462a000, 0x4e3ab022a000, 0x55f1e862a000, 0x4d1dc882a000, ...): page
+aligned, the same low bits, a different base each run: the page after some mapping. FORWARD_VERIFY_TRACE=1 (new: a
+sync and a line per step of the MoE section) put it after gpu_moe_group, in the expert-tiled checks. The cause:
+g_x / g_y (/dev/shm, registered) were sized max(vocab, 2 HQ HD, FF) = 248,320 floats (993 KB) on Qwen3.6-35B,
+but the MoE section writes T x n_used rows of the experts' down outputs, 20 x 8 x 2048 = 327,680 floats (1.31 MB):
+the GPU wrote 334 KB past the mapping, which faulted when the next pages were unmapped (about every second run
+with the memory full of page cache) and silently overwrote other memory otherwise. Now sized for those too: 6
+runs of 6 clean (it faulted in 3 of 5 before). The engine was not involved (qwen_demo never faulted).
+- Its remaining FAIL on this Q4_0 35B with the ref35_Q4_0 reference (engine l_out worst 0.988955 at layer 21) is
+  drift, not a step: 0.993 at 15, 0.989 at 19-21, back to 0.997 at 39; next token = llama.cpp's; the same with
+  the kernels before today's. A threshold question for the regression tests.
 - **Recaching.** inference_stage_info now says, when no staging was asked for, how much of the mapped GGUF is on
   2 MB pages ("not staged; 13240 of 13243 MB on 2 MB pages"); rocm-inference-server prints it at startup
   ("model memory: ...", with a hint when it is low) and takes --recache (GGUF_RECACHE=1 for the model's load:
@@ -2984,7 +2998,7 @@ previous commit's build (a worktree in /data/rocm-hip-base), 2,426-token prompt 
 - **Tried, no gain: IQ WMMA staging prefetch** (the block read into registers in load(), decoded in store() with a
   compile-time sub-block index; no scratch, 210-228 VGPRs): 35B IQ3_S 1,868 vs 1,868 tok/s, 0.6B IQ types -1%;
   reverted. The 0.6B IQ types run ~8,200 tok/s on an idle CPU (the 7,100-7,800 above were measured during quantizing).
-- **forward_verify faults (open, pre-existing).** On the 35B, about 1 run in 3 aborts with a GPU memory fault at a
+- **forward_verify faults (RESOLVED 2026-11-04: a test bug, see "forward_verify fault" below).** On the 35B, about 1 run in 3 aborts with a GPU memory fault at a
   non-canonical address (0xd5..-0xe7..), in different kernels (quantize_q8, deltanet_pre, matvec_q8_id_q5_K), the
   previous commit's build too; qwen_demo runs never fault. Memory was tight (4 GB free, 106 GB page cache) and the
   test registers / unregisters many small /dev/shm buffers. Rerun until clean.

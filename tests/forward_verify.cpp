@@ -179,6 +179,13 @@ static int g_fail = 0;
 
 // FORWARD_VERIFY_LAYERS=1 prints the per-layer end-to-end diff
 static bool verbose_layers() { return getenv("FORWARD_VERIFY_LAYERS") != nullptr; }
+// FORWARD_VERIFY_TRACE=1: a sync and a line on stderr at each marked step (to find a step that faults)
+static void trace(const char* what) {
+    static const bool on = getenv("FORWARD_VERIFY_TRACE") != nullptr;
+    if (!on) return;
+    const hipError_t e = hipDeviceSynchronize();
+    fprintf(stderr, "[trace] %s: %s\n", what, hipGetErrorString(e));
+}
 
 // Worst case over all tokens of one check
 struct Stat {
@@ -287,8 +294,13 @@ int main(int argc, char** argv) {
     printf("forward_verify: %s, %d tokens, E=%d HQ=%d HKV=%d HD=%d n_rot=%d FF=%d V=%d eps=%g\n", argv[1], T, E, HQ,
            HKV, HD, m->n_rot, FF, V, eps);
 
+    // g_x / g_y hold one projection's input / output, or a whole MoE section's: T x n_used rows of the experts'
+    // gate / up (n_ff_exp) or down (n_embd) outputs. (Sized only for the first, the MoE down outputs ran 1.3 MB
+    // past the end of a 1 MB mapping on Qwen3.6-35B: a GPU memory fault when the next page was unmapped, about
+    // one run in three, memory corruption when it was not.)
     ShmBuf xin, yout;
-    const size_t big = (size_t)std::max(V, std::max(2 * HQ * HD, FF));
+    const size_t moe = (size_t)T * m->n_expert_used * std::max(E, m->n_ff_exp);
+    const size_t big = std::max({(size_t)V, (size_t)2 * HQ * HD, (size_t)FF, (size_t)T * E, moe});
     if (!xin.alloc("fwdv_x.bin", big) || !yout.alloc("fwdv_y.bin", big)) { fprintf(stderr, "alloc failed\n"); return 1; }
     g_x = xin.p;
     g_y = yout.p;
@@ -369,8 +381,10 @@ int main(int argc, char** argv) {
                 return 1;
 
             ProjStat srl, ssg, ssu, ssd;
+            trace("moe: start");
             for (int t = 0; t < T; ++t)
                 if (!proj(L.W_router, &b[(size_t)t * E], &lg[(size_t)t * NE], srl)) return 1;
+            trace("moe: router projections");
 
             // Reference expert choice: the NU largest probabilities, descending (ties: lowest index)
             std::vector<int> rids((size_t)T * NU);
@@ -393,7 +407,9 @@ int main(int argc, char** argv) {
             int* gids = (int*)b_ids.p;
             memcpy(b_lg.p, lg.data(), (size_t)T * NE * sizeof(float));
             memcpy(b_x.p, b.data(), (size_t)T * E * sizeof(float));
+            trace("moe: buffers");
             hipError_t e = gpu_moe_router(b_lg.p, b_x.p, L.shexp_gate, gids, b_w.p, b_sg.p, NE, NU, E, T, 0, 0);
+            trace("moe: gpu_moe_router");
             if (e == hipSuccess) e = hipDeviceSynchronize();
             if (e != hipSuccess) { fprintf(stderr, "moe_router: %s\n", hipGetErrorString(e)); return 1; }
             int id_bad = 0;
@@ -411,8 +427,10 @@ int main(int argc, char** argv) {
             for (int k = 0; k < 2; ++k) {
                 memcpy(g_x, b.data(), (size_t)T * E * sizeof(float));
                 e = qmatvec_quantize(g_x, T * E, &g_q8, 0);
+                trace("moe: quantize");
                 if (e == hipSuccess)
                     e = qmatvec_launch_q8_id(W3[k]->type, W3[k]->data, W3[k]->row_bytes, gids, NU, 0, &g_q8, g_y, FE, E, T, 0);
+                trace("moe: q8_id gate/up");
                 if (e == hipSuccess) e = hipDeviceSynchronize();
                 if (e != hipSuccess) { fprintf(stderr, "expert matvec: %s\n", hipGetErrorString(e)); return 1; }
                 for (int r = 0; r < T * NU; ++r) S3[k]->add(g_y + (size_t)r * FE, &(*R3[k])[(size_t)r * FE], FE);
@@ -448,7 +466,9 @@ int main(int argc, char** argv) {
                 }
                 int *gt = (int*)b_gt.p, *gp = (int*)b_gp.p, *gn = (int*)b_gn.p, *ge = (int*)b_ge.p,
                     *gs = (int*)b_gs.p, *gc = (int*)b_gc.p;
+                trace("moe: down done, group buffers");
                 e = gpu_moe_group(gids, T, NU, NE, tile, gt, gp, gn, ge, gs, gc, 0);
+                trace("moe: gpu_moe_group");
                 for (int k = 0; k < 2 && e == hipSuccess; ++k) {
                     memcpy(g_x, b.data(), (size_t)T * E * sizeof(float));
                     e = qmatvec_quantize(g_x, T * E, &g_q8, 0);
