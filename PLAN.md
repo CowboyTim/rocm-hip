@@ -2814,6 +2814,13 @@ row. Now:
   pp2048 1,359 at depth 0, 848 at 8k, 373 at 30k: ~650 averaged).
 - Checks: attn_decode_verify (all 21 cases, now also faster than per head at 100 positions), forward_verify on
   Qwen3-30B / Qwen2.5-7B / 0.5B (all pass, next token = llama.cpp's).
+- **rocm-inference-server `--kv-type auto`** (the default now, 2026-11-04, user: "4, 1 and 10"): q8_0 for a
+  `--ctx` of 32768 or more (the default context of most chat models), f16 below that or where the model's rows
+  do not suit q8_0 (kv_cache_init fails; the server retries with f16): Qwen3-30B default context -> q8_0,
+  Qwen2.5-0.5B at 32k -> f16, an explicit --kv-type wins. t/60-server.t passes (Qwen3.5-4B). Note: Qwen3-0.6B
+  fails its "Is 91 prime?" check with thinking on, with either cache and either attention path; the suite was
+  never run on it (Qwen3.5-4B / 35B / Gemma). Q8_0 prefill on Qwen3-30B is ~15% slower than F16 (7.6k 1,358 vs
+  1,584; 31k 566 vs 658), on Qwen3.6-35B the same: a lead for later.
 
 ### Performance round: fewer passes over memory (2026-11-02, user: "do all of the performance ones in 1 go, mind to not copy around memory ... less copy on memory bandwidth helps for tg")
 
