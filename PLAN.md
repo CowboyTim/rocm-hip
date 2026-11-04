@@ -2894,6 +2894,14 @@ scaling), which the engine only read as Gemma-4's "rotate the first pairs". Now:
   t/10-generate.t q4_0 ('Paris'); Qwen3-30B at 31k and Qwen3.6-35B at 112k answer coherently and on topic.
 - Speed: Qwen3-30B 31k generation F16 27.9 / Q8_0 29.7 / Q4_0 31.4 tok/s, prefill 668 / 698 / 624 (Q4_0's flash
   staging costs ~10%); Qwen3.6-35B 112k generation 32.4 / 35.2 / 36.8, prefill (Q4_0) 724.
+- **5. Launch gaps: HIP graphs do not pay here (measured).** Qwen3.6-35B decode: 562 launches per token (81
+  add_rmsnorm 4.5 us, 80 + 80 + 40 expert / dense matvecs, 40 each moe_router / swiglu / moe_combine, 60 small
+  DeltaNet kernels, ...); under rocprofv3 the GPU is busy 92% of the time with a median gap of 1.9 us. A chain of
+  562 tiny dependent kernels takes 1.96-1.97 us each launched plainly and 1.87-1.89 us replayed as a HIP graph
+  (scratch graph_bench.hip): the gap is the GPU's dispatch of each dependent kernel, not the CPU's launches
+  (the CPU runs ahead), so a graph would save ~50 us of 16 ms per token, and its per-token parameter updates
+  (positions, chunk grids) cost more code than that. Only fewer kernels would help (~120 small ones per token:
+  at most ~4%); merging them was assessed as not worth it (6d, 2026-10-21) and stays so.
 
 ### Performance round: fewer passes over memory (2026-11-02, user: "do all of the performance ones in 1 go, mind to not copy around memory ... less copy on memory bandwidth helps for tg")
 
