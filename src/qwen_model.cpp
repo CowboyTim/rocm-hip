@@ -730,8 +730,10 @@ struct QwenModel {
                 o.gated = eng->attn_gated ? 1 : 0;
                 o.kv_stride = kv_cache_row_halves(kvc);
                 o.kv_q8 = kv_cache_type(kvc) == KV_CACHE_Q8_0;
-                o.no_qk_norm = !L.q_norm;  // Qwen2: none, biases instead
+                o.no_qk_norm = !L.q_norm;  // Qwen2, Llama: none (Qwen2: biases instead)
                 o.bq = L.bq, o.bk = L.bk, o.bv = L.bv;
+                o.rope_norm = L.rope_norm ? 1 : 0;
+                o.freq_factors = L.rope_ff;
                 return check(attention_forward_opts(s.qfull + r * L.Wq.N, s.k + r * L.Wk.N, s.v + r * L.Wv.N, L.q_norm,
                                                     L.k_norm, K, V, kv_cache_block_shift(kvc),
                                                     kv_cache_block_stride(kvc), HQ, HKV, eng->n_rot, pos, Tr,

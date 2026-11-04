@@ -405,6 +405,12 @@ static bool load_layer(inference_model* m, gguf_model_t* g, int i, LayerWeights&
         if (!bind_norm(g, nm(i, "attn_q.bias"), L.Wq.N, L.bq, false)) return false;
         if (!bind_norm(g, nm(i, "attn_k.bias"), L.Wk.N, L.bk, false)) return false;
         if (!bind_norm(g, nm(i, "attn_v.bias"), L.Wv.N, L.bv, false)) return false;
+        // Llama: RoPE on adjacent pairs (llama.cpp LLAMA_ROPE_TYPE_NORM; the converter permutes q / k for it), and
+        // Llama 3's rope_freqs dividing each pair's frequency (its long-context scaling)
+        if (m->model_name == "llama") {
+            L.rope_norm = true;
+            if (!bind_norm(g, "rope_freqs.weight", m->n_rot / 2, L.rope_ff, false)) return false;
+        }
         // Gated attention (Qwen3.5 and later): attn_q holds Q and the output gate, head_dim each, interleaved per
         // head; Qwen3: Q only. The first attention layer decides, the others must agree.
         if (L.kv_slot == 0) m->attn_gated = L.Wq.N == 2 * HQ * HD;

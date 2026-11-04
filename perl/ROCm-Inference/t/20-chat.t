@@ -18,9 +18,13 @@ kv_cache_init($m, 4096);
 my @messages = ({ role => 'system', content => 'Answer briefly.' },
                 { role => 'user', content => 'Name three primary colors.' });
 # the user turn and the generation prompt without thinking (an empty think block), as the chat format writes them
-# (Qwen / Nemotron-3 or Gemma-4)
-my $gemma = ROCm::Inference::reply_tags($m) == $ROCm::Inference::REPLY_TAG_SETS{gemma4};
+# (Qwen / Nemotron-3, Gemma-4 or Llama 3, which has no thinking)
+my $tags = ROCm::Inference::reply_tags($m);
+my $gemma = $tags == $ROCm::Inference::REPLY_TAG_SETS{gemma4};
+my $llama = $tags == $ROCm::Inference::REPLY_TAG_SETS{llama3};
 my ($user, $gen) = $gemma ? (qr/<\|turn>user\n(.*?)<turn\|>/s, qr/<\|turn>model\n<\|channel>thought\n<channel\|>\z/)
+                 : $llama ? (qr/<\|start_header_id\|>user<\|end_header_id\|>\n\n(.*?)<\|eot_id\|>/s,
+                             qr/<\|start_header_id\|>assistant<\|end_header_id\|>\n\n\z/)
                           : (qr/<\|im_start\|>user\n(.*?)<\|im_end\|>/s, qr/<\|im_start\|>assistant\n<think>\s*<\/think>\s*\z/);
 my $prompt = chat_render($m, \@messages, enable_thinking => 0);
 is(($prompt =~ $user)[0], 'Name three primary colors.', 'the template renders the user turn');
@@ -39,17 +43,20 @@ ok($reused > 0, "turn 2 reused $reused tokens");
 like($reply2, qr/green|orange|purple/i, "reply 2: $reply2");
 
 # Thinking on, streamed by kind, with a thinking budget: the reasoning is cut short, then the answer follows
-my $q = [{ role => 'user', content => 'Is 91 a prime number? Answer in one sentence.' }];
-my (%deltas, @kinds);
-my ($content, $why3, $msg) = chat($m, $q, { temperature => 0, max_new_tokens => 200, max_thinking_tokens => 16,
-    vars => { enable_thinking => 1 },
-    on_delta => sub { $deltas{ $_[1] } .= $_[0]; push @kinds, $_[1] unless @kinds && $kinds[-1] eq $_[1]; 0 } });
-is($why3, STOP_EOG, 'thinking budget: the answer ends at end-of-turn');
-is("@kinds", 'reasoning content', 'streamed: reasoning, then content');
-ok(length $msg->{reasoning_content}, "reasoning: " . short($msg->{reasoning_content}));
-unlike($content, qr/<\/?think>|<\|channel>|<channel\|>/, "content without tags: " . short($content));
-is($deltas{reasoning}, $msg->{reasoning_content}, 'the reasoning deltas add up to reasoning_content');
-is($deltas{content}, $content, 'the content deltas add up to the content');
+SKIP: {
+    skip 'the chat format has no reasoning (Llama 3)', 6 if $llama;
+    my $q = [{ role => 'user', content => 'Is 91 a prime number? Answer in one sentence.' }];
+    my (%deltas, @kinds);
+    my ($content, $why3, $msg) = chat($m, $q, { temperature => 0, max_new_tokens => 200, max_thinking_tokens => 16,
+        vars => { enable_thinking => 1 },
+        on_delta => sub { $deltas{ $_[1] } .= $_[0]; push @kinds, $_[1] unless @kinds && $kinds[-1] eq $_[1]; 0 } });
+    is($why3, STOP_EOG, 'thinking budget: the answer ends at end-of-turn');
+    is("@kinds", 'reasoning content', 'streamed: reasoning, then content');
+    ok(length $msg->{reasoning_content}, "reasoning: " . short($msg->{reasoning_content}));
+    unlike($content, qr/<\/?think>|<\|channel>|<channel\|>/, "content without tags: " . short($content));
+    is($deltas{reasoning}, $msg->{reasoning_content}, 'the reasoning deltas add up to reasoning_content');
+    is($deltas{content}, $content, 'the content deltas add up to the content');
+}
 
 # A tool call round trip: the call is parsed, the result goes back, and the next turn reuses the first
 my @tools = ({ type => 'function', function => { name => 'get_weather', description => 'Current weather for a city',

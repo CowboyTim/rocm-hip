@@ -71,6 +71,8 @@ struct LayerWeights {
     const float* q_norm = nullptr;                    // [head_dim] F32, full attention only; none in Qwen2
     const float* k_norm = nullptr;                    // [head_dim] F32, full attention only; none in Qwen2
     const float *bq = nullptr, *bk = nullptr, *bv = nullptr;  // attn_q / k / v biases (Qwen2), F32; else NULL
+    bool rope_norm = false;                           // RoPE on adjacent pairs (Llama), not NeoX
+    const float* rope_ff = nullptr;                   // rope_freqs [n_rot / 2]: per-pair frequency divisors (Llama 3)
 
     // Gated DeltaNet (LAYER_LINEAR_ATTN only, Phase 20 Step 5)
     QuantWeight W_qkv;                                // attn_qkv: [Q (n_group*d_state) | K (same) | V (d_inner)]

@@ -2827,6 +2827,32 @@ row. Now:
   attn_flash_128_h1t4 5.3%, add_rmsnorm_rows 4.6%. Left: attn_k / attn_v as two 4-workgroup launches (~1%); more
   needs a faster int8 WMMA kernel (bigger tiles tried 2026-10-21: no gain).
 
+### `llama` (Llama 3.x, Mistral) (2026-11-04, user: "4, 1 and 10"; Llama-3.2-1B-Instruct Q8_0 downloaded)
+
+Llama-3.2-1B-Instruct-Q8_0 (bartowski, ungated; /data/hf/llama-gguf) loaded and talked through the generic path
+(plain attention, no q / k norm, tied LM head) but forward_verify failed from layer 0 (cos 0.81): llama.cpp
+rotates Llama's q / k on adjacent pairs (LLAMA_ROPE_TYPE_NORM; the converter permutes the weights for it), the
+engine only did NeoX, and Llama 3 ships rope_freqs (32 per-pair frequency divisors, 1 .. 8: its long-context
+scaling), which the engine only read as Gemma-4's "rotate the first pairs". Now:
+- attention_opts.rope_norm (pairs (2 i, 2 i + 1)) and .freq_factors (theta_i / ff[i]) in attn_prep's norm_rope;
+  the loader sets LayerWeights.rope_norm / rope_ff for arch `llama`. forward_verify's CPU reference does both.
+- Checks: forward_verify (reference /data/q4_0/refs/ref_llama32_1b, `ref_dump_stock acts`, 18 tokens): all
+  layers cos >= 0.99927, next token = llama.cpp's; a second reference at a greedy split point
+  (ref_llama32_1b_rome): llama.cpp CPU and our engine both say ' Julius' where llama.cpp HIP says ' Augustus' (a
+  near-tie). Qwen3-30B / Qwen2.5-0.5B forward_verify unchanged; attn_decode_verify passes.
+- Speed (llama.cpp ROCm): generation 139 tok/s (143), at 7.5k 125 (120 at d8192); prefill 7,622 tok/s on 2.3k
+  tokens (pp2048 7,888), 6,647 averaged over 7.5k (pp2048 @ d8192 4,805).
+- Chat (Perl): Llama 3's template needed tojson(indent=4) (Minijinja passes no keyword arguments to Perl filters:
+  rewritten to tojson(4)) and strftime_now ("Today Date"). Reply format `llama3` in %REPLY_TAG_SETS (picked by
+  the template's <|start_header_id|> / <|eot_id|>): a tool call is <|python_tag|>{json} or a reply that is just
+  {"name", "parameters"} (content starting with { is held back to the end, then a call or content); "parameters"
+  and a {"function": {...}} wrapper accepted. t/16-reply.t +Llama cases; t/10-generate.t, t/20-chat.t,
+  t/60-server.t format-aware (Llama 3: header tags, no reasoning). With Llama-3.2-1B everything passes except
+  the tool round trip: the 1B nests its arguments as {"properties": {"city": ...}} (the model, not the parser);
+  Qwen3.5-4B passes the full suite.
+- Left for `llama`: Mistral (llama arch, SentencePiece tokenizer) and Llama-3.1-8B untested (no files);
+  llama 3.1's built-in tools (<|python_tag|> brave_search.call(...)) are not parsed.
+
 ### Performance round: fewer passes over memory (2026-11-02, user: "do all of the performance ones in 1 go, mind to not copy around memory ... less copy on memory bandwidth helps for tg")
 
 UMA: every extra pass over activations or outputs takes memory bandwidth from token generation. A/B against the

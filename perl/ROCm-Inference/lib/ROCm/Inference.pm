@@ -174,7 +174,11 @@ sub _render_template {
     Minijinja::add_filter($env, "py_$_", $PY_METHODS{$_}) for grep { ref $PY_METHODS{$_} } keys %PY_METHODS;
     Minijinja::add_filter($env, 'tojson', \&_py_tojson);
     Minijinja::add_function($env, 'raise_exception', sub { die(($_[0] // 'template error') . "\n") });
-    my $text = Minijinja::render_str($env, 'chat_template', _py_methods($tmpl), \%ctx);
+    # Llama 3's "Today Date" (as llama.cpp's renderer provides it)
+    Minijinja::add_function($env, 'strftime_now', sub { require POSIX; POSIX::strftime($_[0] // '%Y-%m-%d', localtime) });
+    # filters take no keyword arguments here: tojson(indent=4) (Llama 3's tool definitions) as tojson(4)
+    my $src = _py_methods($tmpl) =~ s/\btojson\(\s*indent\s*=\s*(\d+)\s*\)/tojson($1)/gr;
+    my $text = Minijinja::render_str($env, 'chat_template', $src, \%ctx);
     croak "ROCm::Inference::chat_render: " . (Minijinja::error_detail() // 'template error') unless defined $text;
     return $text;
 }
@@ -188,7 +192,13 @@ our %REPLY_TAG_SETS = (
     # Gemma-4: <|channel>thought\n...<channel|>, <|tool_call>call:name{key:value,...}<tool_call|>
     gemma4 => { reasoning => ['<|channel>thought', '<channel|>', "\n<channel|>"],
                 tool_call => ['<|tool_call>', '<tool_call|>'] },
+    # Llama 3.x: a tool call is <|python_tag|>{json} (ended by <|eom_id|>, an end-of-generation token) or a reply
+    # that is just {"name": ..., "parameters": {...}} (json_calls); no reasoning, but <think> as DeepSeek-R1's
+    # Llama distills write it. Picked by the header tags its template writes (detect).
+    llama3 => { reasoning => ['<think>', '</think>', "\n</think>\n\n"], tool_call => ['<|python_tag|>', '<|eom_id|>'],
+                json_calls => 1, detect => ['<|start_header_id|>', '<|eot_id|>'] },
 );
+my @REPLY_KINDS = qw(reasoning tool_call);  # the tag pairs of a set (the other keys are options)
 
 # reply_tags($m): the tag set (%REPLY_TAG_SETS) of the model's chat format, from the tags its chat template
 # writes; the default %REPLY_TAGS when there is no template or no other set matches
@@ -197,7 +207,8 @@ sub reply_tags {
     my $tmpl = eval { chat_template($m) } // '';
     for my $name (grep { $_ ne 'qwen' } sort keys %REPLY_TAG_SETS) {
         my $set = $REPLY_TAG_SETS{$name};
-        return $set unless grep { index($tmpl, $_) < 0 } map { @{$_}[0, 1] } values %$set;
+        my @need = $set->{detect} ? @{ $set->{detect} } : map { @{ $set->{$_} }[0, 1] } @REPLY_KINDS;
+        return $set unless grep { index($tmpl, $_) < 0 } @need;
     }
     return \%REPLY_TAGS;
 }
@@ -207,14 +218,21 @@ sub reply_tags {
 # (a tool call block's inner text), without the tags. Reasoning and content are trimmed as the chat templates
 # trim them (leading whitespace dropped, trailing whitespace held back until more text follows), so the
 # deltas of a kind add up to the message's field. Tags are found in the text, not by token: the text a token
-# brings may arrive with the next one.
+# brings may arrive with the next one. With json_calls (Llama 3), content that starts with { is held back to the
+# end: a reply that is a JSON tool call becomes one, anything else is content after all.
 sub _reply_splitter {
     my ($kind, $on_delta, $tags) = @_;
     $tags //= \%REPLY_TAGS;
-    my (%text, %hold, @calls, $buf, $stop) = (reasoning => '', content => '');
+    my (%text, %hold, @calls, $buf, $stop, $json) = (reasoning => '', content => '');
+    my $json_calls = $tags->{json_calls};
     $buf = '';
-    my $put = sub {
+    my $put;
+    $put = sub {
         my ($k, $t) = @_;
+        if ($k eq 'content' && $json_calls && !length $text{content}) {
+            if (defined $json) { $json .= $t; return }
+            if ($t =~ /\A\s*\{/) { $json = $t; return }
+        }
         if ($k eq 'tool_call') {
             $calls[-1] .= $t;
         } else {
@@ -230,7 +248,7 @@ sub _reply_splitter {
         $buf .= $_[0] // '';
         while (length $buf) {
             # the tags that can end this kind: its close tag, or in content the open tags
-            my %next = $kind eq 'content' ? map { $tags->{$_}[0] => $_ } keys %$tags : ($tags->{$kind}[1] => 'content');
+            my %next = $kind eq 'content' ? map { $tags->{$_}[0] => $_ } @REPLY_KINDS : ($tags->{$kind}[1] => 'content');
             my ($at, $tag) = (-1, undef);
             for my $t (keys %next) {
                 my $i = index($buf, $t);
@@ -263,6 +281,12 @@ sub _reply_splitter {
         finish => sub {
             $put->($kind, $buf) if length $buf;
             $buf = '';
+            if (defined $json) {  # a held-back reply: a JSON tool call, or content after all
+                my $t = $json;
+                undef $json;
+                $json_calls = 0;
+                _parse_tool_call($t) ? push(@calls, $t) : $put->('content', $t);
+            }
             my %msg = (role => 'assistant', content => $text{content});
             $msg{reasoning_content} = $text{reasoning} if length $text{reasoning};
             for my $raw (@calls) {
@@ -275,7 +299,8 @@ sub _reply_splitter {
 }
 
 # A tool call block's text as { type => 'function', function => { name, arguments => {...} } }: Qwen3.5+ XML
-# (<function=name> <parameter=p>value</parameter>, values as written), Qwen3 JSON ({"name", "arguments"}) or
+# (<function=name> <parameter=p>value</parameter>, values as written), Qwen3 / Llama 3 JSON ({"name", "arguments"
+# or "parameters"}) or
 # Gemma-4 (call:name{key:value,...}); undef when it is none of those
 sub _parse_tool_call {
     my ($t) = @_;
@@ -293,8 +318,10 @@ sub _parse_tool_call {
     }
     require JSON::PP;
     my $j = eval { JSON::PP->new->decode($t) };
+    # Llama 3 writes "parameters" (small models sometimes inside {"function": {...}}, as the tool definitions are)
+    $j = $j->{function} if ref $j eq 'HASH' && !defined $j->{name} && ref $j->{function} eq 'HASH';
     return undef unless ref $j eq 'HASH' && defined $j->{name} && !ref $j->{name};
-    my $args = $j->{arguments} // {};
+    my $args = $j->{arguments} // $j->{parameters} // {};
     $args = eval { JSON::PP->new->decode($args) } // $args unless ref $args;  # arguments as a JSON string
     return { type => 'function', function => { name => $j->{name}, arguments => $args } };
 }
@@ -662,7 +689,9 @@ character strings. Needs Minijinja 0.1.1 or later.
 C<chat> splits the reply at its tags into reasoning, content and tool calls: Qwen / Nemotron's
 C<< <think> >> ... C<< </think> >> and C<< <tool_call> >> ... C<< </tool_call> >>
 (C<%ROCm::Inference::REPLY_TAGS>), or Gemma-4's C<< <|channel>thought >> ... C<< <channel|> >> and
-C<< <|tool_call> >> ... C<< <tool_call|> >>; C<reply_tags($m)> picks the set (C<%ROCm::Inference::REPLY_TAG_SETS>)
+C<< <|tool_call> >> ... C<< <tool_call|> >>, or Llama 3's tool calls (C<< <|python_tag|> >> and JSON, or a reply
+that is just a C<< {"name": ..., "parameters": {...}} >> object: content that starts with C<{> is held back
+until the reply ends); C<reply_tags($m)> picks the set (C<%ROCm::Inference::REPLY_TAG_SETS>)
 whose tags the model's chat template writes. A generation prompt that opens the reasoning (Qwen3.5+ with
 thinking on) starts the reply in it. It returns the content,
 and in list context also the stop reason and the reply as a message to push onto the conversation:

@@ -142,6 +142,7 @@ DeltaNet (`ssm_alpha`); MoE (`ffn_gate_inp`) or dense FFN.
 | Architecture | Models | Blocks |
 |---|---|---|
 | `qwen2` | Qwen2.5-0.5B / 1.5B / 7B | plain attention with q / k / v biases and no q / k norm (head_dim 64 or 128), dense SwiGLU |
+| `llama` | Llama-3.2-1B | plain attention, no q / k norm, RoPE on adjacent pairs (`rope_norm`) with Llama 3's `rope_freqs` dividing each pair's frequency, dense SwiGLU, tied LM head |
 | `qwen3` | Qwen3-0.6B | plain attention only (head_dim 128, no output gate), dense SwiGLU; no recurrent state |
 | `qwen3moe` | Qwen3-30B-A3B | Qwen3's attention, a 128-expert top-8 MoE with no shared expert |
 | `qwen35` | Qwen3.5-0.8B, Qwen3.5-4B | 3 DeltaNet : 1 gated attention (head_dim 256), dense SwiGLU, RMSNorm residual |
@@ -246,8 +247,9 @@ tokens after a short prompt. Runs vary by about ±5%.
 | Qwen3.8-27B (dense) | Q4_0_ROCMFP4_FAST (14.6 GB) | 13.8 tok/s (~200 GB/s of weights) | 296 tok/s |
 | Qwen3.5-27B (dense) | BF16 (54 GB) | 4.1 tok/s (the bandwidth) | 510-529 tok/s (2026-11-02; stock llama.cpp ROCm pp2048 329) |
 | Qwen3.5-122B-A10B | UD-Q4_K_XL (77 GB): Q4_K / Q5_K experts, Q8_0 dense | 22.6 tok/s | 620 tok/s |
-| Qwen2.5-0.5B / 1.5B / 7B | Q8_0 (0.7 / 1.9 / 8.1 GB) | 201 / 95 / 26 tok/s (llama.cpp ROCm 255 / 108 / 29) | 14,442 / 5,776 / 1,285 tok/s (llama.cpp 14,821 / 5,690 / 1,538; 2026-11-03) |
-| Qwen3-30B-A3B (qwen3moe) | Q8_0 (32 GB) | 44 tok/s (llama.cpp ROCm 52.6) | 2,162 tok/s (llama.cpp 1,357; 2026-11-03) |
+| Qwen2.5-0.5B / 1.5B / 7B | Q8_0 (0.7 / 1.9 / 8.1 GB) | 244 / 104 / 27.5 tok/s at 2.4k (llama.cpp ROCm tg128 @ d2048 242 / 103 / 27.8) | 14,442 / 5,776 / 1,440 tok/s (llama.cpp 14,821 / 5,690 / 1,473; 2026-11-04) |
+| Qwen3-30B-A3B (qwen3moe) | Q8_0 (32 GB) | 50 tok/s at 2.4k, 30 at 31k with a Q8_0 cache (llama.cpp 49.8 / 30.1) | 2,162 tok/s (llama.cpp 1,357; 2026-11-03) |
+| Llama-3.2-1B | Q8_0 (1.3 GB) | 139 tok/s, 125 at 7.5k (llama.cpp 143 / 120 at 8k) | 7,622 tok/s (llama.cpp pp2048 7,888) |
 | Qwen3.8-Flash-Next (177B) | Q4_0_ROCmFP4_FAST (94 GB) | 34–38 tok/s; 48–55 with the MTP head | 826 tok/s |
 
 Profiling: `QWEN_PROFILE=1` (per-section times), `rocprofv3 --kernel-trace` + `tools/prof_summary.py` (per kernel).

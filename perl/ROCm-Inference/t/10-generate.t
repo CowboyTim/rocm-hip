@@ -74,15 +74,18 @@ reset($m);
 my $died = eval { generate($m, $ids, { max_new_tokens => 4, on_token => sub { die "boom\n" } }); 1 } ? '' : $@;
 is($died, "boom\n", 'a die in on_token propagates');
 
-# Hand-rendered chat turns with prefix reuse
-my $sys = "<|im_start|>system\nYou are a helpful assistant. Answer briefly.<|im_end|>\n";
-my $turn = "$sys<|im_start|>user\nName three primary colors.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+# Hand-rendered chat turns with prefix reuse (ChatML as Qwen writes it, or Llama 3's header tags)
+my $llama = index(chat_template($m) // '', '<|start_header_id|>') >= 0;
+my ($bt, $et, $gen) = $llama ? (sub { "<|start_header_id|>$_[0]<|end_header_id|>\n\n" }, '<|eot_id|>', '')
+                             : (sub { "<|im_start|>$_[0]\n" }, "<|im_end|>\n", "<think>\n\n</think>\n\n");
+my $sys = $bt->('system') . "You are a helpful assistant. Answer briefly.$et";
+my $turn = "$sys" . $bt->('user') . "Name three primary colors.$et" . $bt->('assistant') . $gen;
 reset($m);
 my ($a1, $r1) = generate($m, tokenize($m, $turn), { max_new_tokens => 64, temperature => 0, reuse_prefix => 1 });
 is($r1, STOP_EOG, 'a chat turn ends at end-of-turn');
 my $reply = detokenize($m, $a1);
-my $turn2 = "$sys<|im_start|>user\nName three primary colors.<|im_end|>\n<|im_start|>assistant\n$reply<|im_end|>\n"
-          . "<|im_start|>user\nAnd three secondary colors?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+my $turn2 = "$sys" . $bt->('user') . "Name three primary colors.$et" . $bt->('assistant') . "$reply$et"
+          . $bt->('user') . "And three secondary colors?$et" . $bt->('assistant') . $gen;
 my ($a2) = generate($m, tokenize($m, $turn2), { max_new_tokens => 64, temperature => 0, reuse_prefix => 1 });
 my ($reused, $prefilled) = last_prompt_stats($m);
 ok($reused > 0, "turn 2 reused $reused tokens, prefilled $prefilled");

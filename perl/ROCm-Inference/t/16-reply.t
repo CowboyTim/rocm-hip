@@ -90,6 +90,24 @@ check('multi-line value', 'content',
           { role => 'assistant', content => 'Ok', invalid_tool_calls => ['call:x{a:<|"|>open'] });
 }
 
+# Llama 3: <|python_tag|>{json} or a reply that is just {"name": ..., "parameters": {...}}
+{
+    local $TAGS = $ROCm::Inference::REPLY_TAG_SETS{llama3};
+    my $call = { type => 'function', function => { name => 'get_weather', arguments => { city => 'Gent' } } };
+    check('Llama 3: text', 'content', "\n\nParis is the capital.", { role => 'assistant', content => 'Paris is the capital.' });
+    check('Llama 3: a JSON tool call', 'content', qq[{"name": "get_weather", "parameters": {"city": "Gent"}}],
+          { role => 'assistant', content => '', tool_calls => [$call] });
+    check('Llama 3: <|python_tag|>', 'content', qq[<|python_tag|>{"name": "get_weather", "parameters": {"city": "Gent"}}],
+          { role => 'assistant', content => '', tool_calls => [$call] });
+    check('Llama 3: the call inside {"function": ...}', 'content',
+          qq[{"function": {"description": "x", "name": "get_weather", "parameters": {"city": "Gent"}}}],
+          { role => 'assistant', content => '', tool_calls => [$call] });
+    check('Llama 3: JSON that is no call is content', 'content', qq[ {"answer": 42} is the result],
+          { role => 'assistant', content => '{"answer": 42} is the result' });
+    check('Llama 3: braces later on are content', 'content', qq[Use {"name": "x"} here.],
+          { role => 'assistant', content => 'Use {"name": "x"} here.' });
+}
+
 # on_delta asking to stop is reported by feed
 my $s = ROCm::Inference::_reply_splitter('content', sub { $_[0] =~ /stop/ });
 ok(!$s->{feed}->('go on '), 'feed: no stop');
@@ -107,6 +125,11 @@ SKIP: {
 {% endif %}{{ m.content }}{% endfor %}];
     is(ROCm::Inference::_render_template($tmpl, { messages => [$msg] }),
        "assistant: <think>\nWhy.\n</think>\n\nBecause.", 'renders back');
+    # Llama 3's templates: tojson(indent=4) (filters take no keyword arguments: rewritten), strftime_now
+    is(ROCm::Inference::_render_template('{{ t | tojson(indent=2) }}', { t => { a => [1] } }),
+       qq[{\n  "a": [\n    1\n  ]\n}], 'tojson(indent=2)');
+    like(ROCm::Inference::_render_template('{{ strftime_now("%d %b %Y") }}', {}), qr/\A\d\d \w{3} \d{4}\z/,
+         'strftime_now');
 }
 
 done_testing;

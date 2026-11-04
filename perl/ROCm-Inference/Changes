@@ -26,6 +26,8 @@ Revision history for ROCm-Inference
       loads; stage_info; rocm-inference-server --stage. Nemotron-3 (nemotron_h_moe) models.
     - set_kv_type($m, 'q8_0'): a Q8_0 KV cache (half the memory); rocm-inference-server --kv-type, by default
       auto: q8_0 from a 32768-position context (faster decoding at depth), else f16.
+    - Llama 3 chat: the template's tojson(indent=N) and strftime_now; tool calls as <|python_tag|>{json} or a
+      reply that is a {"name", "parameters"} object (reply format llama3).
     - Sequences: seq_new / seq_select / seq_current / seq_free, several conversations on one model, each with
       its own KV cache and state. stream_begin (ROCm::Inference::Stream) and chat_start
       (ROCm::Inference::ChatStream) generate one token per step, so sequences can be interleaved.

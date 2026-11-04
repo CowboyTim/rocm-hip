@@ -80,6 +80,8 @@ typedef struct {
     const float* bq;  // biases added to attn_q / attn_k / attn_v's outputs before the norms and RoPE (Qwen2); NULL:
     const float* bk;  // none
     const float* bv;
+    int rope_norm;              // RoPE on pairs (2 i, 2 i + 1) (llama.cpp's LLAMA_ROPE_TYPE_NORM: Llama), not NeoX's
+    const float* freq_factors;  // [n_rot / 2] rope_freqs: pair i's frequency divided by it (Llama 3); NULL: none
     long long part_slots;  // partial-result slots part_ml / part_acc hold (attention_part_slots(n_ctx, rows) of the
                            // caller's sizing); 0: those of this call's T. More let decoding use smaller chunks.
 } attention_opts;

@@ -803,6 +803,8 @@ int main(int argc, char** argv) {
         ao.gated = m->attn_gated ? 1 : 0;
         ao.no_qk_norm = !L.q_norm;
         ao.bq = L.bq, ao.bk = L.bk, ao.bv = L.bv;
+        ao.rope_norm = L.rope_norm ? 1 : 0;
+        ao.freq_factors = L.rope_ff;
         // CPU: x (+ bias) -> RMSNorm (if any) -> NeoX RoPE at pos
         auto qk_ref = [&](const float* x, const float* bias, const float* norm, float* out, int p) {
             std::vector<float> t(x, x + HD);
@@ -810,7 +812,18 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < HD; ++i) t[i] += bias[i];
             if (norm) qwen_rmsnorm(t.data(), norm, out, HD, eps);
             else memcpy(out, t.data(), HD * sizeof(float));
-            qwen_rope_neox(out, m->n_rot, p, m->rope_freq_base);
+            if (!L.rope_norm && !L.rope_ff) {
+                qwen_rope_neox(out, m->n_rot, p, m->rope_freq_base);
+                return;
+            }
+            // Llama: pairs (2 i, 2 i + 1), frequencies divided by rope_freqs
+            for (int i = 0; i < m->n_rot / 2; ++i) {
+                const double th = p * pow((double)m->rope_freq_base, -2.0 * i / m->n_rot) / (L.rope_ff ? L.rope_ff[i] : 1.0);
+                const int i0 = L.rope_norm ? 2 * i : i, i1 = L.rope_norm ? 2 * i + 1 : i + m->n_rot / 2;
+                const float x0 = out[i0], x1 = out[i1];
+                out[i0] = (float)(x0 * cos(th) - x1 * sin(th));
+                out[i1] = (float)(x0 * sin(th) + x1 * cos(th));
+            }
         };
         auto v_ref = [&](const float* v, int i) { return v[i] + (L.bv ? L.bv[i] : 0.0f); };
         ShmBuf b_qf, b_k, b_v, b_q, b_ml, b_acc, b_out, b_K, b_V;

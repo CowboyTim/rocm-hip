@@ -112,12 +112,14 @@ __device__ float block_max(float v) {
     return m;
 }
 
-// RMSNorm (gamma w; none if NULL; no norm at all unless norm) then NeoX RoPE of one head held one value per thread
-// (D threads); returns this thread's value. Pairs (i, i + n_rot / 2) with i < rot_pairs rotate (theta_i = pos *
-// base^(-2 i / n_rot)), the others stay as they are; n_rot 0: no RoPE.
+// RMSNorm (gamma w; none if NULL; no norm at all unless norm) then RoPE of one head held one value per thread
+// (D threads); returns this thread's value. NeoX: pairs (i, i + n_rot / 2); rope_norm (llama.cpp's
+// LLAMA_ROPE_TYPE_NORM: Llama): pairs (2 i, 2 i + 1). Pair i < rot_pairs rotates by theta_i = pos *
+// base^(-2 i / n_rot) / ff[i] (ff: rope_freqs, Llama 3's frequency divisors; NULL: 1), the others stay as they are;
+// n_rot 0: no RoPE.
 template <int D>
 __device__ float norm_rope(float x, const float* w, int n_rot, int rot_pairs, int pos, float freq_base, float eps,
-                           bool norm = true) {
+                           bool norm = true, int rope_norm = 0, const float* ff = nullptr) {
     __shared__ float v[D];
     const int d = threadIdx.x;
     if (norm) {  // uniform
@@ -127,13 +129,15 @@ __device__ float norm_rope(float x, const float* w, int n_rot, int rot_pairs, in
     v[d] = x;
     __syncthreads();
     const int half = n_rot / 2;
-    if (d < n_rot && (d < half ? d : d - half) < rot_pairs) {
-        const int i = d < half ? d : d - half;
-        const float theta = (float)pos * powf(freq_base, -2.0f * (float)i / (float)n_rot);
+    const int i = rope_norm ? d / 2 : d < half ? d : d - half;  // this dim's pair
+    if (d < n_rot && i < rot_pairs) {
+        float theta = (float)pos * powf(freq_base, -2.0f * (float)i / (float)n_rot);
+        if (ff) theta /= ff[i];
         float sn, cs;
         sincosf(theta, &sn, &cs);
-        const float x0 = v[i], x1 = v[i + half];
-        x = d < half ? x0 * cs - x1 * sn : x0 * sn + x1 * cs;
+        const int i0 = rope_norm ? 2 * i : i, i1 = rope_norm ? 2 * i + 1 : i + half;
+        const float x0 = v[i0], x1 = v[i1];
+        x = d == i0 ? x0 * cs - x1 * sn : x0 * sn + x1 * cs;
     }
     __syncthreads();
     return x;
@@ -145,7 +149,7 @@ __device__ __forceinline__ void attn_prep_body(const float* qfull, const float* 
                                                int kv_shift, long long kv_bstride, int n_q, int n_kv, int n_rot,
                                                int pos0, float freq_base, float eps, int gated, int rot_pairs,
                                                int v_norm, int qk_norm, int kv_q8, const float* bq, const float* bk,
-                                               const float* bv) {
+                                               const float* bv, int rope_norm, const float* ff) {
     const int b = blockIdx.x, d = threadIdx.x, z = blockIdx.y, pos = pos0 + z;
     const int qs = gated ? 2 * D : D;  // a head's stride in attn_q's output
     qfull += (size_t)z * n_q * qs;
@@ -156,11 +160,11 @@ __device__ __forceinline__ void attn_prep_body(const float* qfull, const float* 
     __half* v_row = V + kv_row(pos, kv_stride, kv_shift, kv_bstride);
     if (b < n_q) {
         const float x = qfull[(size_t)b * qs + d] + (bq ? bq[(size_t)b * qs + d] : 0.0f);
-        q_out[b * D + d] = norm_rope<D>(x, q_norm, n_rot, rot_pairs, pos, freq_base, eps, qk_norm);
+        q_out[b * D + d] = norm_rope<D>(x, q_norm, n_rot, rot_pairs, pos, freq_base, eps, qk_norm, rope_norm, ff);
     } else {
         const int g = b - n_q;
         const float x = norm_rope<D>(k[g * D + d] + (bk ? bk[g * D + d] : 0.0f), k_norm, n_rot, rot_pairs, pos,
-                                     freq_base, eps, qk_norm);
+                                     freq_base, eps, qk_norm, rope_norm, ff);
         const float vv = v[g * D + d] + (bv ? bv[g * D + d] : 0.0f);
         const float vx = v_norm ? norm_rope<D>(vv, nullptr, 0, 0, pos, freq_base, eps) : vv;
         if (kv_q8) {  // uniform: a wave's 32 dims are one block
@@ -764,9 +768,10 @@ ATTN_GQA_KERNELS(256)
                       const float* k_norm, float* q_out, __half* K, __half* V, int kv_stride, int kv_shift,    \
                       long long kv_bstride, int n_q, int n_kv, int n_rot, int pos0, float freq_base, float eps, \
                       int gated, int rot_pairs, int v_norm, int qk_norm, int kv_q8, const float* bq,         \
-                      const float* bk, const float* bv) {                                                    \
+                      const float* bk, const float* bv, int rope_norm, const float* ff) {                    \
         attn_prep_body<D>(qfull, k, v, q_norm, k_norm, q_out, K, V, kv_stride, kv_shift, kv_bstride, n_q, n_kv, \
-                          n_rot, pos0, freq_base, eps, gated, rot_pairs, v_norm, qk_norm, kv_q8, bq, bk, bv); \
+                          n_rot, pos0, freq_base, eps, gated, rot_pairs, v_norm, qk_norm, kv_q8, bq, bk, bv, \
+                          rope_norm, ff);                                                                    \
     }                                                                                                        \
     extern "C" __global__ void __launch_bounds__(CH)                                                         \
         attn_partial_##D(const float* q, const __half* K, const __half* V, int kv_stride, int kv_shift,       \

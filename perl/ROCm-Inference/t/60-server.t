@@ -17,6 +17,9 @@ require ROCm::Inference;
 plan skip_all => "Minijinja $ROCm::Inference::MINIJINJA_VERSION is not installed"
     unless ROCm::Inference::_require_minijinja();
 
+# does the chat format have reasoning (Llama 3's has none)?
+my $thinks = do { my $t = ROCm::Inference::chat_template(ROCm::Inference::load_model($path)) // '';
+                  index($t, '<|start_header_id|>') < 0 };
 my $dir = tempdir(CLEANUP => 1);
 my $sock = "$dir/llm.sock";
 my $J = JSON::PP->new->utf8->canonical;
@@ -86,7 +89,7 @@ for (@chunks) {
     $content .= $c->{delta}{content} // '';
     $finish = $c->{finish_reason} if $c->{finish_reason};
 }
-ok(length $reasoning, 'reasoning deltas');
+ok(!$thinks || length $reasoning, $thinks ? 'reasoning deltas' : 'no reasoning in this chat format');
 like($content, qr/7|13|not/i, "content deltas: $content");
 is($finish, 'stop', 'finish_reason');
 ok($usage && $usage->{completion_tokens} > 0, 'a usage chunk');
