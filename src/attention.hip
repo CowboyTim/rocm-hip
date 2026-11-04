@@ -41,45 +41,67 @@ __device__ __forceinline__ size_t kv_row(int p, int kv_stride, int kv_shift, lon
     return (size_t)(p >> kv_shift) * (size_t)kv_bstride + (size_t)(p & ((1 << kv_shift) - 1)) * (size_t)kv_stride;
 }
 
-// Q8_0 KV cache rows (attention_opts.kv_q8): d_row int8 values, then their fp16 scales, one per 32 values (as
-// ggml's q8_0: d = amax / 127, q = round(x / d)); kv_stride (in halves) = d_row * 17 / 32. Element e of a row at
-// row (as __half*): ((int8*)row)[e] * scale[e / 32].
-__device__ __forceinline__ int kvq_drow(int kv_stride) { return kv_stride * 32 / 17; }
+// Quantized KV cache rows (attention_opts.kv_quant, KQ): d_row values, then their fp16 scales, one per 32 values.
+// KQ 1, Q8_0: int8 values (as ggml's q8_0: d = amax / 127, q = round(x / d)); kv_stride (in halves) = d_row * 17 /
+// 32. KQ 2, Q4_0: 4-bit values q + 8 (as ggml's q4_0: d = max / -8, max the value of largest magnitude), byte 4 j + k
+// (k < 4) holding values 8 j + k (low nibble) and 8 j + k + 4 (high: 4 bytes unpack to 8 consecutive values with
+// two masks); kv_stride = d_row * 9 / 32. Element e: q[e] * scale[e / 32].
+template <int KQ>
+__device__ __forceinline__ int kvq_drow(int kv_stride) { return kv_stride * 32 / (KQ == 2 ? 9 : 17); }
+template <int KQ>
+__device__ __forceinline__ const __half* kvq_scales(const __half* row, int drow) {
+    return (const __half*)((const int8_t*)row + (KQ == 2 ? drow / 2 : drow));
+}
+
+// halves (1024 + 128 + byte k of w, k = sel's bytes) - bias, times sc: the packed dequantization below
+__device__ __forceinline__ __half2 kvq_pair(uint32_t w, uint32_t sel, __half2 bias, __half2 sc) {
+    const uint32_t h = __builtin_amdgcn_perm(0x64646464u, w, sel);
+    return __hmul2(__hsub2(*(const __half2*)&h, bias), sc);
+}
 
 // 8 consecutive values e .. e + 7 (e % 8 == 0) of a cache row as fp16, in a uint4 (KQ: dequantized)
-template <bool KQ>
+template <int KQ>
 __device__ __forceinline__ uint4 kv_load8(const __half* row, int e, int drow) {
-    if constexpr (!KQ) {
+    if constexpr (KQ == 0) {
         return *(const uint4*)(row + e);
+    } else if constexpr (KQ == 2) {  // nibble n under the exponent of 1024 is the half 1024 + n: (that - 1032) * scale
+        const uint32_t w = *(const uint32_t*)((const uint8_t*)row + e / 2);
+        const __half2 sc = __half2half2(kvq_scales<2>(row, drow)[e / 32]);
+        const __half2 bias = __float2half2_rn(1032.0f);
+        const uint32_t lo = w & 0x0F0F0F0Fu, hi = (w >> 4) & 0x0F0F0F0Fu;  // values e .. e + 3, e + 4 .. e + 7
+        uint4 r;
+        __half2* h = (__half2*)&r;
+        h[0] = kvq_pair(lo, 0x04010400u, bias, sc), h[1] = kvq_pair(lo, 0x04030402u, bias, sc);
+        h[2] = kvq_pair(hi, 0x04010400u, bias, sc), h[3] = kvq_pair(hi, 0x04030402u, bias, sc);
+        return r;
     } else {
         // packed: byte q (as q + 128) under the exponent of 1024 is the half 1024 + 128 + q, so (that - 1152) *
         // scale is q * scale rounded once, as (float)q * scale then to half (both products are exact)
         const int8_t* b = (const int8_t*)row;
         const uint2 q = *(const uint2*)(b + e);
-        const __half2 sc = __half2half2(((const __half*)(b + drow))[e / 32]);
+        const __half2 sc = __half2half2(kvq_scales<1>(row, drow)[e / 32]);
         const __half2 bias = __float2half2_rn(1152.0f);
         const uint32_t w[2] = {q.x ^ 0x80808080u, q.y ^ 0x80808080u};
         uint4 r;
         __half2* h = (__half2*)&r;
 #pragma unroll
-        for (int k = 0; k < 2; ++k) {
-            const uint32_t lo = __builtin_amdgcn_perm(0x64646464u, w[k], 0x04010400u);  // bytes 0, 1
-            const uint32_t hi = __builtin_amdgcn_perm(0x64646464u, w[k], 0x04030402u);  // bytes 2, 3
-            h[2 * k] = __hmul2(__hsub2(*(const __half2*)&lo, bias), sc);
-            h[2 * k + 1] = __hmul2(__hsub2(*(const __half2*)&hi, bias), sc);
-        }
+        for (int k = 0; k < 2; ++k)
+            h[2 * k] = kvq_pair(w[k], 0x04010400u, bias, sc), h[2 * k + 1] = kvq_pair(w[k], 0x04030402u, bias, sc);
         return r;
     }
 }
 
 // One value of a cache row as float
-template <bool KQ>
+template <int KQ>
 __device__ __forceinline__ float kv_value(const __half* row, int e, int drow) {
-    if constexpr (!KQ) {
+    if constexpr (KQ == 0) {
         return __half2float(row[e]);
+    } else if constexpr (KQ == 2) {
+        const uint8_t byte = ((const uint8_t*)row)[(e >> 3) * 4 + (e & 3)];
+        const int n = (e & 4) ? byte >> 4 : byte & 15;
+        return (float)(n - 8) * __half2float(kvq_scales<2>(row, drow)[e / 32]);
     } else {
-        const int8_t* b = (const int8_t*)row;
-        return (float)b[e] * __half2float(((const __half*)(b + drow))[e / 32]);
+        return (float)((const int8_t*)row)[e] * __half2float(kvq_scales<1>(row, drow)[e / 32]);
     }
 }
 
@@ -91,6 +113,27 @@ __device__ __forceinline__ float wave_sum(float v) {
 __device__ __forceinline__ float wave_max(float v) {
     for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor(v, off, 32));
     return v;
+}
+
+// Writes value x as element e = 32 b + (lane) of a quantized cache row (all 32 lanes of a wave together: one
+// block): Q8_0 or Q4_0 (kq), the block's scale by lane 0
+__device__ __forceinline__ void kvq_store(__half* row, int e, float x, int kq, int kv_stride) {
+    const int lane = e & 31;
+    if (kq == 1) {
+        const int drow = kvq_drow<1>(kv_stride);
+        const float d = wave_max(fabsf(x)) / 127.0f;
+        ((int8_t*)row)[e] = (int8_t)(int)rintf(d != 0.0f ? x * (1.0f / d) : 0.0f);
+        if (lane == 0) ((__half*)((int8_t*)row + drow))[e / 32] = __float2half(d);
+    } else {
+        const int drow = kvq_drow<2>(kv_stride);
+        const float amax = wave_max(fabsf(x));
+        const float mx = wave_max(fabsf(x) == amax ? x : -INFINITY);  // the value of largest magnitude
+        const float d = mx / -8.0f;
+        const int n = min(15, (int)(d != 0.0f ? x * (1.0f / d) + 8.5f : 8.0f));
+        const int hi = __shfl_down(n, 4, 32);  // value e + 4 shares a byte with e (e % 8 < 4)
+        if ((e & 4) == 0) ((uint8_t*)row)[(e >> 3) * 4 + (e & 3)] = (uint8_t)(n | (hi << 4));
+        if (lane == 0) ((__half*)((int8_t*)row + drow / 2))[e / 32] = __float2half(d);
+    }
 }
 
 // Sum / max over the NTH threads of a workgroup (wave32)
@@ -156,7 +199,7 @@ __device__ __forceinline__ void attn_prep_body(const float* qfull, const float* 
                                                const float* k_norm, float* q_out, __half* K, __half* V, int kv_stride,
                                                int kv_shift, long long kv_bstride, int n_q, int n_kv, int n_rot,
                                                int pos0, float freq_base, float eps, int gated, int rot_pairs,
-                                               int v_norm, int qk_norm, int kv_q8, const float* bq, const float* bk,
+                                               int v_norm, int qk_norm, int kv_quant, const float* bq, const float* bk,
                                                const float* bv, int rope_norm, const float* ff) {
     const int b = blockIdx.x, d = threadIdx.x, z = blockIdx.y, pos = pos0 + z;
     const int qs = gated ? 2 * D : D;  // a head's stride in attn_q's output
@@ -175,16 +218,9 @@ __device__ __forceinline__ void attn_prep_body(const float* qfull, const float* 
                                      freq_base, eps, qk_norm, rope_norm, ff);
         const float vv = v[g * D + d] + (bv ? bv[g * D + d] : 0.0f);
         const float vx = v_norm ? norm_rope<D>(vv, nullptr, 0, 0, pos, freq_base, eps) : vv;
-        if (kv_q8) {  // uniform: a wave's 32 dims are one block
-            const int drow = kvq_drow(kv_stride), e = g * D + d;
-            const float ka = wave_max(fabsf(x)), va = wave_max(fabsf(vx));
-            const float kd = ka / 127.0f, vd = va / 127.0f;
-            ((int8_t*)k_row)[e] = (int8_t)(int)rintf(kd != 0.0f ? x * (1.0f / kd) : 0.0f);
-            ((int8_t*)v_row)[e] = (int8_t)(int)rintf(vd != 0.0f ? vx * (1.0f / vd) : 0.0f);
-            if ((d & 31) == 0) {
-                ((__half*)((int8_t*)k_row + drow))[e / 32] = __float2half(kd);
-                ((__half*)((int8_t*)v_row + drow))[e / 32] = __float2half(vd);
-            }
+        if (kv_quant) {  // uniform: a wave's 32 dims are one block
+            kvq_store(k_row, g * D + d, x, kv_quant, kv_stride);
+            kvq_store(v_row, g * D + d, vx, kv_quant, kv_stride);
         } else {
             k_row[g * D + d] = __float2half(x);
             v_row[g * D + d] = __float2half(vx);
@@ -192,7 +228,7 @@ __device__ __forceinline__ void attn_prep_body(const float* qfull, const float* 
     }
 }
 
-template <int D, bool KQ = false>
+template <int D, int KQ = 0>
 __device__ __forceinline__ void attn_partial_body(const float* q, const __half* K, const __half* V, int kv_stride,
                                                   int kv_shift, long long kv_bstride, int pos0, int n_q, int n_kv_heads,
                                                   float scale, float* part_ml, float* part_acc, int window) {
@@ -218,9 +254,9 @@ __device__ __forceinline__ void attn_partial_body(const float* q, const __half* 
     float score = -INFINITY;
     if (p < n_kv && p >= lo) {
         float s = 0.0f;
-        if constexpr (KQ) {  // per 32-value block: the int8 dot with q, times the block's scale
+        if constexpr (KQ == 1) {  // per 32-value block: the int8 dot with q, times the block's scale
             const int8_t* kb = (const int8_t*)(K + kv_row(p, kv_stride, kv_shift, kv_bstride));
-            const __half* ks = (const __half*)(kb + kvq_drow(kv_stride)) + g * (D / 32);
+            const __half* ks = (const __half*)(kb + kvq_drow<1>(kv_stride)) + g * (D / 32);
             kb += g * D;
 #pragma unroll 2
             for (int blk = 0; blk < D / 32; ++blk) {
@@ -232,11 +268,25 @@ __device__ __forceinline__ void attn_partial_body(const float* q, const __half* 
                 for (int j = 0; j < 16; ++j) sb += (float)q0[j] * sq[32 * blk + j] + (float)q1[j] * sq[32 * blk + 16 + j];
                 s += sb * __half2float(ks[blk]);
             }
-        } else {
-            const uint4* kr = (const uint4*)(K + kv_row(p, kv_stride, kv_shift, kv_bstride) + (size_t)g * D);
+        } else if constexpr (KQ == 2) {  // per 8 values: the 4-bit values' dot with q, times the block's scale
+            const __half* kr = K + kv_row(p, kv_stride, kv_shift, kv_bstride);
+            const __half* ks = kvq_scales<2>(kr, kvq_drow<2>(kv_stride)) + g * (D / 32);
+            const uint32_t* kw = (const uint32_t*)kr + g * D / 8;
 #pragma unroll 4
             for (int i = 0; i < D / 8; ++i) {
-                const uint4 u = kr[i];
+                const uint32_t w = kw[i];
+                float sb = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    sb += (float)((int)((w >> (8 * j)) & 15) - 8) * sq[8 * i + j] +
+                          (float)((int)((w >> (8 * j + 4)) & 15) - 8) * sq[8 * i + 4 + j];
+                s += sb * __half2float(ks[i / 4]);
+            }
+        } else {
+            const __half* kr = K + kv_row(p, kv_stride, kv_shift, kv_bstride);
+#pragma unroll 4
+            for (int i = 0; i < D / 8; ++i) {
+                const uint4 u = *(const uint4*)(kr + g * D + 8 * i);
                 const __half2* h2 = (const __half2*)&u;
 #pragma unroll
                 for (int k2 = 0; k2 < 4; ++k2) {
@@ -258,10 +308,10 @@ __device__ __forceinline__ void attn_partial_body(const float* q, const __half* 
     for (int d = t; d < D; d += CH) {
         float acc = 0.0f;
         if constexpr (KQ) {
-            const int drow = kvq_drow(kv_stride);
+            const int drow = kvq_drow<KQ>(kv_stride);
 #pragma unroll 8
             for (int i = i0; i < np; ++i)
-                acc += sw[i] * kv_value<true>(V + kv_row(p0 + i, kv_stride, kv_shift, kv_bstride), g * D + d, drow);
+                acc += sw[i] * kv_value<KQ>(V + kv_row(p0 + i, kv_stride, kv_shift, kv_bstride), g * D + d, drow);
         } else {
             const __half* vb = V + (size_t)g * D + d;
 #pragma unroll 8  // (8 positions' loads in flight)
@@ -334,7 +384,7 @@ typedef float v8f __attribute__((ext_vector_type(8)));
 // NG: KV heads per workgroup (its NH query heads read KV head h / (n_q / n_kv)): 1 when the ratio n_q / n_kv
 // is a multiple of NH, 2 for ratio 2 with NH 4 (Qwen3). Each block stages the NG KV heads' K / V rows; wave w
 // reads those of its own KV head (local index (w % NH) * NG / NH).
-template <int D, int NG, int NH, int TT, int DS, bool KQ = false>
+template <int D, int NG, int NH, int TT, int DS, int KQ = 0>
 __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K, const __half* V, int kv_stride,
                                                 int kv_shift, long long kv_bstride, int pos0, int T, int n_q,
                                                 int n_kv_heads, int chunk, float scale, float* part_ml,
@@ -358,7 +408,7 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
     const int npos = min(chunk, pos0 + zmax + 1 - c * chunk);  // chunk positions any token of the tiles sees
     const int nb = npos > 0 ? (npos + FB - 1) / FB : 0;
     const int lo0 = window > 0 ? pos0 + zt + 1 - window : 0;  // the first token's first position
-    const int drow = KQ ? kvq_drow(kv_stride) : 0;            // Q8_0 rows: values per row
+    const int drow = KQ ? kvq_drow<KQ>(kv_stride) : 0;        // quantized rows: values per row
 
     // This wave's Q rows (tokens z0 .. z0 + 15 of head h) to FP16; rows past T are zero
     for (int idx = lane; idx < FT * D / 4; idx += 32) {
@@ -569,7 +619,7 @@ __device__ void attn_bidir_body(const float* q, const __half* K, const __half* V
 // groups added in LDS. A decode step is latency-bound (Qwen3-30B at 32k: 2,048 workgroups of 64 positions), so all
 // of a thread's K pieces and its first V batch are loaded before anything waits: one memory round trip instead of
 // a chain (q, then K, then V in 4 batches). R <= RMAX. KQ: a Q8_0 cache (int8 values times their block's scale).
-template <int D, int RMAX, int PW, bool KQ = false>
+template <int D, int RMAX, int PW, int KQ = 0>
 __device__ __forceinline__ void attn_partial_gqa_body(const float* q, const __half* K, const __half* V, int kv_stride,
                                                       int kv_shift, long long kv_bstride, int pos0, int n_q,
                                                       int n_kv_heads, float scale, float* part_ml, float* part_acc,
@@ -598,20 +648,26 @@ __device__ __forceinline__ void attn_partial_gqa_body(const float* q, const __ha
         }
         return;
     }
-    const int drow = KQ ? kvq_drow(kv_stride) : 0;
+    const int drow = KQ ? kvq_drow<KQ>(kv_stride) : 0;
     // 8 K values of piece k (as 8 floats; KQ: times the block's scale)
     auto k_load = [&](const __half* krow, int k, uint4& u, float& sc) {
         const int e = g * D + 8 * k;
-        if constexpr (KQ) {
+        if constexpr (KQ == 2) {
+            u.x = *(const uint32_t*)((const uint8_t*)krow + e / 2);
+            sc = __half2float(kvq_scales<2>(krow, drow)[e / 32]);
+        } else if constexpr (KQ == 1) {
             const uint2 w = *(const uint2*)((const int8_t*)krow + e);
             u.x = w.x, u.y = w.y;
-            sc = __half2float(((const __half*)((const int8_t*)krow + drow))[e / 32]);
+            sc = __half2float(kvq_scales<1>(krow, drow)[e / 32]);
         } else {
             u = *(const uint4*)(krow + e);
         }
     };
     auto k_unpack = [&](const uint4& u, float sc, float* f) {
-        if constexpr (KQ) {
+        if constexpr (KQ == 2) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) f[j] = (float)((int)((u.x >> (8 * (j & 3) + 4 * (j >> 2))) & 15) - 8) * sc;
+        } else if constexpr (KQ == 1) {
             const int8_t* qv = (const int8_t*)&u;
 #pragma unroll
             for (int j = 0; j < 8; ++j) f[j] = (float)qv[j] * sc;
@@ -631,9 +687,13 @@ __device__ __forceinline__ void attn_partial_gqa_body(const float* q, const __ha
     const int ib = i0 + (pg - i0 % NPG + NPG) % NPG;  // this thread's first position
     auto v_load = [&](int iu, float2& x) {
         const __half* row = V + kv_row(p0 + max(0, min(iu, np - 1)), kv_stride, kv_shift, kv_bstride);
-        if constexpr (KQ) {
+        if constexpr (KQ == 2) {  // dims e0, e0 + 1: the same nibble of two adjacent bytes
+            const float sc = __half2float(kvq_scales<2>(row, drow)[e0 / 32]);
+            const int w = *(const unsigned short*)((const uint8_t*)row + (e0 >> 3) * 4 + (e0 & 3)) >> (e0 & 4);
+            x = make_float2((float)((w & 15) - 8) * sc, (float)(((w >> 8) & 15) - 8) * sc);
+        } else if constexpr (KQ == 1) {
             const int8_t* b = (const int8_t*)row;
-            const float sc = __half2float(((const __half*)(b + drow))[e0 / 32]);
+            const float sc = __half2float(kvq_scales<1>(row, drow)[e0 / 32]);
             const short w = *(const short*)(b + e0);
             x = make_float2((float)(int8_t)w * sc, (float)(int8_t)(w >> 8) * sc);
         } else {
@@ -756,8 +816,9 @@ __device__ __forceinline__ void attn_partial_gqa_body(const float* q, const __ha
                                                n_kv_heads, scale, part_ml, part_acc, window);                \
     }
 #define ATTN_GQA_KERNEL(NAME, D, RMAX, PW)                                                                    \
-    ATTN_GQA_KERNEL_KQ(NAME, D, RMAX, PW, false)                                                              \
-    ATTN_GQA_KERNEL_KQ(NAME##_q8, D, RMAX, PW, true)
+    ATTN_GQA_KERNEL_KQ(NAME, D, RMAX, PW, 0)                                                                  \
+    ATTN_GQA_KERNEL_KQ(NAME##_q8, D, RMAX, PW, 1)                                                             \
+    ATTN_GQA_KERNEL_KQ(NAME##_q4, D, RMAX, PW, 2)
 #define ATTN_GQA_KERNELS(D)                                                                                   \
     ATTN_GQA_KERNEL(attn_partial_gqa8_##D, D, 8, 256)                                                         \
     ATTN_GQA_KERNEL(attn_partial_gqa16_##D, D, 16, 256)                                                       \
@@ -775,10 +836,10 @@ ATTN_GQA_KERNELS(256)
         attn_prep_##D(const float* qfull, const float* k, const float* v, const float* q_norm,                \
                       const float* k_norm, float* q_out, __half* K, __half* V, int kv_stride, int kv_shift,    \
                       long long kv_bstride, int n_q, int n_kv, int n_rot, int pos0, float freq_base, float eps, \
-                      int gated, int rot_pairs, int v_norm, int qk_norm, int kv_q8, const float* bq,         \
+                      int gated, int rot_pairs, int v_norm, int qk_norm, int kv_quant, const float* bq,      \
                       const float* bk, const float* bv, int rope_norm, const float* ff) {                    \
         attn_prep_body<D>(qfull, k, v, q_norm, k_norm, q_out, K, V, kv_stride, kv_shift, kv_bstride, n_q, n_kv, \
-                          n_rot, pos0, freq_base, eps, gated, rot_pairs, v_norm, qk_norm, kv_q8, bq, bk, bv, \
+                          n_rot, pos0, freq_base, eps, gated, rot_pairs, v_norm, qk_norm, kv_quant, bq, bk, bv, \
                           rope_norm, ff);                                                                    \
     }                                                                                                        \
     extern "C" __global__ void __launch_bounds__(CH)                                                         \
@@ -792,8 +853,15 @@ ATTN_GQA_KERNELS(256)
         attn_partial_##D##_q8(const float* q, const __half* K, const __half* V, int kv_stride, int kv_shift,  \
                               long long kv_bstride, int pos0, int n_q, int n_kv_heads, float scale,           \
                               float* part_ml, float* part_acc, int window) {                                 \
-        attn_partial_body<D, true>(q, K, V, kv_stride, kv_shift, kv_bstride, pos0, n_q, n_kv_heads, scale,    \
-                                   part_ml, part_acc, window);                                               \
+        attn_partial_body<D, 1>(q, K, V, kv_stride, kv_shift, kv_bstride, pos0, n_q, n_kv_heads, scale,       \
+                                part_ml, part_acc, window);                                                  \
+    }                                                                                                        \
+    extern "C" __global__ void __launch_bounds__(CH)                                                         \
+        attn_partial_##D##_q4(const float* q, const __half* K, const __half* V, int kv_stride, int kv_shift,  \
+                              long long kv_bstride, int pos0, int n_q, int n_kv_heads, float scale,           \
+                              float* part_ml, float* part_acc, int window) {                                 \
+        attn_partial_body<D, 2>(q, K, V, kv_stride, kv_shift, kv_bstride, pos0, n_q, n_kv_heads, scale,       \
+                                part_ml, part_acc, window);                                                  \
     }                                                                                                        \
     extern "C" __global__ void __launch_bounds__(256)                                                        \
         attn_combine_##D(const float* part_ml, const float* part_acc, int n_chunks, int n_q, const float* qfull, \
@@ -824,8 +892,9 @@ ATTN_GQA_KERNELS(256)
                                                n_kv_heads, chunk, scale, part_ml, part_acc, window);         \
     }
 #define ATTN_FLASH_KERNEL_NAMED(NAME, D, NG, NH, TT, DS)                                                      \
-    ATTN_FLASH_KERNEL_KQ(NAME, D, NG, NH, TT, DS, false)                                                      \
-    ATTN_FLASH_KERNEL_KQ(NAME##_q8, D, NG, NH, TT, DS, true)
+    ATTN_FLASH_KERNEL_KQ(NAME, D, NG, NH, TT, DS, 0)                                                          \
+    ATTN_FLASH_KERNEL_KQ(NAME##_q8, D, NG, NH, TT, DS, 1)                                                     \
+    ATTN_FLASH_KERNEL_KQ(NAME##_q4, D, NG, NH, TT, DS, 2)
 
 ATTN_KERNELS(64)
 ATTN_KERNELS(128)

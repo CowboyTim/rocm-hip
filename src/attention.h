@@ -72,7 +72,8 @@ typedef struct {
     int window;      // sliding window: a token at p attends to positions > p - window only; 0: all before it
     float scale;     // the scores' scale; 0: 1 / sqrt(head_dim) (Gemma-4: 1, its q / k norms replace it)
     int no_qk_norm;  // Q and K as they come (no RMSNorm; Nemotron-H), q_norm / k_norm unused
-    int kv_q8;       // the KV cache rows are Q8_0 (kv_cache_config_t.kv_type): int8 values, then an fp16 scale per 32
+    int kv_quant;    // the KV cache rows (kv_cache_config_t.kv_type): 0 F16, 1 Q8_0 (int8 values), 2 Q4_0 (4-bit values,
+                     // attention.hip has the layout), then an fp16 scale per 32
     int bidir;       // embedding models: a batch at positions 0 .. T - 1 (pos0 0, T <= 2048, F16 cache) where every
                      // token attends to all of its positions, or to |p - z| <= window / 2 with a window
                      // (llama.cpp's symmetric sliding window)

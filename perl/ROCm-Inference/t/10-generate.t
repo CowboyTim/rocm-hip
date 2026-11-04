@@ -19,14 +19,14 @@ is(swa_ring($m), 0, 'swa_ring: none at this context');
 ok(!eval { set_swa_ring($m, 0); 1 }, 'set_swa_ring after kv_cache_init dies');
 ok(!eval { set_kv_type($m, 'q8_0'); 1 }, 'set_kv_type after kv_cache_init dies');
 
-# A Q8_0 KV cache: the same greedy continuation of a plain prompt (quantization noise only)
-{
+# A Q8_0 / Q4_0 KV cache: the same greedy continuation of a plain prompt (quantization noise only)
+for my $type (qw(q8_0 q4_0)) {
     my $q = load_model($path);
-    is(set_kv_type($q, 'q8_0'), 0, 'set_kv_type q8_0');
+    is(set_kv_type($q, $type), 0, "set_kv_type $type");
     kv_cache_init($q, 2048);
     my $p = tokenize($q, 'The capital of France is');
     my ($o) = generate($q, $p, { max_new_tokens => 12, temperature => 0, ignore_eog => 1 });
-    like(detokenize($q, $o), qr/Paris/, 'Q8_0 KV cache: ' . detokenize($q, $o));
+    like(detokenize($q, $o), qr/Paris/, "$type KV cache: " . detokenize($q, $o));
 }
 is(n_ctx($m), 2048, 'n_ctx');
 my $err = eval { set_prefill_batch($m, 1024); 1 } ? '' : $@;

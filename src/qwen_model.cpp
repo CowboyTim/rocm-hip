@@ -729,7 +729,7 @@ struct QwenModel {
                 o.head_dim = eng->head_dim;
                 o.gated = eng->attn_gated ? 1 : 0;
                 o.kv_stride = kv_cache_row_halves(kvc);
-                o.kv_q8 = kv_cache_type(kvc) == KV_CACHE_Q8_0;
+                o.kv_quant = kv_cache_type(kvc);
                 o.no_qk_norm = !L.q_norm;  // Qwen2, Llama: none (Qwen2: biases instead)
                 o.bq = L.bq, o.bk = L.bk, o.bv = L.bv;
                 o.rope_norm = L.rope_norm ? 1 : 0;
@@ -1232,7 +1232,7 @@ struct QwenModel {
                 o.part_slots = s.part_slots;
                 o.head_dim = L.head_dim;
                 o.kv_stride = kv_cache_row_halves(kvc);
-                o.kv_q8 = kv_cache_type(kvc) == KV_CACHE_Q8_0;
+                o.kv_quant = kv_cache_type(kvc);
                 o.rot_pairs = L.rot_pairs;
                 const bool emb = eng->embed_pooling >= 0;  // EmbeddingGemma: no V norm, 1 / sqrt(D), bidirectional
                 o.v_norm = emb ? 0 : 1;
@@ -1471,7 +1471,7 @@ struct QwenModel {
                 o.part_slots = s.part_slots;
                 o.head_dim = HD;
                 o.kv_stride = kv_cache_row_halves(kvc);
-                o.kv_q8 = kv_cache_type(kvc) == KV_CACHE_Q8_0;
+                o.kv_quant = kv_cache_type(kvc);
                 o.no_qk_norm = 1;  // and no RoPE (n_rot 0)
                 return check(attention_forward_opts(s.qfull + r * L.Wq.N, s.k + r * L.Wk.N, s.v + r * L.Wv.N, nullptr,
                                                     nullptr, K, V, kv_cache_block_shift(kvc),

@@ -1,7 +1,7 @@
 // demo_qwen.cpp -- text generation with the Qwen3.5 forward pass.
 // Usage: ./qwen_demo <model.gguf> "prompt text" | @prompt_file [n_gen] [--temp T] [--top-k K] [--top-p P] [--min-p P]
 //                    [--repeat-penalty R] [--seed S] [--lm-head-q8] [--ctx N (default 4096)]
-//                    [--draft mtp.gguf [--drafts 0..3]] [--batch N] [--kv-q8] [--stage DIR]
+//                    [--draft mtp.gguf [--drafts 0..3]] [--batch N] [--kv-q8 | --kv-q4] [--stage DIR]
 //
 // --draft: an MTP draft head for speculative decoding; generation then runs through inference_generate_stream
 // (ignoring end-of-generation tokens, as this demo does not stop at them either); --drafts: drafts per pass.
@@ -26,7 +26,7 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         printf("Usage: %s <model.gguf> \"prompt text\" [n_gen] [--temp T] [--top-k K] [--top-p P] [--min-p P] "
                "[--repeat-penalty R] [--seed S] [--lm-head-q8] [--ctx N] [--draft mtp.gguf [--drafts 0..3]]\n"
-               "       [--batch N] [--kv-q8] [--stage DIR]\n",
+               "       [--batch N] [--kv-q8 | --kv-q4] [--stage DIR]\n",
                argv[0]);
         return 1;
     }
@@ -54,7 +54,7 @@ int main(int argc, char** argv) {
     const char* draft = nullptr;
     int drafts = -1;  // drafts per pass (0: adaptive; -1: the library's default)
     int batch = 0;    // tokens per prefill micro-batch (0: the library's default)
-    bool kv_q8 = false;  // a Q8_0 KV cache
+    int kv_type = INFERENCE_KV_F16;  // --kv-q8 / --kv-q4: a Q8_0 / Q4_0 KV cache
     const char* stage_dir = nullptr;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
@@ -70,7 +70,8 @@ int main(int argc, char** argv) {
         else if (a == "--draft") { draft = v; ++i; }
         else if (a == "--drafts") { drafts = atoi(v); ++i; }
         else if (a == "--batch") { batch = atoi(v); ++i; }
-        else if (a == "--kv-q8") kv_q8 = true;
+        else if (a == "--kv-q8") kv_type = INFERENCE_KV_Q8_0;
+        else if (a == "--kv-q4") kv_type = INFERENCE_KV_Q4_0;
         else if (a == "--stage") { stage_dir = v; ++i; }
         else n_gen = atoi(argv[i]);
     }
@@ -91,8 +92,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "--batch: %s\n", inference_get_last_error());
         return 1;
     }
-    if (kv_q8 && inference_set_kv_type(engine, INFERENCE_KV_Q8_0) != 0) {
-        fprintf(stderr, "--kv-q8: %s\n", inference_get_last_error());
+    if (kv_type != INFERENCE_KV_F16 && inference_set_kv_type(engine, kv_type) != 0) {
+        fprintf(stderr, "KV cache type: %s\n", inference_get_last_error());
         return 1;
     }
     if (inference_kv_cache_init(engine, n_ctx) != 0) {

@@ -654,11 +654,12 @@ Larger batches speed up long prompts on MoE models (up to ~10%: each expert's we
 at the cost of scratch memory (about 1 MB per token on Qwen3.8-Flash-Next; Gemma-4's sliding-window ring also
 grows with it); no gain for dense models. Before C<kv_cache_init>; dies after it.
 
-=item set_kv_type($m, 'f16' | 'q8_0')
+=item set_kv_type($m, 'f16' | 'q8_0' | 'q4_0')
 
-The KV cache's element type: C<f16> (the default) or C<q8_0>, int8 with an fp16 scale per 32 values as llama.cpp's
-C<-ctk q8_0 -ctv q8_0>: about half the memory, so twice the context in the same RAM, at about the same speed
-(Qwen3.6-35B at 32k: 640 -> 340 MB). Before C<kv_cache_init>; dies after it.
+The KV cache's element type: C<f16> (the default), C<q8_0>, int8 with an fp16 scale per 32 values as llama.cpp's
+C<-ctk q8_0 -ctv q8_0>: about half the memory, so twice the context in the same RAM, and faster decoding at long
+contexts (Qwen3.6-35B at 32k: 640 -> 340 MB), or C<q4_0>, 4-bit values with an fp16 scale per 32 (as C<q4_0>):
+about a quarter of the memory, less exact. Before C<kv_cache_init>; dies after it.
 
 =item set_swa_ring($m, $positions), swa_ring($m)
 

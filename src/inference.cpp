@@ -1095,12 +1095,12 @@ int inference_swa_ring(const inference_model_t* m) { return m ? m->swa_ring : 0;
 
 int inference_set_kv_type(inference_model_t* m, int kv_type) {
     clear_error();
-    if (!m || (kv_type != INFERENCE_KV_F16 && kv_type != INFERENCE_KV_Q8_0)) {
-        set_error("KV cache type: INFERENCE_KV_F16 or INFERENCE_KV_Q8_0");
+    if (!m || (kv_type != INFERENCE_KV_F16 && kv_type != INFERENCE_KV_Q8_0 && kv_type != INFERENCE_KV_Q4_0)) {
+        set_error("KV cache type: INFERENCE_KV_F16, INFERENCE_KV_Q8_0 or INFERENCE_KV_Q4_0");
         return INFERENCE_ERR_INVALID_ARG;
     }
     if (m->qwen) { set_error("KV cache type: call before inference_kv_cache_init"); return -1; }
-    m->kv_type = kv_type == INFERENCE_KV_Q8_0 ? KV_CACHE_Q8_0 : KV_CACHE_F16;
+    m->kv_type = kv_type == INFERENCE_KV_Q8_0 ? KV_CACHE_Q8_0 : kv_type == INFERENCE_KV_Q4_0 ? KV_CACHE_Q4_0 : KV_CACHE_F16;
     return 0;
 }
 

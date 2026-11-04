@@ -119,12 +119,14 @@ inference_kv_cache_t *kv_cache_create(const char *shm_path, const kv_cache_confi
     c->block_tokens = B;
     while ((1 << c->block_shift) < B) ++c->block_shift;
     const size_t d_kv = (size_t)f.n_heads_kv * f.head_dim;
-    if (f.kv_type == KV_CACHE_Q8_0 && d_kv % 256 != 0) {
-        INFER_LOG("kv_cache: Q8_0 rows need a multiple of 256 values (%zu)\n", d_kv);
+    if (f.kv_type != KV_CACHE_F16 && (f.kv_type > KV_CACHE_Q4_0 || d_kv % 256 != 0)) {
+        INFER_LOG("kv_cache: quantized rows need a multiple of 256 values (%zu), type %d\n", d_kv, f.kv_type);
         delete c;
         return nullptr;
     }
-    c->row_bytes = f.kv_type == KV_CACHE_Q8_0 ? d_kv + d_kv / 32 * sizeof(__half) : d_kv * sizeof(__half);
+    c->row_bytes = f.kv_type == KV_CACHE_Q8_0   ? d_kv + d_kv / 32 * sizeof(__half)
+                   : f.kv_type == KV_CACHE_Q4_0 ? d_kv / 2 + d_kv / 32 * sizeof(__half)
+                                                : d_kv * sizeof(__half);
     // A block is mapped from its own file, so it is padded to whole pages (the stride kernels use includes it)
     const size_t page = (size_t)sysconf(_SC_PAGESIZE);
     c->block_bytes = (2 * (size_t)f.n_layers * B * c->row_bytes + page - 1) / page * page;

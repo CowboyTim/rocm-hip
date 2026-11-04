@@ -1,4 +1,4 @@
-// attn_decode_verify: decode attention (attn_partial and the per-KV-head attn_partial_gqa) over an F16 or Q8_0 KV
+// attn_decode_verify: decode attention (attn_partial and the per-KV-head attn_partial_gqa) over an F16, Q8_0 or Q4_0 KV
 // cache vs a CPU reference computed from the cache's own values and the prepped q, for the head sizes, query / KV
 // head ratios and sliding windows the models use. No model needed; run from build/co (attention.co).
 //
@@ -39,11 +39,11 @@ struct Cfg {
 };
 
 // Largest error of the decode tokens' outputs relative to the largest reference value; *us: one decode step
-static double run(const Cfg& c, int kv_q8, double* us) {
+static double run(const Cfg& c, int kq, double* us) {
     const int D = c.D, n_q = c.n_q, n_kv = c.n_kv, n_ctx = 4096, rows = 1024, T0 = 512, TD = 3, L = 24;
     std::mt19937 rng(1234);
     std::normal_distribution<float> nd(0.0f, 1.0f);
-    const int kv_stride = kv_q8 ? n_kv * D * 17 / 32 : n_kv * D;
+    const int kv_stride = kq ? n_kv * D * (kq == 1 ? 17 : 9) / 32 : n_kv * D;  // F16, Q8_0, Q4_0 rows
     const size_t layer = (size_t)n_ctx * kv_stride;
     __half* K = alloc<__half>(layer * L);
     __half* V = alloc<__half>(layer * L);
@@ -59,7 +59,7 @@ static double run(const Cfg& c, int kv_q8, double* us) {
     float* pacc = alloc<float>(attention_part_acc_floats_d(n_q, n_ctx, rows, D));
     attention_opts o = {};
     o.head_dim = D;
-    o.kv_q8 = kv_q8;
+    o.kv_quant = kq;
     o.window = c.window;
     o.part_slots = (long long)attention_part_slots(n_ctx, rows);  // as the engine's scratch: 64-position chunks
     o.kv_stride = kv_stride;
@@ -78,8 +78,11 @@ static double run(const Cfg& c, int kv_q8, double* us) {
     }
     auto val = [&](const __half* C, int p, int e) -> float {
         const char* row = (const char*)(C + (size_t)p * kv_stride);
-        if (!kv_q8) return h2f(((const uint16_t*)row)[e]);
-        return (float)((const int8_t*)row)[e] * h2f(((const uint16_t*)(row + kv_stride * 32 / 17))[e / 32]);
+        if (!kq) return h2f(((const uint16_t*)row)[e]);
+        const int drow = kv_stride * 32 / (kq == 1 ? 17 : 9);
+        if (kq == 1) return (float)((const int8_t*)row)[e] * h2f(((const uint16_t*)(row + drow))[e / 32]);
+        const uint8_t byte = ((const uint8_t*)row)[(e >> 3) * 4 + (e & 3)];  // (attention.hip's Q4_0 layout)
+        return (float)(((e & 4) ? byte >> 4 : byte & 15) - 8) * h2f(((const uint16_t*)(row + drow / 2))[e / 32]);
     };
     double maxerr = 0.0, maxref = 0.0;
     const int R = n_q / n_kv;
@@ -156,8 +159,8 @@ int main(int argc, char** argv) {
     printf("%-14s %3s %3s %3s %5s %5s %-5s %9s %9s %9s %9s\n", "shape", "D", "n_q", "kv", "pos", "win", "cache",
            "err kv-hd", "err head", "us kv-hd", "us head");
     for (const Cfg& c : cfgs)
-        for (int kq = 0; kq < 2; ++kq) {
-            if (kq && c.n_kv * c.D % 256 != 0) continue;  // (Q8_0 cache rows are 256-value multiples)
+        for (int kq = 0; kq < 3; ++kq) {
+            if (kq && c.n_kv * c.D % 256 != 0) continue;  // (quantized cache rows are 256-value multiples)
             double us[2], err[2];
             for (int off = 0; off < 2; ++off) {  // per KV head (the default), per query head
                 if (off) setenv("ATTN_NO_GQA", "1", 1);
@@ -172,7 +175,7 @@ int main(int argc, char** argv) {
             const bool ok = err[0] < 1e-5 && err[1] < 1e-5;
             bad += !ok;
             printf("%-14s %3d %3d %3d %5d %5d %-5s %9.2e %9.2e %9.1f %9.1f %s\n", c.name, c.D, c.n_q, c.n_kv, c.npos,
-                   c.window, kq ? "Q8_0" : "F16", err[0], err[1], us[0], us[1], ok ? "ok" : "FAIL");
+                   c.window, kq == 2 ? "Q4_0" : kq ? "Q8_0" : "F16", err[0], err[1], us[0], us[1], ok ? "ok" : "FAIL");
         }
     unsetenv("ATTN_NO_GQA");
     attention_free();

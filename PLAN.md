@@ -2881,6 +2881,19 @@ scaling), which the engine only read as Gemma-4's "rotate the first pairs". Now:
   + q, so (that - 1152) * scale (half2 ops) is the same rounding of the same exact product (greedy tokens with a
   Q8_0 cache identical over 96 tokens). Prefill Qwen3-30B 7.6k 1,394-1,435 -> 1,477-1,557 tok/s (F16 1,506-1,552),
   31k 566 -> 664 (F16 668); generation at 31k Q8_0 29.9 vs F16 27.7.
+- **3. Q4_0 KV cache (INFERENCE_KV_Q4_0, Perl set_kv_type 'q4_0', server --kv-type q4_0, qwen_demo --kv-q4).**
+  ggml's q4_0 numbers (d = max / -8, nibble q + 8, fp16 scale per 32), our own byte order: byte 4 j + k holds
+  values 8 j + k and 8 j + k + 4, so 4 bytes unpack to 8 consecutive values with two masks (kv_load8: v_perm
+  under the exponent of 1024, minus 1032, times the scale in half2) and a thread's two adjacent V dims are one
+  2-byte load. Row = d_row / 2 bytes + d_row / 32 scales (kv_stride d_row * 9 / 32 halves). Kernels take `int
+  KQ` (0 F16, 1 Q8_0, 2 Q4_0) instead of bool; every cache reader has a _q4 variant; attention.cpp's tables
+  are [kq]-indexed, filled by name suffix; attention_opts.kv_q8 -> kv_quant (the kv_cache type numbers).
+  attn_prep writes it per wave (kvq_store: the value of largest magnitude, the partner nibble by shfl_down 4).
+  The per-head attn_partial dots the nibbles exactly (fp16-rounded values cost 2e-4 against the reference).
+- Checks: attn_decode_verify now F16 / Q8_0 / Q4_0 (31 cases, all <= 5e-7 vs the cache's own values); Perl
+  t/10-generate.t q4_0 ('Paris'); Qwen3-30B at 31k and Qwen3.6-35B at 112k answer coherently and on topic.
+- Speed: Qwen3-30B 31k generation F16 27.9 / Q8_0 29.7 / Q4_0 31.4 tok/s, prefill 668 / 698 / 624 (Q4_0's flash
+  staging costs ~10%); Qwen3.6-35B 112k generation 32.4 / 35.2 / 36.8, prefill (Q4_0) 724.
 
 ### Performance round: fewer passes over memory (2026-11-02, user: "do all of the performance ones in 1 go, mind to not copy around memory ... less copy on memory bandwidth helps for tg")
 

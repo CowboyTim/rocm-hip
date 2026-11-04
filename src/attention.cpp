@@ -14,19 +14,21 @@ static hipModule_t g_mod = nullptr;
 // [0]: head_dim 128 (attn_*_128), [1]: 256, [2]: 512 (no attn_flash_512), [3]: 64
 #define ATTN_NDIMS 4
 static int attn_dim(int i) { return i < 3 ? 128 << i : 64; }
-static hipFunction_t g_prep[ATTN_NDIMS], g_partial[ATTN_NDIMS], g_combine[ATTN_NDIMS], g_flash[ATTN_NDIMS];
-static hipFunction_t g_partial_q8[ATTN_NDIMS], g_flash_q8[ATTN_NDIMS];
-static hipFunction_t g_bidir[ATTN_NDIMS];  // attn_bidir_<D> (attention_opts.bidir)  // the same reading a Q8_0 KV cache (attention_opts.kv_q8)
+// The kernels that read the KV cache come in one variant per cache format, [kq] (attention_opts.kv_quant): 0 F16,
+// 1 Q8_0 (NAME_q8), 2 Q4_0 (NAME_q4)
+#define ATTN_NKQ 3
+static const char* const kKqSuffix[ATTN_NKQ] = {"", "_q8", "_q4"};
+static hipFunction_t g_prep[ATTN_NDIMS], g_combine[ATTN_NDIMS];
+static hipFunction_t g_partial[ATTN_NDIMS][ATTN_NKQ], g_flash[ATTN_NDIMS][ATTN_NKQ];
+static hipFunction_t g_bidir[ATTN_NDIMS];  // attn_bidir_<D> (attention_opts.bidir; F16 cache)
 // attn_flash_128_g2: 2 KV heads per workgroup, for a query / KV head ratio of 2 (Qwen3); attn_flash_256_h2t2
 // (ratio 2: Gemma-4's sliding layers) and attn_flash_512_h2s2 (Gemma-4's global layers, D split in 2)
-static hipFunction_t g_flash128_g2 = nullptr, g_flash256_h2t2 = nullptr, g_flash512_h2s2 = nullptr;
-static hipFunction_t g_flash128_g2_q8 = nullptr, g_flash256_h2t2_q8 = nullptr, g_flash512_h2s2_q8 = nullptr;
-// Other ratios: attn_flash_<D>_h2t2 (D 64 / 128, ratio a multiple of 2), attn_flash_<D>_h1t4 (D 64 / 128 / 256, any);
-// [i] as g_prep, [k][1] the Q8_0-cache variants
-static hipFunction_t g_flash_h2t2[ATTN_NDIMS][2], g_flash_h1t4[ATTN_NDIMS][2];
-// attn_partial_gqa{8,16}[s]_<D>[_q8] (D 64 / 128 / 256): attn_partial with the query heads of a KV head together;
-// [i][kq][0 / 1] up to 8 / 16 query heads per KV head, [i][kq][2 / 3] the same over 64-position chunks (kq: Q8_0 cache)
-static hipFunction_t g_partial_gqa[ATTN_NDIMS][2][4];
+static hipFunction_t g_flash128_g2[ATTN_NKQ], g_flash256_h2t2[ATTN_NKQ], g_flash512_h2s2[ATTN_NKQ];
+// Other ratios: attn_flash_<D>_h2t2 (D 64 / 128, ratio a multiple of 2), attn_flash_<D>_h1t4 (D 64 / 128 / 256, any)
+static hipFunction_t g_flash_h2t2[ATTN_NDIMS][ATTN_NKQ], g_flash_h1t4[ATTN_NDIMS][ATTN_NKQ];
+// attn_partial_gqa{8,16}[s]_<D> (D 64 / 128 / 256): attn_partial with the query heads of a KV head together;
+// [i][kq][0 / 1] up to 8 / 16 query heads per KV head, [i][kq][2 / 3] the same over 64-position chunks
+static hipFunction_t g_partial_gqa[ATTN_NDIMS][ATTN_NKQ][4];
 static bool g_gqa_off = false;
 
 // attn_flash takes batches of at least this many tokens. QMATVEC_NO_WMMA (qmatvec.h) also turns it off, so
@@ -35,6 +37,13 @@ static const int kFlashMinT = 16;
 // attn_flash splits a token's positions until the launch has this many workgroups (4 per WGP of the 20)
 static const long long kFlashWgs = 160;
 static bool g_flash_off = false;
+
+// f = the kernel `name` (with the format's suffix), or NULL when the module has none
+static void get_fn(hipFunction_t& f, const char* name, int kq = 0) {
+    char n[64];
+    snprintf(n, sizeof(n), "%s%s", name, kKqSuffix[kq]);
+    if (hipModuleGetFunction(&f, g_mod, n) != hipSuccess) f = nullptr;
+}
 
 int attention_init(const char* co_path) {
     if (g_mod) return 0;
@@ -45,50 +54,40 @@ int attention_init(const char* co_path) {
     }
     for (int i = 0; i < ATTN_NDIMS; ++i) {
         const int d = attn_dim(i);
-        char n[6][40];
-        snprintf(n[0], sizeof(n[0]), "attn_prep_%d", d);
-        snprintf(n[1], sizeof(n[1]), "attn_partial_%d", d);
-        snprintf(n[2], sizeof(n[2]), "attn_combine_%d", d);
-        snprintf(n[3], sizeof(n[3]), "attn_flash_%d", d);
-        snprintf(n[4], sizeof(n[4]), "attn_partial_%d_q8", d);
-        snprintf(n[5], sizeof(n[5]), "attn_flash_%d_q8", d);
-        if (hipModuleGetFunction(&g_prep[i], g_mod, n[0]) != hipSuccess ||
-            hipModuleGetFunction(&g_partial[i], g_mod, n[1]) != hipSuccess ||
-            hipModuleGetFunction(&g_combine[i], g_mod, n[2]) != hipSuccess ||
-            hipModuleGetFunction(&g_partial_q8[i], g_mod, n[4]) != hipSuccess ||
-            (d < 512 && (hipModuleGetFunction(&g_flash[i], g_mod, n[3]) != hipSuccess ||
-                         hipModuleGetFunction(&g_flash_q8[i], g_mod, n[5]) != hipSuccess))) {
+        char n[48];
+        snprintf(n, sizeof(n), "attn_prep_%d", d);
+        get_fn(g_prep[i], n);
+        snprintf(n, sizeof(n), "attn_combine_%d", d);
+        get_fn(g_combine[i], n);
+        snprintf(n, sizeof(n), "attn_bidir_%d", d);
+        get_fn(g_bidir[i], n);
+        bool ok = g_prep[i] && g_combine[i];
+        for (int kq = 0; kq < ATTN_NKQ; ++kq) {
+            snprintf(n, sizeof(n), "attn_partial_%d", d);
+            get_fn(g_partial[i][kq], n, kq);
+            snprintf(n, sizeof(n), "attn_flash_%d", d);
+            get_fn(g_flash[i][kq], n, kq);
+            ok = ok && g_partial[i][kq] && (d == 512 || g_flash[i][kq]);
+            snprintf(n, sizeof(n), "attn_flash_%d_h2t2", d);
+            get_fn(g_flash_h2t2[i][kq], n, kq);
+            snprintf(n, sizeof(n), "attn_flash_%d_h1t4", d);
+            get_fn(g_flash_h1t4[i][kq], n, kq);
+            for (int k = 0; k < 4; ++k) {  // k = 2 small + (up to 16 query heads)
+                snprintf(n, sizeof(n), "attn_partial_gqa%d%s_%d", k & 1 ? 16 : 8, k & 2 ? "s" : "", d);
+                get_fn(g_partial_gqa[i][kq][k], n, kq);
+            }
+        }
+        if (!ok) {
             INFER_LOG("[attention] kernels missing in %s\n", co_path);
             attention_free();
             return -1;
         }
     }
-    for (int i = 0; i < ATTN_NDIMS; ++i) {
-        char n[48];
-        snprintf(n, sizeof(n), "attn_bidir_%d", attn_dim(i));
-        if (hipModuleGetFunction(&g_bidir[i], g_mod, n) != hipSuccess) g_bidir[i] = nullptr;
-        for (int q = 0; q < 2; ++q) {
-            snprintf(n, sizeof(n), "attn_flash_%d_h2t2%s", attn_dim(i), q ? "_q8" : "");
-            if (hipModuleGetFunction(&g_flash_h2t2[i][q], g_mod, n) != hipSuccess) g_flash_h2t2[i][q] = nullptr;
-            snprintf(n, sizeof(n), "attn_flash_%d_h1t4%s", attn_dim(i), q ? "_q8" : "");
-            if (hipModuleGetFunction(&g_flash_h1t4[i][q], g_mod, n) != hipSuccess) g_flash_h1t4[i][q] = nullptr;
-            for (int sm = 0; sm < 2; ++sm)
-                for (int kq = 0; kq < 2; ++kq) {
-                    snprintf(n, sizeof(n), "attn_partial_gqa%d%s_%d%s", q ? 16 : 8, sm ? "s" : "", attn_dim(i),
-                             kq ? "_q8" : "");
-                    hipFunction_t& f = g_partial_gqa[i][kq][2 * sm + q];
-                    if (hipModuleGetFunction(&f, g_mod, n) != hipSuccess) f = nullptr;
-                }
-        }
+    for (int kq = 0; kq < ATTN_NKQ; ++kq) {
+        get_fn(g_flash128_g2[kq], "attn_flash_128_g2", kq);
+        get_fn(g_flash256_h2t2[kq], "attn_flash_256_h2t2", kq);
+        get_fn(g_flash512_h2s2[kq], "attn_flash_512_h2s2", kq);
     }
-    if (hipModuleGetFunction(&g_flash128_g2, g_mod, "attn_flash_128_g2") != hipSuccess) g_flash128_g2 = nullptr;
-    if (hipModuleGetFunction(&g_flash256_h2t2, g_mod, "attn_flash_256_h2t2") != hipSuccess) g_flash256_h2t2 = nullptr;
-    if (hipModuleGetFunction(&g_flash512_h2s2, g_mod, "attn_flash_512_h2s2") != hipSuccess) g_flash512_h2s2 = nullptr;
-    if (hipModuleGetFunction(&g_flash128_g2_q8, g_mod, "attn_flash_128_g2_q8") != hipSuccess) g_flash128_g2_q8 = nullptr;
-    if (hipModuleGetFunction(&g_flash256_h2t2_q8, g_mod, "attn_flash_256_h2t2_q8") != hipSuccess)
-        g_flash256_h2t2_q8 = nullptr;
-    if (hipModuleGetFunction(&g_flash512_h2s2_q8, g_mod, "attn_flash_512_h2s2_q8") != hipSuccess)
-        g_flash512_h2s2_q8 = nullptr;
     g_flash_off = getenv("QMATVEC_NO_WMMA") != nullptr || getenv("ATTN_NO_FLASH") != nullptr;  // A/B: attention only
     g_gqa_off = getenv("ATTN_NO_GQA") != nullptr;  // A/B: attn_partial per query head
     return 0;
@@ -98,12 +97,13 @@ void attention_free(void) {
     if (g_mod) (void)hipModuleUnload(g_mod);
     g_mod = nullptr;
     for (int i = 0; i < ATTN_NDIMS; ++i) {
-        g_prep[i] = g_partial[i] = g_combine[i] = g_flash[i] = g_partial_q8[i] = g_flash_q8[i] = g_bidir[i] = nullptr;
-        g_flash_h2t2[i][0] = g_flash_h2t2[i][1] = g_flash_h1t4[i][0] = g_flash_h1t4[i][1] = nullptr;
-        for (int k = 0; k < 8; ++k) g_partial_gqa[i][k / 4][k % 4] = nullptr;
+        g_prep[i] = g_combine[i] = g_bidir[i] = nullptr;
+        for (int kq = 0; kq < ATTN_NKQ; ++kq) {
+            g_partial[i][kq] = g_flash[i][kq] = g_flash_h2t2[i][kq] = g_flash_h1t4[i][kq] = nullptr;
+            for (int k = 0; k < 4; ++k) g_partial_gqa[i][kq][k] = nullptr;
+        }
     }
-    g_flash128_g2 = g_flash256_h2t2 = g_flash512_h2s2 = nullptr;
-    g_flash128_g2_q8 = g_flash256_h2t2_q8 = g_flash512_h2s2_q8 = nullptr;
+    for (int kq = 0; kq < ATTN_NKQ; ++kq) g_flash128_g2[kq] = g_flash256_h2t2[kq] = g_flash512_h2s2[kq] = nullptr;
 }
 
 hipError_t attention_forward(const float* qfull, const float* k, const float* v, const float* q_norm,
@@ -126,16 +126,19 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
     if (!opts) return hipErrorInvalidValue;
     const int D = opts->head_dim, hi = D == 128 ? 0 : D == 256 ? 1 : D == 512 ? 2 : D == 64 ? 3 : -1;
     int gated = opts->gated, window = opts->window, v_norm = opts->v_norm, qk_norm = !opts->no_qk_norm;
-    int kv_q8 = opts->kv_q8, rope_norm = opts->rope_norm;
+    int kq = opts->kv_quant, rope_norm = opts->rope_norm;
     int rot_pairs = opts->rot_pairs > 0 ? opts->rot_pairs : n_rot / 2;
     if (hi < 0) return hipErrorInvalidValue;
     if (!g_prep[hi]) return hipErrorInvalidDeviceFunction;
-    // Q8_0 rows: kv_stride halves hold kv_stride * 32 / 17 values (the caller passes the cache's row stride)
-    int kv_stride = opts->kv_stride > 0 ? opts->kv_stride : kv_q8 ? n_kv * D * 17 / 32 : n_kv * D;
-    const long long row_values = kv_q8 ? (long long)kv_stride * 32 / 17 : kv_stride;
+    if (kq < 0 || kq >= ATTN_NKQ) return hipErrorInvalidValue;
+    // Q8_0 / Q4_0 rows: kv_stride halves hold kv_stride * 32 / u values, u = 17 / 9 (the caller passes the cache's
+    // row stride)
+    const int u = kq == 1 ? 17 : 9;
+    int kv_stride = opts->kv_stride > 0 ? opts->kv_stride : kq ? n_kv * D * u / 32 : n_kv * D;
+    const long long row_values = kq ? (long long)kv_stride * 32 / u : kv_stride;
     if (kv_shift < 0 || kv_shift > 30 || n_kv <= 0 || n_q % n_kv != 0 || (q8 && (long long)n_q * D % 256 != 0) ||
         n_rot > D || n_rot % 2 != 0 || rot_pairs > n_rot / 2 || pos0 < 0 || T <= 0 || window < 0 ||
-        row_values < (long long)n_kv * D || (kv_q8 && ((long long)kv_stride * 32 % 17 != 0 || row_values % 256 != 0)))
+        row_values < (long long)n_kv * D || (kq && ((long long)kv_stride * 32 % u != 0 || row_values % 256 != 0)))
         return hipErrorInvalidValue;
     if (q8 && (long long)T * n_q * D > q8->max_k) return hipErrorInvalidValue;
     const int NB = (n_q * D + 255) / 256;  // attn_combine workgroups per token (256 values each)
@@ -143,7 +146,7 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
 
     void* a_prep[] = {(void*)&qfull, (void*)&k, (void*)&v, (void*)&q_norm, (void*)&k_norm, &q, &K, &V, &kv_stride,
                       &kv_shift, &kv_bstride, &n_q, &n_kv, &n_rot, &pos0, &freq_base, &eps, &gated, &rot_pairs,
-                      &v_norm, &qk_norm, &kv_q8, (void*)&opts->bq, (void*)&opts->bk, (void*)&opts->bv,
+                      &v_norm, &qk_norm, &kq, (void*)&opts->bq, (void*)&opts->bk, (void*)&opts->bv,
                       &rope_norm, (void*)&opts->freq_factors};
     hipError_t e = hipModuleLaunchKernel(g_prep[hi], (unsigned)(n_q + n_kv), (unsigned)T, 1, (unsigned)D, 1, 1, 0,
                                          stream,
@@ -151,7 +154,7 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
     if (e != hipSuccess) return e;
 
     if (opts->bidir) {  // embedding models: every token of the batch sees the whole batch (or its window)
-        if (pos0 != 0 || T > 2048 || kv_q8 || gated || !g_bidir[hi]) return hipErrorInvalidValue;
+        if (pos0 != 0 || T > 2048 || kq || gated || !g_bidir[hi]) return hipErrorInvalidValue;
         const float sc = opts->scale != 0.0f ? opts->scale : 1.0f / sqrtf((float)D);
         int half = window / 2;
         void* a_bidir[] = {&q, &K, &V, &kv_stride, &kv_shift, &kv_bstride, &T, &n_q, &n_kv, (void*)&sc, &half, &out};
@@ -175,12 +178,12 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
     const int ratio = n_q / n_kv;
     hipFunction_t flash = nullptr;
     int nh = 4, tt = 1, ds = 1;
-    if (D < 512 && ratio % 4 == 0) flash = kv_q8 ? g_flash_q8[hi] : g_flash[hi];
-    else if (D == 128 && ratio == 2 && n_q % 4 == 0) flash = kv_q8 ? g_flash128_g2_q8 : g_flash128_g2;
-    else if (D == 256 && ratio % 2 == 0) flash = kv_q8 ? g_flash256_h2t2_q8 : g_flash256_h2t2, nh = 2, tt = 2;
-    else if (D == 512 && ratio % 2 == 0) flash = kv_q8 ? g_flash512_h2s2_q8 : g_flash512_h2s2, nh = 2, ds = 2;
-    else if (ratio % 2 == 0 && g_flash_h2t2[hi][kv_q8]) flash = g_flash_h2t2[hi][kv_q8], nh = 2, tt = 2;
-    else if (g_flash_h1t4[hi][kv_q8]) flash = g_flash_h1t4[hi][kv_q8], nh = 1, tt = 4;
+    if (D < 512 && ratio % 4 == 0) flash = g_flash[hi][kq];
+    else if (D == 128 && ratio == 2 && n_q % 4 == 0) flash = g_flash128_g2[kq];
+    else if (D == 256 && ratio % 2 == 0) flash = g_flash256_h2t2[kq], nh = 2, tt = 2;
+    else if (D == 512 && ratio % 2 == 0) flash = g_flash512_h2s2[kq], nh = 2, ds = 2;
+    else if (ratio % 2 == 0 && g_flash_h2t2[hi][kq]) flash = g_flash_h2t2[hi][kq], nh = 2, tt = 2;
+    else if (g_flash_h1t4[hi][kq]) flash = g_flash_h1t4[hi][kq], nh = 1, tt = 4;
     if (T >= kFlashMinT && !g_flash_off && flash) {
         // Ranges of positions per token (each a multiple of 16 positions, at most ATTN_MAX_SPLITS): only as many
         // as it takes to give the GPU ~kFlashWgs workgroups. A prefill batch has enough without splitting, and
@@ -205,7 +208,7 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
     // attn_partial: one chunk per slot, so the tokens run in groups of slots / chunks. Several query heads per KV head:
     // attn_partial_gqa (K / V read once for the group, not ratio times), over 64-position chunks when the slots
     // hold them (a decode step needs the 4x workgroups: Qwen3-30B at 2.4k positions has 4 KV heads x 10 chunks)
-    const hipFunction_t* gq = g_partial_gqa[hi][kv_q8 ? 1 : 0];
+    const hipFunction_t* gq = g_partial_gqa[hi][kq];
     const bool gqa_ok = !g_gqa_off && ratio >= 2 && ratio <= 16 && gq[ratio > 8];
     const int nc_s = (n_last + 63) / 64;
     const bool small = gqa_ok && gq[2 + (ratio > 8)] && slots >= nc_s;
@@ -235,7 +238,7 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
             e = hipModuleLaunchKernel(gqa, (unsigned)n_kv, (unsigned)n_chunks, (unsigned)tg, ATTN_CHUNK, 1, 1, 0,
                                       stream, a_part, nullptr);
         else
-            e = hipModuleLaunchKernel(kv_q8 ? g_partial_q8[hi] : g_partial[hi], (unsigned)n_q, (unsigned)n_chunks,
+            e = hipModuleLaunchKernel(g_partial[hi][kq], (unsigned)n_q, (unsigned)n_chunks,
                                       (unsigned)tg, ATTN_CHUNK, 1, 1, 0, stream, a_part, nullptr);
         if (e != hipSuccess) return e;
         int nch = n_chunks;

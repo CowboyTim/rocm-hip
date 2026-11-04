@@ -42,7 +42,7 @@ die "--store, --draft, --parallel: not for an embedding model\n"
 # Qwen3-30B-A3B at 31k 27.9 -> 30.0 tok/s, Qwen3.6-35B at 112k 32.4 -> 35.2), f16 below that and where the model's
 # cache rows do not suit q8_0 (a multiple of 256 values: not Qwen2.5-0.5B's 2 x 64)
 my $kvt = $o{'kv-type'} // 'auto';
-die "--kv-type: auto, f16 or q8_0\n" unless $kvt =~ /\A(?:auto|f16|q8_0)\z/;
+die "--kv-type: auto, f16, q8_0 or q4_0\n" unless $kvt =~ /\A(?:auto|f16|q8_0|q4_0)\z/;
 my $auto = $kvt eq 'auto';
 $kvt = !$emb_only && $o{ctx} >= 32768 ? 'q8_0' : 'f16' if $auto;
 set_kv_type($m, $kvt);
@@ -453,10 +453,10 @@ conversation's KV cache is this long: C<--parallel> N takes N times the memory.)
 Copy the model's GPU tensors to a stage file in F<dir> (a huge-page tmpfs such as F</dev/shm>) and run from there
 (C<load_model>'s C<stage>): later starts reuse it and pin in a fraction of the time.
 
-=item --kv-type auto|f16|q8_0
+=item --kv-type auto|f16|q8_0|q4_0
 
 The KV cache's element type (C<set_kv_type>). C<q8_0> takes about half the memory of C<f16> and decodes faster
-at long contexts (fewer bytes read per token). C<auto>, the default, takes C<q8_0> for a C<--ctx> of 32768 or
+at long contexts (fewer bytes read per token); C<q4_0> takes about a quarter, less exactly. C<auto>, the default, takes C<q8_0> for a C<--ctx> of 32768 or
 more and C<f16> below that, or where the model's cache rows do not suit C<q8_0> (a multiple of 256 values).
 
 =item --parallel N

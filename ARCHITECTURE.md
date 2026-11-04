@@ -164,7 +164,8 @@ scratch per token on Qwen3.8).
 
 - **Attention**: gated Q (`[Q | gate]` per head), q/k RMSNorm, partial NeoX / IMRoPE, GQA, sigmoid output gate.
   Decode: split-K partial attention over 256-position chunks + combine (with several query heads per KV head: one
-  workgroup per KV head over 64-position chunks, reading K / V once for its query heads, F16 or Q8_0 cache; loads never in branches, since
+  workgroup per KV head over 64-position chunks, reading K / V once for its query heads, F16, Q8_0 or Q4_0 cache (`attention_opts.kv_quant`; each kernel that reads the
+  cache has a `_q8` / `_q4` variant); loads never in branches, since
   a load in a branch is waited for before the branch ends); prefill: FP16 WMMA flash
   attention.
 - **Gated DeltaNet**: conv1d (state of the last 3 inputs) + SiLU, L2-normed q/k, decay `exp(softplus(alpha +

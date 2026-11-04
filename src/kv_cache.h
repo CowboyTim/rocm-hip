@@ -38,12 +38,13 @@ typedef struct {
     int n_heads_q;     /* query heads */
     int n_heads_kv;    /* key/value heads (GQA: may be < n_heads_q) */
     int block_tokens;  /* positions per block, a power of two; 0: KV_CACHE_DEFAULT_BLOCK */
-    int kv_type;       /* KV_CACHE_F16 (0) or KV_CACHE_Q8_0: rows of int8 values then an fp16 scale per 32
-                          (d_kv a multiple of 256; attention_opts.kv_q8) */
+    int kv_type;       /* KV_CACHE_F16 (0), KV_CACHE_Q8_0 or KV_CACHE_Q4_0: rows of int8 / 4-bit values then an fp16
+                          scale per 32 (d_kv a multiple of 256; attention_opts.kv_quant, the same numbers) */
 } kv_cache_config_t;
 
 #define KV_CACHE_F16 0
 #define KV_CACHE_Q8_0 1
+#define KV_CACHE_Q4_0 2
 
 #define KV_CACHE_DEFAULT_BLOCK 256
 
