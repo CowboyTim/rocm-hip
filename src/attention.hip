@@ -247,10 +247,12 @@ __device__ __forceinline__ void attn_partial_body(const float* q, const __half* 
         float acc = 0.0f;
         if constexpr (KQ) {
             const int drow = kvq_drow(kv_stride);
+#pragma unroll 8
             for (int i = i0; i < np; ++i)
                 acc += sw[i] * kv_value<true>(V + kv_row(p0 + i, kv_stride, kv_shift, kv_bstride), g * D + d, drow);
         } else {
             const __half* vb = V + (size_t)g * D + d;
+#pragma unroll 8  // (8 positions' loads in flight)
             for (int i = i0; i < np; ++i) acc += sw[i] * __half2float(vb[kv_row(p0 + i, kv_stride, kv_shift, kv_bstride)]);
         }
         part_acc[pc * D + d] = acc;
@@ -276,9 +278,12 @@ __device__ __forceinline__ void attn_combine_body(const float* part_ml, const fl
     qfull += (size_t)z * (gated ? 2 : 1) * n_q * D;
     out += (size_t)z * n_q * D;
     const float* ml = part_ml + (size_t)2 * h * n_chunks;
+    // (unrolled: 8 chunks' loads in flight; a long context has hundreds of chunks per head)
     float M = -INFINITY;
+#pragma unroll 8
     for (int c = 0; c < n_chunks; ++c) M = fmaxf(M, ml[2 * c]);
     float num = 0.0f, den = 0.0f;
+#pragma unroll 8
     for (int c = 0; c < n_chunks; ++c) {
         const float w = __expf(ml[2 * c] - M);
         num += w * part_acc[((size_t)h * n_chunks + c) * D + d];
@@ -368,25 +373,28 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
         // consecutive dims) and V blocks transposed (16 x the DH dims of slice ds): a thread takes positions 2 pp
         // and 2 pp + 1 of 8 dims and writes each dim's pair as one dword, consecutive lanes on consecutive pairs
         // (single halves from lanes 8 dims apart hit one LDS bank 32 times). Positions no token of the tiles
-        // sees are zeroed: they are masked, but 0 * (stale V) must stay 0.
+        // sees are zeroed: they are masked, but 0 * (stale V) must stay 0. The loads are unconditional (the last
+        // position's row is read instead, then dropped): a load in a branch is waited for before the branch ends,
+        // which would chain them.
+        const int plast = pos0 + zmax;
 #pragma unroll
         for (int k = 0; k < (KG ? 0 : NG * FB * D / 8 / NTH); ++k) {
             const int idx = tid + NTH * k, gl = idx / (FB * D / 8), r = idx % (FB * D / 8);
             const int p = r / (D / 8), d = 8 * (r % (D / 8));
-            uint4 ku = make_uint4(0, 0, 0, 0);
-            if (P0 + p <= pos0 + zmax)
-                ku = kv_load8<KQ>(K + kv_row(P0 + p, kv_stride, kv_shift, kv_bstride), (g0 + gl) * D + d, drow);
+            uint4 ku = kv_load8<KQ>(K + kv_row(min(P0 + p, plast), kv_stride, kv_shift, kv_bstride), (g0 + gl) * D + d,
+                                    drow);
+            if (P0 + p > plast) ku = make_uint4(0, 0, 0, 0);
             *(uint4*)&sK[gl][p][d] = ku;
         }
 #pragma unroll
         for (int idx = tid; idx < NG * (FB / 2) * (DH / 8); idx += NTH) {  // (D 64: fewer tasks than threads)
             const int pp = idx % (FB / 2), r = idx / (FB / 2);
             const int gl = r / (DH / 8), d = 8 * (r % (DH / 8));
-            uint4 v0 = make_uint4(0, 0, 0, 0), v1 = v0;
             const int col = (g0 + gl) * D + ds * DH + d;
-            if (P0 + 2 * pp <= pos0 + zmax) v0 = kv_load8<KQ>(V + kv_row(P0 + 2 * pp, kv_stride, kv_shift, kv_bstride), col, drow);
-            if (P0 + 2 * pp + 1 <= pos0 + zmax)
-                v1 = kv_load8<KQ>(V + kv_row(P0 + 2 * pp + 1, kv_stride, kv_shift, kv_bstride), col, drow);
+            uint4 v0 = kv_load8<KQ>(V + kv_row(min(P0 + 2 * pp, plast), kv_stride, kv_shift, kv_bstride), col, drow);
+            uint4 v1 = kv_load8<KQ>(V + kv_row(min(P0 + 2 * pp + 1, plast), kv_stride, kv_shift, kv_bstride), col, drow);
+            if (P0 + 2 * pp > plast) v0 = make_uint4(0, 0, 0, 0);
+            if (P0 + 2 * pp + 1 > plast) v1 = make_uint4(0, 0, 0, 0);
             const uint16_t* a0 = (const uint16_t*)&v0;
             const uint16_t* a1 = (const uint16_t*)&v1;
 #pragma unroll
@@ -403,13 +411,12 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
             for (int kk = 0; kk < D / 16; ++kk) {
                 const v16h a = *(const v16h*)&sQ[w][i][kk * 16];
                 v16h bk = {};
-                if (kin) {
-                    const int e = (g0 + gw) * D + 16 * kk;
-                    const uint4 lo = kv_load8<KQ>(krow, e, drow), hi8 = kv_load8<KQ>(krow, e + 8, drow);
-                    _Float16* bh = (_Float16*)&bk;
-                    *(uint4*)bh = lo;
-                    *(uint4*)(bh + 8) = hi8;
-                }
+                const int e = (g0 + gw) * D + 16 * kk;
+                uint4 lo = kv_load8<KQ>(krow, e, drow), hi8 = kv_load8<KQ>(krow, e + 8, drow);  // (unconditional)
+                if (!kin) lo = hi8 = make_uint4(0, 0, 0, 0);
+                _Float16* bh = (_Float16*)&bk;
+                *(uint4*)bh = lo;
+                *(uint4*)(bh + 8) = hi8;
                 s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bk, s);
             }
         } else {
@@ -540,21 +547,25 @@ __device__ void attn_bidir_body(const float* q, const __half* K, const __half* V
     out[((size_t)z * n_q + h) * D + t] = acc / sum;
 }
 
-// attn_partial for grouped-query attention, F16 cache (decode and small batches): one workgroup per KV head g and
-// chunk of PW positions instead of per query head and 256 positions, scoring all R = n_q / n_kv of g's query heads
-// from one read of each K row and accumulating V once for them (attn_partial reads the chunk's K and V R times).
-// PW 64 (the host's choice when the caller's slots allow: 4x the workgroups, which a decode step needs to have
-// enough loads in flight) or 256 (CH). The results as attn_partial's, per (query head, chunk), for attn_combine.
-// grid (n_kv, n_chunks, T), block 256: CH / PW threads per position score its D dims in parts; for V, thread t
-// takes dim t % D and every NPG-th position (NPG = 256 / D), the position groups added in LDS. R <= RMAX.
-// KQ: a Q8_0 cache (each 8 int8 K values times their block's scale; V values one int8 and its scale).
+// attn_partial for grouped-query attention (decode and small batches): one workgroup per KV head g and chunk of PW
+// positions instead of per query head and 256 positions, scoring all R = n_q / n_kv of g's query heads from one
+// read of each K row and accumulating V once for them (attn_partial reads the chunk's K and V R times). PW 64 (the
+// host's choice when the caller's slots allow: 4x the workgroups, which a decode step needs to have enough loads in
+// flight) or 256 (CH). The results as attn_partial's, per (query head, chunk), for attn_combine.
+// grid (n_kv, n_chunks, T), block 256: CH / PW threads per position score its D dims, each 8-value pieces tp, tp +
+// TPP, ..; for V, thread t takes dims 2 (t % (D / 2)) .. + 1 and every NPG-th position (NPG = 512 / D), the position
+// groups added in LDS. A decode step is latency-bound (Qwen3-30B at 32k: 2,048 workgroups of 64 positions), so all
+// of a thread's K pieces and its first V batch are loaded before anything waits: one memory round trip instead of
+// a chain (q, then K, then V in 4 batches). R <= RMAX. KQ: a Q8_0 cache (int8 values times their block's scale).
 template <int D, int RMAX, int PW, bool KQ = false>
 __device__ __forceinline__ void attn_partial_gqa_body(const float* q, const __half* K, const __half* V, int kv_stride,
                                                       int kv_shift, long long kv_bstride, int pos0, int n_q,
                                                       int n_kv_heads, float scale, float* part_ml, float* part_acc,
                                                       int window) {
     constexpr int TPP = CH / PW, DP = D / TPP;  // threads per position, dims per thread
-    constexpr int NPG = CH / D;                  // V position groups
+    constexpr int NK = DP / 8, KP = NK < 8 ? NK : 8;  // K pieces per thread, of them loaded up front
+    constexpr int TPR = D / 2, NPG = CH / TPR;  // V: threads per row (2 dims each), position groups
+    constexpr int NV = PW / NPG, VU = NV < 16 ? NV : 16;  // V positions per thread, per batch
     __shared__ float sq[RMAX][D];
     __shared__ float sw[RMAX][PW];
     __shared__ float sacc[NPG > 1 ? NPG - 1 : 1][RMAX][D];
@@ -575,41 +586,86 @@ __device__ __forceinline__ void attn_partial_gqa_body(const float* q, const __ha
         }
         return;
     }
+    const int drow = KQ ? kvq_drow(kv_stride) : 0;
+    // 8 K values of piece k (as 8 floats; KQ: times the block's scale)
+    auto k_load = [&](const __half* krow, int k, uint4& u, float& sc) {
+        const int e = g * D + 8 * k;
+        if constexpr (KQ) {
+            const uint2 w = *(const uint2*)((const int8_t*)krow + e);
+            u.x = w.x, u.y = w.y;
+            sc = __half2float(((const __half*)((const int8_t*)krow + drow))[e / 32]);
+        } else {
+            u = *(const uint4*)(krow + e);
+        }
+    };
+    auto k_unpack = [&](const uint4& u, float sc, float* f) {
+        if constexpr (KQ) {
+            const int8_t* qv = (const int8_t*)&u;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) f[j] = (float)qv[j] * sc;
+        } else {
+            const __half2* h2 = (const __half2*)&u;
+#pragma unroll
+            for (int k2 = 0; k2 < 4; ++k2) {
+                const float2 x = __half22float2(h2[k2]);
+                f[2 * k2] = x.x, f[2 * k2 + 1] = x.y;
+            }
+        }
+    };
+    // V: dims e0, e0 + 1 of position p0 + iu (0 past np). Loads are never conditional (a row inside the cache is read
+    // and the value dropped): a load in a branch is waited for before the branch ends, which chains them all.
+    const int d0 = (t % TPR) * 2, pg = t / TPR, e0 = g * D + d0;
+    const int p0 = c * PW, i0 = max(0, lo - p0), np = max(0, min(PW, n_kv - p0));
+    const int ib = i0 + (pg - i0 % NPG + NPG) % NPG;  // this thread's first position
+    auto v_load = [&](int iu, float2& x) {
+        const __half* row = V + kv_row(p0 + max(0, min(iu, np - 1)), kv_stride, kv_shift, kv_bstride);
+        if constexpr (KQ) {
+            const int8_t* b = (const int8_t*)row;
+            const float sc = __half2float(((const __half*)(b + drow))[e0 / 32]);
+            const short w = *(const short*)(b + e0);
+            x = make_float2((float)(int8_t)w * sc, (float)(int8_t)(w >> 8) * sc);
+        } else {
+            x = __half22float2(*(const __half2*)(row + e0));
+        }
+        if (iu >= np) x = make_float2(0.0f, 0.0f);
+    };
+
+    // Issue the loads: K pieces 0 .. KP - 1 of position p, the first V batch, q
+    const int pl = t / TPP, tp = t % TPP, p = c * PW + pl;
+    const bool valid = p < n_kv && p >= lo;
+    const __half* krow = K + kv_row(min(p, n_kv - 1), kv_stride, kv_shift, kv_bstride);  // (a row inside the cache)
+    uint4 ku[KP];
+    float ks[KP] = {};
+#pragma unroll
+    for (int i = 0; i < KP; ++i) k_load(krow, i * TPP + tp, ku[i], ks[i]);
+    float2 v[VU];
+#pragma unroll
+    for (int u = 0; u < VU; ++u) v_load(ib + u * NPG, v[u]);
     for (int i = t; i < R * D; i += CH) sq[i / D][i % D] = q[(size_t)h0 * D + i];
     __syncthreads();
 
-    // Scores of position p for the R heads: thread part tp of TPP reads DP dims of the K row (8 halves at a time)
-    const int pl = t / TPP, tp = t % TPP, p = c * PW + pl;
+    // Scores of position p for the R heads
     float s[RMAX];
 #pragma unroll
     for (int r = 0; r < RMAX; ++r) s[r] = 0.0f;
-    const bool valid = p < n_kv && p >= lo;
     if (valid) {
-        const __half* krow = K + kv_row(p, kv_stride, kv_shift, kv_bstride);
-#pragma unroll 2
-        for (int i = 0; i < DP / 8; ++i) {
+#pragma unroll
+        for (int i = 0; i < NK; ++i) {
             float f[8];
-            if constexpr (KQ) {
-                const int e = g * D + tp * DP + 8 * i;
-                const uint2 u = *(const uint2*)((const int8_t*)krow + e);
-                const int8_t* qv = (const int8_t*)&u;
-                const float sc = __half2float(((const __half*)((const int8_t*)krow + kvq_drow(kv_stride)))[e / 32]);
-#pragma unroll
-                for (int j = 0; j < 8; ++j) f[j] = (float)qv[j] * sc;
+            if (i < KP) {
+                k_unpack(ku[i], ks[i], f);
             } else {
-                const uint4 u = ((const uint4*)(krow + (size_t)g * D + tp * DP))[i];
-                const __half2* h2 = (const __half2*)&u;
-#pragma unroll
-                for (int k2 = 0; k2 < 4; ++k2) {
-                    const float2 x = __half22float2(h2[k2]);
-                    f[2 * k2] = x.x, f[2 * k2 + 1] = x.y;
-                }
+                uint4 u;
+                float sc = 0.0f;
+                k_load(krow, i * TPP + tp, u, sc);
+                k_unpack(u, sc, f);
             }
+            const int dk = 8 * (i * TPP + tp);
 #pragma unroll
             for (int r = 0; r < RMAX; ++r)
                 if (r < R)
 #pragma unroll
-                    for (int j = 0; j < 8; ++j) s[r] += f[j] * sq[r][tp * DP + 8 * i + j];
+                    for (int j = 0; j < 8; ++j) s[r] += f[j] * sq[r][dk + j];
         }
     }
 #pragma unroll
@@ -638,47 +694,40 @@ __device__ __forceinline__ void attn_partial_gqa_body(const float* q, const __ha
     }
     __syncthreads();
 
-    // acc[r][d] over this chunk's positions, V read once for the R heads; 8 positions' loads issued together
-    const int d = t % D, pg = t / D;
-    const int p0 = c * PW, i0 = max(0, lo - p0), np = max(0, min(PW, n_kv - p0));
-    float a[RMAX];
+    // acc[r][d0, d0 + 1] over this thread's positions ib, ib + NPG, ..; batch after batch of VU, the first loaded
+    float2 a[RMAX];
 #pragma unroll
-    for (int r = 0; r < RMAX; ++r) a[r] = 0.0f;
-    const __half* vb = V + (size_t)g * D + d;
-    constexpr int VU = 8;
-    for (int i = i0 + (pg - i0 % NPG + NPG) % NPG; i < np; i += VU * NPG) {
-        float v[VU];
-#pragma unroll
-        for (int u = 0; u < VU; ++u) {
-            const int iu = i + u * NPG;
-            if constexpr (KQ)
-                v[u] = iu < np ? kv_value<true>(V + kv_row(p0 + iu, kv_stride, kv_shift, kv_bstride), g * D + d,
-                                                kvq_drow(kv_stride))
-                               : 0.0f;
-            else
-                v[u] = iu < np ? __half2float(vb[kv_row(p0 + iu, kv_stride, kv_shift, kv_bstride)]) : 0.0f;
-        }
+    for (int r = 0; r < RMAX; ++r) a[r] = make_float2(0.0f, 0.0f);
+    for (int i = ib;; ) {
 #pragma unroll
         for (int u = 0; u < VU; ++u) {
             const int iu = min(i + u * NPG, PW - 1);  // (v is 0 past np)
 #pragma unroll
             for (int r = 0; r < RMAX; ++r)
-                if (r < R) a[r] += sw[r][iu] * v[u];
+                if (r < R) {
+                    const float wt = sw[r][iu];
+                    a[r].x += wt * v[u].x, a[r].y += wt * v[u].y;
+                }
         }
+        i += VU * NPG;
+        if (VU == NV || i >= np) break;
+#pragma unroll
+        for (int u = 0; u < VU; ++u) v_load(i + u * NPG, v[u]);
     }
     if (NPG > 1 && pg > 0)
 #pragma unroll
         for (int r = 0; r < RMAX; ++r)
-            if (r < R) sacc[pg - 1][r][d] = a[r];
+            if (r < R) sacc[pg - 1][r][d0] = a[r].x, sacc[pg - 1][r][d0 + 1] = a[r].y;
     __syncthreads();
     if (pg == 0)
 #pragma unroll
         for (int r = 0; r < RMAX; ++r)
             if (r < R) {
-                float x = a[r];
+                float2 x = a[r];
 #pragma unroll
-                for (int k = 1; k < NPG; ++k) x += sacc[k - 1][r][d];
-                part_acc[((size_t)(h0 + r) * n_chunks + c) * D + d] = x;
+                for (int k = 1; k < NPG; ++k) x.x += sacc[k - 1][r][d0], x.y += sacc[k - 1][r][d0 + 1];
+                float* o = part_acc + ((size_t)(h0 + r) * n_chunks + c) * D + d0;
+                o[0] = x.x, o[1] = x.y;
             }
     if (t < R) {
         part_ml[2 * ((size_t)(h0 + t) * n_chunks + c)] = sm[t];

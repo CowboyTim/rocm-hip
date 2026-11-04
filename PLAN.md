@@ -2781,6 +2781,40 @@ fp16 scale, V one int8 value and its scale per position; instantiated as attn_pa
   Greedy text per KV head = per head on the 30B and 7B; on the 35B the two split at token 26 at a near-tie
   ("high performance" / "high bandwidth"), as its F16 cache's two paths do at token 68 (summation order).
 
+### Long-context decode: loads out of branches (2026-11-04, user: "how about large ctx? The ones opencode and hermes use for coding tasks?")
+
+Code prompts of 8k / 33k / 112k tokens (the engine's own sources) showed generation falling off far faster than the
+KV bytes explain: Qwen3-30B-A3B 39.5 / 18.8 tok/s at 8k / 32k (llama.cpp tg64 43.6 / 30.1), Qwen3.6-35B 57.9 / 43.3
+/ 24.1, and a Q8_0 cache no faster than F16. attn_partial_gqa took 626 us per layer at 32k (30B) whatever the code
+did (vectorized V loads, interleaved K pieces, all loads hoisted: all 626-633 us; a Q8_0 cache 601): ~120 GB/s, each
+workgroup alive ~43 us. The ISA showed why: every global load sat in a branch (`if (valid)` for K, `iu < np` for V)
+and the compiler waits for a load before its branch ends, so a thread's 4 K and 16 V loads were 20 round trips in a
+row. Now:
+- **attn_partial_gqa**: all loads unconditional (a row inside the cache is read and the value dropped by a select),
+  a thread's K pieces and first V batch issued before anything waits (one `s_waitcnt` for 21 loads); K pieces
+  interleaved over the TPP threads (no 4-way LDS bank conflict on q); V 2 dims per thread (4-byte loads). 30B at
+  32k: 626 -> 375 us (F16), 601 -> 295 (Q8_0).
+- **attn_combine**: the chunk loops unrolled by 8 (8 chunks' loads in flight): 95 -> 24 us at 513 chunks.
+- attn_partial (per head; D 512, ratio 1): the V loops unrolled by 8. attn_flash: K / V staging loads
+  unconditional too (bit-identical greedy tokens; prefill +3% at 32k, nothing at 3k).
+- Pitfall found on the way: kernel_module_load prefers the copy embedded in the binary (kernels_embed) over the
+  .co path of the same name, so a scratch program linked before a kernel change runs the old kernel; set
+  INFERENCE_KERNEL_DIR=. to time a rebuilt .co.
+- Generation, F16 / Q8_0 cache, before -> after (llama.cpp ROCm tg64 F16 / Q8_0 at that depth):
+
+  | Model, context | F16 | Q8_0 | llama.cpp |
+  |---|---|---|---|
+  | Qwen3-30B-A3B, 7.6k | 39.5 -> 44.7 | 39.1 -> 46.2 | 43.6 |
+  | Qwen3-30B-A3B, 31k | 18.8 -> 27.9 | 19.0 -> **30.0** | 30.1 / 19.8 |
+  | Qwen3.6-35B, 8k | 57.9 -> 61.1 | 58.3 -> 61.7 | — |
+  | Qwen3.6-35B, 33k | 43.3 -> 50.3 | 43.5 -> 52.5 | — |
+  | Qwen3.6-35B, 112k | 24.1 -> 32.4 | 24.1 -> **35.2** | — |
+
+  At long contexts a Q8_0 cache now pays off (half the bytes). Prefill over a whole 31k prompt 675 tok/s (llama.cpp
+  pp2048 1,359 at depth 0, 848 at 8k, 373 at 30k: ~650 averaged).
+- Checks: attn_decode_verify (all 21 cases, now also faster than per head at 100 positions), forward_verify on
+  Qwen3-30B / Qwen2.5-7B / 0.5B (all pass, next token = llama.cpp's).
+
 ### Performance round: fewer passes over memory (2026-11-02, user: "do all of the performance ones in 1 go, mind to not copy around memory ... less copy on memory bandwidth helps for tg")
 
 UMA: every extra pass over activations or outputs takes memory bandwidth from token generation. A/B against the
