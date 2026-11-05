@@ -3070,6 +3070,24 @@ unchanged. INFERENCE_KV_ROT=0 turns it off (A/B). No speed cost: Qwen3.6-35B, Q4
 2,214-2,248 vs 2,160-2,263 tok/s, generation 65.2-65.4 either way. Qwen3.8-Flash, 10 chunks (F16 2.1396): Q8_0 2.1805 -> 2.1484,
 Q4_0 2.2005 -> 2.1403. Left: a quantized cache needs n_kv * D % 256 == 0 (Qwen2.5-0.5B, 2 x 64, cannot have one).
 
+### Long-context prefill: where the time goes (2026-11-05, user: "do 1 [Qwen3.8-27B prefill], but that's a dense model, it wont be fast anyways. For coding, I guess Qwen3.8-Flash-Next would be the way to go")
+
+rocprofv3 of a 32k prompt (passkey, Q8_0 cache), share of GPU time:
+- Qwen3.8-27B (99 s): matmul_wmma_q4_0_rocmfp4_fast 70%, attn_flash_256_h2t2_q8 15% (16 layers, ~14 TFLOPS),
+  DeltaNet 7%, add_rmsnorm_rows 4%, swiglu 3%.
+- Qwen3.8-Flash-Next (46 s): dense FAST matmuls 25%, attn_flash_256_q8 22% (12 layers, ~16 TFLOPS), expert
+  matmuls 21%, hc_norm 9% + hc_mix 4% (memory-bound: ~140 GB/s), DeltaNet 11%.
+- The FAST WMMA loop per 32-value step: 8 WMMAs and ~96 VALU ops (32 each cvt / ew * dx / fma; the compiler
+  already pairs many as v_dual). Taking the scales out of the loop needs FP16 WMMA on pre-scaled weights (one FMA
+  per element), at twice the LDS size and operand traffic: not tried, likely a loss; the earlier ablations and
+  the pipelining attempt agree the kernel is near what this design allows. The 27B stays compute-bound (2 x 27G
+  ops per token; ~26 of ~59 TOPS).
+- **Against stock llama.cpp** (same model and settings: Qwen3.6-35B-A3B-Q4_0, 32k prompt, ub 2048, Q8_0 cache,
+  flash attention): whole prefill 19.0 s (~1,720 tok/s) vs llama-bench pp32768 1,244 tok/s (26.3 s). GPU time
+  18.8 vs 26.6 s: flash attention 5.53 vs 7.66 s, dense Q4_0 matmul 4.16 s vs mul_mat_q ~7.7 s (two variants),
+  MoE 3.74 s. Attention at ~25% of FP16 peak is the larger lever left for long coding prompts (Flash: 22% at 32k,
+  more beyond).
+
 ### forward_verify fault: a test buffer overrun (2026-11-04, user: "yes" to fixing it)
 
 The fault addresses had one shape (0x4c464462a000, 0x4e3ab022a000, 0x55f1e862a000, 0x4d1dc882a000, ...): page
