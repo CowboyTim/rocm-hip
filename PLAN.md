@@ -3,6 +3,13 @@
 > Plan, status and history. How the engine is built: [ARCHITECTURE.md](ARCHITECTURE.md). The current next step:
 > the "▶ NEXT STEP" block in Phase 20.3 below.
 
+> **▶ Next (week of 2026-11-09; user, 2026-11-05: "we will work on it next week")**, details in the sections named:
+> 1. Qwen3.8-Flash-Next from BF16 ("Qwen3.8-Flash-Next from BF16" section): use the model's own MTP layer (blk.48 in
+>    the same GGUF) as its draft head; read a batch's PLE rows from disk in parallel (cold prefill 391 vs 850 tok/s).
+> 2. Concurrent runs in rocm-inference-server ("Concurrent runs" in that section).
+> 3. Server logging through an engine event hook, formatted in Perl ("Server logging" section, planned).
+> Later: a conversion / quantization tool in this project; expert pin / unpin for MoE models larger than memory.
+
 ## What It Is
 
 A HIP/ROCm proof-of-concept for **AMD Strix Halo (gfx1151, RDNA3.5 APU)** proving out two ideas:
@@ -3116,6 +3123,22 @@ activated weights, dense will always be too small, even if it fits in memory)".
   each). **Next:** fetch a batch's PLE rows in parallel (madvise WILLNEED / readahead or a few threads; NVMe
   serves deep queues), so the table can stay on disk at prefill speed. The tiny replica (fork layout) and the
   quick suite pass unchanged; full-suite row qwen38_flash_bf16q.
+- **Next: the model's own MTP layer as its draft head.** The base-model GGUF carries its MTP layer (blk.48:
+  nextn.eh_proj / enorm / hnorm, nextn.hc_head_down / norm / up, attention with QSA compress ratio 4) where the
+  release came with a separate head file (/data/mtp, set_draft_model): ~38 -> ~50 tok/s with that one. Load the
+  nextn block of the same file as the draft (the hc_head_* tensors are new: the head's own hyper-connection mix);
+  dense attention there (exact below top_k 2048 x ratio 4 positions; above, only the drafts' acceptance can
+  differ, the model verifies them); the server's directory scan then needs no separate draft file.
+- **Concurrent runs (to investigate; user, 2026-11-05).** Today the server serves one request at a time unless
+  --parallel N, which batches N conversations of one model (and is not combined with a draft head); with
+  --models-dir each loaded model has its own sequences and the loop steps the models in turn. A request that
+  arrives during another's (or during a model load, 2 s from the page cache, minutes from a cold disk) waits:
+  a test request waited 7 min 22 s behind the Flash's load / another request, then ran at 38 tok/s. To look at:
+  --parallel by default (and with speculative decoding: a draft per sequence or verify batches), several models
+  generating at once (one forward pass each per round; GPU sharing), long prefills in chunks between other
+  requests' tokens (prefill_chunk exists), loads off the request path (a load between rounds, or in a second
+  process), fairness / queue limits per user (with the logging's user and conversation id), and llama-server
+  running on the same GPU.
 - **To investigate: a conversion / quantization tool in this project** (user: "the conversion belongs with this
   project sort of", 2026-11-05). What the engine runs is specialized (ROCmFP4 FAST, the PLE table on disk as
   Q8_0, per-tensor recipes) and depends on the fork's converter and quantizer, whose metadata conventions can
