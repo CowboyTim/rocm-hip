@@ -225,7 +225,11 @@ sub pick {
         error(400, "$r->{id} is an embedding model: use /v1/embeddings") if $kind eq 'chat';
         error(400, "$r->{id} is not an embedding model (start the server with --embedding-model)");
     }
-    eval { load($r); 1 } or error(500, $@ =~ s/\n\z//r, 'server_error');
+    if (!eval { load($r); 1 }) {
+        my $why = $@ =~ s/\n\z//r;
+        print STDERR "load $r->{id} failed: $why\n";  # the server log keeps it, not only the client
+        error(500, $why, 'server_error');
+    }
     $r->{used} = ++$stamp;
     $default{$kind} = $r if $r->{dir} || !$default{$kind};  # (the last used, for requests that name none)
     return $r;
