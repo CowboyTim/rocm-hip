@@ -6,6 +6,8 @@ Revision history for ROCm-Inference
     - rocm-inference-server --models-dir: the directory's models listed in /v1/models and loaded when a
       request's "model" names one; idle ones unloaded for room (least recently used; --models-max,
       --models-margin); POST /models/load and /models/unload as llama.cpp's router.
+    - rocm-inference-server: by default a model's whole trained context, unless its KV caches would exceed
+      --kv-budget GB (16): the longest that fits (was at most 131072 for every model).
     - First version: the libinference C API function by function (load_model, kv_cache_init, tokenize,
       detokenize, generate with streaming callbacks and stop strings, prefill, decode_token, get_logits, ...).
     - Chat: chat_render / chat with the model's own chat template, rendered by the Minijinja module, with

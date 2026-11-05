@@ -15,8 +15,8 @@ use Time::HiRes ();
 use ROCm::Inference qw(:all);
 use Web::Route;
 
-my %o = (listen => './rocm-inference.sock', max_tokens => 0, 'models-margin' => 4);
-GetOptions(\%o, 'model=s', 'models-dir=s', 'models-max=i', 'models-margin=f', 'listen=s', 'mode=s', 'ctx=i',
+my %o = (listen => './rocm-inference.sock', max_tokens => 0, 'models-margin' => 4, 'kv-budget' => 16);
+GetOptions(\%o, 'model=s', 'models-dir=s', 'models-max=i', 'models-margin=f', 'kv-budget=f', 'listen=s', 'mode=s', 'ctx=i',
            'name=s', 'draft=s', 'store=s', 'max_tokens=i', 'swa-ring=i', 'stage=s', 'recache', 'kv-type=s',
            'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'log!', 'help')
     or pod2usage(2);
@@ -88,18 +88,27 @@ sub mem_available {
     return;
 }
 
-# The context and KV cache type a model gets: --ctx, else its trained context (at most 131072; an embedding model's
-# input is one batch: at most 2048); --kv-type auto: q8_0 from 32768 positions (half the memory, and faster decoding
-# at those depths: Qwen3-30B-A3B at 31k 27.9 -> 30.0 tok/s, Qwen3.6-35B at 112k 32.4 -> 35.2), f16 below that and
-# where the model's cache rows do not suit q8_0 (a multiple of 256 values: not Qwen2.5-0.5B's 2 x 64)
+# The context and KV cache type a model gets: --ctx, else its trained context unless its KV caches (each of the
+# --parallel conversations has one, model_info's estimate) would take more than --kv-budget GB: then the longest
+# context, in 256-position steps, that fits (Qwen3.8-Flash / Qwen3.6-35B: 262144 positions, ~3.4 / 3.1 GB as Q8_0;
+# Gemma-4 26B less: 215 KB a position before its sliding-window ring). An embedding model's input is one batch:
+# at most 2048. --kv-type auto: q8_0 from 32768 positions (half the memory, and faster decoding at those depths:
+# Qwen3-30B-A3B at 31k 27.9 -> 30.0 tok/s, Qwen3.6-35B at 112k 32.4 -> 35.2), f16 below that and where the model's
+# cache rows do not suit q8_0 (a multiple of 256 values: not Qwen2.5-0.5B's 2 x 64)
+my %kv_factor = (f16 => 1, q8_0 => 17 / 32, q4_0 => 9 / 32);
 sub settings {
     my ($r) = @_;
-    my $emb = $r->{info}{kind} eq 'embedding';
-    my $cap = $emb ? 2048 : 131072;
     my $trained = $r->{info}{n_ctx_train} || 4096;
-    my $ctx = $emb ? ($trained < $cap ? $trained : $cap) : $o{ctx} // ($trained < $cap ? $trained : $cap);
-    my $kvt = $kv_type eq 'auto' ? (!$emb && $ctx >= 32768 ? 'q8_0' : 'f16') : $emb ? 'f16' : $kv_type;
-    return ($ctx, $kvt);
+    if ($r->{info}{kind} eq 'embedding') { return ($trained < 2048 ? $trained : 2048, 'f16') }
+    my $kvt_for = sub { $kv_type eq 'auto' ? ($_[0] >= 32768 ? 'q8_0' : 'f16') : $kv_type };
+    return ($o{ctx}, $kvt_for->($o{ctx})) if $o{ctx};
+    my $per = $r->{info}{kv_bytes_per_token} * $parallel;
+    my $fit = sub { $per ? int($o{'kv-budget'} * 2**30 / ($per * $kv_factor{ $_[0] }) / 256) * 256 : $trained };
+    my $ctx = $trained;
+    $ctx = $fit->($kvt_for->($ctx)) if $fit->($kvt_for->($ctx)) < $ctx;
+    $ctx = $fit->('f16') if $kv_type eq 'auto' && $ctx < 32768 && $fit->('f16') < $ctx;  # (f16 below 32768)
+    $ctx = 256 if $ctx < 256;
+    return ($ctx, $kvt_for->($ctx));
 }
 
 # What a model takes while loaded: its files (pinned) and its KV caches (estimated from model_info)
@@ -107,7 +116,7 @@ sub footprint {
     my ($r) = @_;
     my ($ctx, $kvt) = settings($r);
     my $seqs = $r->{info}{kind} eq 'chat' ? $parallel : 1;
-    return $r->{info}{bytes} + $r->{info}{kv_bytes_per_token} * $ctx * $seqs * { f16 => 1, q8_0 => 17 / 32, q4_0 => 9 / 32 }->{$kvt};
+    return $r->{info}{bytes} + $r->{info}{kv_bytes_per_token} * $ctx * $seqs * $kv_factor{$kvt};
 }
 
 sub idle { my ($r) = @_; !@{ $r->{queue} } && !@{ $r->{running} } && !$r->{busy} }
@@ -650,7 +659,7 @@ the page cache or a tmpfs takes a few seconds; from a cold disk what the disk gi
 another needs the room (C<--models-max>, C<--models-margin>), least recently used first, never one that serves a
 request. The directory is read again when the list is asked for, so files added or removed show. A draft (MTP) head
 in the directory is used for the model it fits (Qwen3.8-Flash-Next; not with C<--parallel>). Each model gets the
-context and KV cache type C<--ctx> / C<--kv-type> give, by default from its own trained context.
+context and KV cache type C<--ctx> / C<--kv-type> give, by default from its own trained context (C<--kv-budget>).
 
 =item --models-max N
 
@@ -678,8 +687,15 @@ The socket file's permissions (nginx's user must be able to write to it).
 
 =item --ctx N
 
-Context length per conversation: the model's trained context, at most 131072, unless given. (Each
-conversation's KV cache is this long: C<--parallel> N takes N times the memory.)
+Context length per conversation, for every model (each conversation's KV cache is this long: C<--parallel> N
+takes N times the memory). Default: each model's trained context, unless its KV caches would take more than
+C<--kv-budget>: then the longest context that fits (in steps of 256). An embedding model takes at most 2048.
+
+=item --kv-budget GB
+
+Without C<--ctx>: the most a model's KV caches (all its C<--parallel> conversations together) may take
+(default 16). Qwen3.8-Flash-Next and Qwen3.6-35B get their whole 262144 positions (3.4 / 3.1 GB as Q8_0),
+Nemotron-3 its 1048576 (4.5 GB); Gemma-4 26B (215 KB a position before its sliding-window ring) 150272.
 
 =item --stage F<dir>
 
