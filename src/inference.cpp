@@ -283,13 +283,34 @@ static bool check_shape(const char* what, int layer, const QuantWeight& w, int N
 }
 
 // Bind a hyper-connection mixer <prefix>_{norm,down,up,inject}.weight (inject only with_inject)
+// A fused tensor's rows [0, n0) and [n0, N) as two weights (views into the mapping, nothing copied). Upstream
+// llama.cpp's converter concatenates projections that read the same input (qwen4exp: attn_qkv_gate =
+// [attn_qkv | attn_gate], ssm_beta_alpha = [ssm_beta | ssm_alpha], hc_*_down_inject = [hc_*_down | hc_*_inject]),
+// where the ROCmFPX fork writes them apart.
+static bool bind_split(gguf_model_t* g, const char* name, int n0, QuantWeight& a, QuantWeight& b) {
+    QuantWeight w;
+    if (!bind_weight(g, name, w, true)) return false;
+    if (n0 <= 0 || n0 >= w.N) {
+        set_error("%s: %d rows, cannot split after row %d", name, w.N, n0);
+        return false;
+    }
+    a = w;
+    a.N = n0;
+    b = w;
+    b.data = w.row(n0);
+    b.N = w.N - n0;
+    return true;
+}
+
 static bool bind_hc_mix(inference_model* m, gguf_model_t* g, const char* prefix, HcMix& h, bool with_inject) {
     const int HCD = m->n_hc * m->n_embd, R = m->hc_rank;
     char name[160];
     auto nm = [&](const char* t) { snprintf(name, sizeof(name), "%s_%s.weight", prefix, t); return name; };
-    if (!bind_norm(g, nm("norm"), HCD, h.norm, true) || !bind_weight(g, nm("down"), h.down, true) ||
+    const bool fused = with_inject && find_tensor_index(g, nm("down_inject")) >= 0;
+    if (!bind_norm(g, nm("norm"), HCD, h.norm, true) ||
+        !(fused ? bind_split(g, nm("down_inject"), R, h.down, h.inject) : bind_weight(g, nm("down"), h.down, true)) ||
         !bind_weight(g, nm("up"), h.up, true) ||
-        (with_inject && !bind_weight(g, nm("inject"), h.inject, true)))
+        (with_inject && !fused && !bind_weight(g, nm("inject"), h.inject, true)))
         return false;
     if (h.down.N != R || h.down.K != HCD || h.up.N != HCD || h.up.K != R ||
         (with_inject && (h.inject.N != m->n_hc || h.inject.K != HCD))) {
@@ -327,11 +348,17 @@ static bool load_qwen4exp(inference_model* m, std::vector<int>& ple_layers) {
     m->gdn_sigmoid_gate = true;
     if (m->hc_rank <= 0) { set_error("hyper_connection.low_rank missing"); return false; }
     if (!bind_hc_mix(m, m->gguf, "output_hc", m->hc_head, false)) return false;
-    // QSA sparse attention is not implemented: only dense attention (every compress ratio 0, as released)
+    // QSA sparse attention is not implemented: only dense attention in the decoder layers (compress ratio 0, as
+    // released). The base model's MTP layer (after them) has ratio 4: as a draft head it attends densely, the same
+    // below top_k * ratio positions; above, only which drafts are accepted can differ (the model verifies them)
     std::vector<uint64_t> ratios;
     if (kv_u64_array(m->gguf, (a + "attention.compress_ratios").c_str(), ratios))
-        for (uint64_t r : ratios)
-            if (r != 0) { set_error("QSA sparse attention (compress ratio %llu) is not supported", (unsigned long long)r); return false; }
+        for (size_t l = 0; l < ratios.size() && l < (size_t)m->n_layer; ++l)
+            if (ratios[l] != 0) {
+                set_error("QSA sparse attention (layer %zu: compress ratio %llu) is not supported", l,
+                          (unsigned long long)ratios[l]);
+                return false;
+            }
     std::vector<uint64_t> pl;
     if (!kv_u64_array(m->gguf, (a + "ple.layers").c_str(), pl) || pl.empty()) return true;
     for (uint64_t l : pl) ple_layers.push_back((int)l);
@@ -372,7 +399,8 @@ static bool load_layer(inference_model* m, gguf_model_t* g, int i, LayerWeights&
     // --- Classify the block by the tensors it carries (Phase 20 Step 2) ---
     // ssm_alpha.weight => Gated DeltaNet linear attention; attn_q.weight => full attention. MTP (nextn) blocks
     // sit past n_layer and are never loaded here.
-    const bool linear = find_tensor_index(g, nm(i, "ssm_alpha.weight")) >= 0;
+    const bool linear = find_tensor_index(g, nm(i, "ssm_alpha.weight")) >= 0 ||
+                        find_tensor_index(g, nm(i, "ssm_beta_alpha.weight")) >= 0;
     const bool full = find_tensor_index(g, nm(i, "attn_q.weight")) >= 0;
     if (linear == full) {
         set_error("blk.%d: cannot classify (ssm_alpha=%d attn_q=%d)", i, linear, full);
@@ -421,10 +449,18 @@ static bool load_layer(inference_model* m, gguf_model_t* g, int i, LayerWeights&
                       m->ssm_d_conv, DS, NG, NV, DI);
             return false;
         }
-        if (!bind_weight(g, nm(i, "attn_qkv.weight"), L.W_qkv, true)) return false;
-        if (!bind_weight(g, nm(i, "attn_gate.weight"), L.W_z, true)) return false;
-        if (!bind_weight(g, nm(i, "ssm_alpha.weight"), L.W_alpha, true)) return false;
-        if (!bind_weight(g, nm(i, "ssm_beta.weight"), L.W_beta, true)) return false;
+        if (find_tensor_index(g, nm(i, "attn_qkv_gate.weight")) >= 0) {  // upstream's fused layout
+            if (!bind_split(g, nm(i, "attn_qkv_gate.weight"), conv_dim, L.W_qkv, L.W_z)) return false;
+        } else if (!bind_weight(g, nm(i, "attn_qkv.weight"), L.W_qkv, true) ||
+                   !bind_weight(g, nm(i, "attn_gate.weight"), L.W_z, true)) {
+            return false;
+        }
+        if (find_tensor_index(g, nm(i, "ssm_beta_alpha.weight")) >= 0) {
+            if (!bind_split(g, nm(i, "ssm_beta_alpha.weight"), NV, L.W_beta, L.W_alpha)) return false;
+        } else if (!bind_weight(g, nm(i, "ssm_alpha.weight"), L.W_alpha, true) ||
+                   !bind_weight(g, nm(i, "ssm_beta.weight"), L.W_beta, true)) {
+            return false;
+        }
         if (!bind_weight(g, nm(i, "ssm_out.weight"), L.W_ssm_out, true)) return false;
         if (!bind_f32(g, nm(i, "ssm_conv1d.weight"), m->ssm_d_conv, conv_dim, L.ssm_conv1d)) return false;
         if (!bind_norm(g, nm(i, "ssm_dt.bias"), NV, L.ssm_dt, true)) return false;

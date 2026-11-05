@@ -46,6 +46,7 @@ full	ppl	qwen36_35b_q4kv	/models/Qwen3.6-35B-A3B-ROCMFP4.gguf	--ctx 512 --chunks
 full	ppl	qwen36_35b_16k_q8kv	/models/Qwen3.6-35B-A3B-ROCMFP4.gguf	--ctx 16384 --chunks 2 --kv q8_0	4.8882	0.2
 full	ppl	qwen38_27b	/models/Qwen3.8-27B-Q4_0_ROCMFP4_FAST.gguf	--ctx 512 --chunks 10	7.6476	0.2
 full	ppl	qwen38_flash	/models/Qwen3.8-Flash-Next-Uncensored-Q4_0-ROCmFP4-FAST-00001-of-00003.gguf	--ctx 512 --chunks 10	2.1396	0.2
+full	ppl	qwen38_flash_bf16q	/data/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST-PLE_Q8_0.gguf	--ctx 512 --chunks 10	2.1927	0.2
 # the 35B in every quant type present (2- to 5-bit, FP4 kinds)
 full	ppl	qwen36_35b_q4_0	/data/q4_0/Qwen3.6-35B-A3B-Q4_0.gguf	--ctx 512 --chunks 20	6.9540	0.2
 full	ppl	qwen36_35b_q2_k	/data/q4_0/Qwen3.6-35B-A3B-Q2_K.gguf	--ctx 512 --chunks 20	11.6507	0.2

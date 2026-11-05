@@ -3105,6 +3105,17 @@ activated weights, dense will always be too small, even if it fits in memory)".
   worktree of that branch (/data/rocmfpx-strix, CPU build, not pushed) reads the bool form in
   src/models/qwen4exp.cpp; llama-quantize --tensor-type per_layer_token_embd=q8_0 ... Q4_0_ROCMFP4_FAST into
   /data/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST-PLE_Q8_0.gguf. (llama-server would reject the file the same way.)
+- **Runs (2026-11-05)**, after two loader changes: the QSA check covers the decoder layers only (the base model's
+  MTP layer 48 has compress ratio 4, all 48 decoder layers 0), and upstream's fused tensors are bound as row views
+  where the fork's separate ones are missing (bind_split: attn_qkv_gate = [attn_qkv | attn_gate], ssm_beta_alpha =
+  [ssm_beta | ssm_alpha], hc_*_down_inject = [hc_*_down | hc_*_inject]; nextn.hc_head_* not used yet). The file:
+  122.8 GB (PLE table Q8_0 54 GB on disk, the rest ROCmFP4 FAST; ple_conv1d F16), quantized in 24 min.
+  Greedy is_prime: a correct function. Wikitext ppl (ctx 512, 10 chunks) 2.1927 (the uncensored release 2.1396:
+  another model). 2k prompt: prefill 849-854 tok/s, generation 39.3 tok/s with the PLE rows in the page cache;
+  a text whose rows are not cached yet 391 tok/s: ~32k random 4 KB reads of the table, one at a time (~85 us
+  each). **Next:** fetch a batch's PLE rows in parallel (madvise WILLNEED / readahead or a few threads; NVMe
+  serves deep queues), so the table can stay on disk at prefill speed. The tiny replica (fork layout) and the
+  quick suite pass unchanged; full-suite row qwen38_flash_bf16q.
 - **To investigate: a conversion / quantization tool in this project** (user: "the conversion belongs with this
   project sort of", 2026-11-05). What the engine runs is specialized (ROCmFP4 FAST, the PLE table on disk as
   Q8_0, per-tensor recipes) and depends on the fork's converter and quantizer, whose metadata conventions can
