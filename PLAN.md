@@ -3070,6 +3070,31 @@ unchanged. INFERENCE_KV_ROT=0 turns it off (A/B). No speed cost: Qwen3.6-35B, Q4
 2,214-2,248 vs 2,160-2,263 tok/s, generation 65.2-65.4 either way. Qwen3.8-Flash, 10 chunks (F16 2.1396): Q8_0 2.1805 -> 2.1484,
 Q4_0 2.2005 -> 2.1403. Left: a quantized cache needs n_kv * D % 256 == 0 (Qwen2.5-0.5B, 2 x 64, cannot have one).
 
+### Qwen3.8-Flash-Next from BF16: FP4 with the n-gram table on disk; expert pin / unpin later (2026-11-05, user)
+
+User: "the idea is to possibly allow mmap() to not pin it, and have the OS take care of it. And the *real* idea is
+to go for FP4, and make the n-gram layer stay on disk for real, as it's used only a couple of kb at the time";
+"eventually I'd like to investigate the unpin/pin for larger models (for MoE models with a limited set of
+activated weights, dense will always be too small, even if it fits in memory)".
+- The user is converting /data/Qwen3.8-Flash-Next-BF16.gguf (177B parameters: ~354 GB; 51.2B of them the PLE
+  table). /data made room for it (2026-11-05, ~120 GB: the 35B Q4_1 / Q5_0 / Q5_1 / NVFP4-scaled GGUFs and their
+  suite rows, the NVFP4-Fast safetensors source, one-off reference dumps, old profiles, Qwen2.5-1.5B).
+- Today: a GGUF file (each shard) is one read-only mapping; pin_gguf registers it (hipHostRegister, ReadOnly) in
+  ranges around the CPU-only tensors, which stay page cache read a row at a time (MADV_NOHUGEPAGE): the PLE table
+  is on disk already. Everything the GPU reads is pinned, up front.
+- No XNACK: rocminfo "XNACK enabled: NO", amdgpu noretry=1; gfx11 code objects have no xnack+ variant (the driver
+  can switch it, with stability problems by the user's experience): the GPU cannot fault pages in, so "the OS
+  takes care of it" works for CPU-read tensors only. Streaming GPU weights from NVMe (~7 GB/s) is far too slow
+  for dense weights (BF16 Flash: ~250 GB per token).
+- **Next for Flash:** quantize the BF16 with the fork's llama-quantize (qwen4exp, ROCmFP4 types), the PLE table
+  kept BF16 (~102 GB on disk) or Q8_0 (~51 GB) by a per-tensor override, the rest ROCmFP4 (~67 GB pinned); run it,
+  compare with the existing Flash (perplexity, forward_verify on the reference dump). No llama.cpp imatrix (it
+  would read the BF16 for every token); an engine-side imatrix collection on the GPU from an FP4 model is an option.
+- **Later: expert pin / unpin for MoE models larger than memory.** hipHostRegister works on any range of the
+  mapping: after the router, make the chosen experts' ranges resident and registered, with a cache of recently
+  used experts (as KTransformers / llama.cpp --cpu-moe in their ways); dense layers stay pinned. Flash: 512
+  experts, 10 per token. Only worth it for MoE models that do not fit even at FP4.
+
 ### Server logging: events from the engine, formatted in Perl (planned 2026-11-05, not started; user: "proper logging: prefill stage, % of, prefill done, tg generation, streamed batch etc.. make a plan so that I can follow what it does (PID, user, timestamp, coloring) ... via a hook to perl, so we can perlify the logging *in perl*, not in C"; "record in PLAN.md, dont start yet")
 
 Today: the library prints nothing (INFERENCE_VERBOSE: unstructured debug text); the only hook into Perl is

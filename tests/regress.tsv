@@ -48,9 +48,6 @@ full	ppl	qwen38_27b	/models/Qwen3.8-27B-Q4_0_ROCMFP4_FAST.gguf	--ctx 512 --chunk
 full	ppl	qwen38_flash	/models/Qwen3.8-Flash-Next-Uncensored-Q4_0-ROCmFP4-FAST-00001-of-00003.gguf	--ctx 512 --chunks 10	2.1396	0.2
 # the 35B in every quant type present (2- to 5-bit, FP4 kinds)
 full	ppl	qwen36_35b_q4_0	/data/q4_0/Qwen3.6-35B-A3B-Q4_0.gguf	--ctx 512 --chunks 20	6.9540	0.2
-full	ppl	qwen36_35b_q4_1	/data/q4_0/Qwen3.6-35B-A3B-Q4_1.gguf	--ctx 512 --chunks 20	7.0628	0.2
-full	ppl	qwen36_35b_q5_0	/data/q4_0/Qwen3.6-35B-A3B-Q5_0.gguf	--ctx 512 --chunks 20	6.9174	0.2
-full	ppl	qwen36_35b_q5_1	/data/q4_0/Qwen3.6-35B-A3B-Q5_1.gguf	--ctx 512 --chunks 20	6.8667	0.2
 full	ppl	qwen36_35b_q2_k	/data/q4_0/Qwen3.6-35B-A3B-Q2_K.gguf	--ctx 512 --chunks 20	11.6507	0.2
 full	ppl	qwen36_35b_q3_k_s	/data/q4_0/Qwen3.6-35B-A3B-Q3_K_S.gguf	--ctx 512 --chunks 20	7.7855	0.2
 full	ppl	qwen36_35b_iq4_nl	/data/q4_0/Qwen3.6-35B-A3B-IQ4_NL.gguf	--ctx 512 --chunks 20	6.9755	0.2
@@ -59,7 +56,6 @@ full	ppl	qwen36_35b_iq3_s	/data/q4_0/Qwen3.6-35B-A3B-IQ3_S.gguf	--ctx 512 --chun
 full	ppl	qwen36_35b_iq3_xxs	/data/q4_0/Qwen3.6-35B-A3B-IQ3_XXS.gguf	--ctx 512 --chunks 20	7.5269	0.2
 full	ppl	qwen36_35b_mxfp4	/data/q4_0/Qwen3.6-35B-A3B-MXFP4.gguf	--ctx 512 --chunks 20	6.9641	0.2
 full	ppl	qwen36_35b_nvfp4	/data/q4_0/Qwen3.6-35B-A3B-NVFP4.gguf	--ctx 512 --chunks 20	7.2451	0.2
-full	ppl	qwen36_35b_nvfp4_scaled	/data/q4_0/Qwen3.6-35B-A3B-NVFP4-scaled.gguf	--ctx 512 --chunks 20	7.2451	0.2
 full	ppl	qwen36_35b_nvfp4_fast	/data/q4_0/Qwen3.6-35B-A3B-NVFP4-Fast.gguf	--ctx 512 --chunks 20	6.7181	0.2
 full	fv	fv_qwen36_35b_q4_0	/data/q4_0/Qwen3.6-35B-A3B-Q4_0.gguf	$REFS/ref35_Q4_0	0.985	-
 # long-context retrieval (pass keys): 32k at 3 depths per KV cache type, 128k at mid depth (Qwen3.8-Flash reasons
