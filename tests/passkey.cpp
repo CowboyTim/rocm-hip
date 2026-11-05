@@ -3,12 +3,14 @@
 // long context, with each KV cache type (perplexity at 16k does not show that).
 //
 //   passkey <model.gguf> <text file> [--ctx 8192,32768] [--depth 0.1,0.5,0.9] [--kv f16|q8_0|q4_0] [--n 12]
+//           [--chatml 1]
 //
 // The prompt (raw text, no chat template): an instruction, the text file's tokens from its start (wikitext-2 test:
 // real prose, not a repeated filler) with "The pass key is K. Remember it. K is the pass key." inserted at the depth,
 // then "What is the pass key? The pass key is"; together --ctx - 4 - --n tokens. One line per trial, then "passkey: F of
 // N found"; exit 0 when all are. --n: tokens generated (a model that
-// reasons first needs more). Run from build/co.
+// reasons first needs more). --chatml 1: the prompt as one ChatML user turn and the question at its end, the
+// reply as the assistant's (reasoning models answer a raw-text completion unreliably). Run from build/co.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -31,17 +33,18 @@ static std::vector<double> parse_list(const char* s) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <model.gguf> <text file> [--ctx 8192,32768] [--depth 0.1,0.5,0.9] [--kv f16|q8_0|q4_0] [--n 12]\n",
+        fprintf(stderr, "usage: %s <model.gguf> <text file> [--ctx 8192,32768] [--depth 0.1,0.5,0.9] [--kv f16|q8_0|q4_0] [--n 12] [--chatml 1]\n",
                 argv[0]);
         return 2;
     }
     std::vector<double> ctxs = {8192, 32768}, depths = {0.1, 0.5, 0.9};
-    int kv = INFERENCE_KV_F16, n_gen = 12;
+    int kv = INFERENCE_KV_F16, n_gen = 12, chatml = 0;
     for (int i = 3; i + 1 < argc; i += 2) {
         const std::string a = argv[i], v = argv[i + 1];
         if (a == "--ctx") ctxs = parse_list(v.c_str());
         else if (a == "--depth") depths = parse_list(v.c_str());
         else if (a == "--n") n_gen = atoi(v.c_str());
+        else if (a == "--chatml") chatml = atoi(v.c_str());
         else if (a == "--kv") kv = v == "q8_0" ? INFERENCE_KV_Q8_0 : v == "q4_0" ? INFERENCE_KV_Q4_0 : INFERENCE_KV_F16;
         else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
@@ -71,10 +74,14 @@ int main(int argc, char** argv) {
         if (!first && !v.empty() && v[0] == bos) v.erase(v.begin());
         return v;
     };
-    const std::vector<int32_t> head = tok("There is an important piece of information hidden inside a lot of irrelevant "
-                                          "text. Find it and memorize it. I will quiz you about it.\n\n", true);
+    const std::vector<int32_t> head = tok(std::string(chatml ? "<|im_start|>user\n" : "") +
+                                              "There is an important piece of information hidden inside a lot of "
+                                              "irrelevant text. Find it and memorize it. I will quiz you about it.\n\n",
+                                          true);
     const std::vector<int32_t> filler = tok(text, false);
-    const std::vector<int32_t> tail = tok("\n\nWhat is the pass key? The pass key is", false);
+    const std::vector<int32_t> tail = tok(chatml ? "\n\nWhat is the pass key?<|im_end|>\n<|im_start|>assistant\n"
+                                                 : "\n\nWhat is the pass key? The pass key is",
+                                          false);
 
     int found = 0, trials = 0;
     unsigned lcg = 12345;

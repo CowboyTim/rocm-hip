@@ -235,6 +235,34 @@ __device__ float norm_rope(float x, const float* w, int n_rot, int rot_pairs, in
     return x;
 }
 
+// Orthonormal Walsh-Hadamard transform (symmetric, its own inverse) of NT values held one per thread, in blocks of
+// N, as llama.cpp rotates attention for a quantized cache (src/llama-kv-cache.cpp, attn_rot): Q and K by blocks of
+// HK(D) (64, doubled while it divides D: the whole head for 64 / 128 / 256), so Q.K is unchanged; V by blocks of 64,
+// the attention output rotated back (attn_combine). The outliers of a row are spread over its block before the 4- /
+// 8-bit quantization (Qwen3-0.6B, Q4_0 cache: ppl 132.7 -> 84.7). Butterflies in LDS; all NT threads take part.
+__host__ __device__ constexpr int hadamard_k(int D) {
+    int r = 64;
+    while (D % (2 * r) == 0) r *= 2;
+    return r;
+}
+// attn_prep's kv_quant: the cache type (0 F16, 1 Q8_0, 2 Q4_0) | ATTN_KV_ROT (rotate; the host sets it for a
+// quantized cache and D % 64 == 0 unless INFERENCE_KV_ROT=0)
+#define ATTN_KV_ROT 4
+template <int NT, int N>
+__device__ float hadamard_rot(float x) {
+    __shared__ float v[NT];
+    const int d = threadIdx.x;
+#pragma unroll
+    for (int s = 1; s < N; s <<= 1) {
+        v[d] = x;
+        __syncthreads();
+        const float y = v[d ^ s];
+        x = (d & s) ? y - x : x + y;
+        __syncthreads();
+    }
+    return x * (1.0f / __builtin_sqrtf((float)N));
+}
+
 template <int D>
 __device__ __forceinline__ void attn_prep_body(const float* qfull, const float* k, const float* v, const float* q_norm,
                                                const float* k_norm, float* q_out, __half* K, __half* V, int kv_stride,
@@ -252,16 +280,20 @@ __device__ __forceinline__ void attn_prep_body(const float* qfull, const float* 
     __half* v_row = V + kv_row(pos, kv_stride, kv_shift, kv_bstride);
     if (b < n_q) {
         const float x = qfull[(size_t)b * qs + d] + (bq ? bq[(size_t)b * qs + d] : 0.0f);
-        q_out[b * D + d] = norm_rope<D>(x, q_norm, n_rot, rot_pairs, pos, freq_base, eps, qk_norm, rope_norm, ff);
+        const float y = norm_rope<D>(x, q_norm, n_rot, rot_pairs, pos, freq_base, eps, qk_norm, rope_norm, ff);
+        q_out[b * D + d] = y;
+        if (kv_quant & ATTN_KV_ROT) q_out[b * D + d] = hadamard_rot<D, hadamard_k(D)>(y);  // (uniform; K the same)
     } else {
         const int g = b - n_q;
-        const float x = norm_rope<D>(k[g * D + d] + (bk ? bk[g * D + d] : 0.0f), k_norm, n_rot, rot_pairs, pos,
-                                     freq_base, eps, qk_norm, rope_norm, ff);
+        float x = norm_rope<D>(k[g * D + d] + (bk ? bk[g * D + d] : 0.0f), k_norm, n_rot, rot_pairs, pos, freq_base,
+                               eps, qk_norm, rope_norm, ff);
+        if (kv_quant & ATTN_KV_ROT) x = hadamard_rot<D, hadamard_k(D)>(x);  // (uniform)
         const float vv = v[g * D + d] + (bv ? bv[g * D + d] : 0.0f);
-        const float vx = v_norm ? norm_rope<D>(vv, nullptr, 0, 0, pos, freq_base, eps) : vv;
-        if (kv_quant) {  // uniform: a wave's 32 dims are one block
-            kvq_store(k_row, g * D + d, x, kv_quant, kv_stride);
-            kvq_store(v_row, g * D + d, vx, kv_quant, kv_stride);
+        float vx = v_norm ? norm_rope<D>(vv, nullptr, 0, 0, pos, freq_base, eps) : vv;
+        if (kv_quant & ATTN_KV_ROT) vx = hadamard_rot<D, 64>(vx);  // (uniform; attn_combine rotates back)
+        if (kv_quant & 3) {  // uniform: a wave's 32 dims are one block
+            kvq_store(k_row, g * D + d, x, kv_quant & 3, kv_stride);
+            kvq_store(v_row, g * D + d, vx, kv_quant & 3, kv_stride);
         } else {
             k_row[g * D + d] = __float2half(x);
             v_row[g * D + d] = __float2half(vx);
@@ -368,7 +400,7 @@ __device__ __forceinline__ void attn_partial_body(const float* q, const __half* 
 
 template <int D>
 __device__ __forceinline__ void attn_combine_body(const float* part_ml, const float* part_acc, int n_chunks, int n_q,
-                                                  const float* qfull, float* out, Q8Out o, int gated) {
+                                                  const float* qfull, float* out, Q8Out o, int gated, int vrot) {
     __shared__ Q8Shared sh;
     // workgroup: 256 values of the token's n_q * D (256 / D heads, or 256 / D of one head for D 512); the last one
     // partly past n_q * D when that is not a multiple of 256 (no int8 output then)
@@ -393,6 +425,7 @@ __device__ __forceinline__ void attn_combine_body(const float* part_ml, const fl
         den += w * ml[2 * c + 1];
     }
     float r = num / den;
+    if (vrot) r = hadamard_rot<256, 64>(r);  // (uniform; V was cached rotated: attn_prep)
     if (gated) r /= 1.0f + __expf(-qfull[(size_t)h * 2 * D + D + d]);
     if (active) out[h * D + d] = r;
     if (q8_wanted(o)) q8_block_value(r, active, z * nb + blockIdx.x, threadIdx.x, sh, o);  // uniform: one 256-block
@@ -966,8 +999,8 @@ ATTN_GQA_KERNELS(256)
     }                                                                                                        \
     extern "C" __global__ void __launch_bounds__(256)                                                        \
         attn_combine_##D(const float* part_ml, const float* part_acc, int n_chunks, int n_q, const float* qfull, \
-                         float* out, Q8Out o, int gated) {                                                   \
-        attn_combine_body<D>(part_ml, part_acc, n_chunks, n_q, qfull, out, o, gated);                         \
+                         float* out, Q8Out o, int gated, int vrot) {                                         \
+        attn_combine_body<D>(part_ml, part_acc, n_chunks, n_q, qfull, out, o, gated, vrot);                   \
     }
 #define ATTN_BIDIR_KERNEL(D)                                                                                  \
     extern "C" __global__ void __launch_bounds__(D)                                                          \

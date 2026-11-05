@@ -127,6 +127,11 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
     const int D = opts->head_dim, hi = D == 128 ? 0 : D == 256 ? 1 : D == 512 ? 2 : D == 64 ? 3 : -1;
     int gated = opts->gated, window = opts->window, v_norm = opts->v_norm, qk_norm = !opts->no_qk_norm;
     int kq = opts->kv_quant, rope_norm = opts->rope_norm;
+    // A quantized cache holds Q / K and V Hadamard-rotated (attention.hip hadamard_rot; attn_combine rotates the
+    // output back); INFERENCE_KV_ROT=0 turns it off (A/B; the KV store does not tell the two apart)
+    static const bool rot_on = [] { const char* e = getenv("INFERENCE_KV_ROT"); return !e || atoi(e) != 0; }();
+    int vrot = rot_on && kq && D % 64 == 0;
+    int kq_prep = kq | (vrot ? 4 : 0);  // (attention.hip ATTN_KV_ROT)
     int rot_pairs = opts->rot_pairs > 0 ? opts->rot_pairs : n_rot / 2;
     if (hi < 0) return hipErrorInvalidValue;
     if (!g_prep[hi]) return hipErrorInvalidDeviceFunction;
@@ -146,7 +151,7 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
 
     void* a_prep[] = {(void*)&qfull, (void*)&k, (void*)&v, (void*)&q_norm, (void*)&k_norm, &q, &K, &V, &kv_stride,
                       &kv_shift, &kv_bstride, &n_q, &n_kv, &n_rot, &pos0, &freq_base, &eps, &gated, &rot_pairs,
-                      &v_norm, &qk_norm, &kq, (void*)&opts->bq, (void*)&opts->bk, (void*)&opts->bv,
+                      &v_norm, &qk_norm, &kq_prep, (void*)&opts->bq, (void*)&opts->bk, (void*)&opts->bv,
                       &rope_norm, (void*)&opts->freq_factors};
     hipError_t e = hipModuleLaunchKernel(g_prep[hi], (unsigned)(n_q + n_kv), (unsigned)T, 1, (unsigned)D, 1, 1, 0,
                                          stream,
@@ -202,7 +207,7 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
         e = hipModuleLaunchKernel(flash, (unsigned)(n_q / nh * ds), (unsigned)((T + 16 * tt - 1) / (16 * tt)),
                                   (unsigned)n_split, (unsigned)(32 * nh * tt * sp), 1, 1, 0, stream, a_flash, nullptr);
         if (e != hipSuccess) return e;
-        void* a_comb[] = {&part_ml, &part_acc, &n_split, &n_q, (void*)&qfull, &out, &o, &gated};
+        void* a_comb[] = {&part_ml, &part_acc, &n_split, &n_q, (void*)&qfull, &out, &o, &gated, &vrot};
         return hipModuleLaunchKernel(g_combine[hi], (unsigned)NB, (unsigned)T, 1, 256, 1, 1, 0, stream, a_comb,
                                      nullptr);
     }
@@ -244,7 +249,7 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
                                       (unsigned)tg, ATTN_CHUNK, 1, 1, 0, stream, a_part, nullptr);
         if (e != hipSuccess) return e;
         int nch = n_chunks;
-        void* a_comb[] = {&part_ml, &part_acc, &nch, &n_q, (void*)&qfz, &outz, &oz, &gated};
+        void* a_comb[] = {&part_ml, &part_acc, &nch, &n_q, (void*)&qfz, &outz, &oz, &gated, &vrot};
         e = hipModuleLaunchKernel(g_combine[hi], (unsigned)NB, (unsigned)tg, 1, 256, 1, 1, 0, stream, a_comb,
                                   nullptr);
         if (e != hipSuccess) return e;

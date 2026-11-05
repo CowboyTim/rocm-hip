@@ -1935,6 +1935,10 @@ int inference_store_open(inference_model_t* m, const char* dir, int snapshot_eve
                                (uint64_t)kv_cache_d_kv(m->kvc), (uint64_t)kv_cache_block_bytes(m->kvc),
                                (uint64_t)state_bytes(m), (uint64_t)kv_cache_type(m->kvc)};
     sha256_update(&c, layout, sizeof(layout));
+    if (kv_cache_type(m->kvc) != 0) {  // quantized rows hold Hadamard-rotated K (attention.hip hadamard_rot)
+        const char rot[] = "k hadamard v1";
+        sha256_update(&c, rot, sizeof(rot));
+    }
     if (gbase) sha256_update(&c, gbase, std::min(gsize, (size_t)4 << 20));
     for (int i = 1; i < gguf_n_maps(m->gguf); ++i) {  // the other files of a split model: their sizes
         size_t sz = 0;

@@ -3037,7 +3037,9 @@ pass; Qwen3.6-35B Q4_0 the same figures as before) unchanged.
   is the pass key? The pass key is", greedy; --n tokens generated). Qwen3.6-35B ROCMFP4: 18 of 18 at 32k and
   128k with F16, Q8_0 and Q4_0 caches (128k prefill ~152 s). Qwen3.8-27B: 3 of 3 at 32k, 1 of 1 at 128k
   (prefill 32k ~134 s, 128k ~910 s while another job shared the GPU). Qwen3.8-Flash: 1 of 1 at 128k; at 32k it
-  answers "a 5-digit number. <think>" and finds the key after reasoning (--n 160: 3 of 3, quoting the sentence).
+  answers "a 5-digit number. <think>" and finds the key after reasoning (--n 160: 3 of 3, quoting the sentence;
+  a raw-text completion proved fragile: after the rotation one trial answered " 5 digits." and stopped, as Q4_0
+  without it did too, so the suite asks it as a ChatML turn: --chatml 1 --n 400, 3 of 3 with Q8_0 and Q4_0).
   Suite rows (kind pk): 0.6B at 4k / 16k (quick), 35B 32k per cache type and 128k Q4_0, 27B 16k, Flash 32k.
   The suite is now 65 rows: quick ~2 min, full ~20 min (the pass-key rows ~12 of it); all pass.
 - **Found on the way: llama.cpp rotates Q / K / V for quantized caches.** Qwen3-0.6B with a Q4_0 cache: ppl
@@ -3047,9 +3049,26 @@ pass; Qwen3.6-35B Q4_0 the same figures as before) unchanged.
   llama.cpp (PR 21038, src/llama-kv-cache.cpp) multiplies Q and K by an orthonormal Walsh-Hadamard matrix (64,
   doubled while it divides the head size: the whole head for 128 / 256) and V by 64-blocks (the attention output
   rotated back) when the cache type is quantized: Q.K is unchanged, outliers are spread before quantizing.
-  Qwen3.6-35B (head 256) loses only 0.4% with Q4_0 (6.8778 vs 6.8527) without it. **Next:** the same rotation in
-  attn_prep (Q, K; V) and after attention (the output), for Q8_0 / Q4_0 caches; then re-record the q4kv / q8kv
-  baselines.
+  Qwen3.6-35B (head 256) loses only 0.4% with Q4_0 (6.8778 vs 6.8527) without it. Done next (below).
+
+### Hadamard rotation for quantized KV caches (2026-11-05, user: "yes" to doing it)
+
+With a Q8_0 or Q4_0 cache, attn_prep multiplies Q and K (after norm and RoPE) by an orthonormal Walsh-Hadamard
+matrix of HK(D) (64, doubled while it divides D: the whole head for 64 / 128 / 256 / 512) and V by blocks of 64;
+attn_combine (every path's last step: flash prefill and decode) rotates the output back before the gate and the
+int8 quantization for attn_output. Q.K is unchanged; the outliers of a row are spread over its block before
+quantizing (llama.cpp's attn_rot, PR 21038). hadamard_rot<NT, N>: log2 N butterflies in LDS. attn_decode_verify's
+reference rotates its output back too. The KV store's root hash includes "k hadamard v1" for quantized caches
+(rows stored before are not reused). Wikitext ppl, ctx 512, 5 chunks (F16 / Q8_0 / Q4_0; llama.cpp Q4_0):
+- Qwen3-0.6B: 19.51 / 19.63 -> 19.59 / 132.7 -> 82.20 (llama.cpp 84.6)
+- Qwen3-30B-A3B: 7.613 / 7.640 -> 7.612 / 8.20 -> 7.80 (7.75)
+- Llama-3.2-1B: 12.41 / 12.44 / 13.16 -> 12.97 (13.12)
+- K only rotated (first step): 0.6B Q4_0 84.70, 30B 7.82, Llama 13.01: K carries most of it.
+Suite baselines re-recorded (20 chunks): Qwen3.6-35B Q8_0 6.8718 -> 6.8552, Q4_0 6.8778 -> 6.8616 (F16 6.8527);
+16k Q8_0 4.8861 -> 4.8882 (F16 4.8886); Qwen3.5-4B Q4_0 10.4103 -> 10.3442 (F16 10.3231). Every other row
+unchanged. INFERENCE_KV_ROT=0 turns it off (A/B). No speed cost: Qwen3.6-35B, Q4_0 cache, 2k prompt: prefill
+2,214-2,248 vs 2,160-2,263 tok/s, generation 65.2-65.4 either way. Qwen3.8-Flash, 10 chunks (F16 2.1396): Q8_0 2.1805 -> 2.1484,
+Q4_0 2.2005 -> 2.1403. Left: a quantized cache needs n_kv * D % 256 == 0 (Qwen2.5-0.5B, 2 x 64, cannot have one).
 
 ### forward_verify fault: a test buffer overrun (2026-11-04, user: "yes" to fixing it)
 

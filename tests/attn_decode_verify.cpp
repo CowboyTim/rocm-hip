@@ -113,6 +113,16 @@ static double run(const Cfg& c, int kq, double* us) {
                     l += e;
                     for (int i = 0; i < D; ++i) acc[i] += e * val(V, p, g * D + i);
                 }
+                // a quantized cache holds V Hadamard-rotated in blocks of 64 (attention.hip hadamard_rot): the
+                // output is rotated back (the transform is its own inverse)
+                if (kq)
+                    for (int b = 0; b < D; b += 64)
+                        for (int st = 1; st < 64; st <<= 1)
+                            for (int i = b; i < b + 64; ++i)
+                                if (!(i & st)) {
+                                    const double x = acc[i], y = acc[i | st];
+                                    acc[i] = (x + y) / sqrt(2.0), acc[i | st] = (x - y) / sqrt(2.0);
+                                }
                 for (int i = 0; i < D; ++i) {
                     maxerr = std::max(maxerr, fabs(acc[i] / l - oz[h * D + i]));
                     maxref = std::max(maxref, fabs(acc[i] / l));
