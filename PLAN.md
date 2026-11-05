@@ -3098,7 +3098,10 @@ activated weights, dense will always be too small, even if it fits in memory)".
 - First quantization (2026-11-05): the BF16 file's qwen4exp.attention.recurrent_layers is 49 bool flags (one per
   layer; the MTP layer 48 full attention, which its attn_q / k / v tensors are), but ROCmFPX's loader (also its
   newest branch nemotron-mtp-rocmfp4-strix, c7f132374) takes layer indices (uint32) and llama-quantize stops
-  ("is not a string/float32/uint32/int32/uint64 array"); no converter in the fork writes the key. A local
+  ("is not a string/float32/uint32/int32/uint64 array"). The BF16 was converted with upstream's
+  llama.cpp-stock/convert_hf_to_gguf.py (e216f4ec8), whose writer (add_recurrent_layers(Sequence[bool])) and
+  qwen4exp loader (get_key_or_arr into is_recr_impl) both use bool flags: the file is right, the fork's qwen4exp
+  is behind upstream's (worth porting there; its own converter writes no such key). A local
   worktree of that branch (/data/rocmfpx-strix, CPU build, not pushed) reads the bool form in
   src/models/qwen4exp.cpp; llama-quantize --tensor-type per_layer_token_embd=q8_0 ... Q4_0_ROCMFP4_FAST into
   /data/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST-PLE_Q8_0.gguf. (llama-server would reject the file the same way.)
