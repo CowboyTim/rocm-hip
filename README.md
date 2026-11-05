@@ -23,7 +23,7 @@ forked-llama.cpp snapshot).
 ## Documents
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — how the engine is built
-- [PLAN.md](PLAN.md) — plan, status, measurements and history (the current next step is at "▶ NEXT STEP")
+- [PLAN.md](PLAN.md) — what is open: next steps (at "▶ Next"), planned work, leads (finished work is in the git history)
 - [AGENTS.md](AGENTS.md) — working conventions
 - [perl/ROCm-Inference/README](perl/ROCm-Inference/README) — the Perl module
 

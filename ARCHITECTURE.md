@@ -2,8 +2,9 @@
 
 How the inference engine in this repository is built: a standalone, zero-copy LLM engine for **AMD Strix Halo
 (gfx1151, RDNA3.5 APU, 128 GB unified memory)**, a C library (`libinference.so`) with a Perl XS binding
-(`ROCm::Inference`). This file describes the design as it is; [PLAN.md](PLAN.md) holds the status, the
-measurements behind each decision and the history (phases).
+(`ROCm::Inference`). This file describes the design as it is; [PLAN.md](PLAN.md) holds what is open (next steps,
+planned work, leads). The measurements behind each decision and the history are in the git history (PLAN.md as of
+commit 7d4ed63 has them all).
 
 ## 1. Principles
 

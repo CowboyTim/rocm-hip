@@ -1,7 +1,7 @@
 # tests/regress.tsv -- the regression suite's checks (tests/regress.sh). Tab-separated:
 # tier	kind	name	model	args	expect	tol
 # tier: quick (small models, minutes) or full. ppl: expect = the baseline perplexity on wikitext-2 test (llama.cpp's
-# llama-perplexity agrees within ~0.5%, K-quants ~1%: PLAN.md "Regression suite"), tol in percent; the chunk settings in
+# llama-perplexity agrees within ~0.5%, K-quants ~1%: commit c48e150's PLAN.md), tol in percent; the chunk settings in
 # args. fv: args = the llama.cpp reference dump (tools/ref_oracle), expect = the minimum cosine. pk: args = passkey
 # options (pass keys at context lengths x depths). --update rewrites the ppl baselines.
 # kernels and the C API
