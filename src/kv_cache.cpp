@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <errno.h>
 #include <unistd.h>
@@ -142,6 +143,16 @@ inference_kv_cache_t *kv_cache_create(const char *shm_path, const kv_cache_confi
         c->dir = slash == std::string::npos ? "." : slash == 0 ? "/" : c->dir.substr(0, slash);
     }
     const int n_slots = c->cfg.n_ctx / B;
+    // Each slot keeps its file open: raise the soft open-file limit to what the slots need (the hard limit permitting)
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < (rlim_t)n_slots + 256) {
+        rlim_t want = (rlim_t)n_slots + 256;
+        if (rl.rlim_max != RLIM_INFINITY && want > rl.rlim_max) want = rl.rlim_max;
+        const rlim_t soft = rl.rlim_cur;
+        rl.rlim_cur = want;
+        if (setrlimit(RLIMIT_NOFILE, &rl) != 0) INFER_LOG("kv_cache: open-file limit %lu: %s\n", (unsigned long)soft, strerror(errno));
+        else if (want < (rlim_t)n_slots + 16) INFER_LOG("kv_cache: %d slots need more open files than the hard limit %lu allows\n", n_slots, (unsigned long)rl.rlim_max);
+    }
     c->base = mmap(NULL, c->total_bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);  // reserve
     if (c->base == MAP_FAILED) { INFER_LOG("kv_cache: reserve: %s\n", strerror(errno)); delete c; return nullptr; }
     c->slot_fd.assign(n_slots, -1);
