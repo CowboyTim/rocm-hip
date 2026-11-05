@@ -3,6 +3,9 @@
 #
 #   gen_qwen4exp_tiny.py <real_header.gguf> <out.gguf> [seed]
 #
+# PLE_TYPE (environment): the per_layer_token_embd table's type, q5_1 (the release's, default), q8_0, q4_0, bf16 or
+# f16: the CPU decodes its rows, whatever the type (qt_to_float), from disk.
+#
 # The real model (98.5 GiB) does not fit here, so the architecture is verified on this file instead: the same
 # tensor names, layer pattern, quant types per tensor and tokenizer as the release GGUF, with small widths. The
 # tokenizer metadata (and the PLE hash multipliers / EOS ids) are copied from the first megabytes of the real
@@ -75,6 +78,7 @@ class Writer:
 
 # ---------------------------------------------------------------- random quantized blocks
 T_F32, T_F16, T_Q5_1, T_Q5_K, T_Q6_K, T_FP4, T_FP4F = 0, 1, 7, 13, 14, 100, 101
+T_Q4_0, T_Q8_0, T_BF16 = 2, 8, 30
 rng = random.Random(1)
 
 
@@ -99,6 +103,8 @@ def quant(gtype, n_values, std):
         return b"".join(struct.pack("<f", rng.gauss(0, std)) for _ in range(n_values))
     if gtype == T_F16:
         return b"".join(f16(rng.gauss(0, std)) for _ in range(n_values))
+    if gtype == T_BF16:  # the top half of the float32
+        return b"".join(struct.pack("<f", rng.gauss(0, std))[2:] for _ in range(n_values))
     nb = n_values // (256 if gtype in (T_Q5_K, T_Q6_K) else 32)
     out = bytearray()
     if gtype in (T_FP4, T_FP4F):  # codebook rms ~5.36 at half scale
@@ -109,6 +115,15 @@ def quant(gtype, n_values, std):
             out.append(scales[i % 8])
             if gtype == T_FP4:
                 out.append(scales[(i + 3) % 8])
+    elif gtype == T_Q8_0:  # d * q, q uniform -127..127 (std ~73.6)
+        d = std / 73.6
+        for i in range(nb):
+            out += f16(d) + bytes(rng.randrange(-127, 128) & 0xFF for _ in range(32))
+    elif gtype == T_Q4_0:  # d * (q - 8), q uniform 0..15 (std ~4.6)
+        d = std / 4.6
+        body = os.urandom(16 * nb)
+        for i in range(nb):
+            out += f16(d) + body[16 * i:16 * i + 16]
     elif gtype == T_Q5_1:  # d * q + m, q uniform 0..31 (std ~9.2)
         d = std / 9.2
         body = os.urandom(20 * nb)
@@ -193,7 +208,8 @@ def main():
     w.tensor("output_hc_down.weight", [HCD, LR], T_FP4F, quant(T_FP4F, HCD * LR, s(HCD)))
     w.tensor("output_hc_up.weight", [LR, HCD], T_FP4F, quant(T_FP4F, LR * HCD, 2 * s(LR)))
     ple_rows = (sum(hv) + 255) // 256 * 256
-    w.tensor("per_layer_token_embd.weight", [PD, ple_rows], T_Q5_1, quant(T_Q5_1, PD * ple_rows, 1.0))
+    pt = {"q5_1": T_Q5_1, "q8_0": T_Q8_0, "q4_0": T_Q4_0, "bf16": T_BF16, "f16": T_F16}[os.environ.get("PLE_TYPE", "q5_1")]
+    w.tensor("per_layer_token_embd.weight", [PD, ple_rows], pt, quant(pt, PD * ple_rows, 1.0))
 
     for l in range(NL):
         b = f"blk.{l}."

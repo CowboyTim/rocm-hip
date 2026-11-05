@@ -3090,6 +3090,11 @@ activated weights, dense will always be too small, even if it fits in memory)".
   kept BF16 (~102 GB on disk) or Q8_0 (~51 GB) by a per-tensor override, the rest ROCmFP4 (~67 GB pinned); run it,
   compare with the existing Flash (perplexity, forward_verify on the reference dump). No llama.cpp imatrix (it
   would read the BF16 for every token); an engine-side imatrix collection on the GPU from an FP4 model is an option.
+- PLE table types (user: "Q8_0 it is, but perhaps attempt support for BF16 (and lower too?)"): the engine decodes
+  its rows with qt_to_float, any type it knows whose block divides the row (160 values in the release: 32-value
+  blocks, not the 256-value K-quants / IQ super-blocks, which llama-quantize would not write for such rows either).
+  Checked on the tiny replica (gen_qwen4exp_tiny.py PLE_TYPE=...; header from the BF16 file's first 32 MB) against
+  the ROCmFPX reference with qwen4exp_verify: q5_1, q8_0, q4_0, bf16, f16 all PASS (6 of 6 checks each).
 - **Later: expert pin / unpin for MoE models larger than memory.** hipHostRegister works on any range of the
   mapping: after the router, make the chosen experts' ranges resident and registered, with a cache of recently
   used experts (as KTransformers / llama.cpp --cpu-moe in their ways); dense layers stay pinned. Flash: 512
