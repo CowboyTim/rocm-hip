@@ -3070,6 +3070,42 @@ unchanged. INFERENCE_KV_ROT=0 turns it off (A/B). No speed cost: Qwen3.6-35B, Q4
 2,214-2,248 vs 2,160-2,263 tok/s, generation 65.2-65.4 either way. Qwen3.8-Flash, 10 chunks (F16 2.1396): Q8_0 2.1805 -> 2.1484,
 Q4_0 2.2005 -> 2.1403. Left: a quantized cache needs n_kv * D % 256 == 0 (Qwen2.5-0.5B, 2 x 64, cannot have one).
 
+### Server logging: events from the engine, formatted in Perl (planned 2026-11-05, not started; user: "proper logging: prefill stage, % of, prefill done, tg generation, streamed batch etc.. make a plan so that I can follow what it does (PID, user, timestamp, coloring) ... via a hook to perl, so we can perlify the logging *in perl*, not in C"; "record in PLAN.md, dont start yet")
+
+Today: the library prints nothing (INFERENCE_VERBOSE: unstructured debug text); the only hook into Perl is
+on_token; a prompt's prefill is one blocking C call (generate_stream -> sync_prompt -> batches), so Perl sees nothing
+until the first token; the server logs Web::Route's one line per request and plain STDERR lines at model loads.
+1. **C: an event hook, no formatting.** inference_set_event_cb(model, cb, user): a small struct (type, sequence,
+   counts, ms) at prefill_begin (total, reused from the sequence, from the KV store, to prefill), prefill_progress
+   (after each batch / chunk: done of total, ms), prefill_end (tokens, ms), checkpoint (DeltaNet) and store
+   (blocks resumed / published), draft (proposed / accepted per pass), context_full. Nothing printed in C; no cost
+   without a hook. Generation speed needs none: Perl times on_token.
+2. **XS:** set_event_handler($m, sub { my ($event, $info) = @_ }); a die in the handler becomes a warning.
+3. **Perl: ROCm::Inference::Log.** A line: timestamp (ms), PID, level, user, client IP, conversation id, request id,
+   model, event, message. Colours per kind (request bold, prefill cyan, generation green, model load / unload
+   magenta, warn yellow, error red); auto (a terminal) / always (docker logs) / never, NO_COLOR honoured. Progress
+   at most every 10% or 2 s. Text or JSON lines. Levels error / warn / info / debug (debug: --parallel step lines,
+   "step: 3 seqs, 3 tokens, 41 ms").
+4. **Server:** per request: received (client, user, model, messages, tools, stream), queue wait (--parallel),
+   model load / unload (time, memory), prefill progress and result (reused / store / new, tok/s), time to first
+   token, generation every few seconds (tokens, tok/s), done (finish reason, tokens, prefill / generation time and
+   tok/s, total), client gone, errors. Web::Route's request line through the same logger (a log callback option).
+5. **Who:** the user (nginx: X-Remote-User from $remote_user, later the subject of a JWT: the user may add Keycloak
+   login with a JWT as API key), the client IP (X-Real-IP, set by nginx already) and opencode's conversation id
+   (conv_id / X-LLamaCPP-Id-slot from the fixups). Docker repo: proxy_set_header X-Remote-User in /rocm/.
+6. Options --log-level, --log-format text|json, --log-color auto|always|never (Docker: ROCM_ARGS; always there).
+7. Tests: the C events' order (progress increasing, ending at the total); the formatter without a GPU (colours,
+   throttling, JSON); log lines in t/60-server.t.
+
+Example (text, one opencode turn):
+    2026-11-05 14:03:12.481 [41231] INFO  alice 10.0.0.7 conv-17 chatcmpl-6f3a Qwen3.6-35B  > POST /v1/chat/completions  stream, 14 msgs, 9 tools
+    2026-11-05 14:03:12.483 [41231] INFO  ... prefill 31,204 tok: 28,672 reused, 2,532 new
+    2026-11-05 14:03:12.890 [41231] INFO  ... prefill  41%  1,040/2,532  2,555 tok/s
+    2026-11-05 14:03:13.471 [41231] INFO  ... prefill done 2,532 tok in 0.99 s (2,558 tok/s)
+    2026-11-05 14:03:13.520 [41231] INFO  ... first token after 1.04 s
+    2026-11-05 14:03:15.522 [41231] INFO  ... generating  122 tok  61.0 tok/s
+    2026-11-05 14:03:17.640 [41231] INFO  ... done tool_calls  251 tok in 4.12 s (60.9 tok/s), total 5.16 s
+
 ### Models from a directory, chosen per request (2026-11-05, user: "cant I make that \"dynamic\" with the API like in llama.cpp + a API to list available models ... plan for this change IF possible"; then "yes and yes")
 
 Measured (Qwen3.6-35B ROCMFP4, 20 GB, file in the page cache): load (mmap + pin) 0.44 s, a 128k KV cache 1-1.6 s,
