@@ -3019,6 +3019,38 @@ pass; Qwen3.6-35B Q4_0 the same figures as before) unchanged.
 - The 35B Q4_0 forward_verify row uses min cos 0.985 (worst 0.988955 at layer 21: smooth drift, the next
   token matches llama.cpp's; see the fault section below).
 
+### Quality round: K-quant gap, capi_smoke, long context (2026-11-05, user: "do 1, 2 and 3")
+
+- **1. The K-quant gap is the activation format, not a bug.** The engine dots K-quant (and IQ / TQ) weights with
+  Q8_K activations (one scale per 256 values), as ggml's CPU backend does; ggml's CUDA / HIP backend uses q8_1 (a
+  scale per 32), which keeps a little more precision. Wikitext ppl (ctx 512, 20 chunks), engine / llama.cpp CPU /
+  llama.cpp HIP: 35B Q2_K 11.6507 / 11.6386 / 11.4959, Q3_K_S 7.7855 / 7.7227 / 7.7381; 0.6B Q2_K 220.57 / 221.69
+  / 216.66, Q3_K_S 35.60 / 35.65 / 35.49. matvec_verify: the Q2_K / Q3_K / Q4_K kernels exact vs the Q8_K
+  reference. Left as an option: q8_1-style activations for the K-quants (~1% at Q2_K; the ROCmFP4 models
+  already use 32-value scales).
+- **2. capi_smoke on small models: the test's expectation.** Qwen3-0.6B's greedy reply is "Count from 1 to 10,
+  separated by commas:\n**1, 2, 3, 4, 5, " (llama.cpp's top token is "Count" too: 25.55 vs 25.40 here, same
+  order of the top 6), Qwen2.5-0.5B and Llama-3.2-1B write "1,2,3,4,5,". The check now looks for 1..5 anywhere,
+  spaces aside; passes on all four models; a quick-tier row (regress.sh test rows may name a model: the binary's
+  first argument).
+- **3. Long context: tests/passkey** (a 5-digit pass key inside wikitext-2 at depths 0.1 / 0.5 / 0.9, then "What
+  is the pass key? The pass key is", greedy; --n tokens generated). Qwen3.6-35B ROCMFP4: 18 of 18 at 32k and
+  128k with F16, Q8_0 and Q4_0 caches (128k prefill ~152 s). Qwen3.8-27B: 3 of 3 at 32k, 1 of 1 at 128k
+  (prefill 32k ~134 s, 128k ~910 s while another job shared the GPU). Qwen3.8-Flash: 1 of 1 at 128k; at 32k it
+  answers "a 5-digit number. <think>" and finds the key after reasoning (--n 160: 3 of 3, quoting the sentence).
+  Suite rows (kind pk): 0.6B at 4k / 16k (quick), 35B 32k per cache type and 128k Q4_0, 27B 16k, Flash 32k.
+  The suite is now 65 rows: quick ~2 min, full ~20 min (the pass-key rows ~12 of it); all pass.
+- **Found on the way: llama.cpp rotates Q / K / V for quantized caches.** Qwen3-0.6B with a Q4_0 cache: ppl
+  132.7 (F16 19.51), llama.cpp 84.6; Qwen3-30B 8.20 (F16 7.61) vs 7.75. Not a defect here: the stored rows equal
+  ggml's quantize_row_q4_0 (layer 0 dumped from both caches: same error, 0.0548 K / 0.108 V), prefill, decode and
+  mixed paths agree (132.7 / 129.1 / 134.7), and llama.cpp with LLAMA_ATTN_ROT_DISABLE=1 gives 137.7 and 8.28.
+  llama.cpp (PR 21038, src/llama-kv-cache.cpp) multiplies Q and K by an orthonormal Walsh-Hadamard matrix (64,
+  doubled while it divides the head size: the whole head for 128 / 256) and V by 64-blocks (the attention output
+  rotated back) when the cache type is quantized: Q.K is unchanged, outliers are spread before quantizing.
+  Qwen3.6-35B (head 256) loses only 0.4% with Q4_0 (6.8778 vs 6.8527) without it. **Next:** the same rotation in
+  attn_prep (Q, K; V) and after attention (the output), for Q8_0 / Q4_0 caches; then re-record the q4kv / q8kv
+  baselines.
+
 ### forward_verify fault: a test buffer overrun (2026-11-04, user: "yes" to fixing it)
 
 The fault addresses had one shape (0x4c464462a000, 0x4e3ab022a000, 0x55f1e862a000, 0x4d1dc882a000, ...): page

@@ -2,10 +2,12 @@
 # tier	kind	name	model	args	expect	tol
 # tier: quick (small models, minutes) or full. ppl: expect = the baseline perplexity on wikitext-2 test (llama.cpp's
 # llama-perplexity agrees within ~0.5%, K-quants ~1%: PLAN.md "Regression suite"), tol in percent; the chunk settings in
-# args. fv: args = the llama.cpp reference dump (tools/ref_oracle), expect = the minimum cosine. --update rewrites
-# the ppl baselines.
-# no model
+# args. fv: args = the llama.cpp reference dump (tools/ref_oracle), expect = the minimum cosine. pk: args = passkey
+# options (pass keys at context lengths x depths). --update rewrites the ppl baselines.
+# kernels and the C API
 quick	test	attn_decode	-	attn_decode_verify --no-timing	-	-
+quick	test	capi_smoke	/models/Qwen3-0.6B-Q8_0.gguf	capi_smoke	-	-
+quick	pk	pk_qwen3_06b	/models/Qwen3-0.6B-Q8_0.gguf	--ctx 4096,16384 --kv q8_0	-	-
 # small models
 quick	ppl	qwen25_05b	/data/hf/qwen-gguf/qwen2.5-0.5b-instruct-q8_0.gguf	--ctx 512 --chunks 20	16.8243	0.2
 quick	ppl	qwen3_06b	/models/Qwen3-0.6B-Q8_0.gguf	--ctx 512 --chunks 20	23.6061	0.2
@@ -60,6 +62,14 @@ full	ppl	qwen36_35b_nvfp4	/data/q4_0/Qwen3.6-35B-A3B-NVFP4.gguf	--ctx 512 --chun
 full	ppl	qwen36_35b_nvfp4_scaled	/data/q4_0/Qwen3.6-35B-A3B-NVFP4-scaled.gguf	--ctx 512 --chunks 20	7.2451	0.2
 full	ppl	qwen36_35b_nvfp4_fast	/data/q4_0/Qwen3.6-35B-A3B-NVFP4-Fast.gguf	--ctx 512 --chunks 20	6.7181	0.2
 full	fv	fv_qwen36_35b_q4_0	/data/q4_0/Qwen3.6-35B-A3B-Q4_0.gguf	$REFS/ref35_Q4_0	0.985	-
+# long-context retrieval (pass keys): 32k at 3 depths per KV cache type, 128k at mid depth (Qwen3.8-Flash reasons
+# before it answers: --n 160)
+full	pk	pk_qwen36_35b_32k	/models/Qwen3.6-35B-A3B-ROCMFP4.gguf	--ctx 32768	-	-
+full	pk	pk_qwen36_35b_32k_q8kv	/models/Qwen3.6-35B-A3B-ROCMFP4.gguf	--ctx 32768 --kv q8_0	-	-
+full	pk	pk_qwen36_35b_32k_q4kv	/models/Qwen3.6-35B-A3B-ROCMFP4.gguf	--ctx 32768 --kv q4_0	-	-
+full	pk	pk_qwen36_35b_128k_q4kv	/models/Qwen3.6-35B-A3B-ROCMFP4.gguf	--ctx 131072 --depth 0.5 --kv q4_0	-	-
+full	pk	pk_qwen38_27b_16k_q8kv	/models/Qwen3.8-27B-Q4_0_ROCMFP4_FAST.gguf	--ctx 16384 --kv q8_0	-	-
+full	pk	pk_qwen38_flash_32k_q8kv	/models/Qwen3.8-Flash-Next-Uncensored-Q4_0-ROCmFP4-FAST-00001-of-00003.gguf	--ctx 32768 --kv q8_0 --n 160	-	-
 # other architectures
 full	ppl	qwen25_7b	/data/hf/qwen-gguf/qwen2.5-7b-instruct-q8_0-00001-of-00003.gguf	--ctx 512 --chunks 20	7.5229	0.2
 full	ppl	qwen3_30b	/data/hf/qwen-gguf/Qwen3-30B-A3B-Q8_0.gguf	--ctx 512 --chunks 20	9.4331	0.2

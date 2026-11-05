@@ -84,7 +84,13 @@ int main(int argc, char** argv) {
     const int rc = inference_generate_stream(m, ids, n, &o, NULL, 0, &n_out, &reason);
     inference_free_tokens(ids, n);
     printf("      reply \"%s\" (%d tokens, %d callbacks, stop reason %d)\n", c.text, n_out, c.calls, (int)reason);
-    check(rc == 0 && reason == INFERENCE_STOP_STRING && strncmp(c.text, "1, 2, 3, 4, 5", 13) == 0 && !strchr(c.text, '6'),
+    /* (spaces aside: small models write "1,2,3" or restate the question first, "Count from 1 to 10, ...:\n**1, 2") */
+    char packed[sizeof c.text];
+    int np = 0;
+    for (const char* t = c.text; *t; ++t)
+        if (*t != ' ') packed[np++] = *t;
+    packed[np] = '\0';
+    check(rc == 0 && reason == INFERENCE_STOP_STRING && strstr(packed, "1,2,3,4,5") != NULL && !strchr(c.text, '6'),
           "greedy chat turn streams \"1, 2, 3, 4, 5\" and stops before the stop string \"6\"");
 
     inference_kv_cache_free(m);

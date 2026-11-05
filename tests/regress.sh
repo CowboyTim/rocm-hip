@@ -13,8 +13,9 @@
 #   ppl   perplexity <model> <text> <args>: within tol percent of expect (the baseline); the text is $WIKITEXT
 #         (default /data/hf/wikitext/wikitext-2-raw/wiki.test.raw, llama.cpp's scripts/get-wikitext-2.sh)
 #   fv    forward_verify <model> <args = llama.cpp reference dump> with FORWARD_VERIFY_MIN_COS=expect: exit 0
+#   pk    passkey <model> <text> <args> (a pass key found at every context length and depth): exit 0
 #   mv    matvec_verify <model> <args = tensors>: exit 0
-#   test  <args = a test binary and its arguments, no model>: exit 0
+#   test  <args = a test binary and its arguments; the model, if any, is its first argument>: exit 0
 # Paths may use $VARS (exported here: REFS). Runs from build/co, as the binaries expect; logs in $REGRESS_LOGS
 # (default /tmp/regress-logs).
 set -u
@@ -79,14 +80,23 @@ while IFS= read -r line; do
             FORWARD_VERIFY_MIN_COS=$expect ../forward_verify "$model" "$args" > "$log" 2>&1
             rc=$?; ok=$([ $rc = 0 ] && echo 1 || echo 0)
             msg="$(grep -E 'engine l_out' "$log" | sed 's/^ *\[[A-Z]*\] *//' | cut -c1-80) (exit $rc)" ;;
+        pk)
+            if [ ! -f "$W" ]; then
+                printf "SKIP  %-28s no %s\n" "$name" "$W"; skip=$((skip + 1)); echo "$line" >> "$new"; continue
+            fi
+            # shellcheck disable=SC2086
+            ../passkey "$model" "$W" $args > "$log" 2>&1
+            rc=$?; ok=$([ $rc = 0 ] && echo 1 || echo 0)
+            msg="$(tail -1 "$log") (exit $rc)" ;;
         mv)
             # shellcheck disable=SC2086
             ../matvec_verify "$model" $args > "$log" 2>&1
             rc=$?; ok=$([ $rc = 0 ] && echo 1 || echo 0)
             msg=$(tail -1 "$log") ;;
         test)
-            # shellcheck disable=SC2086
-            ../$args > "$log" 2>&1
+            set -- $args
+            bin=$1; shift
+            if [ "$model" = - ]; then ../$bin "$@" > "$log" 2>&1; else ../$bin "$model" "$@" > "$log" 2>&1; fi
             rc=$?; ok=$([ $rc = 0 ] && echo 1 || echo 0)
             msg="$(tail -1 "$log") (exit $rc)" ;;
         *) ok=0 msg="unknown kind $kind" ;;

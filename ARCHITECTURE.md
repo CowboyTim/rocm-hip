@@ -231,7 +231,8 @@ less well and 2 is best; the adaptive default is within ~1% of the best fixed co
 | `matvec_verify`, `dequant_verify`, `attn_decode_verify`, `kv_verify`, `tokenizer_*`, `sampler_verify`, `capi_smoke` | kernels, decoders, tokenizer, C API |
 | `perl/ROCm-Inference/t/*.t` | the Perl binding (GPU tests with `ROCM_INFERENCE_TEST_*`) |
 | `perplexity` | wikitext-2 perplexity as llama.cpp's `llama-perplexity` computes it (logits of every position: `inference_prefill_logits`) |
-| `regress.sh` (`make regress`, `make regress-full`) | the regression suite in `tests/regress.tsv`: perplexity baselines per model, quant type, KV cache type and context; `forward_verify` with a per-model minimum cosine; `matvec_verify`; `attn_decode_verify` |
+| `passkey` | long-context retrieval: a pass key hidden in wikitext-2 at several depths and context lengths, per KV cache type |
+| `regress.sh` (`make regress`, `make regress-full`) | the regression suite in `tests/regress.tsv`: perplexity baselines per model, quant type, KV cache type and context; `forward_verify` with a per-model minimum cosine; `passkey` rows; `matvec_verify`; `attn_decode_verify`; `capi_smoke` |
 
 The regression suite is deterministic (every perplexity reproduces to the last digit); its tolerance (0.2%) is
 for intended numeric changes. A change meant to move the numbers re-records them with `regress.sh --update` and
