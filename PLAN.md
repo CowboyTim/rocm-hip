@@ -3104,7 +3104,7 @@ activated weights, dense will always be too small, even if it fits in memory)".
   is behind upstream's (worth porting there; its own converter writes no such key). A local
   worktree of that branch (/data/rocmfpx-strix, CPU build, not pushed) reads the bool form in
   src/models/qwen4exp.cpp; llama-quantize --tensor-type per_layer_token_embd=q8_0 ... Q4_0_ROCMFP4_FAST into
-  /data/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST-PLE_Q8_0.gguf. (llama-server would reject the file the same way.)
+  /models/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST-PLE_Q8_0.gguf. (llama-server would reject the file the same way.)
 - **Runs (2026-11-05)**, after two loader changes: the QSA check covers the decoder layers only (the base model's
   MTP layer 48 has compress ratio 4, all 48 decoder layers 0), and upstream's fused tensors are bound as row views
   where the fork's separate ones are missing (bind_split: attn_qkv_gate = [attn_qkv | attn_gate], ssm_beta_alpha =
