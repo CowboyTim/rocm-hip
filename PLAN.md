@@ -3095,6 +3095,22 @@ activated weights, dense will always be too small, even if it fits in memory)".
   blocks, not the 256-value K-quants / IQ super-blocks, which llama-quantize would not write for such rows either).
   Checked on the tiny replica (gen_qwen4exp_tiny.py PLE_TYPE=...; header from the BF16 file's first 32 MB) against
   the ROCmFPX reference with qwen4exp_verify: q5_1, q8_0, q4_0, bf16, f16 all PASS (6 of 6 checks each).
+- First quantization (2026-11-05): the BF16 file's qwen4exp.attention.recurrent_layers is 49 bool flags (one per
+  layer; the MTP layer 48 full attention, which its attn_q / k / v tensors are), but ROCmFPX's loader (also its
+  newest branch nemotron-mtp-rocmfp4-strix, c7f132374) takes layer indices (uint32) and llama-quantize stops
+  ("is not a string/float32/uint32/int32/uint64 array"); no converter in the fork writes the key. A local
+  worktree of that branch (/data/rocmfpx-strix, CPU build, not pushed) reads the bool form in
+  src/models/qwen4exp.cpp; llama-quantize --tensor-type per_layer_token_embd=q8_0 ... Q4_0_ROCMFP4_FAST into
+  /data/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST-PLE_Q8_0.gguf. (llama-server would reject the file the same way.)
+- **To investigate: a conversion / quantization tool in this project** (user: "the conversion belongs with this
+  project sort of", 2026-11-05). What the engine runs is specialized (ROCmFP4 FAST, the PLE table on disk as
+  Q8_0, per-tensor recipes) and depends on the fork's converter and quantizer, whose metadata conventions can
+  disagree (the recurrent_layers case above). Scope to look at: HF safetensors -> GGUF for the architectures
+  here, the metadata normalized to what the engine and llama.cpp both read; quantization to the engine's types
+  with per-tensor recipes (PLE / token embeddings / output, attention K/V), streamed tensor by tensor (no
+  full-model RAM: the BF16 Flash is 359 GB); an importance matrix collected on the GPU by the engine from an FP4
+  model (llama.cpp's would read the BF16 for every token); checks with dequant_verify / forward_verify against
+  ggml's own quantizers. C/C++ next to quant_types.cpp, a Perl front end.
 - **Later: expert pin / unpin for MoE models larger than memory.** hipHostRegister works on any range of the
   mapping: after the router, make the chosen experts' ranges resident and registered, with a cache of recently
   used experts (as KTransformers / llama.cpp --cpu-moe in their ways); dense layers stay pinned. Flash: 512
