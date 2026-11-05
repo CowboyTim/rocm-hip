@@ -55,6 +55,27 @@ inference_model_t* inference_load_model_ex(const char* gguf_path, const inferenc
 // again, which the environment variable GGUF_RECACHE=1 does at the load). Valid while the model is.
 const char* inference_stage_info(const inference_model_t* model);
 
+// What a GGUF file is, from its header alone (the file is mapped, nothing pinned or loaded; cheap enough to scan a
+// directory with): a model to chat with, an embedding model, a draft (MTP) head to pair with its model, or one this
+// engine cannot run (why says why: not a model, an architecture or a tensor type it does not support). A split
+// model is given by its first file (-00001-of-0000N); bytes counts all its files. kv_bytes_per_token: K and V of
+// one position over the layers that have them, as F16 (the K / V projections' widths): an estimate of the KV cache
+// for a context (Q8_0 about half of it, Q4_0 a quarter). Returns 0, negative if the file cannot be read as a GGUF.
+#define INFERENCE_MODEL_UNSUPPORTED (-1)
+#define INFERENCE_MODEL_CHAT 0
+#define INFERENCE_MODEL_EMBEDDING 1
+#define INFERENCE_MODEL_DRAFT 2
+typedef struct inference_model_info_t {
+    int kind;                     // INFERENCE_MODEL_*
+    char arch[32];                // general.architecture ("" if none)
+    char why[160];                // INFERENCE_MODEL_UNSUPPORTED: the reason
+    long long n_ctx_train;        // the trained context (0 if not given)
+    int n_files;                  // files of the model (shards)
+    unsigned long long bytes;     // their size
+    unsigned long long kv_bytes_per_token;
+} inference_model_info_t;
+int inference_model_info(const char* gguf_path, inference_model_info_t* out);
+
 // Reference counting for shared ownership
 void inference_model_retain(inference_model_t* model);
 void inference_model_release(inference_model_t* model);

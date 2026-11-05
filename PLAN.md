@@ -3070,6 +3070,45 @@ unchanged. INFERENCE_KV_ROT=0 turns it off (A/B). No speed cost: Qwen3.6-35B, Q4
 2,214-2,248 vs 2,160-2,263 tok/s, generation 65.2-65.4 either way. Qwen3.8-Flash, 10 chunks (F16 2.1396): Q8_0 2.1805 -> 2.1484,
 Q4_0 2.2005 -> 2.1403. Left: a quantized cache needs n_kv * D % 256 == 0 (Qwen2.5-0.5B, 2 x 64, cannot have one).
 
+### Models from a directory, chosen per request (2026-11-05, user: "cant I make that \"dynamic\" with the API like in llama.cpp + a API to list available models ... plan for this change IF possible"; then "yes and yes")
+
+Measured (Qwen3.6-35B ROCMFP4, 20 GB, file in the page cache): load (mmap + pin) 0.44 s, a 128k KV cache 1-1.6 s,
+unload 0.4 s; one process already holds two models (chat + --embedding-model). So in-process, not llama.cpp's
+router of child servers. From a cold disk a load takes what the disk gives (this container's /models: ~90 MB/s).
+Steps:
+1. **model_info($path)** (C: inference_model_info): from the GGUF header only (mapped, not pinned): architecture,
+   kind (chat / embedding / draft head / unsupported, with why), trained context, bytes over all shards, KV bytes
+   per token (the K / V projections' widths: an estimate for budgeting), every tensor type supported.
+2. **rocm-inference-server --models-dir DIR** (instead of --model): a scan of *.gguf (a split model by its
+   -00001-of-N file; mmproj, imatrix, unsupported files left out), rescanned when listed; an MTP head is paired
+   with the model it fits (set_draft_model checks).
+3. **API as llama.cpp's router**: GET /v1/models (every available model, loaded or not, context, kind),
+   "model" in POST /v1/chat/completions and /v1/embeddings selects it and loads it when needed (404 if unknown;
+   none: the current one), POST /models/load and /models/unload.
+4. **Memory**: footprint = file bytes + KV cache; before a load, idle models are unloaded least recently used
+   first until it fits --models-max N and a budget (llama-server shares the 128 GB in the Docker image); a model
+   with running or waiting requests is never unloaded.
+5. Per model, automatic: context (trained, at most 131072), KV type, draft head, block store (keyed by model).
+6. Docker: llama.sh starts it with --models-dir /models when ROCM_MODEL is not set.
+7. Tests: t/60-server.t with a directory of small models (list, switch, unload).
+
+Done (steps 1-5, 7):
+- inference_model_info / model_info: every file in /models classified in a few ms each (chat; embeddinggemma
+  embedding; the Flash MTP head draft; an imatrix file "not a model"); KV estimate exact where checked (Qwen3-0.6B
+  28 x 2048 x 2 B = 114,688 per position). Later shards are not GGUFs on their own: the scan takes -00001-of-N.
+- rocm-inference-server --models-dir (and --models-max, --models-margin): records per model (pool, queue,
+  running, LRU stamp); --model / --embedding-model as before (loaded at start, never unloaded, any 'model' name
+  gets --model when there is no directory); GET /v1/models with status / kind / arch / context_length,
+  POST /models/load and /models/unload (409 while serving); --parallel per model (tick steps each loaded model).
+- Memory: MemAvailable does not drop for pinned file pages (Qwen3.6-35B, 20 GB pinned: MemAvailable -2.7 GB, its
+  KV cache and scratch), so the files of the models loaded here are subtracted from it. Checked: unload frees
+  them (server RSS 21.6 -> 0.2 GB); with --models-margin 45, loading the 27B after the 4B and the 35B unloaded the
+  4B, then the 35B (least recently used first).
+- t/65-models-dir.t (54 tests, --parallel 1 and 2): listing (a later shard and a non-GGUF left out), load on
+  request, --models-max 1 eviction, no 'model' = the last used, unknown = 404, load / unload endpoints,
+  embedding vs chat routing, files added / removed. The whole Perl suite passes.
+- Not tried on the real Flash (its 94 GB from this container's slow /models): the draft-head pairing.
+
 ### Long-context prefill: where the time goes (2026-11-05, user: "do 1 [Qwen3.8-27B prefill], but that's a dense model, it wont be fast anyways. For coding, I guess Qwen3.8-Flash-Next would be the way to go")
 
 rocprofv3 of a 32k prompt (passkey, Q8_0 cache), share of GPU time:

@@ -1,6 +1,11 @@
 Revision history for ROCm-Inference
 
 0.01  unreleased
+    - model_info: what a GGUF is from its header (kind chat / embedding / draft / unsupported, architecture,
+      trained context, bytes, KV bytes per position), without loading it.
+    - rocm-inference-server --models-dir: the directory's models listed in /v1/models and loaded when a
+      request's "model" names one; idle ones unloaded for room (least recently used; --models-max,
+      --models-margin); POST /models/load and /models/unload as llama.cpp's router.
     - First version: the libinference C API function by function (load_model, kv_cache_init, tokenize,
       detokenize, generate with streaming callbacks and stop strings, prefill, decode_token, get_logits, ...).
     - Chat: chat_render / chat with the model's own chat template, rendered by the Minijinja module, with

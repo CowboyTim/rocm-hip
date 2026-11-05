@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 # rocm-inference-server: an OpenAI-compatible chat server (/v1/chat/completions, streamed as server-sent events)
-# for one model, and /v1/embeddings for an embedding model, on a unix socket behind nginx. See the POD at the end,
-# or --help.
+# and /v1/embeddings, on a unix socket behind nginx: one model (--model), or the models of a directory, each loaded
+# when a request names it (--models-dir). See the POD at the end, or --help.
 use strict;
 use warnings;
 
@@ -11,84 +11,275 @@ use B ();
 use JSON::PP ();
 use MIME::Base64 qw(encode_base64);
 use Pod::Usage qw(pod2usage);
+use Time::HiRes ();
 use ROCm::Inference qw(:all);
 use Web::Route;
 
-my %o = (listen => './rocm-inference.sock', max_tokens => 0);
-GetOptions(\%o, 'model=s', 'listen=s', 'mode=s', 'ctx=i', 'name=s', 'draft=s', 'store=s', 'max_tokens=i',
-           'swa-ring=i', 'stage=s', 'recache', 'kv-type=s', 'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s',
-           'thinking!', 'log!', 'help') or pod2usage(2);
+my %o = (listen => './rocm-inference.sock', max_tokens => 0, 'models-margin' => 4);
+GetOptions(\%o, 'model=s', 'models-dir=s', 'models-max=i', 'models-margin=f', 'listen=s', 'mode=s', 'ctx=i',
+           'name=s', 'draft=s', 'store=s', 'max_tokens=i', 'swa-ring=i', 'stage=s', 'recache', 'kv-type=s',
+           'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'log!', 'help')
+    or pod2usage(2);
 pod2usage(-verbose => 2, -exitval => 0) if $o{help};
-pod2usage("--model is required\n") unless $o{model};
+pod2usage("--model or --models-dir is required\n") unless $o{model} || $o{'models-dir'};
 ROCm::Inference::_require_minijinja()
     or die "rocm-inference-server needs the Minijinja module $ROCm::Inference::MINIJINJA_VERSION\n";
-
-my $name = $o{name} // basename($o{model}) =~ s/(?:-\d{5}-of-\d{5})?\.gguf\z//r;
-print STDERR "loading $o{model} ...\n";
-# --recache: drop the model file's cached pages first, so that it is read again as 2 MB pages (the GPU reads the
-# weights in place: fewer TLB misses; it pays where the page cache holds the file in 4 KB pages)
-$ENV{GGUF_RECACHE} = 1 if $o{recache};
-my $m = load_model($o{model}, { stage => $o{stage} }) // die "cannot load $o{model}: " . last_error() . "\n";
-delete $ENV{GGUF_RECACHE};
-my $pages = stage_info($m);
-print STDERR "stage: $pages\n" if $o{stage};
-if (!$o{stage} && $pages =~ /(\d+) of (\d+) MB on 2 MB pages/) {
-    print STDERR "model memory: $1 of $2 MB on 2 MB pages", ($1 * 2 < $2 ? " (--recache reads it again as 2 MB pages)" : ''),
-        "\n";
-}
-# a block store needs every layer's history: no sliding-window ring unless asked for
-my $ring = $o{'swa-ring'} // ($o{store} ? 0 : -1);
-set_swa_ring($m, $ring);
-# the model's trained context unless asked (n_ctx before kv_cache_init), at most 131072 by default (an embedding
-# model's input is one batch: at most 2048)
-my $trained = n_ctx($m);
-my $emb_only = embedding_dim($m) > 0;  # --model is an embedding model: /v1/embeddings only
-my $cap = $emb_only ? 2048 : 131072;
-$o{ctx} //= $trained < $cap ? $trained : $cap;
-die "--store, --draft, --parallel: not for an embedding model\n"
-    if $emb_only && ($o{store} || $o{draft} || ($o{parallel} // 1) > 1);
-# --kv-type auto (the default): q8_0 from 32768 positions (half the memory, and faster decoding at those depths:
-# Qwen3-30B-A3B at 31k 27.9 -> 30.0 tok/s, Qwen3.6-35B at 112k 32.4 -> 35.2), f16 below that and where the model's
-# cache rows do not suit q8_0 (a multiple of 256 values: not Qwen2.5-0.5B's 2 x 64)
-my $kvt = $o{'kv-type'} // 'auto';
-die "--kv-type: auto, f16, q8_0 or q4_0\n" unless $kvt =~ /\A(?:auto|f16|q8_0|q4_0)\z/;
-my $auto = $kvt eq 'auto';
-$kvt = !$emb_only && $o{ctx} >= 32768 ? 'q8_0' : 'f16' if $auto;
-set_kv_type($m, $kvt);
-if (!eval { kv_cache_init($m, $o{ctx}); 1 }) {
-    die $@ unless $auto && $kvt eq 'q8_0';
-    set_kv_type($m, $kvt = 'f16');
-    kv_cache_init($m, $o{ctx});
-}
-print STDERR "context $o{ctx}, KV cache $kvt\n";
-# the embedding model: --model itself, or --embedding-model next to a chat model
-my ($E, $ename) = $emb_only ? ($m, $name) : ();
-if ($o{'embedding-model'}) {
-    die "--embedding-model: --model is an embedding model already\n" if $emb_only;
-    $ename = $o{'embedding-name'} // basename($o{'embedding-model'}) =~ s/(?:-\d{5}-of-\d{5})?\.gguf\z//r;
-    print STDERR "loading $o{'embedding-model'} ...\n";
-    $E = load_model($o{'embedding-model'}) // die "cannot load $o{'embedding-model'}: " . last_error() . "\n";
-    die "$o{'embedding-model'} is not an embedding model\n" unless embedding_dim($E);
-    my $n = n_ctx($E);
-    kv_cache_init($E, $n < 2048 ? $n : 2048);
-}
-set_draft_model($m, $o{draft}) if $o{draft};
-die "--store needs every layer's KV history: --swa-ring 0 (the default with --store)\n" if $o{store} && swa_ring($m);
-store_open($m, $o{store}) if $o{store};
+die "--draft goes with --model\n" if $o{draft} && !$o{model};
+die "--models-dir: no directory $o{'models-dir'}\n" if $o{'models-dir'} && !-d $o{'models-dir'};
 my $parallel = $o{parallel} // 1;
 die "--parallel N: 1 or more\n" if $parallel < 1;
 die "--parallel: not with --draft (speculative decoding is single-sequence)\n" if $parallel > 1 && $o{draft};
-# --parallel N: N sequences (conversations at once), each a KV cache of --ctx; sequence 0 and N - 1 more
-my @pool = map { { seq => $_, job => undef, prompt => [] } } 0, map { seq_new($m) } 2 .. $parallel;
-my (@queue, @running);  # jobs waiting for a sequence, jobs generating
+my $kv_type = $o{'kv-type'} // 'auto';
+die "--kv-type: auto, f16, q8_0 or q4_0\n" unless $kv_type =~ /\A(?:auto|f16|q8_0|q4_0)\z/;
 my $created = time;
 my $J = JSON::PP->new->utf8->canonical;
+
+# ---- The models. A record per model the server knows: id, path, info (model_info: kind chat / embedding, arch,
+# trained context, bytes, KV bytes per position), and while loaded: m (the handle), ctx, kvt, its sequences (pool)
+# and requests (queue, running), used (for least recently used). --model / --embedding-model are loaded at start
+# and stay; --models-dir adds the directory's models, loaded when a request names one.
+my (%M, %default);  # id -> record; kind -> the record a request without 'model' gets
+my $stamp = 0;
+
+sub model_id { basename($_[0]) =~ s/(?:-\d{5}-of-\d{5})?\.gguf\z//r }
+
+# A record for a file (dies when it is not a model this engine runs)
+sub add_model {
+    my ($path, $id, %x) = @_;
+    my $info = model_info($path);
+    die "$path: $info->{why}\n" if $info->{kind} eq 'unsupported';
+    die "$path is a draft head: --draft\n" if $info->{kind} eq 'draft';
+    return $M{$id} = { id => $id, path => $path, info => $info, pool => [], queue => [], running => [], %x };
+}
+
+# --models-dir: its models (a split one by its -00001-of-N file), rescanned when listed or asked for; a file's
+# model_info is kept while its size and time stay. Draft heads become candidates for the chat models of their
+# architecture (the first that set_draft_model takes).
+my (%scanned, %dir_drafts);
+sub scan {
+    my $dir = $o{'models-dir'} or return;
+    opendir my $dh, $dir or return;
+    my (%seen, @drafts);
+    for my $f (sort readdir $dh) {
+        next unless $f =~ /\.gguf\z/ && $f !~ /^mmproj/i;
+        next if $f =~ /-(\d{5})-of-\d{5}\.gguf\z/ && $1 != 1;
+        my $path = "$dir/$f";
+        my @st = stat $path or next;
+        my $c = $scanned{$path};
+        my $info = $c && $c->[0] == $st[9] && $c->[1] == $st[7] ? $c->[2] : eval { model_info($path) };
+        $scanned{$path} = [ $st[9], $st[7], $info ];
+        next unless $info;
+        if ($info->{kind} eq 'draft') { push @drafts, [ $path, $info->{arch} ]; next }
+        next unless $info->{kind} eq 'chat' || $info->{kind} eq 'embedding';
+        my $id = model_id($f);
+        next if $M{$id} && !$M{$id}{dir};  # --model's name wins
+        $seen{$id} = 1;
+        my $r = $M{$id} //= { id => $id, dir => 1, pool => [], queue => [], running => [] };
+        @$r{qw(path info)} = ($path, $info) unless $r->{m};
+    }
+    for my $id (grep { $M{$_}{dir} && !$seen{$_} && !$M{$_}{m} } keys %M) { delete $M{$id} }  # gone from the dir
+    %dir_drafts = ();
+    push @{ $dir_drafts{ $_->[1] } }, $_->[0] for @drafts;
+}
+
+sub mem_available {
+    open my $fh, '<', '/proc/meminfo' or return;
+    while (<$fh>) { return $1 * 1024 if /^MemAvailable:\s+(\d+)/ }
+    return;
+}
+
+# The context and KV cache type a model gets: --ctx, else its trained context (at most 131072; an embedding model's
+# input is one batch: at most 2048); --kv-type auto: q8_0 from 32768 positions (half the memory, and faster decoding
+# at those depths: Qwen3-30B-A3B at 31k 27.9 -> 30.0 tok/s, Qwen3.6-35B at 112k 32.4 -> 35.2), f16 below that and
+# where the model's cache rows do not suit q8_0 (a multiple of 256 values: not Qwen2.5-0.5B's 2 x 64)
+sub settings {
+    my ($r) = @_;
+    my $emb = $r->{info}{kind} eq 'embedding';
+    my $cap = $emb ? 2048 : 131072;
+    my $trained = $r->{info}{n_ctx_train} || 4096;
+    my $ctx = $emb ? ($trained < $cap ? $trained : $cap) : $o{ctx} // ($trained < $cap ? $trained : $cap);
+    my $kvt = $kv_type eq 'auto' ? (!$emb && $ctx >= 32768 ? 'q8_0' : 'f16') : $emb ? 'f16' : $kv_type;
+    return ($ctx, $kvt);
+}
+
+# What a model takes while loaded: its files (pinned) and its KV caches (estimated from model_info)
+sub footprint {
+    my ($r) = @_;
+    my ($ctx, $kvt) = settings($r);
+    my $seqs = $r->{info}{kind} eq 'chat' ? $parallel : 1;
+    return $r->{info}{bytes} + $r->{info}{kv_bytes_per_token} * $ctx * $seqs * { f16 => 1, q8_0 => 17 / 32, q4_0 => 9 / 32 }->{$kvt};
+}
+
+sub idle { my ($r) = @_; !@{ $r->{queue} } && !@{ $r->{running} } && !$r->{busy} }
+
+sub unload {
+    my ($r) = @_;
+    return unless $r->{m};
+    @$r{qw(pool queue running)} = ([], [], []);
+    delete $default{ $r->{info}{kind} } if ($default{ $r->{info}{kind} } // 0) == $r && $r->{dir};
+    undef $r->{m};  # (the only reference: unmapped and unpinned now)
+    print STDERR "unloaded $r->{id}\n";
+}
+
+# Before loading r: unload idle models (least recently used first, never --model / --embedding-model) until r fits
+# in the memory available less --models-margin GB, and --models-max allows one more. Loaded anyway when nothing more
+# can go. Available: MemAvailable (what other programs hold, llama-server's too, is not in it) less the files of the
+# models loaded here: their pages are pinned, but the kernel still counts them as page cache it could reclaim
+# (Qwen3.6-35B, 20 GB pinned: MemAvailable 2.7 GB lower, its KV cache and scratch).
+sub make_room {
+    my ($r) = @_;
+    my $need = footprint($r);
+    my @lru = sort { $a->{used} <=> $b->{used} } grep { $_->{m} && $_->{dir} && $_ != $r } values %M;
+    while (1) {
+        my $avail = mem_available();
+        if (defined $avail) { $avail -= $_->{info}{bytes} for grep { $_->{m} } values %M }
+        my $fits = !defined $avail || $avail - $o{'models-margin'} * 2**30 >= $need;
+        my $count_ok = !$o{'models-max'} || (grep { $_->{m} } values %M) < $o{'models-max'};
+        last if $fits && $count_ok;
+        my ($victim) = grep { idle($_) } @lru or last;
+        @lru = grep { $_ != $victim } @lru;
+        unload($victim);
+    }
+}
+
+sub load {
+    my ($r) = @_;
+    return $r if $r->{m};
+    make_room($r);
+    my ($ctx, $kvt) = settings($r);
+    print STDERR "loading $r->{path} ...\n";
+    # --recache: drop the model file's cached pages first, so that it is read again as 2 MB pages (the GPU reads the
+    # weights in place: fewer TLB misses; it pays where the page cache holds the file in 4 KB pages)
+    local $ENV{GGUF_RECACHE} = $o{recache} ? 1 : $ENV{GGUF_RECACHE};
+    delete $ENV{GGUF_RECACHE} unless defined $ENV{GGUF_RECACHE};
+    my $m = eval { load_model($r->{path}, { stage => $o{stage} }) };
+    $m or die "cannot load $r->{path}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r || last_error()) . "\n";
+    my $pages = stage_info($m);
+    print STDERR "stage: $pages\n" if $o{stage};
+    if ($pages =~ /(\d+) of (\d+) MB on 2 MB pages/) {
+        print STDERR "model memory: $1 of $2 MB on 2 MB pages",
+            ($1 * 2 < $2 ? " (--recache reads it again as 2 MB pages)" : ''), "\n";
+    }
+    my $emb = $r->{info}{kind} eq 'embedding';
+    # a block store needs every layer's history: no sliding-window ring unless asked for
+    set_swa_ring($m, $o{'swa-ring'} // ($o{store} ? 0 : -1)) unless $emb;
+    set_kv_type($m, $kvt);
+    if (!eval { kv_cache_init($m, $ctx); 1 }) {
+        die $@ unless $kv_type eq 'auto' && $kvt eq 'q8_0';
+        set_kv_type($m, $kvt = 'f16');
+        kv_cache_init($m, $ctx);
+    }
+    print STDERR "$r->{id}: context $ctx (trained $r->{info}{n_ctx_train}), KV cache $kvt\n";
+    if (!$emb) {
+        if ($r->{draft}) {
+            set_draft_model($m, $r->{draft});
+        } elsif ($r->{dir} && $parallel == 1) {  # a draft head of the directory that fits this model
+            for my $d (@{ $dir_drafts{ $r->{info}{arch} } // [] }) {
+                next unless eval { set_draft_model($m, $d); 1 };
+                print STDERR "$r->{id}: draft head $d\n";
+                last;
+            }
+        }
+        die "--store needs every layer's KV history: --swa-ring 0 (the default with --store)\n"
+            if $o{store} && swa_ring($m);
+        store_open($m, $o{store}) if $o{store};
+    }
+    # --parallel N: N sequences (conversations at once), each a KV cache of the context; sequence 0 and N - 1 more
+    $r->{pool} = [ map { { seq => $_, job => undef, prompt => [] } } 0, $emb ? () : map { seq_new($m) } 2 .. $parallel ];
+    @$r{qw(m ctx kvt)} = ($m, $ctx, $kvt);
+    return $r;
+}
 
 # An OpenAI-style error, as a response to die with
 sub error {
     my ($status, $msg, $type) = @_;
     die json({ error => { message => $msg, type => $type // 'invalid_request_error' } }, $status);
 }
+
+# The model a request is for (loaded): its 'model' if the server knows it, else the default of the kind. With
+# --models-dir an unknown name is an error; with --model alone any name gets the model, as before.
+sub pick {
+    my ($p, $kind) = @_;
+    scan();
+    my $want = ref $p eq 'HASH' && defined $p->{model} && !ref $p->{model} && length $p->{model} ? $p->{model} : undef;
+    my $r = defined $want ? $M{$want} : undef;
+    if (!$r) {
+        error(404, "model '$want' not found (GET /v1/models lists them)", 'not_found_error')
+            if defined $want && $o{'models-dir'};
+        $r = $default{$kind};
+        my @k = grep { $_->{info}{kind} eq $kind } values %M;
+        $r //= $k[0] if @k == 1;
+        $r or error(400, $kind eq 'embedding' && !@k ? 'no embedding model (--embedding-model, or one in --models-dir)'
+                                                     : "say which model ('model'): GET /v1/models lists them");
+    }
+    if ($r->{info}{kind} ne $kind) {
+        error(400, "$r->{id} is an embedding model: use /v1/embeddings") if $kind eq 'chat';
+        error(400, "$r->{id} is not an embedding model (start the server with --embedding-model)");
+    }
+    eval { load($r); 1 } or error(500, $@ =~ s/\n\z//r, 'server_error');
+    $r->{used} = ++$stamp;
+    $default{$kind} = $r if $r->{dir} || !$default{$kind};  # (the last used, for requests that name none)
+    return $r;
+}
+
+if ($o{model}) {
+    my $r = eval { add_model($o{model}, $o{name} // model_id($o{model}), draft => $o{draft}) } or die $@;
+    die "--store, --draft, --parallel: not for an embedding model\n"
+        if $r->{info}{kind} eq 'embedding' && ($o{store} || $o{draft} || $parallel > 1);
+    load($r);
+    $r->{used} = ++$stamp;
+    $default{ $r->{info}{kind} } = $r;
+}
+if ($o{'embedding-model'}) {
+    die "--embedding-model: --model is an embedding model already\n" if $default{embedding};
+    my $r = add_model($o{'embedding-model'}, $o{'embedding-name'} // model_id($o{'embedding-model'}));
+    die "$o{'embedding-model'} is not an embedding model\n" unless $r->{info}{kind} eq 'embedding';
+    load($r);
+    $r->{used} = ++$stamp;
+    $default{embedding} = $r;
+}
+scan();
+
+sub model_entry {
+    my ($r) = @_;
+    my ($ctx) = $r->{m} ? $r->{ctx} : settings($r);
+    return { id => $r->{id}, object => 'model', created => $created, owned_by => 'rocm-inference',
+             status => { value => $r->{m} ? 'loaded' : 'unloaded' }, kind => $r->{info}{kind}, arch => $r->{info}{arch},
+             context_length => $ctx, n_ctx_train => $r->{info}{n_ctx_train}, bytes => $r->{info}{bytes} };
+}
+
+route::get '/health' => sub { { status => 'ok' } };
+
+route::get '/v1/models' => sub {
+    scan();
+    { object => 'list', data => [ map { model_entry($M{$_}) } sort keys %M ] };
+};
+route::get '/v1/models/*id' => sub {
+    my ($req) = @_;
+    scan();
+    my $r = $M{ $req->{params}{id} } or error(404, "no model '$req->{params}{id}'", 'not_found_error');
+    model_entry($r);
+};
+
+# llama.cpp's router: load a model now, or unload one that serves no request ({"model": id})
+route::post '/models/load' => sub {
+    my ($req) = @_;
+    my $p = $req->{json};
+    ref $p eq 'HASH' && defined $p->{model} or error(400, "expected {\"model\": id}");
+    scan();
+    my $r = $M{ $p->{model} } or error(404, "no model '$p->{model}'", 'not_found_error');
+    pick($p, $r->{info}{kind});
+    { success => JSON::PP::true, model => model_entry($r) };
+};
+route::post '/models/unload' => sub {
+    my ($req) = @_;
+    my $p = $req->{json};
+    ref $p eq 'HASH' && defined $p->{model} or error(400, "expected {\"model\": id}");
+    my $r = $M{ $p->{model} } or error(404, "no model '$p->{model}'", 'not_found_error');
+    idle($r) or error(409, "$r->{id} is serving requests");
+    unload($r);
+    { success => JSON::PP::true, model => model_entry($r) };
+};
 
 # OpenAI messages as the chat template wants them: text parts joined, tool call arguments as hashes,
 # 'developer' as 'system'
@@ -122,7 +313,7 @@ sub messages {
 
 # The request's options as chat's
 sub options {
-    my ($p) = @_;
+    my ($p, $r) = @_;
     error(400, 'n > 1 is not supported') if ($p->{n} // 1) != 1;
     my %vars = %{ ref $p->{chat_template_kwargs} eq 'HASH' ? $p->{chat_template_kwargs} : {} };
     $vars{tools} = $p->{tools} if ref $p->{tools} eq 'ARRAY' && @{ $p->{tools} } && ($p->{tool_choice} // '') ne 'none';
@@ -133,7 +324,7 @@ sub options {
     }
     # the request's max_tokens, else up to the context's end (finish_reason length); --max_tokens N caps both
     my $want = $p->{max_completion_tokens} // $p->{max_tokens};
-    $want = $o{ctx} if !defined $want || $want < 1;
+    $want = $r->{ctx} if !defined $want || $want < 1;
     $want = $o{max_tokens} if $o{max_tokens} > 0 && $want > $o{max_tokens};
     my %c = (vars => \%vars, max_new_tokens => $want);
     for (qw(temperature top_p top_k min_p seed repeat_penalty)) { $c{$_} = $p->{$_} if defined $p->{$_} }
@@ -159,19 +350,6 @@ sub finish_reason {
     return $why == STOP_MAX_TOKENS() || $why == STOP_CONTEXT_FULL() ? 'length' : 'stop';
 }
 
-route::get '/health' => sub { { status => 'ok' } };
-
-my @models = ($name, $E && $E != $m ? $ename : ());
-route::get '/v1/models' => sub {
-    { object => 'list', data => [ map { { id => $_, object => 'model', created => $created, owned_by => 'rocm-inference' } }
-                                  @models ] };
-};
-route::get '/v1/models/*id' => sub {
-    my ($req) = @_;
-    grep { $_ eq $req->{params}{id} } @models or error(404, "no model '$req->{params}{id}'", 'not_found_error');
-    { id => $req->{params}{id}, object => 'model', created => $created, owned_by => 'rocm-inference' };
-};
-
 # OpenAI's /v1/embeddings: input a string, an array of strings, an array of token ids or an array of those;
 # encoding_format float (default) or base64 (little-endian float32); dimensions: the first N values, renormalized
 # (EmbeddingGemma is trained for 768, 512, 256 and 128). Each input is one batch: at most the context's tokens.
@@ -180,7 +358,8 @@ route::post '/v1/embeddings' => sub {
     my ($req) = @_;
     my $p = $req->{json};
     ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');
-    $E or error(400, "$name is not an embedding model (start the server with --embedding-model)");
+    my $r = pick($p, 'embedding');
+    my $E = $r->{m};
     my $in = $p->{input};
     my @inputs = !ref $in                                        ? ($in)
                : ref $in eq 'ARRAY' && @$in && is_number($in->[0]) ? ($in)
@@ -211,15 +390,16 @@ route::post '/v1/embeddings' => sub {
                       embedding => $fmt eq 'base64' ? encode_base64(pack('f<*', @$e), '') : $e };
         $tokens += @$ids;
     }
-    { object => 'list', data => \@data, model => $ename, usage => { prompt_tokens => $tokens, total_tokens => $tokens } };
+    { object => 'list', data => \@data, model => $r->{id}, usage => { prompt_tokens => $tokens, total_tokens => $tokens } };
 };
 
 route::post '/v1/chat/completions' => sub {
     my ($req) = @_;
     my $p = $req->{json};
     ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');
-    error(400, "$name is an embedding model: use /v1/embeddings") if $emb_only;
-    my ($messages, $opts) = (messages($p->{messages}), options($p));
+    my $r = pick($p, 'chat');
+    my ($m, $name) = @$r{qw(m id)};
+    my ($messages, $opts) = (messages($p->{messages}), options($p, $r));
     my $id = sprintf 'chatcmpl-%x%06x', time, int rand 2**24;
     my ($prompt_tokens, $completion_tokens) = (undef, 0);
     # the prompt's length is the sequence length when the first token comes; every token emitted counts
@@ -230,9 +410,10 @@ route::post '/v1/chat/completions' => sub {
           total_tokens => $prompt_tokens + $completion_tokens };
     };
 
-    return start_job($id, $messages, $opts, $p) if $parallel > 1;
+    return start_job($r, $id, $messages, $opts, $p) if $parallel > 1;
 
     unless ($p->{stream}) {
+        local $r->{busy} = 1;
         my ($content, $why, $msg) = eval { chat($m, $messages, $opts) };
         error(400, $@ =~ s/ at \S+ line \d+\.?\n?\z//r) unless $msg;
         my %out = (role => 'assistant', content => $content);
@@ -246,6 +427,7 @@ route::post '/v1/chat/completions' => sub {
     my $include_usage = ref $p->{stream_options} eq 'HASH' && $p->{stream_options}{include_usage};
     return stream(200, [ 'Content-Type' => 'text/event-stream' ], sub {
         my ($write) = @_;
+        local $r->{busy} = 1;
         my $chunk = sub {
             my ($delta, $finish) = @_;
             $write->(sse({ id => $id, object => 'chat.completion.chunk', created => time, model => $name,
@@ -277,23 +459,23 @@ route::post '/v1/chat/completions' => sub {
     });
 };
 
-# ---- --parallel: conversations at once. A request becomes a job: it waits for a free sequence (the one whose last
-# prompt shares the most tokens with its prompt, for prefix reuse), then each round of the server's loop (tick)
-# advances every running job by one token, all in one forward pass (batched decoding); its response pulls what the job produced (SSE events, or the JSON at
-# the end). A client that leaves cancels its job.
+# ---- --parallel: conversations at once. A request becomes a job of its model: it waits for a free sequence (the
+# one whose last prompt shares the most tokens with its prompt, for prefix reuse), then each round of the server's
+# loop (tick) advances every running job by one token, a model's all in one forward pass (batched decoding); its
+# response pulls what the job produced (SSE events, or the JSON at the end). A client that leaves cancels its job.
 
 # A job for this request; the response pulls its output
 sub start_job {
-    my ($id, $messages, $opts, $p) = @_;
+    my ($r, $id, $messages, $opts, $p) = @_;
     $opts = { %$opts, prefill_chunk => $o{'prefill-chunk'} // 512 };
     delete $opts->{on_token};  # (a step gives the job its tokens)
     my %vars = %{ $opts->{vars} // {} };
-    my $text = eval { chat_render($m, $messages, %vars) };  # template errors are this request's (400), now
+    my $text = eval { chat_render($r->{m}, $messages, %vars) };  # template errors are this request's (400), now
     error(400, $@ =~ s/ at \S+ line \d+\.?\n?\z//r) unless defined $text;
-    my $job = { id => $id, messages => $messages, opts => $opts, stream => $p->{stream} ? 1 : 0, out => [],
-                prompt => tokenize($m, $text), completion => 0,
+    my $job = { r => $r, id => $id, messages => $messages, opts => $opts, stream => $p->{stream} ? 1 : 0, out => [],
+                prompt => tokenize($r->{m}, $text), completion => 0,
                 usage_chunk => ref $p->{stream_options} eq 'HASH' && $p->{stream_options}{include_usage} };
-    push @queue, $job;
+    push @{ $r->{queue} }, $job;
     if ($job->{stream}) {
         push @{ $job->{out} }, chunk($job, { role => 'assistant', content => '' }, undef);
     }
@@ -306,16 +488,17 @@ sub start_job {
 
 sub chunk {
     my ($job, $delta, $finish) = @_;
-    return sse({ id => $job->{id}, object => 'chat.completion.chunk', created => time, model => $name,
+    return sse({ id => $job->{id}, object => 'chat.completion.chunk', created => time, model => $job->{r}{id},
                  choices => [ { index => 0, delta => $delta, finish_reason => $finish } ] });
 }
 
 sub release {
     my ($job) = @_;
-    my ($slot) = grep { ($_->{job} // 0) == $job } @pool;
+    my $r = $job->{r};
+    my ($slot) = grep { ($_->{job} // 0) == $job } @{ $r->{pool} };
     $slot->{job} = undef if $slot;
-    @running = grep { $_ != $job } @running;
-    @queue = grep { $_ != $job } @queue;
+    $r->{running} = [ grep { $_ != $job } @{ $r->{running} } ];
+    $r->{queue} = [ grep { $_ != $job } @{ $r->{queue} } ];
 }
 
 sub cancel {
@@ -353,14 +536,14 @@ sub job_output {
         }
         push @{ $job->{out} }, chunk($job, {}, finish_reason($why, $msg));
         push @{ $job->{out} }, sse({ id => $job->{id}, object => 'chat.completion.chunk', created => time,
-                                     model => $name, choices => [], usage => \%usage }) if $job->{usage_chunk};
+                                     model => $job->{r}{id}, choices => [], usage => \%usage }) if $job->{usage_chunk};
         push @{ $job->{out} }, sse('[DONE]');
     } else {
         my %out = (role => 'assistant', content => $content);
         $out{reasoning_content} = $msg->{reasoning_content} if defined $msg->{reasoning_content};
         $out{tool_calls} = tool_calls($msg) if $msg->{tool_calls};
         push @{ $job->{out} }, $J->encode({ id => $job->{id}, object => 'chat.completion', created => time,
-            model => $name, choices => [ { index => 0, message => \%out, finish_reason => finish_reason($why, $msg) } ],
+            model => $job->{r}{id}, choices => [ { index => 0, message => \%out, finish_reason => finish_reason($why, $msg) } ],
             usage => \%usage });
     }
     $job->{done} = 1;
@@ -375,53 +558,66 @@ sub job_error {
     release($job);
 }
 
-# One round: start what waits (free sequences), then one token for every running job
+# One round: for every loaded model, start what waits (free sequences), then one token for each of its running jobs
 sub tick {
-    while (@queue) {
-        my @free = grep { !$_->{job} } @pool or last;
-        my $job = shift @queue;
-        my ($slot) = sort { common_prefix($b->{prompt}, $job->{prompt}) <=> common_prefix($a->{prompt}, $job->{prompt}) } @free;
-        $slot->{job} = $job;
-        $slot->{prompt} = $job->{prompt};
-        seq_select($m, $slot->{seq});
-        $job->{chat} = eval { chat_start($m, $job->{messages}, $job->{opts}) };
-        if (!$job->{chat}) { job_error($job, $@); next }
-        $job->{prompt_tokens} = $job->{chat}->prompt_tokens;
-        push @running, $job;
-    }
-    return 0 unless @running;
-    # one forward pass for all of them (batched decoding)
-    my @jobs = @running;  # (a job that ends leaves @running)
-    my @r = eval { step_chats(map { $_->{chat} } @jobs) };
-    if (!@r) {
-        my $err = $@;
-        job_error($_, $err) for @jobs;
-        return 0;
-    }
-    for my $i (0 .. $#jobs) {
-        my $job = $jobs[$i];
-        my ($deltas, $going) = @{ $r[$i] };
-        $job->{completion} = $job->{chat}->tokens;
-        if (!$going) {
-            $job->{finished} = [ $job->{chat}->result ];
-            $job->{chat} = undef;
-            release($job);
+    my $n = 0;
+    for my $r (grep { $_->{m} } values %M) {
+        my $m = $r->{m};
+        while (@{ $r->{queue} }) {
+            my @free = grep { !$_->{job} } @{ $r->{pool} } or last;
+            my $job = shift @{ $r->{queue} };
+            my ($slot) = sort { common_prefix($b->{prompt}, $job->{prompt}) <=> common_prefix($a->{prompt}, $job->{prompt}) } @free;
+            $slot->{job} = $job;
+            $slot->{prompt} = $job->{prompt};
+            seq_select($m, $slot->{seq});
+            $job->{chat} = eval { chat_start($m, $job->{messages}, $job->{opts}) };
+            if (!$job->{chat}) { job_error($job, $@); next }
+            $job->{prompt_tokens} = $job->{chat}->prompt_tokens;
+            push @{ $r->{running} }, $job;
         }
-        job_output($job, $deltas);
+        next unless @{ $r->{running} };
+        # one forward pass for all of them (batched decoding)
+        my @jobs = @{ $r->{running} };  # (a job that ends leaves running)
+        my @res = eval { step_chats(map { $_->{chat} } @jobs) };
+        if (!@res) {
+            my $err = $@;
+            job_error($_, $err) for @jobs;
+            next;
+        }
+        for my $i (0 .. $#jobs) {
+            my $job = $jobs[$i];
+            my ($deltas, $going) = @{ $res[$i] };
+            $job->{completion} = $job->{chat}->tokens;
+            if (!$going) {
+                $job->{finished} = [ $job->{chat}->result ];
+                $job->{chat} = undef;
+                release($job);
+            }
+            job_output($job, $deltas);
+        }
+        $n += @{ $r->{running} };
     }
-    return scalar @running;
+    return $n;
 }
 
-print STDERR "serving $name on $o{listen}: context $o{ctx} tokens (trained $trained)",
-    ($parallel > 1 ? ", $parallel conversations at once" : ''), "\n";
+if ($o{'models-dir'}) {
+    my @ids = sort keys %M;
+    print STDERR "serving ", scalar @ids, " models from $o{'models-dir'} on $o{listen}",
+        ($parallel > 1 ? ", $parallel conversations at once per model" : ''), ": @ids\n";
+} else {
+    my $r = $default{chat} // $default{embedding};
+    print STDERR "serving $r->{id} on $o{listen}: context $r->{ctx} tokens (trained $r->{info}{n_ctx_train})",
+        ($parallel > 1 ? ", $parallel conversations at once" : ''), "\n";
+}
 run(listen => $o{listen}, log => $o{log} // 1, defined $o{mode} ? (mode => oct $o{mode}) : (),
     $parallel > 1 ? (tick => \&tick) : ());
+
 
 __END__
 
 =head1 NAME
 
-rocm-inference-server - an OpenAI-compatible chat server for one model, behind nginx
+rocm-inference-server - an OpenAI-compatible chat server for one model or a directory of them, behind nginx
 
 =head1 SYNOPSIS
 
@@ -430,14 +626,42 @@ rocm-inference-server - an OpenAI-compatible chat server for one model, behind n
     curl --unix-socket /run/llm/llm.sock http://x/v1/chat/completions -H 'Content-Type: application/json' \
          -d '{"messages": [{"role": "user", "content": "Hi!"}], "stream": true}'
 
+    # every model in /models, each loaded when a request names it
+    rocm-inference-server --models-dir /models --listen /run/llm/llm.sock --mode 0660
+    curl --unix-socket /run/llm/llm.sock http://x/v1/models
+    curl --unix-socket /run/llm/llm.sock http://x/v1/chat/completions -H 'Content-Type: application/json' \
+         -d '{"model": "Qwen3.6-35B-A3B-ROCMFP4", "messages": [{"role": "user", "content": "Hi!"}]}'
+
 =head1 OPTIONS
 
 =over
 
 =item --model F<file.gguf>
 
-The model (the first shard of a split one). Required. An embedding model (EmbeddingGemma) serves
-C</v1/embeddings> only.
+The model (the first shard of a split one), loaded at start; it stays loaded. An embedding model (EmbeddingGemma)
+serves C</v1/embeddings> only. This or C<--models-dir> (or both) is required.
+
+=item --models-dir F<dir>
+
+Serve the models in F<dir>: every GGUF this engine runs (chat and embedding models; a split one by its
+F<-00001-of-0000N> file; not other files, shards, mmproj or imatrix files), listed by C<GET /v1/models> with the
+file name without F<.gguf> as id. None is loaded at start: a request loads the model its C<model> names (a load from
+the page cache or a tmpfs takes a few seconds; from a cold disk what the disk gives), and a model is unloaded when
+another needs the room (C<--models-max>, C<--models-margin>), least recently used first, never one that serves a
+request. The directory is read again when the list is asked for, so files added or removed show. A draft (MTP) head
+in the directory is used for the model it fits (Qwen3.8-Flash-Next; not with C<--parallel>). Each model gets the
+context and KV cache type C<--ctx> / C<--kv-type> give, by default from its own trained context.
+
+=item --models-max N
+
+With C<--models-dir>: at most N models loaded at once (default: as many as fit).
+
+=item --models-margin GB
+
+With C<--models-dir>: memory to leave free (default 4). A model is loaded when its files and KV cache fit in
+MemAvailable less this margin (and less the files of the models loaded already, whose pinned pages the kernel
+counts as reclaimable); before that, idle models are unloaded. Programs next to the server (llama-server) count
+with what they hold.
 
 =item --embedding-model F<file.gguf>, --embedding-name NAME
 
@@ -535,13 +759,20 @@ C<tool_calls>. Beyond OpenAI's: C<top_k>, C<min_p>, C<repeat_penalty>, C<chat_te
 variables, e.g. C<{"enable_thinking": false}>), C<reasoning_effort> (C<none> / C<minimal> turn thinking off),
 C<max_thinking_tokens> (or C<thinking_budget_tokens>): close the reasoning after that many tokens.
 
+C<model> picks the model: with C<--models-dir> one from C<GET /v1/models> (loaded when needed; an unknown one is a
+404), none: the one used last (or the only one); with C<--model> alone any name gets that model. C<GET /v1/models>
+lists each with C<status.value> (C<loaded> / C<unloaded>), C<kind> (C<chat> / C<embedding>), C<arch>,
+C<context_length> (what it gets), C<n_ctx_train> and C<bytes>. As llama.cpp's router: C<POST /models/load> and
+C<POST /models/unload> with C<{"model": id}> load a model now or unload one (409 while it serves a request).
+
 C<POST /v1/embeddings> (with an embedding model), as OpenAI's: C<input> (a string, an array of strings, an array
 of token ids or an array of those), C<encoding_format> (C<float> or C<base64>), C<dimensions> (the leading values,
 renormalized: Matryoshka), C<usage.prompt_tokens>. Embeddings are normalized to length 1, as llama-server's; an
 input longer than the embedding model's context (2048 tokens at most) is an error (400).
 
-Requests are served one at a time; the model keeps the last conversation, so its next turn only prefills
-what is new (C<--store> extends that to every conversation). A client that disconnects stops its reply.
+Requests are served one at a time (with C<--parallel> N, N per model at once); a model keeps its last
+conversation, so its next turn only prefills what is new (C<--store> extends that to every conversation, of every
+model). A client that disconnects stops its reply.
 
 =head1 NGINX
 

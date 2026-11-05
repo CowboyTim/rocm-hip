@@ -16,7 +16,7 @@ BEGIN {  # at compile time: the constants below call into the XS
 
 # The C library (libinference.so) mapped one function per C call; plus the plain-Perl chat helpers below
 our @EXPORT_OK = qw(
-    load_model free_model kv_cache_init set_lm_head_q8 set_draft_model set_draft_tokens set_prefill_batch
+    model_info load_model free_model kv_cache_init set_lm_head_q8 set_draft_model set_draft_tokens set_prefill_batch
     set_swa_ring swa_ring stage_info set_kv_type
     seq_new seq_select seq_current seq_free stream_begin chat_start step_streams step_chats
     embedding_dim embed
@@ -608,6 +608,15 @@ C<"reused PATH (N MB)"> or C<"not staged: WHY">. When not asked for: how much of
 C<"not staged; X of Y MB on 2 MB pages"> (the GGUF is mapped for them; a file the page cache holds in 4 KB pages
 stays so until it is read again: C<$ENV{GGUF_RECACHE} = 1> before C<load_model> does that, or the server's
 C<--recache>).
+
+=item model_info($path)
+
+What a GGUF file is, from its header alone (mapped, not loaded: cheap enough to scan a directory with), as a hash
+reference: C<kind> (C<chat>, C<embedding>, C<draft>: an MTP head for the model it was made for, see
+C<set_draft_model>; or C<unsupported>, with C<why>: not a model, an architecture or a tensor type this engine does
+not run), C<arch>, C<n_ctx_train> (0 if not given), C<files> and C<bytes> (a split model is given by its
+F<-00001-of-0000N> file: all its files), C<kv_bytes_per_token> (K and V of one position as F16 over the attention
+layers: an estimate of the KV cache, Q8_0 about half, Q4_0 a quarter). Dies if the file is not a GGUF.
 
 =item kv_cache_init($m, $n_ctx)
 

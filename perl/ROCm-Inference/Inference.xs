@@ -149,6 +149,26 @@ load_model(path, opts = NULL)
   OUTPUT:
     RETVAL
 
+SV*
+model_info(path)
+    const char* path
+  CODE:
+    /* What a GGUF is, from its header (inference_model_info): nothing loaded */
+    inference_model_info_t mi;
+    if (inference_model_info(path, &mi) != 0) croak_last(aTHX_ "model_info", INFERENCE_ERR_MODEL_LOAD);
+    static const char* const kinds[] = {"unsupported", "chat", "embedding", "draft"};
+    HV* hv = newHV();
+    (void)hv_stores(hv, "kind", newSVpv(kinds[mi.kind + 1], 0));
+    (void)hv_stores(hv, "arch", newSVpv(mi.arch, 0));
+    if (mi.kind == INFERENCE_MODEL_UNSUPPORTED) (void)hv_stores(hv, "why", newSVpv(mi.why, 0));
+    (void)hv_stores(hv, "n_ctx_train", newSViv((IV)mi.n_ctx_train));
+    (void)hv_stores(hv, "files", newSViv(mi.n_files));
+    (void)hv_stores(hv, "bytes", newSVuv((UV)mi.bytes));
+    (void)hv_stores(hv, "kv_bytes_per_token", newSVuv((UV)mi.kv_bytes_per_token));
+    RETVAL = newRV_noinc((SV*)hv);
+  OUTPUT:
+    RETVAL
+
 const char*
 stage_info(h)
     SV* h

@@ -797,6 +797,59 @@ inference_model_t* inference_load_model(const char* gguf_path) { return inferenc
 
 const char* inference_stage_info(const inference_model_t* m) { return m ? m->stage_info.c_str() : ""; }
 
+int inference_model_info(const char* path, inference_model_info_t* out) {
+    clear_error();
+    if (!path || !out) { set_error("NULL argument"); return -1; }
+    memset(out, 0, sizeof(*out));
+    out->kind = INFERENCE_MODEL_UNSUPPORTED;
+    gguf_model_t* g = gguf_mmap_open(path);
+    if (!g) { set_error("%s: not a GGUF file", path); return -1; }
+    out->n_files = gguf_n_maps(g);
+    for (int i = 0; i < out->n_files; ++i) {
+        size_t sz = 0;
+        gguf_map_at(g, i, &sz);
+        out->bytes += sz;
+    }
+    const char* arch = gguf_arch(g);
+    snprintf(out->arch, sizeof(out->arch), "%s", arch ? arch : "");
+    out->n_ctx_train = gguf_context_length(g) > 0 ? gguf_context_length(g) : 0;
+    // the architectures the loader runs (ARCHITECTURE.md, models)
+    static const char* const archs[] = {"qwen2",  "qwen3",  "qwen3moe", "qwen35",          "qwen35moe",
+                                        "qwen4exp", "gemma4", "llama",  "nemotron_h_moe", "gemma-embedding"};
+    bool known = false;
+    for (const char* a : archs) known = known || (arch && !strcmp(arch, a));
+    const int64_t ty = gguf_find_kv(g, "general.type");
+    const char* gtype = ty >= 0 ? gguf_kv_str_val(g, ty) : nullptr;
+    bool layer0 = false;
+    const int64_t nt = gguf_n_tensors(g);
+    int bad_type = -1;
+    for (int64_t i = 0; i < nt; ++i) {
+        const char* name = gguf_tensor_name(g, i);
+        if (!strncmp(name, "blk.0.", 6)) layer0 = true;
+        if (bad_type < 0 && !qt_get_traits(gguf_tensor_type(g, i))) bad_type = gguf_tensor_type(g, i);
+        // K and V widths of the attention layers (an F16 cache's bytes per position)
+        const char* dot = strncmp(name, "blk.", 4) ? nullptr : strchr(name + 4, '.');
+        if (dot && (!strcmp(dot, ".attn_k.weight") || !strcmp(dot, ".attn_v.weight")))
+            out->kv_bytes_per_token += 2ull * (unsigned long long)gguf_tensor_ne(g, i)[1];
+    }
+    if (gtype && strcmp(gtype, "model"))
+        snprintf(out->why, sizeof(out->why), "not a model (general.type %s)", gtype);
+    else if (!arch)
+        snprintf(out->why, sizeof(out->why), "no general.architecture");
+    else if (!known)
+        snprintf(out->why, sizeof(out->why), "architecture %s is not supported", arch);
+    else if (bad_type >= 0)
+        snprintf(out->why, sizeof(out->why), "tensor type %d is not supported", bad_type);
+    else if (!strcmp(arch, "gemma-embedding"))
+        out->kind = INFERENCE_MODEL_EMBEDDING;
+    else if (!layer0 && gguf_arch_int(g, "nextn_predict_layers", 0) > 0)
+        out->kind = INFERENCE_MODEL_DRAFT;  // the MTP layers alone: a draft head for its model
+    else
+        out->kind = INFERENCE_MODEL_CHAT;
+    gguf_mmap_close(g);
+    return 0;
+}
+
 // The tensors staged (inference_load_opts.stage_dir): what the GPU reads. Not the PLE table, nor the token
 // embeddings when the LM head is a tensor of its own (the CPU decodes their rows), nor the MTP (nextn) blocks after
 // the decoder stack
