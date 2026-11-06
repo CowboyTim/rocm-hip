@@ -9,6 +9,9 @@
    read from disk in parallel.
 2. **Concurrent runs** in rocm-inference-server (section below).
 3. **Server logging** through an engine event hook, formatted in Perl (section below, planned, not started).
+4. **GLM-5.3-Flash (`glm5_next`) as an architecture** (section below): the gate is memory capacity, not kernels -
+   95% of its 320B params are expert weights, and none of FP8 / FP4 / Q4_0 fits 128 GB, so nothing runs until the
+   expert pin / unpin decision below is made. Start with the tiny GGUF generator, not the kernels.
 
 Later: a conversion / quantization tool in this project; expert pin / unpin for MoE models larger than memory.
 
@@ -46,6 +49,105 @@ disk. ppl 2.1927 (wikitext, 10 chunks); 2k prompt 850 tok/s prefill, 39.3 tok/s 
 - No XNACK on gfx1151 (rocminfo "XNACK enabled: NO", amdgpu noretry=1; the driver can switch it, unstable by the
   user's experience): the GPU cannot fault pages in, so whatever it reads must be pinned; only CPU-read tensors
   (the PLE table) can be left to the page cache.
+
+## GLM-5.3-Flash (`glm5_next`): what has to change, and in what order (planned, not started; user, 2026-11-06)
+
+Config read from huggingface.co/zai-org/GLM-5.3-Flash/raw/main/config.json on 2026-11-06; the numbers below are
+computed from it, not copied from its model card. 320B total / 18B active, 45 decoder layers, hidden 4096, vocab
+154,880, 1M context. 34 linear-attention layers (KDA) + 11 sparse-attention layers (MLA with a top-2048 index over
+a k=4-pooled compressed index) at layers 3, 7, 11 ... 43; 42 MoE layers (the first 3 layers are dense FFN), 288
+routed experts + 1 shared, top-8, sigmoid routing with `mlp.gate.e_score_correction_bias` and
+`routed_scaling_factor` 2.5; `mhc` with `hc_mult` 4 and `hc_sinkhorn_iters` 20; `swiglu_limit` 10.0;
+`num_nextn_predict_layers` 1. Two readings are inference, not config: `kda_layers` as Kimi Delta Attention
+(gated-deltanet family) and `index_kpool_compress` as key pooling by 4 with APE to restore the lost position
+information. Both set buffer sizes (`conv_dim = (2*n_k + n_v) * 128`), so check them against the checkpoint's
+tensor shapes before sizing anything.
+
+1. **Gate: capacity, not kernels.** 42 layers x 289 experts x 3 x 4096 x 2048 = **305.5B of the 320B params
+   (95%) are expert weights**; the non-expert part (attention, embed, LM head, norms) is 14.5B. As released (FP8
+   e4m3) that is 320 GB; at ROCmFP4_FAST 4.25 bpw it is 170 GB; Q4_0 is 180 GB. None fit 128 GB, and ~2.6 bpw is
+   the first quantization that does. Pinning decides the speed: the non-experts cost 7.7 GB pinned at FP4, leaving
+   120 GB -> 8,996 of the 12,096 experts resident (**74%**), and the other 26% of expert reads are NVMe traffic at
+   3-5 GB/s, ~50x slower than the 220-256 GB/s UMA. Per token, 8 experts x 42 layers = 8.46B params are touched:
+   all of it off NVMe at 3-5 GB/s is 0.7-1.1 tok/s, 26% cold is 2.6-4.3 tok/s (the NVMe reads only, no compute), and the all-resident
+   bandwidth ceiling is 26-30 tok/s at FP8 (8.46 GB/token) and 49-57 at FP4 (4.5 GB/token) at 220-256 GB/s. The earlier
+   12-14 / 23-27 were estimates with no stated efficiency; measure them before quoting. So "can we run it" is a routing-trace question, not a kernel question:
+   route ~10k tokens through the router alone (small enough to run on CPU from a quantized copy), count the
+   distinct experts hit per layer, and settle the target bpw + the pinned fraction **before** writing a kernel.
+   This is the "expert pin / unpin" item under **Later** below, and for this model it is a prerequisite, not a
+   later nicety.
+2. **The converter and the loader, no kernels.** `llama.cpp/conversion/` has base, command_r, deepseek,
+   diffusion_gemma, laguna, llama, mellum, muse_glimmer, qwen4exp and zaya - **no `glm5_next` mapping** - so the
+   HF -> GGUF conversion is itself a deliverable. The loader dispatches on `general.architecture` against a
+   hardcoded list at `src/inference.cpp:856`, so an unknown arch fails with "architecture %s is not supported"
+   before anything runs. Tensor name -> slot map from the checkpoint's own `modules_to_not_convert` (a literal
+   tensor-name list): `self_attn.{q,k,v,qkv_proj,o,f_a,f_b,g_a,g_b,b}_proj*`, `{q,k,v}_conv1d`, `A_log`, `dt_bias`,
+   `o_norm`, `fused_qkvbfg_a_proj`, `indexer.{wq_b,wk,k_norm,weights_proj,index_kpool_compress_ape,
+   index_kpool_compress_gate}`, `hyper_connection`, `mapping_proj`, `mlp.gate`, `mlp.gate.e_score_correction_bias`.
+   Keys to carry through the loader: `index_topk` (2048), `index_kpool` (4), `index_kpool_compress`,
+   `index_share_for_mtp_iteration`, `hc_mult` (4), `hc_sinkhorn_iters` (20), `hc_eps`, `kv_lora_rank` (512),
+   `q_lora_rank` (1536), `qk_head_dim` (256), `qk_rope_head_dim` (0), `mla_use_nope`, `swiglu_limit` (10.0),
+   `first_k_dense_replace` (3), `num_nextn_predict_layers` (1). De-risk first: extend
+   `tools/gen_qwen4exp_tiny.py` into a `gen_glm5next_tiny.py` that writes a 4-layer tiny GGUF (3 dense + 1 DSA,
+   8 experts, tiny hidden) from these names, so phases 1-2 below are testable in the hermes container - it has 16 cores, 124 GB
+   and no ROCm userspace (the hermes container cannot run HIP), so it can do phases 1-2 only. The work host has
+   `/opt/rocm` with hipcc and the gfx1151 GPU, so phases 3-4 run there.
+3. **CPU reference path against the oracle.** The vendored fork already has `llama.cpp/src/models/glm-dsa.cpp`
+   implementing MLA + the DSA indexer (`ATTENTION_KEY_LENGTH_MLA`, `ATTENTION_VALUE_LENGTH_MLA`,
+   `INDEXER_HEAD_COUNT`, `INDEXER_KEY_LENGTH`, `INDEXER_TOP_K`, `wq_b / wv_b / wo / indexer_k_norm /
+   indexer_proj`), so `tools/ref_oracle/ref_dump` is a working oracle for the sparse path from day one. Check
+   whether that file also has mHC and the KDA per-channel decay; if not, the reference for those does not exist
+   and has to be written from HF's modeling file. CPU ops in the `qwen_ops.cpp` style the forward pass and
+   `tests/forward_verify.cpp` already share: the KDA step (per-channel decay), indexer score -> kpool compress ->
+   top-k -> gather, the mHC Sinkhorn mixer, the MoE router **with sigmoid scoring + `e_score_correction_bias`**
+   (this router does softmax - a real difference, not a detail: sigmoid + bias, then top-8, then renormalize, x2.5)
+   and the `swiglu_limit` clamp at 10.0.
+   **The #1 correctness risk is here, not in the kernels:** the indexer's top-k is a *selection*, not a summation.
+   Exactness by construction (batched kernels reproducing the single-token summation order bit for bit under
+   `QMATVEC_NO_WMMA=1`) does not cover selection order - a prefill of N tokens must select exactly the entries N
+   single-token steps would have, or the sparse attention reads different positions and the logits diverge
+   silently. Pin the tie-break down (ties to the lower index, as `moe_router` already does) and test it as a
+   property, not as a perplexity number.
+4. **GPU kernels.** KDA's decay is per-**channel** diagonal, not this engine's per-head scalar gate: `g_out` grows
+   from `[T][n_v]` to `[T][n_v*128]` and the state update becomes `S *= exp(g_c)` per channel, in
+   `deltanet_pre`/`deltanet_rule` (`DELTANET_HEAD_SIZE` is already 128 and KDA's head_dim is 128, so the state
+   shape carries over unchanged). The indexer's top-2048 selection over the k=4-pooled index is the same problem
+   shape as the bitonic top-k in `moe_router` (32 index heads x 128 in, an index out) - reuse that machinery.
+   Prefill stays dense FP16-WMMA flash attention (with the whole prefix there is nothing to select); decode gathers
+   the selected 2048 positions, replacing the split-K-over-256-position-chunks decode for those 11 layers only.
+5. **KV cache layout + quantization, both gates.** MLA stores one latent of `kv_lora_rank` 512 (+ a 64 rope slot;
+   `qk_rope_head_dim` is 0, so NoPE) per position, not per-head K/V: `kv_bytes_per_token` is computed at load from
+   the `attn_k` / `attn_v` tensor widths in `src/inference.cpp` and must become a latent-cache path or the KV budget
+   is wrong by a large factor. It is a big win: 576 floats x 11 layers = **12 KB/position** in F16 against 704
+   KB/position for a 64-head x 256-dim layout, and that is what makes 1M context addressable. The block store's
+   SHA-hashed `<hash>.kvb` slots must also key on the **compressed index**, or a resumed sequence has no index for
+   its reused prefix. On quantization: the release is FP8 with dynamic scaling and gfx1151 has no FP8/BF8/FP6/FP4
+   instructions (ARCHITECTURE.md s4), so either an e4m3 -> F16 LUT decode feeding the F16 WMMA path (256-entry LUT
+   = 512 B, fits LDS) or offline requantization to ROCmFP4_FAST; the `v_perm` codebook trick that the int8 path
+   uses for 4-bit codes does not reach 8-bit codes (3-bit indices only), so there is no free version of the first.
+   Decide before the kernels, because it sets the resident set and therefore the tok/s in item 1.
+
+What breaks that the new-kernel list does not show: `index_share_for_mtp_iteration: true` means the draft head
+shares the main model's index, so the verify path's `deltanet_mid_states` / `qwen_model_rollback(keep)` has to roll
+the index back too or rebuild it per pass; the `n_hc == 0` dispatch (`src/inference_internal.h:95`) branches the
+whole forward pass's residual handling, and mHC replaces *every* norm, so the decode profile's `hc_norm` 98 x 7.6 us
+and `hc_mix` 97 x 2.9 us items stay and grow (a per-token 4x4 doubly-stochastic matrix, cheap per layer but on the
+critical path of all 45); and layer kinds are classified from the tensors present, never by index, so the
+classifier's predicate must learn KDA's `A_log`/`dt_bias`/`b_proj`/`f_a_proj` names or every KDA layer silently
+falls through to the wrong kind and the model runs wrong-but-silently. Vision (`glm5_next_vision`: 24 layers,
+hidden 1024, 16 heads, patch 14, 448 px, `spatial_merge_size` 2, `temporal_patch_size` 2, `projection_intermediate_size`
+10240 -> `out_hidden_size` 4096) is an independent track that can go last: the engine has no encoder and the C API
+is text-in/text-out, so it needs an encoder path, a patch + merger projection to `n_embd`, the image/video token
+interleave (image_token_id 154854, image_start/end 154830/154831, video_start/end 154832/154833) and the Perl
+template's thinking channel - the engine streams every emitted token, so `reasoning_effort` (low/high/max, default
+max) and `clear_thinking` (default false) need the reply-kind channel flag currently listed as "only if a non-Perl
+user needs it". A GLM tokenizer (vocab 154,880) is a GGUF-metadata problem for `tokenizer.cpp`, not a new tokenizer.
+
+Ordering: the gate comes first because its answer decides whether the rest is worth doing on this hardware. The
+phases after it are cheap, CPU-only and oracle-backed, and are where the indexer's selection-order risk resolves;
+GPU time on KDA / indexer / sparse attention belongs after those. An optional cheaper first target: a smaller DSA
+sibling, which the oracle already knows as `glm-dsa`, exercises KDA + indexer + MLA + MoE with none of the capacity
+problem, then scale up to the full model.
 
 ## Concurrent runs (to investigate; user, 2026-11-05)
 
