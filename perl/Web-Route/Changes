@@ -6,5 +6,7 @@ Revision history for Web-Route
       clashes), requests as plain hashes, responses as [status, headers, body] (a hash becomes JSON,
       a string text), json / text / stream / sse helpers, and a small sequential HTTP/1.1 server on a unix
       socket (or host:port) for behind nginx: streamed responses, client-gone detection, limits, SIGTERM.
+    - A pull response whose client takes no bytes is closed off like a client that left (on_close runs): more
+      than max_pending (1 MB) unsent, or none taken for stall (30 s) while output is pending. Both are run options.
     - pull responses: bodies the server pulls while serving other connections (non-blocking writes), with a
       tick hook per round and on_close for clients that leave early: many slow responses at once.

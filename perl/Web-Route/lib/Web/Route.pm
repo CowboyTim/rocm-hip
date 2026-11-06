@@ -279,7 +279,8 @@ sub _listen {
 # comes; a pull response stays open and is served by the loop together with the others (non-blocking writes), with
 # tick => sub { ... } called once per round while any is open (true: it did work, so do not wait for the sockets).
 sub run {
-    my %o = (backlog => 128, timeout => 30, max_header => 65536, max_body => 16 << 20, log => 0, @_);
+    my %o = (backlog => 128, timeout => 30, max_header => 65536, max_body => 16 << 20, log => 0,
+                max_pending => 1 << 20, stall => 30, @_);
     my $srv = _listen(\%o);
     my $stop = 0;
     local $SIG{PIPE} = 'IGNORE';
@@ -327,8 +328,10 @@ sub run {
                 $l->{gone} = 1 if defined $n && $n == 0;
             }
         }
+        my $now = Time::HiRes::time();
         for my $l (@live) {
             next if $l->{gone};
+            $l->{progress} //= $now;
             if (!$l->{done}) {
                 my $piece = eval { $l->{pull}{code}->() };
                 if ($@) {
@@ -343,9 +346,15 @@ sub run {
             }
             while (length $l->{out}) {
                 my $n = syswrite($l->{c}, $l->{out});
-                if (defined $n) { substr($l->{out}, 0, $n, ''); next }
+                if (defined $n) { substr($l->{out}, 0, $n, ''); $l->{progress} = $now; next }
                 $l->{gone} = 1 unless $!{EAGAIN} || $!{EWOULDBLOCK};
                 last;
+            }
+            # a client that takes no bytes: output past max_pending, or none taken for stall seconds, is closed off
+            if (!length $l->{out}) { $l->{progress} = $now }
+            elsif (length $l->{out} > $o{max_pending} || $now - $l->{progress} > $o{stall}) {
+                printf STDERR "%s stalled: %d bytes pending, closed\n", scalar localtime, length $l->{out} if $o{log};
+                $l->{gone} = 1;
             }
         }
         @live = grep {
@@ -490,7 +499,7 @@ C<retry>.
 Serve until SIGINT or SIGTERM (after the current request). C<$where> is a socket path (an old socket file is
 replaced, and removed at the end) or C<host:port>. Options: C<mode> (the socket file's permissions, e.g.
 C<0660> for a group nginx is in), C<backlog> (128), C<timeout> (seconds to wait for a request's bytes, 30),
-C<max_header> (64 KB), C<max_body> (16 MB; 413 above), C<log> (a line per request on STDERR), C<on_start>
+C<max_header> (64 KB), C<max_body> (16 MB; 413 above), C<max_pending> (1 MB) and C<stall> (30 s): a pull response whose client takes no bytes (more than max_pending unsent, or none taken for stall seconds while output is pending) is closed off as if the client had left, so on_close runs. C<log> (a line per request on STDERR), C<on_start>
 (called with the listening socket), C<tick> (called once per round while any C<pull> response is open; returning
 true means it did work, so the loop does not wait on the sockets). Requests are read and dispatched one at a time
 as they come; only C<pull> bodies are served concurrently. Request bodies come with a C<Content-Length>: nginx sends them so with
