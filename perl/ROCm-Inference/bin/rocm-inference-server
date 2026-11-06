@@ -406,11 +406,20 @@ route::post '/v1/embeddings' => sub {
     { object => 'list', data => \@data, model => $r->{id}, usage => { prompt_tokens => $tokens, total_tokens => $tokens } };
 };
 
+# a line when a chat request begins (its end is the access line, when the reply is finished): client, model, stream, cap
+sub start_line {
+    my ($req, $r, $p) = @_;
+    return unless $o{log} // 1;
+    printf STDERR "%s START %s model=%s stream=%d max_tokens=%s\n", scalar localtime, $req->{remote} // '-', $r->{id},
+        $p->{stream} ? 1 : 0, $p->{max_completion_tokens} // $p->{max_tokens} // 'default';
+}
+
 route::post '/v1/chat/completions' => sub {
     my ($req) = @_;
     my $p = $req->{json};
     ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');
     my $r = pick($p, 'chat');
+    start_line($req, $r, $p);
     my ($m, $name) = @$r{qw(m id)};
     my ($messages, $opts) = (messages($p->{messages}), options($p, $r));
     my $id = sprintf 'chatcmpl-%x%06x', time, int rand 2**24;
@@ -764,7 +773,7 @@ Thinking on or off when a request does not say (default: the chat template's def
 
 =item --[no]log
 
-A line per request on STDERR (on).
+A START line on STDERR when a chat request begins (client, model, stream, max_tokens), and a line per request when it ends (on).
 
 =back
 

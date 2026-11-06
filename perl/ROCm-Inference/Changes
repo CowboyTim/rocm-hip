@@ -1,6 +1,8 @@
 Revision history for ROCm-Inference
 
 0.01  unreleased
+    - rocm-inference-server: a START line on STDERR when a chat request begins (client address, model, stream,
+      max_tokens), so a long request shows while it runs; the access line still comes at its end.
     - model_info: what a GGUF is from its header (kind chat / embedding / draft / unsupported, architecture,
       trained context, bytes, KV bytes per position), without loading it.
     - rocm-inference-server --models-dir: the directory's models listed in /v1/models and loaded when a
