@@ -1,7 +1,7 @@
 # Project Plan: rocm-hip (Strix Halo, gfx1151)
 
 > What is open: next steps, planned work, leads. How the engine is built and what it runs: [ARCHITECTURE.md](ARCHITECTURE.md).
-> Finished work, with its measurements, is in the git history (this file was pruned of it on 2026-11-05).
+> Finished work, with its measurements, is in the git history (this file was pruned of it on 2026-11-05 and 2026-11-06).
 
 ## ▶ Next (week of 2026-11-09; user, 2026-11-05: "we will work on it next week")
 
@@ -17,24 +17,15 @@ Later: a conversion / quantization tool in this project; expert pin / unpin for 
 
 ## Status in brief
 
-A standalone engine (no llama.cpp linked; `llama.cpp/` = the ROCmFPX fork and `llama.cpp-stock/` = upstream are
-reference oracles only): GGUF files mapped and pinned in place (zero-copy on the UMA), HIP kernels per quant type
-(int8 / WMMA), a C API (`libinference.so`), the Perl XS module ROCm::Inference with chat templates (Minijinja) and
-reply parsing, and rocm-inference-server (OpenAI-compatible, SSE, tools, embeddings, `--models-dir` with models
-loaded per request, each by default at its trained context within `--kv-budget`). Architectures: qwen2, qwen3,
-qwen3moe, qwen35 / qwen35moe, qwen4exp (Qwen3.8-Flash-Next), gemma4, gemma-embedding, nemotron_h_moe, llama. KV
-caches F16 / Q8_0 / Q4_0 (Hadamard-rotated when quantized), a KV block store, batched decoding, MTP speculative
-decoding. Regression suite: `make regress` / `make regress-full` (tests/regress.tsv: perplexity per model / quant
-type / KV type / context, pass keys to 128k, forward_verify; perplexity agrees with llama.cpp within ~0.5%, the
-K-quants ~1%). Deployment: the user's llama.cpp-rocm-gfx1151-docker (branch rocm-inference) builds rocm-hip from
-GitHub `main` and serves the engine at /rocm/v1 next to llama-server (no CPAN release planned yet).
+The engine runs qwen2, qwen3, qwen3moe, qwen35 / qwen35moe, qwen4exp (Qwen3.8-Flash-Next), gemma4, gemma-embedding,
+nemotron_h_moe and llama from zero-copy GGUF mappings on the UMA. Surfaces: the C API (`libinference.so`), the Perl
+XS module ROCm::Inference (Minijinja templates), rocm-inference-server (OpenAI-compatible, `--models-dir`). Regression
+suite: `make regress` / `make regress-full`. Deployed by the user's llama.cpp-rocm-gfx1151-docker (branch
+rocm-inference), which builds rocm-hip from GitHub `main`. Design: ARCHITECTURE.md; measurements: git history.
 
 ## Qwen3.8-Flash-Next from BF16
 
-/models/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST-PLE_Q8_0.gguf (122.8 GB): upstream's convert_hf_to_gguf.py, then the
-ROCmFPX llama-quantize (local worktree /data/rocmfpx-strix, patched to read `recurrent_layers` as upstream's bool
-flags; `--tensor-type per_layer_token_embd=q8_0`, Q4_0_ROCMFP4_FAST). ~68 GB pinned, the 54 GB PLE table read from
-disk. ppl 2.1927 (wikitext, 10 chunks); 2k prompt 850 tok/s prefill, 39.3 tok/s generation with the PLE rows cached.
+Quantized: /models/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST-PLE_Q8_0.gguf (PLE table Q8_0 on disk). Open:
 - **The model's own MTP layer as its draft head.** The base-model GGUF carries it (blk.48: nextn.eh_proj / enorm /
   hnorm, nextn.hc_head_down / norm / up — the head's own hyper-connection mix, new — and attention with QSA
   compress ratio 4); the release came with a separate head file (/data/mtp, set_draft_model: ~38 -> ~50 tok/s).
@@ -43,12 +34,8 @@ disk. ppl 2.1927 (wikitext, 10 chunks); 2k prompt 850 tok/s prefill, 39.3 tok/s 
 - **PLE rows in parallel.** A text whose rows are not cached prefills at 391 tok/s: ~32k random 4 KB reads of the
   table one at a time (~85 us each). Fetch a batch's rows concurrently (madvise WILLNEED / readahead, or a few
   threads: NVMe serves deep queues) so the table can stay on disk at prefill speed.
-- Not tried yet: the server pairing a separate draft-head file from `--models-dir` with the real Flash.
 - The fork's qwen4exp is behind upstream's (recurrent_layers as indices vs upstream's bool flags; llama-server
   rejects these files): worth porting in the fork (the user's).
-- No XNACK on gfx1151 (rocminfo "XNACK enabled: NO", amdgpu noretry=1; the driver can switch it, unstable by the
-  user's experience): the GPU cannot fault pages in, so whatever it reads must be pinned; only CPU-read tensors
-  (the PLE table) can be left to the page cache.
 
 ## GLM-5.3-Flash (`glm5_next`): what has to change, and in what order (planned, not started; user, 2026-11-06)
 
@@ -89,9 +76,8 @@ tensor shapes before sizing anything.
    `q_lora_rank` (1536), `qk_head_dim` (256), `qk_rope_head_dim` (0), `mla_use_nope`, `swiglu_limit` (10.0),
    `first_k_dense_replace` (3), `num_nextn_predict_layers` (1). De-risk first: extend
    `tools/gen_qwen4exp_tiny.py` into a `gen_glm5next_tiny.py` that writes a 4-layer tiny GGUF (3 dense + 1 DSA,
-   8 experts, tiny hidden) from these names, so phases 1-2 below are testable in the hermes container - it has 16 cores, 124 GB
-   and no ROCm userspace (the hermes container cannot run HIP), so it can do phases 1-2 only. The work host has
-   `/opt/rocm` with hipcc and the gfx1151 GPU, so phases 3-4 run there.
+   8 experts, tiny hidden) from these names, so phases 1-2 below can run on a CPU host. Hermes has ROCm 10.1 access (user, 2026-11-06), as the work host
+   does (`/opt/rocm`, hipcc, the gfx1151 GPU); phases 3-4 need the GPU, so they run on the work host.
 3. **CPU reference path against the oracle.** The vendored fork already has `llama.cpp/src/models/glm-dsa.cpp`
    implementing MLA + the DSA indexer (`ATTENTION_KEY_LENGTH_MLA`, `ATTENTION_VALUE_LENGTH_MLA`,
    `INDEXER_HEAD_COUNT`, `INDEXER_KEY_LENGTH`, `INDEXER_TOP_K`, `wq_b / wv_b / wo / indexer_k_norm /
@@ -160,42 +146,13 @@ each per round; GPU sharing); long prefills in chunks between other requests' to
 off the request path (between rounds, or in a second process); fairness and queue limits per user (with the
 logging's user and conversation id); llama-server on the same GPU.
 
-## Server logging: events from the engine, formatted in Perl (planned, not started)
+## Server logging (planned; step plan in WORKLOG.md, not started)
 
-User: "proper logging: prefill stage, % of, prefill done, tg generation, streamed batch etc.. make a plan so that I
-can follow what it does (PID, user, timestamp, coloring) ... via a hook to perl, so we can perlify the logging *in
-perl*, not in C". Today the library prints nothing (INFERENCE_VERBOSE: unstructured debug text), the only hook into
-Perl is on_token, a prompt's prefill is one blocking C call, and the server logs Web::Route's line per request.
-1. **C: an event hook, no formatting.** `inference_set_event_cb(model, cb, user)`: a small struct (type, sequence,
-   counts, ms) at prefill_begin (total, reused from the sequence, from the KV store, to prefill), prefill_progress
-   (after each batch / chunk), prefill_end, checkpoint (DeltaNet) and store (blocks resumed / published), draft
-   (proposed / accepted per pass), context_full. Nothing printed in C; no cost without a hook. Generation speed:
-   Perl times on_token.
-2. **XS:** `set_event_handler($m, sub { my ($event, $info) = @_ })`; a die in the handler becomes a warning.
-3. **Perl: ROCm::Inference::Log.** A line: timestamp (ms), PID, level, user, client IP, conversation id, request
-   id, model, event, message. Colours per kind (request bold, prefill cyan, generation green, model load / unload
-   magenta, warn yellow, error red); auto / always (docker logs) / never, NO_COLOR honoured. Progress at most every
-   10% or 2 s. Text or JSON lines. Levels error / warn / info / debug (debug: --parallel step lines).
-4. **Server:** per request: received (client, user, model, messages, tools, stream), queue wait, model load /
-   unload (time, memory), prefill progress and result (reused / store / new, tok/s), time to first token,
-   generation every few seconds, done (finish reason, tokens, times, tok/s), client gone, errors; Web::Route's
-   request line through the same logger.
-5. **Who:** the user (nginx X-Remote-User from $remote_user; later the subject of a JWT: the user may add Keycloak
-   login with a JWT as API key), the client IP (X-Real-IP) and opencode's conversation id (conv_id / slot header
-   from the fixups). Docker repo: proxy_set_header X-Remote-User in /rocm/.
-6. Options `--log-level`, `--log-format text|json`, `--log-color auto|always|never`.
-7. Tests: the C events' order (progress increasing to the total); the formatter without a GPU; log lines in
-   t/60-server.t.
-
-Example (text, one opencode turn):
-
-    2026-11-05 14:03:12.481 [41231] INFO  alice 10.0.0.7 conv-17 chatcmpl-6f3a Qwen3.6-35B  > POST /v1/chat/completions  stream, 14 msgs, 9 tools
-    2026-11-05 14:03:12.483 [41231] INFO  ... prefill 31,204 tok: 28,672 reused, 2,532 new
-    2026-11-05 14:03:12.890 [41231] INFO  ... prefill  41%  1,040/2,532  2,555 tok/s
-    2026-11-05 14:03:13.471 [41231] INFO  ... prefill done 2,532 tok in 0.99 s (2,558 tok/s)
-    2026-11-05 14:03:13.520 [41231] INFO  ... first token after 1.04 s
-    2026-11-05 14:03:15.522 [41231] INFO  ... generating  122 tok  61.0 tok/s
-    2026-11-05 14:03:17.640 [41231] INFO  ... done tool_calls  251 tok in 4.12 s (60.9 tok/s), total 5.16 s
+An engine event hook in C, formatted in Perl: request received, queue wait, model load / unload, prefill progress
+and result, first token, generation pace, done, client gone, errors. The START line of a chat request is in
+(c234f88); the rest is WORKLOG.md phases 1-5. Identity: the user (nginx X-Remote-User; a Keycloak JWT later), the
+client address (X-Real-IP), and the conversation id from the opencode fixups; the docker repo's nginx needs
+`proxy_set_header X-Remote-User` on /rocm/. Options --log-level, --log-format, --log-color.
 
 ## Later
 
