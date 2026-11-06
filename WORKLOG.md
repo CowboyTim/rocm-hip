@@ -4,24 +4,42 @@ Plan as of 2026-11-06, grounded in the code as of c234f88. Phases are dependency
 the C event hook (1) must land before the XS trampoline (2), which must land before the
 Perl formatter (3) and the server wiring (4). Decisions in phase 0 gate the rest.
 
-## 0. Gaps found in the current code
+## 0. Decisions (decided 2026-11-06; Phase 1 can start)
 
-- **C library:** no event hook exists. The only diagnostics are `INFER_LOG` in
-  `src/inference_log.h` — an `fprintf(stderr)` gated on a cached `INFERENCE_VERBOSE`
-  getenv. A host program cannot subscribe to anything.
-- **XS layer:** the only Perl-visible callback is `on_token` (`Inference.xs`,
-  `on_token_cb` + `cb_ctx` trampoline). No event callback exists.
-- **Prefill is one blocking C call:** `inference_generate_stream` (`src/inference.cpp:2116`)
-  and `inference_stream_begin` (`:2265`) run `sync_prompt`/`prefill_with_checkpoint`
-  synchronously; the chunked-prefill path (`prefill_chunk`) is invisible to the caller.
-- **Store/checkpoint events fire nowhere:** `store_snapshot_at`, `store_snapshot_every`
-  (`inference.cpp:1499`, `:2041`), `checkpoint_tail` — all internal, no callback.
-- **Draft events:** `spec_drafts_for_pass` / `spec_observe` (`:1552-1617`) know
-  proposed/accepted per verify pass; nothing publishes them.
-- **Server:** `bin/rocm-inference-server` prints unformatted `print STDERR` lines at
-  load/unload (lines 130-230) and a `start_line` on request start (`:409-414`);
-  Web::Route's `log =>` option (`Route.pm:290`) prints its own access line. No ms
-  timestamps, no user/IP/conversation-id fields, no progress events.
+Verified facts the decisions rest on, checked in the code today:
+- no `std::thread`/`std::mutex`/`pthread_create` anywhere in `src/` — the engine is
+  single-threaded per model (one HIP stream per forward pass, one `hipDeviceSynchronize`);
+  Web::Route has no threads either (single-process event loop with a `tick`).
+- `libinference.map` exports `inference_*` wholesale — a new `inference_set_event_cb` is
+  exported automatically, no map edit.
+- the `on_token` trampoline (`Inference.xs:53-64`) is the pattern to copy, but its
+  `cb_ctx` is stack-allocated for the duration of `generate` — an event handler is
+  per-model and outlives any single call, so the XS must own the code ref's lifetime.
+
+Decisions:
+- **0.1 Payload shape: struct in C.** `struct inference_event { int type; int seq; int
+  n0; int n1; double ms; }`, callback `int (*inference_event_cb)(void* user, const
+  inference_event* ev)`. Pass by pointer, no allocation on the hot path. The Perl side
+  converts to `($event_name, $info_hashref)` once per event — noise against the GPU
+  forward that follows. Decided over positional args: one arg to marshal, and the struct
+  can grow fields without changing the callback signature.
+- **0.2 Registration: per model.** `inference_set_event_cb(inference_model_t*, cb,
+  void* user)` — handle-first like every other API here; the server passes its model
+  record from `%M` as `user`, so each model's events (load, prefill, store, draft) carry
+  their model without a global fan-out. Chosen over a single global hook, which would
+  make every event re-derive the model.
+- **0.3 Cost without a hook: one null check** of the callback pointer per fire site —
+  that is the whole cost. No mutex, no atomics: single-threaded per model (verified
+  above), and events fire on the caller's thread, which is where the host wants them.
+- **0.4 Re-entrancy: synchronous, caller's thread, no I/O in C.** The C fire site does
+  nothing but check the pointer and call through it (no fprintf, no allocation); the
+  callback may die only in the sense that a Perl handler's `die` becomes a `warn`
+  (`G_EVAL`, copy the `cb_ctx` pattern incl. `PERL_IMPLICIT_CONTEXT` from
+  `Inference.xs:53-64`) — unlike `on_token`, where a true return stops generation.
+  XS ownership: `set_event_handler` SvREFCNT_inc's the code ref, a re-set or model free
+  dec's the old one (the new fact above: it is not call-scoped like on_token's cb_ctx).
+- **0.5 `INFERENCE_VERBOSE`/`INFER_LOG` stay as-is** — raw developer debug stays
+  orthogonal to structured events; nothing in this plan removes or gates them.
 
 ## 1. C API (`src/inference.h`, `src/inference.cpp`)
 
