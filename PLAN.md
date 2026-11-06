@@ -212,6 +212,12 @@ Example (text, one opencode turn):
   around the CPU-only tensors; registration works on any range, so: after the router, make the chosen experts'
   ranges resident and registered, with a cache of recently used experts; dense layers stay pinned. Only for MoE
   models that do not fit even at FP4.
+- **Qwen3.8-Flash-Next beyond 262,144 tokens (YaRN)** (HF card, 2026-11-06). The checkpoint is 262,144 natively
+  (`max_position_embeddings`, `rope_type` default); the card reaches 1M by a YaRN override (`factor` 4.0, original
+  262144, with an attention scale). Nothing is dropped by the converter: the GGUF has no rope-scaling keys, and the
+  engine has no YaRN. To do: YaRN frequencies and the attention scale in the RoPE, a `--rope-factor` option, and a
+  quality check at long context (not only that it runs). The 16 GB KV budget caps it at about 600k positions at F16
+  even then. Keep in mind; not started.
 
 ## Open leads
 
