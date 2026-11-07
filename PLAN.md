@@ -142,17 +142,19 @@ build 5, explore1 4, explore2 2, verifier 3), `max_concurrency` 2, and compactio
 The server keeps ONE sequence, so every switch between slots re-prefills the conversation: that is the 12k-token
 reuse in the logs (the shared system prompt and tools), and a 59k prefill at 263 tok/s (227 s).
 
-Decision (user, 2026-11-07): KV persists, and concurrent slots reuse without clearing each other's cache. Switching
-is measured fast enough that waiting is not needed: the 27B model's KV is 69,632 bytes per token (F16), so a 12k
-prefix is 0.84 GB and a 60k prefix 4.2 GB; /data reads 6.5 GB/s (writes 5.1 GB/s), so restoring 60k takes under a
-second against 227 s of re-prefill. Plan:
-1. Per-slot sequences: a request carries its slot; the server keeps one sequence per slot (up to --parallel N, LRU
-   beyond that) and prefers the slot's own sequence for its prefix.
-2. Persistence through the block store (`--store`, already resumes blocks and recurrent snapshots): on by default
-   per model, so an evicted slot and a restart resume from disk.
-3. Measure the restore on the real model before choosing the default N (KV budget: 5 slots at 131072 context is about
-   45 GB of F16 KV for this model; the store makes N a latency choice, not a memory one).
-
+Decision (user, 2026-11-07): KV persists, and one conversation's cache is not cleared by another's requests. Per-slot
+sequences are dropped (the engine does not have them; tried for llama.cpp without success). Status, checked
+2026-11-07:
+- **Persistence: implemented, opt-in.** The block store (`--store DIR`) keeps the blocks and recurrent snapshots as
+  files; a new process or a restart resumes from them. `tests/store_verify.sh` passes all four phases on
+  Qwen3-0.6B (on /dev/shm). The server uses it only with `--store`; the Docker repo passes it only when ROCM_STORE
+  is set (run.sh, llama.sh; empty by default).
+- **Switching reads the prefix back** instead of prefilling it: a sequence resumes from any stored prefix.
+- **Not done:** the store on by default; eviction and a disk tier in the server (`ROCm::Inference::Store` has the
+  policy, the server does not call it); a measured switch on the 27B model. Estimate: its KV is 69,632 bytes per
+  token (F16), so a 12k prefix is 0.84 GB and /data reads at 6.5 GB/s; a switch should take seconds against the 227 s
+  re-prefill in the logs. Unmeasured.
+Next: measure a 27B switch with `--store` on /dev/shm, then decide the default (run.sh), then wire eviction in.
 
 The server serves one request at a time unless `--parallel N`, which batches N conversations of one model (not
 with a draft head); with `--models-dir` each loaded model has its own sequences and the loop steps them in turn. A
