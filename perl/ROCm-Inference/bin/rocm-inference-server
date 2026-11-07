@@ -16,10 +16,12 @@ use ROCm::Inference qw(:all);
 use ROCm::Inference::Log;
 use Web::Route;
 
-my %o = (listen => './rocm-inference.sock', max_tokens => 0, 'models-margin' => 4, 'kv-budget' => 16);
+my %o = (listen => './rocm-inference.sock', max_tokens => 0, 'models-margin' => 4, 'kv-budget' => 16,
+         'thinking-low' => 2048, 'thinking-medium' => 8192, 'thinking-high' => 0);  # thinking budgets by reasoning_effort (0: none)
 GetOptions(\%o, 'model=s', 'models-dir=s', 'models-max=i', 'models-margin=f', 'kv-budget=f', 'listen=s', 'mode=s', 'ctx=i',
            'name=s', 'draft=s', 'store=s', 'max_tokens=i', 'swa-ring=i', 'stage=s', 'recache', 'kv-type=s',
-           'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'log!', 'log-level=s', 'log-format=s', 'log-color=s', 'help')
+           'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'log!', 'log-level=s', 'log-format=s', 'log-color=s',
+           'thinking-low=i', 'thinking-medium=i', 'thinking-high=i', 'help')
     or pod2usage(2);
 # The log: --nolog is level none; --log-level, --log-format, --log-color are checked by the formatter
 our $LOG = eval { ROCm::Inference::Log->new(level => ($o{log} // 1) ? ($o{'log-level'} // 'info') : 'none',
@@ -346,6 +348,12 @@ sub options {
     for (qw(temperature top_p top_k min_p seed repeat_penalty presence_penalty repeat_last_n)) { $c{$_} = $p->{$_} if defined $p->{$_} }
     $c{stop} = ref $p->{stop} ? $p->{stop} : [ $p->{stop} ] if defined $p->{stop};
     my $budget = $p->{max_thinking_tokens} // $p->{thinking_budget_tokens};
+    # with no budget of its own, reasoning_effort gives one: low, medium, high (none and minimal turned thinking off above)
+    if (!defined $budget && defined $p->{reasoning_effort} && ($vars{enable_thinking} // 1)) {
+        my $e = $p->{reasoning_effort};
+        $budget = $e eq 'low' ? $o{'thinking-low'} : $e eq 'medium' ? $o{'thinking-medium'} : $o{'thinking-high'};
+        $budget = undef unless $budget > 0;
+    }
     $c{max_thinking_tokens} = $budget if defined $budget && $budget >= 0;
     return \%c;
 }
@@ -422,10 +430,11 @@ sub log_fields { my ($q) = @_; return map { ($_ => $q->{$_}) } qw(user ip conv r
 
 # a line when a chat request begins
 sub start_line {
-    my ($q, $p) = @_;
+    my ($q, $p, $opts) = @_;
     $LOG->info('request', log_fields($q), event => 'start',
-               msg => sprintf('stream=%d max_tokens=%s', $p->{stream} ? 1 : 0,
-                              $p->{max_completion_tokens} // $p->{max_tokens} // 'default'));
+               msg => sprintf('stream=%d max_tokens=%s reasoning_effort=%s thinking_budget=%s', $p->{stream} ? 1 : 0,
+                              $p->{max_completion_tokens} // $p->{max_tokens} // 'default',
+                              $p->{reasoning_effort} // '-', $opts->{max_thinking_tokens} // '-'));
 }
 
 # a line when a chat request is done: its prompt (reused from the cache / prefilled now), pp/s (the prefill's rate),
@@ -492,8 +501,8 @@ route::post '/v1/chat/completions' => sub {
     my ($m, $name) = @$r{qw(m id)};
     my $q = request_ctx($req, $r);
     my $id = $q->{req};
-    start_line($q, $p);
     my ($messages, $opts) = (messages($p->{messages}), options($p, $r));
+    start_line($q, $p, $opts);
     my ($prompt_tokens, $completion_tokens, $prefill) = (undef, 0, undef);
     # the prompt's length is the sequence length when the first token comes; every token emitted counts
     # the reasoning's tokens and its close (the reply's own thinking section, when it has one), for tg/s by part
@@ -876,6 +885,12 @@ Thinking on or off when a request does not say (default: the chat template's def
 The log on STDERR, one line per event: a request's start and done (prompt tokens, reused from the cache and prefilled,
 the reply, the times), the prefill's progress, model loads and unloads, the access line of each request. Off with
 C<--nolog> (the same as C<--log-level none>).
+
+=item --thinking-low N, --thinking-medium N, --thinking-high N
+
+The thinking budget (tokens of reasoning, then the answer) for a request's C<reasoning_effort> low, medium and high,
+when the request gives no budget of its own. 0 is no limit; the defaults are 2048, 8192 and no limit. C<none> and
+C<minimal> turn thinking off, as before.
 
 =item --log-level error|warn|info|debug|none
 
