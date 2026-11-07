@@ -124,6 +124,32 @@ int main() {
         sampler_free(s);
     }
     {
+        sampler_params p = plain();
+        p.temperature = 0.0f;
+        p.presence_penalty = 1.5f;
+        const std::vector<float> l2 = {3.0f, 2.0f, -1.0f};
+        sampler_t* s = sampler_create(&p);
+        const int t0 = sampler_sample(s, l2.data(), 3);
+        sampler_accept(s, 0);  // 3 - 1.5 = 1.5 < 2: token 1 wins
+        const int t1 = sampler_sample(s, l2.data(), 3);
+        sampler_accept(s, 1);  // both in the window: 3 - 1.5 = 1.5 still beats 2 - 1.5 = 0.5
+        const int t2 = sampler_sample(s, l2.data(), 3);
+        sampler_free(s);
+        check(t0 == 0 && t1 == 1 && t2 == 0, "presence penalty subtracts from each token in the window");
+    }
+    {
+        sampler_params p = plain();
+        p.temperature = 0.0f;
+        p.presence_penalty = 1.5f;
+        p.repeat_last_n = 1;
+        const std::vector<float> l2 = {3.0f, 2.0f, -1.0f};
+        sampler_t* s = sampler_create(&p);
+        sampler_accept(s, 0);
+        sampler_accept(s, 2);  // window of 1: token 0 is out of it again
+        check(sampler_sample(s, l2.data(), 3) == 0, "presence penalty only looks back repeat_last_n tokens");
+        sampler_free(s);
+    }
+    {
         std::vector<float> big(248320);
         std::mt19937 g(1);
         std::normal_distribution<float> nd(0.0f, 3.0f);

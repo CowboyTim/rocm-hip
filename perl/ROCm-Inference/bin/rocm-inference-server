@@ -340,7 +340,7 @@ sub options {
     $want = $r->{ctx} if !defined $want || $want < 1;
     $want = $o{max_tokens} if $o{max_tokens} > 0 && $want > $o{max_tokens};
     my %c = (vars => \%vars, max_new_tokens => $want);
-    for (qw(temperature top_p top_k min_p seed repeat_penalty)) { $c{$_} = $p->{$_} if defined $p->{$_} }
+    for (qw(temperature top_p top_k min_p seed repeat_penalty presence_penalty repeat_last_n)) { $c{$_} = $p->{$_} if defined $p->{$_} }
     $c{stop} = ref $p->{stop} ? $p->{stop} : [ $p->{stop} ] if defined $p->{stop};
     my $budget = $p->{max_thinking_tokens} // $p->{thinking_budget_tokens};
     $c{max_thinking_tokens} = $budget if defined $budget && $budget >= 0;
@@ -798,7 +798,7 @@ C<messages> (text content; tool calls and tool results), C<tools>, C<tool_choice
 C<max_tokens> / C<max_completion_tokens>, C<temperature>, C<top_p>, C<seed>, C<stop>, C<stream> and
 C<stream_options.include_usage>. A reply's reasoning comes as C<reasoning_content> (in C<message> or in the
 streamed C<delta>s), its tool calls as C<tool_calls> (with arguments as a JSON string) and C<finish_reason>
-C<tool_calls>. Beyond OpenAI's: C<top_k>, C<min_p>, C<repeat_penalty>, C<chat_template_kwargs> (template
+C<tool_calls>. Beyond OpenAI's: C<top_k>, C<min_p>, C<repeat_penalty>, C<presence_penalty>, C<repeat_last_n>, C<chat_template_kwargs> (template
 variables, e.g. C<{"enable_thinking": false}>), C<reasoning_effort> (C<none> / C<minimal> turn thinking off),
 C<max_thinking_tokens> (or C<thinking_budget_tokens>): close the reasoning after that many tokens.
 

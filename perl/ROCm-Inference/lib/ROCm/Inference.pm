@@ -630,7 +630,7 @@ Special tokens written in the text (e.g. C<< <|im_start|> >>) become their ids.
 
 Continues the current sequence with the prompt tokens and generates. Returns C<(\@ids, $stop_reason)>.
 Options: C<max_new_tokens> (256), C<temperature> (0.8; 0 = greedy), C<top_k>, C<top_p>, C<min_p>,
-C<repeat_penalty>, C<repeat_last_n>, C<seed>, C<stop> (array ref of strings), C<ignore_eog>,
+C<repeat_penalty>, C<presence_penalty> (subtracted from the logits of the last C<repeat_last_n> tokens), C<repeat_last_n>, C<seed>, C<stop> (array ref of strings), C<ignore_eog>,
 C<reuse_prefix> (the prompt is the whole sequence; the shared prefix is reused), C<checkpoint_tail>, and
 C<on_token> (called with the token id and the text that is ready; return true to stop).
 

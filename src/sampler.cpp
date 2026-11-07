@@ -35,13 +35,14 @@ struct sampler {
 
     // Logit of token i after the repetition penalty
     float val(const float* logits, int i) const {
-        const float l = logits[i];
+        float l = logits[i];
         if (!pen || !marked[i]) return l;
-        return l > 0.0f ? l / prm.repeat_penalty : l * prm.repeat_penalty;
+        if (prm.repeat_penalty != 1.0f) l = l > 0.0f ? l / prm.repeat_penalty : l * prm.repeat_penalty;
+        return l - prm.presence_penalty;
     }
 
     int sample(const float* logits, int n) {
-        pen = prm.repeat_penalty != 1.0f && !history.empty();
+        pen = (prm.repeat_penalty != 1.0f || prm.presence_penalty != 0.0f) && !history.empty();
         if (pen) {
             marked.resize(n, 0);
             for (int t : history)
@@ -186,6 +187,7 @@ sampler_params sampler_default_params(void) {
     p.repeat_penalty = 1.0f;
     p.repeat_last_n = 64;
     p.seed = 0;
+    p.presence_penalty = 0.0f;
     return p;
 }
 

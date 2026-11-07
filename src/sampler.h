@@ -22,6 +22,8 @@ typedef struct sampler_params {
     float repeat_penalty;  // divide positive logits / multiply negative ones of recent tokens; 1: off
     int repeat_last_n;     // how many accepted tokens the penalty looks back over
     uint64_t seed;         // RNG seed; the same seed and inputs give the same tokens
+    float presence_penalty; // subtract from the logit of each token in the penalty window (the last repeat_last_n
+                           // accepted tokens), after repeat_penalty; 0: off (OpenAI's presence_penalty, over that window)
 } sampler_params;
 
 typedef struct sampler sampler_t;

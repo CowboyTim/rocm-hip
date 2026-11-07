@@ -94,7 +94,7 @@ static SV* opt(pTHX_ HV* h, const char* key) {
 }
 
 /* generate / stream_begin options (all optional): max_new_tokens, temperature, top_k, top_p, min_p,
- * repeat_penalty, repeat_last_n, seed, stop => [strings], ignore_eog, reuse_prefix, checkpoint_tail. Returns the
+ * repeat_penalty, presence_penalty, repeat_last_n, seed, stop => [strings], ignore_eog, reuse_prefix, checkpoint_tail. Returns the
  * stop strings' array (Safefree it after the call that uses g), NULL when none. */
 static const char** gen_options(pTHX_ HV* o, inference_gen_options* g, const char* who) {
     *g = inference_gen_default_options();
@@ -105,6 +105,7 @@ static const char** gen_options(pTHX_ HV* o, inference_gen_options* g, const cha
     if ((v = opt(aTHX_ o, "top_p"))) g->sampler.top_p = (float)SvNV(v);
     if ((v = opt(aTHX_ o, "min_p"))) g->sampler.min_p = (float)SvNV(v);
     if ((v = opt(aTHX_ o, "repeat_penalty"))) g->sampler.repeat_penalty = (float)SvNV(v);
+    if ((v = opt(aTHX_ o, "presence_penalty"))) g->sampler.presence_penalty = (float)SvNV(v);
     if ((v = opt(aTHX_ o, "repeat_last_n"))) g->sampler.repeat_last_n = (int)SvIV(v);
     if ((v = opt(aTHX_ o, "seed"))) g->sampler.seed = (uint64_t)SvUV(v);
     if ((v = opt(aTHX_ o, "ignore_eog"))) g->ignore_eog = SvTRUE(v) ? 1 : 0;
@@ -448,7 +449,7 @@ generate(h, prompt_ref, opts_ref = NULL)
     SV* opts_ref
   PPCODE:
     /* Returns (\@token_ids, $stop_reason). Options (all optional): max_new_tokens, temperature, top_k, top_p,
-     * min_p, repeat_penalty, repeat_last_n, seed, stop => [strings], ignore_eog, reuse_prefix, checkpoint_tail,
+     * min_p, repeat_penalty, presence_penalty, repeat_last_n, seed, stop => [strings], ignore_eog, reuse_prefix, checkpoint_tail,
      * on_token => sub { my ($token, $text) = @_; return $stop } */
     inference_model_t* m = handle_ptr(aTHX_ h, 0);
     HV* o = NULL;
