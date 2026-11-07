@@ -6,6 +6,7 @@ use strict;
 use warnings;
 
 use Getopt::Long qw(GetOptions);
+use List::Util qw(max);
 use File::Basename qw(basename);
 use B ();
 use JSON::PP ();
@@ -14,14 +15,16 @@ use Pod::Usage qw(pod2usage);
 use Time::HiRes ();
 use ROCm::Inference qw(:all);
 use ROCm::Inference::Log;
+use ROCm::Inference::Store qw(store_evict store_usage);
 use Web::Route;
 
 my %o = (listen => './rocm-inference.sock', max_tokens => 0, 'models-margin' => 4, 'kv-budget' => 16,
-         'thinking-low' => 2048, 'thinking-medium' => 8192, 'thinking-high' => 0);  # thinking budgets by reasoning_effort (0: none)
+         'thinking-low' => 2048, 'thinking-medium' => 8192, 'thinking-high' => 0, 'store-max' => 16);  # thinking budgets by reasoning_effort (0: none)
 GetOptions(\%o, 'model=s', 'models-dir=s', 'models-max=i', 'models-margin=f', 'kv-budget=f', 'listen=s', 'mode=s', 'ctx=i',
            'name=s', 'draft=s', 'store=s', 'max_tokens=i', 'swa-ring=i', 'stage=s', 'recache', 'kv-type=s',
            'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'log!', 'log-level=s', 'log-format=s', 'log-color=s',
-           'thinking-low=i', 'thinking-medium=i', 'thinking-high=i', 'help')
+           'thinking-low=i', 'thinking-medium=i', 'thinking-high=i',
+           'store-max=f', 'help')
     or pod2usage(2);
 # The log: --nolog is level none; --log-level, --log-format, --log-color are checked by the formatter
 our $LOG = eval { ROCm::Inference::Log->new(level => ($o{log} // 1) ? ($o{'log-level'} // 'info') : 'none',
@@ -197,6 +200,9 @@ sub load {
         die "--store needs every layer's KV history: --swa-ring 0 (the default with --store)\n"
             if $o{store} && swa_ring($m);
         store_open($m, $o{store}) if $o{store};
+        my ($bytes, $files) = store_usage($o{store});
+        $LOG->info('store', model => $r->{id}, event => 'open', msg => sprintf('KV store %s: %d files, %.2f GB, %d tokens a block',
+                   $o{store}, $files, $bytes / 2**30, store_stats($m)->{block_tokens}));
     }
     # --parallel N: N sequences (conversations at once), each a KV cache of the context; sequence 0 and N - 1 more
     $r->{pool} = [ map { { seq => $_, job => undef, prompt => [] } } 0, $emb ? () : map { seq_new($m) } 2 .. $parallel ];
@@ -422,8 +428,11 @@ route::post '/v1/embeddings' => sub {
 sub request_ctx {
     my ($req, $r) = @_;
     my %h = %{ $req->{headers} // {} };
-    return { req => sprintf('chatcmpl-%x%06x', time, int rand 2**24), ip => $req->{remote}, user => $h{'x-remote-user'},
-             conv => $h{'x-llamacpp-id-slot'}, model => $r->{id}, t0 => Time::HiRes::time() };
+    # the store's counters when the request starts: its own mapped and published blocks are the difference at the end
+    my $q = { req => sprintf('chatcmpl-%x%06x', time, int rand 2**24), ip => $req->{remote}, user => $h{'x-remote-user'},
+              conv => $h{'x-llamacpp-id-slot'}, model => $r->{id}, t0 => Time::HiRes::time(), m => $r->{m} };
+    $q->{st0} = store_stats($r->{m}) if $o{store} && $r->{m};
+    return $q;
 }
 
 sub log_fields { my ($q) = @_; return map { ($_ => $q->{$_}) } qw(user ip conv req model) }
@@ -459,6 +468,36 @@ sub done_line {
                msg => sprintf('%s: prompt %d tok (reused %s, prefilled %s), pp %s tok/s; %d tok out in %.2f s, tg %s tok/s%s; first token %s ms%s',
                               $finish, $usage->{prompt_tokens}, $reused, $prefilled, $pp, $out, $secs, $tg, $split,
                               defined $q->{ttft} ? sprintf('%.0f', $q->{ttft}) : '-', $queued));
+    store_report($q);
+    store_trim();
+}
+
+# What the request's KV cache took from the store: the blocks mapped in (the prompt's first ones, read in place, no
+# copy), the blocks it wrote, and the store's size. Blocks already in its sequence are not mapped again.
+sub store_report {
+    my ($q) = @_;
+    return unless $o{store} && $q->{st0} && $q->{m};
+    my $st = eval { store_stats($q->{m}) } or return;
+    my ($bb, $tb) = @$st{qw(block_bytes block_tokens)};
+    my %d = map { $_ => $st->{$_} - $q->{st0}{$_} } qw(blocks_attached blocks_published tokens_from_store);
+    my $tok = max(0, $d{tokens_from_store}) - max(0, $d{tokens_from_store}) % $tb;
+    my ($bytes, $files) = eval { store_usage($o{store}) };
+    $LOG->info('store', log_fields($q), event => 'kv',
+               msg => sprintf('mapped %d blocks (tok 0-%d, %.1f MB) from %s, published %d (%.1f MB); store %d files, %.2f GB of %.0f GB',
+                              $d{blocks_attached}, $tok, $d{blocks_attached} * $bb / 2**20, $o{store}, $d{blocks_published},
+                              $d{blocks_published} * $bb / 2**20, $files // 0, ($bytes // 0) / 2**30, $o{'store-max'}));
+}
+
+# The KV store is trimmed to --store-max GB after each request: the least recently used files go first (a block in
+# use was touched by its last request, so it goes last). A file a sequence maps stays readable until it is unmapped.
+sub store_trim {
+    return unless $o{store} && $o{'store-max'} > 0;
+    my @gone = eval { store_evict($o{store}, max_bytes => $o{'store-max'} * 2**30) };
+    if ($@) { $LOG->warn_(event => 'store', msg => "trim failed: " . ($@ =~ s/\s+\z//r)); return }
+    return unless @gone;
+    my $now = eval { store_usage($o{store}) } // 0;
+    $LOG->info('store', event => 'evict', msg => sprintf('evicted %d files; store now %.2f GB of %.1f GB',
+                                                     scalar @gone, $now / 2**30, $o{'store-max'}));
 }
 
 # The engine's events for a model (set_event_handler at load): the request in progress on it ($r->{cur}) labels them
@@ -869,6 +908,11 @@ An MTP draft head for speculative decoding (Qwen3.8-Flash-Next).
 =item --store F<dir>
 
 A KV block store (e.g. under F</dev/shm>): prompt prefixes are reused across conversations and restarts.
+
+=item --store-max GB
+
+The most the store may hold (default 16 GB): after each request the least recently used blocks are deleted to stay under
+it. Deleting a block a sequence maps is safe; a block that is needed again is prefilled again.
 
 =item --max_tokens N
 
