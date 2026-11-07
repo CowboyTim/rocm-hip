@@ -24,7 +24,7 @@ GetOptions(\%o, 'model=s', 'models-dir=s', 'models-max=i', 'models-margin=f', 'k
            'name=s', 'draft=s', 'store=s', 'max_tokens=i', 'swa-ring=i', 'stage=s', 'recache', 'kv-type=s',
            'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'log!', 'log-level=s', 'log-format=s', 'log-color=s',
            'thinking-low=i', 'thinking-medium=i', 'thinking-high=i',
-           'store-max=f', 'help')
+           'store-max=f', 'debug-stream!', 'help')
     or pod2usage(2);
 # The log: --nolog is level none; --log-level, --log-format, --log-color are checked by the formatter
 our $LOG = eval { ROCm::Inference::Log->new(level => ($o{log} // 1) ? ($o{'log-level'} // 'info') : 'none',
@@ -369,7 +369,7 @@ sub options {
 # (<function=NAME> <parameter=KEY>VALUE</parameter>), so the pieces are the arguments of the final message. A second call
 # in the reply is not streamed: the server sends it whole at the end (tool_stream_end's caller).
 sub tool_stream_new {
-    return { buf => '', pos => 0, name => undef, n => 0, first_end => 0, cut => -1,
+    return { buf => '', pos => 0, name => undef, n => 0, bytes => 0, first_end => 0, cut => -1,
              id => sprintf('call_%08x%08x', int rand 2**32, int rand 2**32) };
 }
 
@@ -393,7 +393,9 @@ sub tool_stream_feed {
     while ($rest =~ /<parameter=([^>\n]+)>\n?(.*?)\n?<\/parameter>/sg) {
         my ($k, $v) = ($1, $2);
         $end = pos($rest);
-        push @d, { index => 0, function => { arguments => ($st->{n}++ ? ',' : '') . $J->encode($k) . ':' . $J->encode($v) } };
+        my $frag = ($st->{n}++ ? ',' : '') . $J->encode($k) . ':' . $J->encode($v);
+        $st->{bytes} += length $frag;
+        push @d, { index => 0, function => { arguments => $frag } };
     }
     $st->{pos} += $end;
     return @d;
@@ -619,7 +621,9 @@ route::post '/v1/chat/completions' => sub {
                 my $rate = sub { my ($n, $t) = @_; $n > 0 && $t > 0 ? sprintf('%.1f', $n / $t) : '-' };
                 my $msg;
                 if (($q->{kind} // '') eq 'tool_call') {
-                    $msg = sprintf('tool call, %d tok in the reply, %s tg/s', $completion_tokens,
+                    my $ts = $q->{ts} // {};
+                    $msg = sprintf('tool call %s: %d params done, %d B of arguments, %d tok in the reply, %s tg/s',
+                                   $ts->{name} // '?', $ts->{n} // 0, $ts->{bytes} // 0, $completion_tokens,
                                    $rate->($completion_tokens, $now - $q->{first_at}));
                 } elsif (defined $q->{think_end}) {
                     my $ans = $completion_tokens - ($q->{think_tok} // 0);
@@ -682,9 +686,14 @@ route::post '/v1/chat/completions' => sub {
                 my ($text, $kind) = @_;
                 $q->{kind} = $kind;
                 if ($kind eq 'tool_call') {  # the call as it is written: its name, then its arguments a parameter at a time
-                    for my $d (tool_stream_feed($ts, $text)) { $gone = 1 unless $chunk->({ tool_calls => [ $d ] }, undef) }
+                    $q->{ts} = $ts;
+                    for my $d (tool_stream_feed($ts, $text)) {
+                        $LOG->info('stream', log_fields($q), event => 'tool', msg => $J->encode($d)) if $o{'debug-stream'};
+                        $gone = 1 unless $chunk->({ tool_calls => [ $d ] }, undef);
+                    }
                     return $gone;
                 }
+                $LOG->info('stream', log_fields($q), event => $kind, msg => $J->encode($text)) if $o{'debug-stream'};
                 $gone = 1 unless $chunk->({ ($kind eq 'reasoning' ? 'reasoning_content' : 'content') => $text }, undef);
                 return $gone;
             } });
@@ -1037,6 +1046,11 @@ C<--nolog> (the same as C<--log-level none>).
 The thinking budget (tokens of reasoning, then the answer) for a request's C<reasoning_effort> low, medium and high,
 when the request gives no budget of its own. 0 is no limit; the defaults are 2048, 8192 and no limit. C<none> and
 C<minimal> turn thinking off, as before.
+
+=item --[no]debug-stream
+
+Logs every delta the server sends a client (its text as JSON, and each tool call piece) at the info level, so the
+stream can be checked. Sequential requests only (the parallel path is not covered yet).
 
 =item --log-level error|warn|info|debug|none
 
