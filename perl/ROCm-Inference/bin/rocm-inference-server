@@ -470,6 +470,12 @@ sub request_ctx {
     my $q = { req => sprintf('chatcmpl-%x%06x', time, int rand 2**24), ip => $req->{remote}, user => $h{'x-remote-user'},
               conv => $h{'x-llamacpp-id-slot'}, model => $r->{id}, t0 => Time::HiRes::time(), m => $r->{m} };
     $q->{st0} = store_stats($r->{m}) if $o{store} && $r->{m};
+    # when the server read the request (Web::Route: after the requests before it, so a busy server shows here), and how
+    # long it waited before that: now less the time nginx sent it (X-Request-Start: nginx's $msec, when the route sets it)
+    $q->{accepted} = $req->{accepted};
+    if (my ($sent) = ($h{'x-request-start'} // '') =~ /(\d+(?:\.\d+)?)\s*\z/) {
+        $q->{wait_ms} = 1000 * ($req->{accepted} - $sent) if $req->{accepted};
+    }
     return $q;
 }
 
@@ -479,9 +485,10 @@ sub log_fields { my ($q) = @_; return map { ($_ => $q->{$_}) } qw(user ip conv r
 sub start_line {
     my ($q, $p, $opts) = @_;
     $LOG->info('request', log_fields($q), event => 'start',
-               msg => sprintf('stream=%d max_tokens=%s reasoning_effort=%s thinking_budget=%s', $p->{stream} ? 1 : 0,
+               msg => sprintf('stream=%d max_tokens=%s reasoning_effort=%s thinking_budget=%s waited %s ms', $p->{stream} ? 1 : 0,
                               $p->{max_completion_tokens} // $p->{max_tokens} // 'default',
-                              $p->{reasoning_effort} // '-', $opts->{max_thinking_tokens} // '-'));
+                              $p->{reasoning_effort} // '-', $opts->{max_thinking_tokens} // '-',
+                              defined $q->{wait_ms} ? sprintf('%.0f', $q->{wait_ms}) : '-'));
 }
 
 # a line when a chat request is done: its prompt (reused from the cache / prefilled now), pp/s (the prefill's rate),

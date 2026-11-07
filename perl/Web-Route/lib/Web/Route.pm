@@ -312,6 +312,7 @@ sub run {
                 my $c = $srv->accept or next;  # (a signal ends the wait)
                 my $t0 = Time::HiRes::time();
                 my ($req, $status, $msg) = _read_request($c, \%o);
+                $req->{accepted} = $t0 if $req;  # when the loop read it: after the requests before it, so it shows a busy server
                 my $res = $req ? dispatch($req) : $status ? json({ error => $msg }, $status) : undef;
                 if ($res && ref $res->[2] eq 'Web::Route::Pull') {
                     if (_respond($c, $req, $res) && $req->{method} ne 'HEAD') {
