@@ -1,6 +1,8 @@
 Revision history for ROCm-Inference
 
 0.01  unreleased
+    - rocm-inference-server: a DONE line when a chat request ends: prompt tokens, how many were reused from the
+      cache and how many prefilled, completion tokens, finish reason, time (not for --parallel N yet).
     - rocm-inference-server: a START line on STDERR when a chat request begins (client address, model, stream,
       max_tokens), so a long request shows while it runs; the access line still comes at its end.
     - model_info: what a GGUF is from its header (kind chat / embedding / draft / unsupported, architecture,
