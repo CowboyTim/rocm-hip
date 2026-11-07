@@ -16,7 +16,7 @@ BEGIN {  # at compile time: the constants below call into the XS
 
 # The C library (libinference.so) mapped one function per C call; plus the plain-Perl chat helpers below
 our @EXPORT_OK = qw(
-    model_info load_model free_model kv_cache_init set_lm_head_q8 set_draft_model set_draft_tokens set_prefill_batch
+    model_info load_model free_model kv_cache_init set_lm_head_q8 set_draft_model set_draft_tokens set_prefill_batch set_event_handler
     set_swa_ring swa_ring stage_info set_kv_type
     seq_new seq_select seq_current seq_free stream_begin chat_start step_streams step_chats
     embedding_dim embed

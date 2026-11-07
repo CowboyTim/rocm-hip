@@ -216,6 +216,13 @@ less well and 2 is best; the adaptive default is within ~1% of the best fixed co
   the longest stored prefix in place (copy on write before writing into shared blocks) and resumes from its
   deepest snapshot; any process sharing the directory benefits. Eviction is deleting files (policy in
   `ROCm::Inference::Store`).
+- **Events** (`inference_set_event_cb`, per model): prefill begin / progress / end, checkpoint, KV-store attach
+  and publish, draft verify passes, context full. A struct per event (type, sequence, two counts, milliseconds),
+  delivered synchronously on the caller's thread; the callback does no I/O. Without a callback, one null check per
+  fire site. With one, the prefill steps are the engine's micro-batches (`qwen_model_max_batch` rows): splitting
+  there changes no output, but splitting elsewhere does on the WMMA path (the GEMMs group rows differently; exact
+  with `QMATVEC_NO_WMMA=1`), so the hook never splits on its own. The Perl side (`ROCm::Inference`'s
+  `set_event_handler`, `ROCm::Inference::Log`) turns events into the server's log lines.
 - **Shared library**: `libinference.so.1` contains the whole engine with the code objects embedded; it exports
   only `inference_*`, `tokenizer_*`, `sampler_*`. `make install PREFIX=…` installs it with headers and a
   `rocm-inference.pc`.

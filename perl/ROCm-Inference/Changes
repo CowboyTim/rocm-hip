@@ -1,6 +1,11 @@
 Revision history for ROCm-Inference
 
 0.01  unreleased
+    - the engine's events to Perl: set_event_handler($model, sub { my ($name, $info) = @_ }), per model; a die in
+      the handler is a warning. ROCm::Inference::Log: the server's log lines (text or JSON, colours, progress at
+      most every 10% or 2 s). rocm-inference-server: --log-level, --log-format, --log-color; START, DONE (prompt
+      reused and prefilled, times, queue wait, first token), prefill progress, loads, and the access line through the
+      same formatter. Who: X-Remote-User, X-Real-IP, X-LLamaCPP-Id-slot.
     - presence_penalty (OpenAI's, over the last repeat_last_n tokens; 0 = off) in the sampler, the XS options and the
       server's chat requests, next to repeat_penalty (which was accepted but not presence). Before, a request's
       presence_penalty was ignored.

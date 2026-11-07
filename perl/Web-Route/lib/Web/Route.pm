@@ -287,10 +287,13 @@ sub run {
     local $SIG{INT} = local $SIG{TERM} = sub { $stop = 1 };
     $o{on_start}->($srv) if $o{on_start};
     my @live;  # open pull responses: { c, req, pull, out, done, t0, status }
-    my $log = sub {
+    my $log = sub {  # log: true = a line on STDERR; a code ref is called with (request, status, ms) instead
         my ($req, $status, $t0) = @_;
+        return unless $o{log};
+        my $ms = 1000 * (Time::HiRes::time() - $t0);
+        return $o{log}->($req, $status, $ms) if ref $o{log} eq 'CODE';
         printf STDERR "%s %s %s %d %.0f ms\n", scalar localtime, $req ? ($req->{method}, $req->{path}) : ('-', '-'),
-            $status, 1000 * (Time::HiRes::time() - $t0) if $o{log};
+            $status, $ms;
     };
     my $close = sub {  # gone: the client left before the end
         my ($l, $gone) = @_;

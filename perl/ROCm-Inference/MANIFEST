@@ -7,9 +7,12 @@ Makefile.PL
 README
 bin/rocm-inference-server
 lib/ROCm/Inference.pm
+lib/ROCm/Inference/Log.pm
 lib/ROCm/Inference/Store.pm
 t/00-load.t
+t/05-log.t
 t/10-generate.t
+t/15-events.t
 t/15-template.t
 t/16-reply.t
 t/20-chat.t

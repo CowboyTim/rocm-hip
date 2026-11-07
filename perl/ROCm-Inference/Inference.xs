@@ -128,6 +128,59 @@ static const char** gen_options(pTHX_ HV* o, inference_gen_options* g, const cha
     return stops;
 }
 
+/* Engine events (inference_set_event_cb, WORKLOG logging Phase 2): the sub gets (event name, { seq, n0, n1, ms }).
+ * A die in the sub is a warning, and generation goes on (unlike on_token, where a true return stops). One handler
+ * per model, kept in g_events until it is replaced or the model is freed. */
+static const char* const EVENT_NAMES[] = {"unknown", "prefill_begin", "prefill_progress", "prefill_end",
+                                          "checkpoint", "store", "draft", "context_full"};
+static HV* g_events = NULL;  /* "%p" of the model => IV of its struct event_ctx */
+
+struct event_ctx {
+#ifdef PERL_IMPLICIT_CONTEXT
+    PerlInterpreter* perl;
+#endif
+    SV* code;
+};
+
+static int on_event_cb(void* user, const inference_event* ev) {
+    struct event_ctx* c = (struct event_ctx*)user;
+#ifdef PERL_IMPLICIT_CONTEXT
+    dTHXa(c->perl);
+#endif
+    dSP;
+    const int t = ev->type >= 1 && ev->type <= 7 ? ev->type : 0;
+    HV* info = newHV();
+    (void)hv_stores(info, "seq", newSViv(ev->seq));
+    (void)hv_stores(info, "n0", newSViv(ev->n0));
+    (void)hv_stores(info, "n1", newSViv(ev->n1));
+    (void)hv_stores(info, "ms", newSVnv(ev->ms));
+    ENTER;
+    SAVETMPS;
+    PUSHMARK(SP);
+    XPUSHs(sv_2mortal(newSVpv(EVENT_NAMES[t], 0)));
+    XPUSHs(sv_2mortal(newRV_noinc((SV*)info)));
+    PUTBACK;
+    call_sv(c->code, G_DISCARD | G_EVAL);
+    if (SvTRUE(ERRSV)) Perl_warn(aTHX_ "ROCm::Inference: event handler died: %s", SvPV_nolen(ERRSV));
+    FREETMPS;
+    LEAVE;
+    return 0;
+}
+
+/* Drops a model's event handler (before the model is freed) */
+static void drop_event_handler(pTHX_ inference_model_t* m) {
+    char key[32];
+    if (!g_events) return;
+    snprintf(key, sizeof key, "%p", (void*)m);
+    SV** old = hv_fetch(g_events, key, (I32)strlen(key), 0);
+    if (!old) return;
+    struct event_ctx* c = INT2PTR(struct event_ctx*, SvIV(*old));
+    inference_set_event_cb(m, NULL, NULL);
+    SvREFCNT_dec(c->code);
+    Safefree(c);
+    hv_delete(g_events, key, (I32)strlen(key), G_DISCARD);
+}
+
 MODULE = ROCm::Inference    PACKAGE = ROCm::Inference
 
 PROTOTYPES: DISABLE
@@ -184,8 +237,32 @@ free_model(h)
   CODE:
     inference_model_t* m = handle_ptr(aTHX_ h, 1);
     if (m) {
+        drop_event_handler(aTHX_ m);
         inference_free_model(m);  /* also frees the KV cache */
         sv_setiv(SvRV(h), 0);
+    }
+
+void
+set_event_handler(h, cb = NULL)
+    SV* h
+    SV* cb
+  CODE:
+    /* The engine's events go to cb as (name, { seq, n0, n1, ms }); cb undef removes the handler */
+    inference_model_t* m = handle_ptr(aTHX_ h, 0);
+    if (!g_events) g_events = newHV();
+    drop_event_handler(aTHX_ m);
+    if (cb && SvOK(cb)) {
+        if (!SvROK(cb) || SvTYPE(SvRV(cb)) != SVt_PVCV) croak("set_event_handler: a code reference (or undef)");
+        struct event_ctx* c;
+        Newxz(c, 1, struct event_ctx);
+#ifdef PERL_IMPLICIT_CONTEXT
+        c->perl = aTHX;
+#endif
+        c->code = newSVsv(cb);
+        char key[32];
+        snprintf(key, sizeof key, "%p", (void*)m);
+        (void)hv_store(g_events, key, (I32)strlen(key), newSViv(PTR2IV(c)), 0);
+        inference_set_event_cb(m, on_event_cb, c);
     }
 
 void

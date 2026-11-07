@@ -13,13 +13,18 @@ use MIME::Base64 qw(encode_base64);
 use Pod::Usage qw(pod2usage);
 use Time::HiRes ();
 use ROCm::Inference qw(:all);
+use ROCm::Inference::Log;
 use Web::Route;
 
 my %o = (listen => './rocm-inference.sock', max_tokens => 0, 'models-margin' => 4, 'kv-budget' => 16);
 GetOptions(\%o, 'model=s', 'models-dir=s', 'models-max=i', 'models-margin=f', 'kv-budget=f', 'listen=s', 'mode=s', 'ctx=i',
            'name=s', 'draft=s', 'store=s', 'max_tokens=i', 'swa-ring=i', 'stage=s', 'recache', 'kv-type=s',
-           'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'log!', 'help')
+           'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'log!', 'log-level=s', 'log-format=s', 'log-color=s', 'help')
     or pod2usage(2);
+# The log: --nolog is level none; --log-level, --log-format, --log-color are checked by the formatter
+our $LOG = eval { ROCm::Inference::Log->new(level => ($o{log} // 1) ? ($o{'log-level'} // 'info') : 'none',
+                                              format => $o{'log-format'} // 'text', color => $o{'log-color'} // 'auto') }
+    or die "--log-level, --log-format, --log-color: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n";
 pod2usage(-verbose => 2, -exitval => 0) if $o{help};
 pod2usage("--model or --models-dir is required\n") unless $o{model} || $o{'models-dir'};
 ROCm::Inference::_require_minijinja()
@@ -127,7 +132,7 @@ sub unload {
     @$r{qw(pool queue running)} = ([], [], []);
     delete $default{ $r->{info}{kind} } if ($default{ $r->{info}{kind} } // 0) == $r && $r->{dir};
     undef $r->{m};  # (the only reference: unmapped and unpinned now)
-    print STDERR "unloaded $r->{id}\n";
+    $LOG->info('model', model => $r->{id}, event => 'unload', msg => 'unloaded');
 }
 
 # Before loading r: unload idle models (least recently used first, never --model / --embedding-model) until r fits
@@ -156,19 +161,15 @@ sub load {
     return $r if $r->{m};
     make_room($r);
     my ($ctx, $kvt) = settings($r);
-    print STDERR "loading $r->{path} ...\n";
     # --recache: drop the model file's cached pages first, so that it is read again as 2 MB pages (the GPU reads the
     # weights in place: fewer TLB misses; it pays where the page cache holds the file in 4 KB pages)
     local $ENV{GGUF_RECACHE} = $o{recache} ? 1 : $ENV{GGUF_RECACHE};
     delete $ENV{GGUF_RECACHE} unless defined $ENV{GGUF_RECACHE};
+    my $t_load = Time::HiRes::time();
     my $m = eval { load_model($r->{path}, { stage => $o{stage} }) };
     $m or die "cannot load $r->{path}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r || last_error()) . "\n";
     my $pages = stage_info($m);
-    print STDERR "stage: $pages\n" if $o{stage};
-    if ($pages =~ /(\d+) of (\d+) MB on 2 MB pages/) {
-        print STDERR "model memory: $1 of $2 MB on 2 MB pages",
-            ($1 * 2 < $2 ? " (--recache reads it again as 2 MB pages)" : ''), "\n";
-    }
+    my $mem = $pages =~ /(\d+) of (\d+) MB on 2 MB pages/ ? "$1 of $2 MB on 2 MB pages" : '';
     my $emb = $r->{info}{kind} eq 'embedding';
     # a block store needs every layer's history: no sliding-window ring unless asked for
     set_swa_ring($m, $o{'swa-ring'} // ($o{store} ? 0 : -1)) unless $emb;
@@ -178,14 +179,16 @@ sub load {
         set_kv_type($m, $kvt = 'f16');
         kv_cache_init($m, $ctx);
     }
-    print STDERR "$r->{id}: context $ctx (trained $r->{info}{n_ctx_train}), KV cache $kvt\n";
+    $LOG->info('model', model => $r->{id}, event => 'load', msg => sprintf('%s: context %d (trained %d), KV cache %s, %.1f s%s',
+        $r->{path}, $ctx, $r->{info}{n_ctx_train}, $kvt, Time::HiRes::time() - $t_load, $mem ? ", model memory $mem" : ''));
+    set_event_handler($m, sub { on_event($r, @_) });
     if (!$emb) {
         if ($r->{draft}) {
             set_draft_model($m, $r->{draft});
         } elsif ($r->{dir} && $parallel == 1) {  # a draft head of the directory that fits this model
             for my $d (@{ $dir_drafts{ $r->{info}{arch} } // [] }) {
                 next unless eval { set_draft_model($m, $d); 1 };
-                print STDERR "$r->{id}: draft head $d\n";
+                $LOG->info('model', model => $r->{id}, event => 'draft', msg => "draft head $d");
                 last;
             }
         }
@@ -227,7 +230,7 @@ sub pick {
     }
     if (!eval { load($r); 1 }) {
         my $why = $@ =~ s/\n\z//r;
-        print STDERR "load $r->{id} failed: $why\n";  # the server log keeps it, not only the client
+        $LOG->error(model => $r->{id}, event => 'load', msg => "failed: $why");  # the server log keeps it too
         error(500, $why, 'server_error');
     }
     $r->{used} = ++$stamp;
@@ -406,24 +409,67 @@ route::post '/v1/embeddings' => sub {
     { object => 'list', data => \@data, model => $r->{id}, usage => { prompt_tokens => $tokens, total_tokens => $tokens } };
 };
 
-# a line when a chat request begins (its end is the access line, when the reply is finished): client, model, stream, cap
-sub start_line {
-    my ($req, $r, $p) = @_;
-    my $t0 = Time::HiRes::time();
-    return $t0 unless $o{log} // 1;
-    printf STDERR "%s START %s model=%s stream=%d max_tokens=%s\n", scalar localtime, $req->{remote} // '-', $r->{id},
-        $p->{stream} ? 1 : 0, $p->{max_completion_tokens} // $p->{max_tokens} // 'default';
-    return $t0;
+# The request's record, carried through its lifecycle: id, client, user (nginx's X-Remote-User), conversation (the
+# X-LLamaCPP-Id-slot header of the opencode fixups), model, start time
+sub request_ctx {
+    my ($req, $r) = @_;
+    my %h = %{ $req->{headers} // {} };
+    return { req => sprintf('chatcmpl-%x%06x', time, int rand 2**24), ip => $req->{remote}, user => $h{'x-remote-user'},
+             conv => $h{'x-llamacpp-id-slot'}, model => $r->{id}, t0 => Time::HiRes::time() };
 }
 
-# a line when a chat request is done: its prompt (reused from the cache / prefilled now), its reply, the time
+sub log_fields { my ($q) = @_; return map { ($_ => $q->{$_}) } qw(user ip conv req model) }
+
+# a line when a chat request begins
+sub start_line {
+    my ($q, $p) = @_;
+    $LOG->info('request', log_fields($q), event => 'start',
+               msg => sprintf('stream=%d max_tokens=%s', $p->{stream} ? 1 : 0,
+                              $p->{max_completion_tokens} // $p->{max_tokens} // 'default'));
+}
+
+# a line when a chat request is done: its prompt (reused from the cache / prefilled now), its reply, the times
 sub done_line {
-    my ($id, $model, $t0, $usage, $prefill, $finish) = @_;
-    return unless $o{log} // 1;
+    my ($q, $usage, $prefill, $finish) = @_;
+    my $secs = Time::HiRes::time() - $q->{t0};
     my ($reused, $prefilled) = $prefill ? @$prefill : ('-', '-');
-    printf STDERR "%s DONE %s model=%s prompt=%d reused=%s prefilled=%s completion=%d finish=%s in %.2f s\n",
-        scalar localtime, $id, $model, $usage->{prompt_tokens}, $reused, $prefilled, $usage->{completion_tokens},
-        $finish, Time::HiRes::time() - $t0;
+    my $rate = $secs > 0 ? sprintf('%.1f', $usage->{completion_tokens} / $secs) : '-';
+    my $queued = defined $q->{queued_ms} ? sprintf(', queued %.0f ms', $q->{queued_ms}) : '';
+    $LOG->info('generation', log_fields($q), event => 'done',
+               msg => sprintf('%s: prompt %d tok (reused %s, prefilled %s), %d tok out in %.2f s (%s tok/s), first token %s ms%s',
+                              $finish, $usage->{prompt_tokens}, $reused, $prefilled, $usage->{completion_tokens}, $secs,
+                              $rate, defined $q->{ttft} ? sprintf('%.0f', $q->{ttft}) : '-', $queued));
+}
+
+# The engine's events for a model (set_event_handler at load): the request in progress on it ($r->{cur}) labels them
+sub on_event {
+    my ($r, $ev, $info) = @_;
+    my $q = $r->{cur} // {};
+    my %f = (model => $r->{id}, event => $ev, map { ($_ => $q->{$_}) } qw(user ip conv req));
+    my ($n0, $n1, $ms) = @$info{qw(n0 n1 ms)};
+    if ($ev eq 'prefill_progress') {
+        $LOG->progress($q->{req} // $r->{id}, $n0, $n1, %f);
+    } elsif ($ev eq 'prefill_end') {
+        my $rate = $ms > 0 ? sprintf('%.0f', 1000 * $n0 / $ms) : '-';
+        $LOG->info('prefill', %f, msg => sprintf('prefill done: %d tok in %.2f s (%s tok/s), %d store blocks', $n0, $ms / 1000, $rate, $n1));
+    } elsif ($ev eq 'prefill_begin') {
+        $LOG->debug('prefill', %f, msg => "prefill of $n0 tok");
+    } elsif ($ev eq 'draft') {
+        $LOG->debug('generation', %f, msg => sprintf('draft: %d proposed, %d accepted, pass %.1f ms', $n0, $n1, $ms));
+    } elsif ($ev eq 'context_full') {
+        $LOG->warn_(%f, msg => "context full at $n0 tokens");
+    } else {
+        $LOG->debug('store', %f, msg => "$ev: $n0, $n1");
+    }
+}
+
+# The access line of a request (Web::Route's log): the same formatter as the rest
+sub access_line {
+    my ($req, $status, $ms) = @_;
+    $req //= {};
+    my %h = %{ $req->{headers} // {} };
+    $LOG->info('request', user => $h{'x-remote-user'}, ip => $req->{remote}, event => 'access',
+               msg => sprintf('%s %s %d %.0f ms', $req->{method} // '-', $req->{path} // '-', $status, $ms));
 }
 
 route::post '/v1/chat/completions' => sub {
@@ -431,26 +477,33 @@ route::post '/v1/chat/completions' => sub {
     my $p = $req->{json};
     ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');
     my $r = pick($p, 'chat');
-    my $t0 = start_line($req, $r, $p);
     my ($m, $name) = @$r{qw(m id)};
+    my $q = request_ctx($req, $r);
+    my $id = $q->{req};
+    start_line($q, $p);
     my ($messages, $opts) = (messages($p->{messages}), options($p, $r));
-    my $id = sprintf 'chatcmpl-%x%06x', time, int rand 2**24;
     my ($prompt_tokens, $completion_tokens, $prefill) = (undef, 0, undef);
     # the prompt's length is the sequence length when the first token comes; every token emitted counts
-    $opts->{on_token} = sub { $prefill //= [ last_prompt_stats($m) ]; $prompt_tokens //= n_past($m); ++$completion_tokens if $_[0] >= 0; 0 };
+    $opts->{on_token} = sub {
+        $prefill //= [ last_prompt_stats($m) ];
+        $prompt_tokens //= n_past($m);
+        if ($_[0] >= 0) { $q->{ttft} //= 1000 * (Time::HiRes::time() - $q->{t0}); ++$completion_tokens }
+        0;
+    };
     my $usage = sub {
         $prompt_tokens //= n_past($m);
         { prompt_tokens => $prompt_tokens, completion_tokens => $completion_tokens,
           total_tokens => $prompt_tokens + $completion_tokens };
     };
 
-    return start_job($r, $id, $messages, $opts, $p) if $parallel > 1;
+    return start_job($r, $id, $messages, $opts, $p, $q) if $parallel > 1;
 
     unless ($p->{stream}) {
         local $r->{busy} = 1;
+        local $r->{cur} = $q;
         my ($content, $why, $msg) = eval { chat($m, $messages, $opts) };
         error(400, $@ =~ s/ at \S+ line \d+\.?\n?\z//r) unless $msg;
-        done_line($id, $name, $t0, $usage->(), $prefill, finish_reason($why, $msg));
+        done_line($q, $usage->(), $prefill, finish_reason($why, $msg));
         my %out = (role => 'assistant', content => $content);
         $out{reasoning_content} = $msg->{reasoning_content} if defined $msg->{reasoning_content};
         $out{tool_calls} = tool_calls($msg) if $msg->{tool_calls};
@@ -463,6 +516,7 @@ route::post '/v1/chat/completions' => sub {
     return stream(200, [ 'Content-Type' => 'text/event-stream' ], sub {
         my ($write) = @_;
         local $r->{busy} = 1;
+        local $r->{cur} = $q;
         my $chunk = sub {
             my ($delta, $finish) = @_;
             $write->(sse({ id => $id, object => 'chat.completion.chunk', created => time, model => $name,
@@ -479,7 +533,7 @@ route::post '/v1/chat/completions' => sub {
             } });
         };
         return if $gone;
-        done_line($id, $name, $t0, $usage->(), $prefill, finish_reason($why, $msg)) if $msg;
+        done_line($q, $usage->(), $prefill, finish_reason($why, $msg)) if $msg;
         unless ($msg) {
             $write->(sse({ error => { message => $@ =~ s/ at \S+ line \d+\.?\n?\z//r, type => 'server_error' } }));
             return;
@@ -502,13 +556,14 @@ route::post '/v1/chat/completions' => sub {
 
 # A job for this request; the response pulls its output
 sub start_job {
-    my ($r, $id, $messages, $opts, $p) = @_;
+    my ($r, $id, $messages, $opts, $p, $q) = @_;
     $opts = { %$opts, prefill_chunk => $o{'prefill-chunk'} // 512 };
     delete $opts->{on_token};  # (a step gives the job its tokens)
     my %vars = %{ $opts->{vars} // {} };
     my $text = eval { chat_render($r->{m}, $messages, %vars) };  # template errors are this request's (400), now
     error(400, $@ =~ s/ at \S+ line \d+\.?\n?\z//r) unless defined $text;
     my $job = { r => $r, id => $id, messages => $messages, opts => $opts, stream => $p->{stream} ? 1 : 0, out => [],
+                q => $q, queued => Time::HiRes::time(),
                 prompt => tokenize($r->{m}, $text), completion => 0,
                 usage_chunk => ref $p->{stream_options} eq 'HASH' && $p->{stream_options}{include_usage} };
     push @{ $r->{queue} }, $job;
@@ -554,6 +609,7 @@ sub common_prefix {
 # The job's reply so far as events, or (done) its response
 sub job_output {
     my ($job, $deltas) = @_;
+    $job->{q}{ttft} //= 1000 * (Time::HiRes::time() - $job->{q}{t0}) if @$deltas && $job->{q};
     if ($job->{stream}) {
         for my $d (@$deltas) {
             my ($text, $kind) = @$d;
@@ -563,6 +619,7 @@ sub job_output {
     }
     return unless $job->{finished};
     my ($content, $why, $msg) = @{ $job->{finished} };
+    done_line($job->{q}, { prompt_tokens => $job->{prompt_tokens} // 0, completion_tokens => $job->{completion} }, undef, finish_reason($why, $msg)) if $job->{q};
     my %usage = (prompt_tokens => $job->{prompt_tokens} // 0, completion_tokens => $job->{completion},
                  total_tokens => ($job->{prompt_tokens} // 0) + $job->{completion});
     if ($job->{stream}) {
@@ -607,6 +664,7 @@ sub tick {
             $slot->{prompt} = $job->{prompt};
             seq_select($m, $slot->{seq});
             $job->{chat} = eval { chat_start($m, $job->{messages}, $job->{opts}) };
+            $job->{q}{queued_ms} = 1000 * (Time::HiRes::time() - $job->{queued}) if $job->{q};
             if (!$job->{chat}) { job_error($job, $@); next }
             $job->{prompt_tokens} = $job->{chat}->prompt_tokens;
             push @{ $r->{running} }, $job;
@@ -638,14 +696,14 @@ sub tick {
 
 if ($o{'models-dir'}) {
     my @ids = sort keys %M;
-    print STDERR "serving ", scalar @ids, " models from $o{'models-dir'} on $o{listen}",
-        ($parallel > 1 ? ", $parallel conversations at once per model" : ''), ": @ids\n";
+    $LOG->info('model', event => 'serve', msg => join(' ', "serving", scalar @ids, "models from $o{'models-dir'} on $o{listen}",
+        ($parallel > 1 ? ", $parallel conversations at once per model" : ''), ": @ids"));
 } else {
     my $r = $default{chat} // $default{embedding};
-    print STDERR "serving $r->{id} on $o{listen}: context $r->{ctx} tokens (trained $r->{info}{n_ctx_train})",
-        ($parallel > 1 ? ", $parallel conversations at once" : ''), "\n";
+    $LOG->info('model', model => $r->{id}, event => 'serve', msg => "serving on $o{listen}: context $r->{ctx} tokens (trained $r->{info}{n_ctx_train})" .
+        ($parallel > 1 ? ", $parallel conversations at once" : ''));
 }
-run(listen => $o{listen}, log => $o{log} // 1, defined $o{mode} ? (mode => oct $o{mode}) : (),
+run(listen => $o{listen}, log => $LOG->enabled('info') ? \&access_line : 0, defined $o{mode} ? (mode => oct $o{mode}) : (),
     $parallel > 1 ? (tick => \&tick) : ());
 
 
@@ -787,7 +845,26 @@ Thinking on or off when a request does not say (default: the chat template's def
 
 =item --[no]log
 
-A START line on STDERR when a chat request begins (client, model, stream, max_tokens), and a line per request when it ends (on).
+The log on STDERR, one line per event: a request's start and done (prompt tokens, reused from the cache and prefilled,
+the reply, the times), the prefill's progress, model loads and unloads, the access line of each request. Off with
+C<--nolog> (the same as C<--log-level none>).
+
+=item --log-level error|warn|info|debug|none
+
+What is written: C<info> (the default) has the requests and the loads; C<debug> adds the prefill starts, the
+checkpoints and stores, the draft passes; C<warn> and C<error> only the problems.
+
+=item --log-format text|json
+
+Text: fixed columns (time, pid, level, user, client, conversation, request, model, event, message). Json: one object
+per line, the same fields.
+
+=item --log-color auto|always|never
+
+Colours by kind on a terminal (auto; off with NO_COLOR), always, or never.
+
+Who a line is for: the user (nginx's X-Remote-User), the client (X-Real-IP, or X-Forwarded-For), the conversation (the
+X-LLamaCPP-Id-slot header of the opencode fixups). See L<ROCm::Inference::Log>.
 
 =back
 
