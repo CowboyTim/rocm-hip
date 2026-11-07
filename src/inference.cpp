@@ -48,6 +48,25 @@ static void set_error(const char* fmt, ...) {
 
 static void clear_error() { g_last_error[0] = 0; }
 
+// Steady-clock milliseconds since an earlier time point (for the events' `ms` field; 0 when nothing was timed)
+static double ms_since(const std::chrono::steady_clock::time_point& t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// Fire one engine event (WORKLOG logging plan, Phase 1). Does nothing when no handler is registered (one null
+// check per fire site, the whole cost when logging is off). Fires synchronously on the caller's thread with a
+// stack event struct; the callback must not do I/O. Returns the callback's return value (0 with no handler).
+static int fire_event(inference_model* m, int type, int n0, int n1, double ms) {
+    if (!m || !m->event_cb) return 0;
+    inference_event ev;
+    ev.type = type;
+    ev.seq = m->cur_seq;
+    ev.n0 = n0;
+    ev.n1 = n1;
+    ev.ms = ms;
+    return m->event_cb(m->event_user, &ev);
+}
+
 static void seq_reset(inference_model_t* m);
 static void free_seqs(inference_model_t* m);
 
@@ -1507,6 +1526,7 @@ static int store_after_forward(inference_model_t* m) {
         set_error("sync failed: %s", qwen_model_last_error());
         return -1;
     }
+    const long long reused0 = m->st_attached;  // blocks attached since the last store event (n0 of the store event)
     for (; m->published < m->chain.size(); ++m->published) {
         const int i = (int)m->published;
         if (kv_cache_slot_shared(m->kvc, i)) continue;  // already a store block
@@ -1516,14 +1536,22 @@ static int store_after_forward(inference_model_t* m) {
         if (rc == 0) ++m->st_published;  // 1: another session published the same block already
     }
     const int B = kv_B(m), k = m->n_past / B;
-    if (m->n_past % B == 0 && snapshot_boundary(m, k) && state_bytes(m) > 0) return store_save_state(m, m->chain[k - 1]);
+    if (m->n_past % B == 0 && snapshot_boundary(m, k) && state_bytes(m) > 0) {
+        int snap = m->st_snap_saved;
+        if (store_save_state(m, m->chain[k - 1]) != 0) return -1;
+        fire_event(m, INFERENCE_EVT_STORE, (int)(m->st_attached - reused0), (int)(m->st_snap_saved - snap), 0.0);
+    }
     return 0;
 }
 
 // One forward pass for token at position n_past (the next position of the current sequence)
 static int forward_next(inference_model_t* m, int token_id) {
     if (!m || !m->kvc || !m->qwen) { set_error("Invalid state (call inference_kv_cache_init first)"); return -1; }
-    if (m->n_past >= m->n_ctx) { set_error("context full (%d tokens)", m->n_ctx); return INFERENCE_ERR_CONTEXT_FULL; }
+    if (m->n_past >= m->n_ctx) {
+        set_error("context full (%d tokens)", m->n_ctx);
+        fire_event(m, INFERENCE_EVT_CONTEXT_FULL, m->n_ctx, 0, 0.0);  // generation stops here
+        return INFERENCE_ERR_CONTEXT_FULL;
+    }
     if (ensure_writable(m, m->n_past, 1) != 0) return -1;
     if (qwen_model_forward(m->qwen, token_id, m->n_past, nullptr) != 0) { set_error("forward pass failed: %s", qwen_model_last_error()); return -1; }
     ++m->n_past;
@@ -1572,6 +1600,8 @@ static int spec_drafts_for_pass(inference_model_t* m) {
 
 // A pass of k drafts kept `accepted` of them: drafts 1 .. accepted were accepted, draft accepted + 1 (if any) not
 static void spec_observe(inference_model_t* m, int k, int accepted) {
+    // The pass's outcome is known here: n0 drafts proposed, n1 accepted, ms the verify pass's time
+    fire_event(m, INFERENCE_EVT_DRAFT, k, accepted, m->spec_pass_ms);
     for (int j = 0; j < k && j <= accepted; ++j)
         m->spec_acc[j] += SPEC_RATE * ((j < accepted ? 1.0f : 0.0f) - m->spec_acc[j]);
 }
@@ -1602,10 +1632,11 @@ static int forward_next_spec(inference_model_t* m, int token_id, SpecPass& sp) {
         set_error("forward pass failed: %s", qwen_model_last_error());
         return -1;
     }
+    const double pass_ms = ms_since(t0);  // the verify pass's time (the draft event's ms, adaptive or not)
+    m->spec_pass_ms = pass_ms;
     if (m->spec_drafts == 0) {  // adaptive: the time of a pass with n drafts
-        const float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
         float& avg = m->spec_ms[n - 1];
-        avg = avg > 0.0f ? avg + SPEC_RATE * (ms - avg) : ms;
+        avg = avg > 0.0f ? avg + SPEC_RATE * ((float)pass_ms - avg) : (float)pass_ms;
     }
     ++m->n_past;
     m->seq.push_back(token_id);
@@ -1628,6 +1659,9 @@ int inference_prefill(inference_model_t* m, const int32_t* tokens, int n) {
     // With a block store, the prefill is cut at the block boundaries that get a state snapshot
     const bool snap = m->store_dirfd >= 0 && state_bytes(m) > 0;
     const int B = kv_B(m);
+    const bool evt = m->event_cb != nullptr;  // prefill progress events (0 cost without a handler)
+    const int step = qwen_model_max_batch(m->qwen);  // the engine's prefill micro-batch, in rows
+    const auto t0 = std::chrono::steady_clock::now();
     for (int done = 0; done < n;) {
         int len = n - done;
         if (snap)
@@ -1636,6 +1670,9 @@ int inference_prefill(inference_model_t* m, const int32_t* tokens, int n) {
                     len = b - m->n_past;
                     break;
                 }
+        // With a hook, the steps are the engine's own micro-batches (qwen_model_max_batch): a split there changes no
+        // output; a split inside one does (the WMMA GEMMs group rows differently), so the hook must not split elsewhere
+        if (evt && len > step) len = step;
         if (ensure_writable(m, m->n_past, len) != 0) return -1;
         if (qwen_model_prefill(m->qwen, (const int*)tokens + done, len, m->n_past, nullptr) != 0) {
             set_error("prefill failed: %s", qwen_model_last_error());
@@ -1644,6 +1681,7 @@ int inference_prefill(inference_model_t* m, const int32_t* tokens, int n) {
         m->n_past += len;
         m->seq.insert(m->seq.end(), tokens + done, tokens + done + len);
         done += len;
+        if (evt && done < n) fire_event(m, INFERENCE_EVT_PREFILL_PROGRESS, done, n, ms_since(t0));
         if (store_after_forward(m) != 0) return -1;
     }
     return 0;
@@ -1839,6 +1877,7 @@ static int save_checkpoint(inference_model_t* m) {
     }
     if (qwen_model_state_save(m->qwen, slot) != 0) { set_error("recurrent state checkpoint failed"); return -1; }
     m->ckpts.push_back({m->n_past, slot, ++m->ckpt_clock});
+    fire_event(m, INFERENCE_EVT_CHECKPOINT, m->n_past, 0, 0.0);  // n0: checkpointed at n_past
     return 0;
 }
 
@@ -2113,6 +2152,15 @@ int inference_last_prompt_stats(const inference_model_t* m, int* reused, int* pr
     return 0;
 }
 
+// WORKLOG logging plan, Phase 1: register (cb != NULL) or clear (cb == NULL) the per-model event hook. Fires
+// synchronously on the caller's thread; the callback must not do I/O (it hands the event struct to its host).
+int inference_set_event_cb(inference_model_t* model, inference_event_cb cb, void* user) {
+    if (!model) return INFERENCE_ERR_INVALID_ARG;
+    model->event_cb = cb;
+    model->event_user = user;
+    return 0;
+}
+
 int inference_generate_stream(inference_model_t* m, const int32_t* prompt_ids, int n_prompt,
                               const inference_gen_options* options, int32_t* out_ids, int max_out, int* n_out,
                               inference_stop_reason* reason) {
@@ -2132,6 +2180,10 @@ int inference_generate_stream(inference_model_t* m, const int32_t* prompt_ids, i
         inference_model_t* m;
         ~ResetSnapshotAt() { m->store_snapshot_at = -1; }
     } reset_snapshot_at{m};
+    const bool evt = m->event_cb != nullptr;
+    const long long store0 = m->st_attached;  // store attachments during this call = the prefill_end event's n1
+    const auto tp0 = std::chrono::steady_clock::now();
+    if (evt) fire_event(m, INFERENCE_EVT_PREFILL_BEGIN, n_prompt, 0, 0.0);  // n0: prompt tokens offered
     if (o.reuse_prefix && n_prompt > 0) {
         const int rc = sync_prompt(m, prompt_ids, n_prompt, o.checkpoint_tail);
         if (rc != 0) return rc;
@@ -2144,6 +2196,8 @@ int inference_generate_stream(inference_model_t* m, const int32_t* prompt_ids, i
         set_error("nothing to continue: empty prompt and an empty sequence");
         return INFERENCE_ERR_INVALID_ARG;
     }
+    if (evt) fire_event(m, INFERENCE_EVT_PREFILL_END, m->last_prefilled, (int)(m->st_attached - store0),
+                        ms_since(tp0));  // n0: prefilled (the sync's count), n1: store hits, ms: prefill time
     std::vector<std::string> stops;
     for (int i = 0; i < o.n_stop_strings; ++i)
         if (o.stop_strings && o.stop_strings[i] && o.stop_strings[i][0]) stops.emplace_back(o.stop_strings[i]);

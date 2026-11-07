@@ -217,6 +217,7 @@ struct inference_model {
     float spec_acc[3] = {0.8f, 0.8f, 0.8f};            // adaptive: acceptance of draft j given drafts < j accepted
     float spec_ms[3] = {0.0f, 0.0f, 0.0f};             // adaptive: time of a pass with j + 1 drafts, ms (0: not yet)
     int spec_passes = 0;                               // adaptive: verify passes so far (exploration schedule)
+    double spec_pass_ms = 0.0;                         // the last verify pass's time, ms (the draft event's ms)
     void* scratch_base = nullptr;                      // temporary scratch buffer base
     size_t scratch_bytes = 0;                          // scratch buffer size in bytes
 
@@ -243,6 +244,12 @@ struct inference_model {
     std::unordered_map<std::string, std::string> chat_templates;  // inference_chat_template, by name
     int lm_head_q8 = 0;                                 // inference_set_lm_head_q8: use an int8 copy of the LM head
     uint64_t seed = 0;                                  // inference_generate sampler seed
+
+    // Engine event hook (WORKLOG logging plan, Phase 1): a per-model observer (inference_set_event_cb). Null until
+    // a host registers one (the default). Events fire synchronously on the caller's thread; the callback must do no
+    // I/O. A null callback costs one pointer check per fire site. See inference.h for the event types.
+    inference_event_cb event_cb = nullptr;
+    void* event_user = nullptr;
 
     double eps = 1e-5;                                  // normalization epsilon
     int full_attention_interval = 0;                   // informational only; use LayerWeights::kind

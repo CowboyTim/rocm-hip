@@ -296,6 +296,38 @@ int inference_embed(inference_model_t* model, const int32_t* tokens, int n, floa
 // How the last inference_generate_stream prompt was handled: tokens reused from the sequence, tokens prefilled.
 int inference_last_prompt_stats(const inference_model_t* model, int* reused, int* prefilled);
 
+// ---- Engine event hook (WORKLOG logging plan, Phase 1): a per-model observer the host registers to watch the
+// engine's prefill / store / draft activity without INFERENCE_VERBOSE's raw stderr spam. The engine calls the
+// callback synchronously, on the caller's thread, with a pointer to a small struct that is valid only for the
+// duration of the call (copy it out if you keep it). The callback must do no I/O and never block: it hands the
+// struct to its host. A null callback (the default) costs one pointer check per fire site and changes nothing
+// else. The payload is a struct (not positional args) so it can grow fields without changing the signature.
+typedef enum {
+    INFERENCE_EVT_PREFILL_BEGIN = 1,   // n0: prompt tokens offered (n1: 0)
+    INFERENCE_EVT_PREFILL_PROGRESS = 2, // chunked prefill: n0 = done so far, n1 = total, ms = chunk time
+    INFERENCE_EVT_PREFILL_END = 3,     // n0 = prefilled, n1 = store hits, ms = prefill time
+    INFERENCE_EVT_CHECKPOINT = 4,      // recurrent-state checkpoint: n0 = n_past, n1 = tail
+    INFERENCE_EVT_STORE = 5,            // KV block store: n0 = blocks reused, n1 = blocks published
+    INFERENCE_EVT_DRAFT = 6,            // speculative verify pass: n0 = drafts proposed, n1 = accepted, ms = pass time
+    INFERENCE_EVT_CONTEXT_FULL = 7,     // n0 = n_ctx (the sequence is full; generation stops)
+} inference_event_type;
+
+typedef struct inference_event {
+    int type;        // inference_event_type
+    int seq;         // the sequence index it fired on (inference_seq_current at fire time)
+    int n0;          // event-specific (see the enum above)
+    int n1;          // event-specific
+    double ms;       // elapsed milliseconds since the event's begin (0 when not measured)
+} inference_event;
+
+typedef int (*inference_event_cb)(void* user, const inference_event* ev);
+
+// Register (or, with cb == NULL, clear) a model's event handler. The handler outlives any single call: the
+// engine owns nothing about the callback's lifetime, so `user` must stay valid until the callback is cleared or
+// the model freed (the XS binding SvREFCNT_inc's a Perl code ref here). Per-model, not a global hook: the
+// server passes its model record as `user` so each model's events carry their model. 0, or < 0 on bad args.
+int inference_set_event_cb(inference_model_t* model, inference_event_cb cb, void* user);
+
 // ---- KV block store (Phase 22b): prompts shared across sessions, processes and restarts.
 // With a store open, every full KV block (inference_store_get_stats: block_tokens positions, all layers) is
 // published as a file <chain hash>.kvb in dir, and the recurrent state (hybrid models) is saved as <chain hash>.rst
