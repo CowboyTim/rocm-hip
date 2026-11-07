@@ -1,6 +1,8 @@
 Revision history for ROCm-Inference
 
 0.01  unreleased
+    - the DONE line: pp/s (the prefill's rate), tg/s over the reply, and for a reply with a thinking section the
+      thinking and answer rates; no cut-off values in the log formatter (request ids, models, IPv6 clients whole).
     - the engine's events to Perl: set_event_handler($model, sub { my ($name, $info) = @_ }), per model; a die in
       the handler is a warning. ROCm::Inference::Log: the server's log lines (text or JSON, colours, progress at
       most every 10% or 2 s). rocm-inference-server: --log-level, --log-format, --log-color; START, DONE (prompt

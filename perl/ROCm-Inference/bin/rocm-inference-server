@@ -428,17 +428,28 @@ sub start_line {
                               $p->{max_completion_tokens} // $p->{max_tokens} // 'default'));
 }
 
-# a line when a chat request is done: its prompt (reused from the cache / prefilled now), its reply, the times
+# a line when a chat request is done: its prompt (reused from the cache / prefilled now), pp/s (the prefill's rate),
+# tg/s over the whole reply and, when the reply has a thinking section, for the thinking and for the answer
 sub done_line {
     my ($q, $usage, $prefill, $finish) = @_;
-    my $secs = Time::HiRes::time() - $q->{t0};
+    my $now = Time::HiRes::time();
+    my $secs = $now - $q->{t0};
     my ($reused, $prefilled) = $prefill ? @$prefill : ('-', '-');
-    my $rate = $secs > 0 ? sprintf('%.1f', $usage->{completion_tokens} / $secs) : '-';
+    my $out = $usage->{completion_tokens};
+    my $rate = sub { my ($n, $t) = @_; $n > 1 && $t > 0 ? sprintf('%.1f', $n / $t) : '-' };
+    my $pp = $q->{prefill_ms} && $q->{prefill_n} ? sprintf('%.1f', $q->{prefill_n} / ($q->{prefill_ms} / 1000)) : '-';
+    my $tg = $q->{first_at} ? $rate->($out, $now - $q->{first_at}) : '-';
+    my $split = '';
+    if ($q->{think_end} && $q->{first_at}) {
+        my $th = $q->{think_tok} // 0;
+        $split = sprintf(' (thinking %s, answer %s tg/s)', $rate->($th, $q->{think_end} - $q->{first_at}),
+                         $rate->($out - $th, $now - $q->{think_end}));
+    }
     my $queued = defined $q->{queued_ms} ? sprintf(', queued %.0f ms', $q->{queued_ms}) : '';
     $LOG->info('generation', log_fields($q), event => 'done',
-               msg => sprintf('%s: prompt %d tok (reused %s, prefilled %s), %d tok out in %.2f s (%s tok/s), first token %s ms%s',
-                              $finish, $usage->{prompt_tokens}, $reused, $prefilled, $usage->{completion_tokens}, $secs,
-                              $rate, defined $q->{ttft} ? sprintf('%.0f', $q->{ttft}) : '-', $queued));
+               msg => sprintf('%s: prompt %d tok (reused %s, prefilled %s), pp %s tok/s; %d tok out in %.2f s, tg %s tok/s%s; first token %s ms%s',
+                              $finish, $usage->{prompt_tokens}, $reused, $prefilled, $pp, $out, $secs, $tg, $split,
+                              defined $q->{ttft} ? sprintf('%.0f', $q->{ttft}) : '-', $queued));
 }
 
 # The engine's events for a model (set_event_handler at load): the request in progress on it ($r->{cur}) labels them
@@ -447,6 +458,7 @@ sub on_event {
     my $q = $r->{cur} // {};
     my %f = (model => $r->{id}, event => $ev, map { ($_ => $q->{$_}) } qw(user ip conv req));
     my ($n0, $n1, $ms) = @$info{qw(n0 n1 ms)};
+    $q->{prefill_n} = $n0, $q->{prefill_ms} = $ms if $ev eq 'prefill_end';  # for pp/s
     if ($ev eq 'prefill_progress') {
         $LOG->progress($q->{req} // $r->{id}, $n0, $n1, %f);
     } elsif ($ev eq 'prefill_end') {
@@ -484,10 +496,22 @@ route::post '/v1/chat/completions' => sub {
     my ($messages, $opts) = (messages($p->{messages}), options($p, $r));
     my ($prompt_tokens, $completion_tokens, $prefill) = (undef, 0, undef);
     # the prompt's length is the sequence length when the first token comes; every token emitted counts
+    # the reasoning's tokens and its close (the reply's own thinking section, when it has one), for tg/s by part
+    my $close = reply_tags($m)->{reasoning}[1];
     $opts->{on_token} = sub {
         $prefill //= [ last_prompt_stats($m) ];
         $prompt_tokens //= n_past($m);
-        if ($_[0] >= 0) { $q->{ttft} //= 1000 * (Time::HiRes::time() - $q->{t0}); ++$completion_tokens }
+        if ($_[0] >= 0) {
+            my $now = Time::HiRes::time();
+            $q->{ttft} //= 1000 * ($now - $q->{t0});
+            $q->{first_at} //= $now;
+            ++$completion_tokens;
+            if (!defined $q->{think_end}) {
+                ++$q->{think_tok};
+                $q->{tail} = substr(($q->{tail} // '') . detokenize($m, [ $_[0] ]), -64);
+                $q->{think_end} = $now if index($q->{tail}, $close) >= 0;
+            }
+        }
         0;
     };
     my $usage = sub {
@@ -609,7 +633,11 @@ sub common_prefix {
 # The job's reply so far as events, or (done) its response
 sub job_output {
     my ($job, $deltas) = @_;
-    $job->{q}{ttft} //= 1000 * (Time::HiRes::time() - $job->{q}{t0}) if @$deltas && $job->{q};
+    if (@$deltas && $job->{q}) {
+        my $now = Time::HiRes::time();
+        $job->{q}{ttft} //= 1000 * ($now - $job->{q}{t0});
+        $job->{q}{first_at} //= $now;
+    }
     if ($job->{stream}) {
         for my $d (@$deltas) {
             my ($text, $kind) = @$d;

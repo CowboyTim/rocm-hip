@@ -58,15 +58,16 @@ sub emit {
     } else {
         my $msg = $f{msg} // '';
         $msg = "\e[$COLOR{$kind}m$msg\e[0m" if $self->{color} && $COLOR{$kind};
-        $line = sprintf '%s %6d %-5s %-10s %-15s %-14s %-16s %-18s %-16s %s',
-            $ts, $$, $level, _col($f{user}, 10), _col($f{ip}, 15), _col($f{conv}, 14), _col($f{req}, 16),
-            _col($f{model}, 18), _col($f{event}, 16), $msg;
+        $line = sprintf '%s %6d %-5s %-10s %-39s %-6s %-22s %-24s %-16s %s',
+            $ts, $$, $level, _col($f{user}), _col($f{ip}), _col($f{conv}), _col($f{req}),
+            _col($f{model}), _col($f{event}), $msg;
     }
     print { $self->{fh} } "$line\n";
     return 1;
 }
 
-sub _col { my ($v, $w) = @_; $v = '-' unless defined $v && length $v; $v =~ s/\s+/_/g; length $v > $w ? substr($v, 0, $w) : $v }
+# a missing field shows as -; a value is never cut (a request id or a model name is what the reader looks for)
+sub _col { my ($v) = @_; $v = '-' unless defined $v && length $v; $v =~ s/\s+/_/g; $v }
 
 sub info  { my ($self, $kind, %f) = @_; $self->emit('info', $kind, %f) }
 sub debug { my ($self, $kind, %f) = @_; $self->emit('debug', $kind, %f) }
