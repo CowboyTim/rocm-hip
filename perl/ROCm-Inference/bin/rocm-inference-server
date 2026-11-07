@@ -364,6 +364,44 @@ sub options {
     return \%c;
 }
 
+# A tool call as it is written, streamed as OpenAI streams one (delta.tool_calls): the function's name when its tag
+# closes, then the arguments as JSON pieces, one per parameter as each one closes. The text is the one the parser reads
+# (<function=NAME> <parameter=KEY>VALUE</parameter>), so the pieces are the arguments of the final message. A second call
+# in the reply is not streamed: the server sends it whole at the end (tool_stream_end's caller).
+sub tool_stream_new {
+    return { buf => '', pos => 0, name => undef, n => 0, first_end => 0, cut => -1,
+             id => sprintf('call_%08x%08x', int rand 2**32, int rand 2**32) };
+}
+
+sub tool_stream_feed {
+    my ($st, $text) = @_;
+    $st->{buf} .= $text;
+    my @d;
+    if (!defined $st->{name} && $st->{buf} =~ /<function=([^>\n]+)>/) {
+        $st->{name} = $1;
+        $st->{first_end} = $+[0];
+        push @d, { index => 0, id => $st->{id}, type => 'function', function => { name => $1, arguments => '{' } };
+    }
+    return @d unless defined $st->{name};
+    if ($st->{cut} < 0) {  # the first call ends where the second one's tag starts
+        my $c = index($st->{buf}, '<function=', $st->{first_end});
+        $st->{cut} = $c if $c >= 0;
+    }
+    my $stop = $st->{cut} >= 0 ? $st->{cut} : length $st->{buf};
+    my $rest = substr($st->{buf}, $st->{pos}, $stop - $st->{pos});
+    my $end = 0;
+    while ($rest =~ /<parameter=([^>\n]+)>\n?(.*?)\n?<\/parameter>/sg) {
+        my ($k, $v) = ($1, $2);
+        $end = pos($rest);
+        push @d, { index => 0, function => { arguments => ($st->{n}++ ? ',' : '') . $J->encode($k) . ':' . $J->encode($v) } };
+    }
+    $st->{pos} += $end;
+    return @d;
+}
+
+# the closing piece of a streamed call
+sub tool_stream_end { return { index => 0, function => { arguments => '}' } } }
+
 sub tool_calls {
     my ($msg) = @_;
     return [ map { {
@@ -573,7 +611,10 @@ route::post '/v1/chat/completions' => sub {
                 $q->{gen_log_t} = $now;
                 my $rate = sub { my ($n, $t) = @_; $n > 0 && $t > 0 ? sprintf('%.1f', $n / $t) : '-' };
                 my $msg;
-                if (defined $q->{think_end}) {
+                if (($q->{kind} // '') eq 'tool_call') {
+                    $msg = sprintf('tool call, %d tok in the reply, %s tg/s', $completion_tokens,
+                                   $rate->($completion_tokens, $now - $q->{first_at}));
+                } elsif (defined $q->{think_end}) {
                     my $ans = $completion_tokens - ($q->{think_tok} // 0);
                     $msg = sprintf('answer %d tok, %s tg/s (thinking %d tok)', $ans,
                                    $rate->($ans, $now - $q->{think_end}), $q->{think_tok} // 0);
@@ -583,6 +624,12 @@ route::post '/v1/chat/completions' => sub {
                 }
                 $LOG->info('generation', log_fields($q), event => 'generating', msg => $msg);
             }
+        }
+        # a keep-alive comment every 5 s while nothing else is written: a proxy keeps the connection, and a failed write
+        # means the client has gone, so the reply stops (the true return)
+        if ($q->{write} && Time::HiRes::time() - ($q->{last_write} // 0) > 5) {
+            return 1 unless $q->{write}->(": keep-alive\n\n");
+            $q->{last_write} = Time::HiRes::time();
         }
         0;
     };
@@ -616,15 +663,21 @@ route::post '/v1/chat/completions' => sub {
         $q->{write} = $write;  # the event handler's liveness check (a keep-alive write)
         my $chunk = sub {
             my ($delta, $finish) = @_;
+            $q->{last_write} = Time::HiRes::time();
             $write->(sse({ id => $id, object => 'chat.completion.chunk', created => time, model => $name,
                            choices => [ { index => 0, delta => $delta, finish_reason => $finish } ] }));
         };
         $chunk->({ role => 'assistant', content => '' }, undef) or return;
         my $gone = 0;
+        my $ts = tool_stream_new();
         my ($content, $why, $msg) = eval {
             chat($m, $messages, { %$opts, on_delta => sub {
                 my ($text, $kind) = @_;
-                return 0 if $kind eq 'tool_call';  # sent whole, once parsed
+                $q->{kind} = $kind;
+                if ($kind eq 'tool_call') {  # the call as it is written: its name, then its arguments a parameter at a time
+                    for my $d (tool_stream_feed($ts, $text)) { $gone = 1 unless $chunk->({ tool_calls => [ $d ] }, undef) }
+                    return $gone;
+                }
                 $gone = 1 unless $chunk->({ ($kind eq 'reasoning' ? 'reasoning_content' : 'content') => $text }, undef);
                 return $gone;
             } });
@@ -635,9 +688,12 @@ route::post '/v1/chat/completions' => sub {
             $write->(sse({ error => { message => $@ =~ s/ at \S+ line \d+\.?\n?\z//r, type => 'server_error' } }));
             return;
         }
-        if ($msg->{tool_calls}) {
-            my $i = 0;
-            $chunk->({ tool_calls => [ map { { index => $i++, %$_ } } @{ tool_calls($msg) } ] }, undef) or return;
+        my @calls = $msg->{tool_calls} ? @{ tool_calls($msg) } : ();
+        if (defined $ts->{name}) {  # the first call was streamed: its end, then any further call whole
+            $chunk->({ tool_calls => [ tool_stream_end($ts) ] }, undef) or return;
+            for my $i (1 .. $#calls) { $chunk->({ tool_calls => [ { index => $i, %{ $calls[$i] } } ] }, undef) or return }
+        } elsif (@calls) {
+            $chunk->({ tool_calls => [ map { { index => $_, %{ $calls[$_] } } } 0 .. $#calls ] }, undef) or return;
         }
         $chunk->({}, finish_reason($why, $msg)) or return;
         $write->(sse({ id => $id, object => 'chat.completion.chunk', created => time, model => $name, choices => [],
@@ -706,6 +762,14 @@ sub common_prefix {
 # The job's reply so far as events, or (done) its response
 sub job_output {
     my ($job, $deltas) = @_;
+    # a keep-alive comment when nothing has been sent for 5 s (the pull is the client's liveness: see on_close)
+    my $now = Time::HiRes::time();
+    $job->{last_out} //= $now;
+    if (@$deltas) { $job->{last_out} = $now }
+    elsif ($job->{stream} && !$job->{finished} && $now - $job->{last_out} > 5) {
+        push @{ $job->{out} }, ": keep-alive\n\n";
+        $job->{last_out} = $now;
+    }
     if (@$deltas && $job->{q}) {
         my $now = Time::HiRes::time();
         $job->{q}{ttft} //= 1000 * ($now - $job->{q}{t0});
@@ -714,7 +778,10 @@ sub job_output {
     if ($job->{stream}) {
         for my $d (@$deltas) {
             my ($text, $kind) = @$d;
-            next if $kind eq 'tool_call';  # sent whole, once parsed
+            if ($kind eq 'tool_call') {  # streamed as it is written (see tool_stream_feed)
+                push @{ $job->{out} }, map { chunk($job, { tool_calls => [ $_ ] }, undef) } tool_stream_feed($job->{ts} //= tool_stream_new(), $text) if $job->{stream};
+                next;
+            }
             push @{ $job->{out} }, chunk($job, { ($kind eq 'reasoning' ? 'reasoning_content' : 'content') => $text }, undef);
         }
     }
@@ -724,9 +791,12 @@ sub job_output {
     my %usage = (prompt_tokens => $job->{prompt_tokens} // 0, completion_tokens => $job->{completion},
                  total_tokens => ($job->{prompt_tokens} // 0) + $job->{completion});
     if ($job->{stream}) {
-        if ($msg->{tool_calls}) {
-            my $i = 0;
-            push @{ $job->{out} }, chunk($job, { tool_calls => [ map { { index => $i++, %$_ } } @{ tool_calls($msg) } ] }, undef);
+        my @calls = $msg->{tool_calls} ? @{ tool_calls($msg) } : ();
+        if (defined $job->{ts}{name}) {
+            push @{ $job->{out} }, chunk($job, { tool_calls => [ tool_stream_end($job->{ts}) ] }, undef);
+            push @{ $job->{out} }, chunk($job, { tool_calls => [ { index => $_, %{ $calls[$_] } } ] }, undef) for 1 .. $#calls;
+        } elsif (@calls) {
+            push @{ $job->{out} }, chunk($job, { tool_calls => [ map { { index => $_, %{ $calls[$_] } } } 0 .. $#calls ] }, undef);
         }
         push @{ $job->{out} }, chunk($job, {}, finish_reason($why, $msg));
         push @{ $job->{out} }, sse({ id => $job->{id}, object => 'chat.completion.chunk', created => time,
