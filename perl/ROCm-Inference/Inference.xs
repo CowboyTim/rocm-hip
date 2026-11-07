@@ -128,9 +128,9 @@ static const char** gen_options(pTHX_ HV* o, inference_gen_options* g, const cha
     return stops;
 }
 
-/* Engine events (inference_set_event_cb, WORKLOG logging Phase 2): the sub gets (event name, { seq, n0, n1, ms }).
- * A die in the sub is a warning, and generation goes on (unlike on_token, where a true return stops). One handler
- * per model, kept in g_events until it is replaced or the model is freed. */
+/* Engine events (inference_set_event_cb): the sub gets (event name, { seq, n0, n1, ms }). On prefill_progress a true
+ * return, or a die, cancels the prefill (the engine stops after that step); on the other events it is ignored. One
+ * handler per model, kept in g_events until it is replaced or the model is freed. */
 static const char* const EVENT_NAMES[] = {"unknown", "prefill_begin", "prefill_progress", "prefill_end",
                                           "checkpoint", "store", "draft", "context_full"};
 static HV* g_events = NULL;  /* "%p" of the model => IV of its struct event_ctx */
@@ -160,11 +160,20 @@ static int on_event_cb(void* user, const inference_event* ev) {
     XPUSHs(sv_2mortal(newSVpv(EVENT_NAMES[t], 0)));
     XPUSHs(sv_2mortal(newRV_noinc((SV*)info)));
     PUTBACK;
-    call_sv(c->code, G_DISCARD | G_EVAL);
-    if (SvTRUE(ERRSV)) Perl_warn(aTHX_ "ROCm::Inference: event handler died: %s", SvPV_nolen(ERRSV));
+    /* the sub's true return, or its death, cancels the work the engine is doing (PREFILL_PROGRESS); the others ignore it */
+    int stop = 0;
+    const int count = call_sv(c->code, G_SCALAR | G_EVAL);
+    SPAGAIN;
+    if (SvTRUE(ERRSV)) {
+        stop = 1;
+        Perl_warn(aTHX_ "ROCm::Inference: event handler died, the work is cancelled: %s", SvPV_nolen(ERRSV));
+    } else if (count > 0) {
+        stop = SvTRUE(POPs) ? 1 : 0;
+    }
+    PUTBACK;
     FREETMPS;
     LEAVE;
-    return 0;
+    return stop;
 }
 
 /* Drops a model's event handler (before the model is freed) */

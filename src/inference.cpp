@@ -1681,7 +1681,10 @@ int inference_prefill(inference_model_t* m, const int32_t* tokens, int n) {
         m->n_past += len;
         m->seq.insert(m->seq.end(), tokens + done, tokens + done + len);
         done += len;
-        if (evt && done < n) fire_event(m, INFERENCE_EVT_PREFILL_PROGRESS, done, n, ms_since(t0));
+        if (evt && done < n && fire_event(m, INFERENCE_EVT_PREFILL_PROGRESS, done, n, ms_since(t0)) != 0) {
+            set_error("prefill cancelled by the event handler after %d of %d tokens", done, n);
+            return INFERENCE_ERR_CANCELLED;  // the tokens so far are in the sequence (and its KV cache), as after any prefill step
+        }
         if (store_after_forward(m) != 0) return -1;
     }
     return 0;

@@ -25,6 +25,12 @@ static int record(void* user, const inference_event* e) {
     return 0;
 }
 
+static int cancel_cb(void* user, const inference_event* e) {
+    if (e->type != INFERENCE_EVT_PREFILL_PROGRESS) return 0;
+    ++*static_cast<int*>(user);
+    return 1;  // cancel after this step
+}
+
 static int count(const Log& l, int type) {
     int n = 0;
     for (const inference_event& e : l.ev) n += e.type == type;
@@ -121,6 +127,17 @@ int main(int argc, char** argv) {
     small.resize(250);  // a prompt that fits; decoding runs into the 256 positions
     generate(m, small, 64, &rc);
     check(count(c, INFERENCE_EVT_CONTEXT_FULL) == 1, "CONTEXT_FULL once when generation fills the context");
+    inference_free_model(m);
+
+    // 2b. a nonzero return on PREFILL_PROGRESS cancels the prefill, after its step
+    printf("cancelled prefill\n");
+    m = fresh(model, 4096, nullptr);
+    int hits = 0;
+    inference_set_event_cb(m, cancel_cb, &hits);
+    rc = 0;
+    generate(m, longp, 4, &rc);
+    check(rc == INFERENCE_ERR_CANCELLED, "a nonzero progress return cancels the prefill");
+    check(hits == 1, "the prefill stops after the step that asked");
     inference_free_model(m);
 
     // 3. the draft events, with a draft head: one per verify pass, the accepted count within the proposed

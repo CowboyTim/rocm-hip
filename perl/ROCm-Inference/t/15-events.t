@@ -5,7 +5,7 @@ use Test::More;
 use ROCm::Inference qw(:all);
 
 # The engine's events (set_event_handler): the handler gets (name, { seq, n0, n1, ms }) on a real generate, the
-# generation is the same with and without it, and a die in the handler warns and does not stop the generation.
+# generation is the same with and without it, and its return on prefill_progress (true, or a die) cancels the prefill.
 # Needs a GPU and a model: ROCM_INFERENCE_TEST_MODEL=/dev/shm/models/Qwen3.5-4B-ROCMFP4.gguf
 my $path = $ENV{ROCM_INFERENCE_TEST_MODEL};
 plan skip_all => 'set ROCM_INFERENCE_TEST_MODEL to a GGUF model to run' unless $path && -f $path;
@@ -16,7 +16,7 @@ my $opts = { max_new_tokens => 6, temperature => 0, ignore_eog => 1, reuse_prefi
 my $m = load_model($path);
 kv_cache_init($m, 4096);
 my @ev;
-set_event_handler($m, sub { push @ev, [@_] });
+set_event_handler($m, sub { push @ev, [@_]; 0 });  # (0: a true return would cancel the prefill)
 my $ids = tokenize($m, $text . 'Question: what color is the fox?');
 my ($with) = generate($m, $ids, $opts);
 my @names = map { $_->[0] } @ev;
@@ -36,13 +36,30 @@ my ($without) = generate($m, $ids, $opts);
 is(scalar(@ev), $n_before, 'no events once the handler is removed');
 is_deeply($without, $with, 'the same tokens with and without the handler');
 
-# a die in the handler: a warning, and the generation goes on
-my @warns;
+# the handler's cancel. Each on a fresh model: the same prompt again would be reused whole, with no prefill steps
 {
-    local $SIG{__WARN__} = sub { push @warns, @_ };
-    set_event_handler($m, sub { die "boom\n" });
-    my ($dying) = generate($m, $ids, $opts);
-    is_deeply($dying, $with, 'a dying handler does not change the generation');
+    my $c = load_model($path);
+    kv_cache_init($c, 4096);
+    set_event_handler($c, sub { $_[0] eq 'prefill_progress' ? 1 : 0 });
+    my $ok = eval { generate($c, tokenize($c, $text . 'Question: what color is the fox?'), $opts); 1 };
+    ok(!$ok, 'a true return on prefill_progress cancels the prefill');
+    like($@, qr/cancelled/, 'the cancel is the error');
 }
-ok(scalar(grep { /event handler died: boom/ } @warns), 'the die becomes a warning');
+{
+    my $c = load_model($path);
+    kv_cache_init($c, 4096);
+    my @warns;
+    local $SIG{__WARN__} = sub { push @warns, @_ };
+    set_event_handler($c, sub { die "boom\n" if $_[0] eq 'prefill_progress'; 0 });
+    my $ok = eval { generate($c, tokenize($c, $text . 'Question: what color is the fox?'), $opts); 1 };
+    ok(!$ok, 'a die on prefill_progress cancels the prefill');
+    ok(scalar(grep { /event handler died, the work is cancelled: boom/ } @warns), 'the die is a warning too');
+}
+{
+    my $c = load_model($path);
+    kv_cache_init($c, 4096);
+    set_event_handler($c, sub { $_[0] ne 'prefill_progress' });
+    my ($ignored) = generate($c, tokenize($c, $text . 'Question: what color is the fox?'), $opts);
+    is_deeply($ignored, $with, 'true returns on the other events change nothing');
+}
 done_testing;

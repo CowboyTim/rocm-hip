@@ -26,6 +26,7 @@ typedef enum {
     INFERENCE_ERR_INVALID_STATE = -7,
     INFERENCE_ERR_NOT_IMPLEMENTED = -8,
     INFERENCE_ERR_CONTEXT_FULL = -9,
+    INFERENCE_ERR_CANCELLED = -10,  // the event handler asked to stop (its PREFILL_PROGRESS returned nonzero)
 } inference_error_t;
 
 // Convert error code to human readable string.
@@ -320,6 +321,9 @@ typedef struct inference_event {
     double ms;       // elapsed milliseconds since the event's begin (0 when not measured)
 } inference_event;
 
+// The callback's return value: nonzero on INFERENCE_EVT_PREFILL_PROGRESS cancels the prefill after that step
+// (INFERENCE_ERR_CANCELLED); the other events ignore it, so a host that wants to stop a generation does it with
+// the on_token callback. A host may also stop by failing (in Perl, a die) on PREFILL_PROGRESS.
 typedef int (*inference_event_cb)(void* user, const inference_event* ev);
 
 // Register (or, with cb == NULL, clear) a model's event handler. The handler outlives any single call: the
