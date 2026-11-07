@@ -559,6 +559,21 @@ route::post '/v1/chat/completions' => sub {
                 $q->{tail} = substr(($q->{tail} // '') . detokenize($m, [ $_[0] ]), -64);
                 $q->{think_end} = $now if index($q->{tail}, $close) >= 0;
             }
+            # a line every 5 s while the reply runs: the phase (thinking or answer), its tokens and its rate
+            if ($now - ($q->{gen_log_t} // $q->{first_at}) >= 5) {
+                $q->{gen_log_t} = $now;
+                my $rate = sub { my ($n, $t) = @_; $n > 0 && $t > 0 ? sprintf('%.1f', $n / $t) : '-' };
+                my $msg;
+                if (defined $q->{think_end}) {
+                    my $ans = $completion_tokens - ($q->{think_tok} // 0);
+                    $msg = sprintf('answer %d tok, %s tg/s (thinking %d tok)', $ans,
+                                   $rate->($ans, $now - $q->{think_end}), $q->{think_tok} // 0);
+                } else {
+                    $msg = sprintf('thinking %d tok, %s tg/s', $completion_tokens,
+                                   $rate->($completion_tokens, $now - $q->{first_at}));
+                }
+                $LOG->info('generation', log_fields($q), event => 'generating', msg => $msg);
+            }
         }
         0;
     };
